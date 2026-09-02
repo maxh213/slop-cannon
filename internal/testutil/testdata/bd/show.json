@@ -1,0 +1,58 @@
+{
+  "data": [
+    {
+      "id": "fx-z7f",
+      "title": "Fix Mean skipping the first value",
+      "description": "stats.Mean starts its loop at index 1.",
+      "status": "in_review",
+      "priority": 1,
+      "issue_type": "bug",
+      "assignee": "sc:test",
+      "created_at": "2026-09-02T14:08:25Z",
+      "updated_at": "2026-09-02T14:09:32Z",
+      "started_at": "2026-09-02T14:09:32Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_round": 1
+      },
+      "labels": [
+        "sc:role:engineer",
+        "sc:run:r1"
+      ],
+      "dependencies": [
+        {
+          "id": "fx-a0u",
+          "title": "Run r1: fix the two bugs",
+          "description": "Run epic",
+          "status": "open",
+          "priority": 1,
+          "issue_type": "epic",
+          "created_at": "2026-09-02T14:08:25Z",
+          "updated_at": "2026-09-02T14:08:25Z",
+          "metadata": {
+            "sc_run": "r1",
+            "sc_kind": "epic"
+          },
+          "labels": [
+            "sc:run:r1"
+          ],
+          "dependency_type": "parent-child"
+        }
+      ],
+      "comments": [
+        {
+          "id": "01a06274-1df4-770d-af65-57e2e138232b",
+          "issue_id": "fx-z7f",
+          "author": "sc:test",
+          "text": "Implementation report\n\n```json\n{\"type\":\"impl_report\",\"summary\":\"fixed Mean\",\"files\":[\"stats/stats.go\"]}\n```",
+          "created_at": "2026-09-02T14:09:32Z"
+        }
+      ],
+      "parent": "fx-a0u",
+      "dependent_count": 0,
+      "dependency_count": 1,
+      "comment_count": 1
+    }
+  ],
+  "schema_version": 1
+}

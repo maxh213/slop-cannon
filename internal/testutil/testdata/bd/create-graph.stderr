@@ -1,0 +1,2 @@
+warning: graph plan node["max"] has unknown field(s): [acceptance_criteria deps] (silently dropped — see 'bd create --graph' schema)
+warning: graph plan node["mean"] has unknown field(s): [acceptance_criteria] (silently dropped — see 'bd create --graph' schema)

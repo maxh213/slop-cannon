@@ -1,0 +1,152 @@
+{
+  "data": [
+    {
+      "CommitHash": "hnuir35ijb5cgae9aqqcetuh31oiodr7",
+      "Committer": "root",
+      "CommitDate": "2026-09-02T15:09:49.217+01:00",
+      "Issue": {
+        "id": "fx-z7f",
+        "title": "Fix Mean skipping the first value",
+        "description": "stats.Mean starts its loop at index 1.",
+        "status": "closed",
+        "priority": 1,
+        "issue_type": "bug",
+        "assignee": "sc:test",
+        "created_at": "2026-09-02T14:08:25Z",
+        "updated_at": "2026-09-02T14:09:49Z",
+        "closed_at": "2026-09-02T14:09:49Z",
+        "close_reason": "fixed in round 1"
+      }
+    },
+    {
+      "CommitHash": "d1l389ehj1vlh0353421u8ojsl4lqcmu",
+      "Committer": "root",
+      "CommitDate": "2026-09-02T15:09:48.812+01:00",
+      "Issue": {
+        "id": "fx-z7f",
+        "title": "Fix Mean skipping the first value",
+        "description": "stats.Mean starts its loop at index 1.",
+        "status": "closed",
+        "priority": 1,
+        "issue_type": "bug",
+        "assignee": "sc:test",
+        "created_at": "2026-09-02T14:08:25Z",
+        "updated_at": "2026-09-02T14:09:49Z",
+        "closed_at": "2026-09-02T14:09:49Z",
+        "close_reason": "fixed in round 1"
+      }
+    },
+    {
+      "CommitHash": "si8nn2i65k0f4pvscehrb0t969ksi443",
+      "Committer": "root",
+      "CommitDate": "2026-09-02T15:09:48.485+01:00",
+      "Issue": {
+        "id": "fx-z7f",
+        "title": "Fix Mean skipping the first value",
+        "description": "stats.Mean starts its loop at index 1.",
+        "status": "in_review",
+        "priority": 1,
+        "issue_type": "bug",
+        "assignee": "sc:test",
+        "created_at": "2026-09-02T14:08:25Z",
+        "updated_at": "2026-09-02T14:09:32Z"
+      }
+    },
+    {
+      "CommitHash": "q7r7j9bdmr53g7n9usv4m5sjmuo75jct",
+      "Committer": "root",
+      "CommitDate": "2026-09-02T15:09:47.599+01:00",
+      "Issue": {
+        "id": "fx-z7f",
+        "title": "Fix Mean skipping the first value",
+        "description": "stats.Mean starts its loop at index 1.",
+        "status": "in_review",
+        "priority": 1,
+        "issue_type": "bug",
+        "assignee": "sc:test",
+        "created_at": "2026-09-02T14:08:25Z",
+        "updated_at": "2026-09-02T14:09:32Z"
+      }
+    },
+    {
+      "CommitHash": "vrdne4ih2q58g4cdutmucgho7ndcne1h",
+      "Committer": "root",
+      "CommitDate": "2026-09-02T15:09:32.905+01:00",
+      "Issue": {
+        "id": "fx-z7f",
+        "title": "Fix Mean skipping the first value",
+        "description": "stats.Mean starts its loop at index 1.",
+        "status": "in_review",
+        "priority": 1,
+        "issue_type": "bug",
+        "assignee": "sc:test",
+        "created_at": "2026-09-02T14:08:25Z",
+        "updated_at": "2026-09-02T14:09:32Z"
+      }
+    },
+    {
+      "CommitHash": "hd0os0akpf8ua7t7nbame93itdk0gedh",
+      "Committer": "root",
+      "CommitDate": "2026-09-02T15:09:32.179+01:00",
+      "Issue": {
+        "id": "fx-z7f",
+        "title": "Fix Mean skipping the first value",
+        "description": "stats.Mean starts its loop at index 1.",
+        "status": "in_review",
+        "priority": 1,
+        "issue_type": "bug",
+        "assignee": "sc:test",
+        "created_at": "2026-09-02T14:08:25Z",
+        "updated_at": "2026-09-02T14:09:32Z"
+      }
+    },
+    {
+      "CommitHash": "ivbn32hjifk17p3chg80c1pbsp2isdu5",
+      "Committer": "root",
+      "CommitDate": "2026-09-02T15:09:31.978+01:00",
+      "Issue": {
+        "id": "fx-z7f",
+        "title": "Fix Mean skipping the first value",
+        "description": "stats.Mean starts its loop at index 1.",
+        "status": "in_review",
+        "priority": 1,
+        "issue_type": "bug",
+        "assignee": "sc:test",
+        "created_at": "2026-09-02T14:08:25Z",
+        "updated_at": "2026-09-02T14:09:32Z"
+      }
+    },
+    {
+      "CommitHash": "lsuncqut7j2ofmca4vhl0io5lfrsgmbn",
+      "Committer": "root",
+      "CommitDate": "2026-09-02T15:09:31.55+01:00",
+      "Issue": {
+        "id": "fx-z7f",
+        "title": "Fix Mean skipping the first value",
+        "description": "stats.Mean starts its loop at index 1.",
+        "status": "in_progress",
+        "priority": 1,
+        "issue_type": "bug",
+        "assignee": "sc:test",
+        "created_at": "2026-09-02T14:08:25Z",
+        "updated_at": "2026-09-02T14:09:32Z"
+      }
+    },
+    {
+      "CommitHash": "g6vtftv5bla80eiakedk37hupu1hfduk",
+      "Committer": "beads",
+      "CommitDate": "2026-09-02T15:08:25.174+01:00",
+      "Issue": {
+        "id": "fx-z7f",
+        "title": "Fix Mean skipping the first value",
+        "description": "stats.Mean starts its loop at index 1.",
+        "status": "open",
+        "priority": 1,
+        "issue_type": "bug",
+        "created_at": "2026-09-02T14:08:25Z",
+        "updated_at": "2026-09-02T14:08:25Z"
+      }
+    }
+  ],
+  "schema_version": 1
+}

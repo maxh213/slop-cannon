@@ -1,0 +1,65 @@
+{
+  "data": [
+    {
+      "id": "fx-z7f",
+      "title": "Fix Mean skipping the first value",
+      "description": "stats.Mean starts its loop at index 1.",
+      "status": "open",
+      "priority": 1,
+      "issue_type": "bug",
+      "created_at": "2026-09-02T14:08:25Z",
+      "updated_at": "2026-09-02T14:08:25Z",
+      "metadata": {
+        "sc_run": "r1"
+      },
+      "labels": [
+        "sc:run:r1"
+      ],
+      "dependencies": [
+        {
+          "issue_id": "fx-z7f",
+          "depends_on_id": "fx-a0u",
+          "type": "parent-child",
+          "created_at": "2026-09-02T15:08:25Z",
+          "created_by": "sc:test",
+          "metadata": "{}"
+        }
+      ],
+      "dependency_count": 0,
+      "dependent_count": 0,
+      "comment_count": 0,
+      "parent": "fx-a0u"
+    },
+    {
+      "id": "fx-0uu",
+      "title": "Fix Max for all-negative input",
+      "description": "stats.Max starts from 0.",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "bug",
+      "created_at": "2026-09-02T14:08:25Z",
+      "updated_at": "2026-09-02T14:08:25Z",
+      "metadata": {
+        "sc_run": "r1"
+      },
+      "labels": [
+        "sc:run:r1"
+      ],
+      "dependencies": [
+        {
+          "issue_id": "fx-0uu",
+          "depends_on_id": "fx-a0u",
+          "type": "parent-child",
+          "created_at": "2026-09-02T15:08:25Z",
+          "created_by": "sc:test",
+          "metadata": "{}"
+        }
+      ],
+      "dependency_count": 0,
+      "dependent_count": 0,
+      "comment_count": 0,
+      "parent": "fx-a0u"
+    }
+  ],
+  "schema_version": 1
+}

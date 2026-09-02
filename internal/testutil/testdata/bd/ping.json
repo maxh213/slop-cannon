@@ -1,0 +1,10 @@
+{
+  "data": {
+    "query_ms": 11,
+    "resolve_ms": 0,
+    "status": "ok",
+    "store_ms": 0,
+    "total_ms": 11
+  },
+  "schema_version": 1
+}

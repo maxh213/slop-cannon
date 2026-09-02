@@ -1,0 +1,16 @@
+{
+  "data": {
+    "beads_dir": "/tmp/fixture-repo/.beads",
+    "repo_root": "/tmp/fixture-repo",
+    "cwd_repo_root": "/tmp/fixture-repo",
+    "is_redirected": false,
+    "is_worktree": false,
+    "backend": "dolt",
+    "dolt_mode": "embedded",
+    "database": "fx",
+    "project_id": "cb1dae52-ab04-4b8d-bebb-e8813efaf0eb",
+    "role": "maintainer",
+    "bd_version": "1.2.2"
+  },
+  "schema_version": 1
+}

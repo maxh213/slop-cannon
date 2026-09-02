@@ -1,0 +1,10 @@
+{
+  "data": {
+    "id": "01a06274-1df4-770d-af65-57e2e138232b",
+    "issue_id": "fx-z7f",
+    "author": "sc:test",
+    "text": "Implementation report\n\n```json\n{\"type\":\"impl_report\",\"summary\":\"fixed Mean\",\"files\":[\"stats/stats.go\"]}\n```",
+    "created_at": "2026-09-02T14:09:32.146469569Z"
+  },
+  "schema_version": 1
+}

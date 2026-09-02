@@ -1,0 +1,17 @@
+{
+  "data": {
+    "id": "fx-a0u.2",
+    "title": "Write Median tests",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "fx@example.com",
+    "created_at": "2026-09-02T14:10:16.254006841Z",
+    "created_by": "sc:test",
+    "updated_at": "2026-09-02T14:10:16.254006841Z",
+    "labels": [
+      "sc:run:r1"
+    ]
+  },
+  "schema_version": 1
+}

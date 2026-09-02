@@ -1,0 +1,51 @@
+# Slop Cannon build targets. Run `make help` for a summary.
+
+SHELL := /bin/sh
+MODULE := slop-cannon
+BIN_DIR := bin
+BINARY := $(BIN_DIR)/sc
+GOLANGCI_LINT_VERSION := v2.13.2
+GOLANGCI_LINT := $(BIN_DIR)/golangci-lint
+
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+DATE    ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS := -s -w \
+	-X $(MODULE)/internal/cli.Version=$(VERSION) \
+	-X $(MODULE)/internal/cli.Commit=$(COMMIT) \
+	-X $(MODULE)/internal/cli.Date=$(DATE)
+
+.PHONY: help build test lint fmt check install integration clean tools
+
+help: ## Show this help
+	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "  %-14s %s\n", $$1, $$2}'
+
+build: ## Build bin/sc with version metadata
+	@mkdir -p $(BIN_DIR)
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BINARY) ./cmd/sc
+
+test: ## Run unit tests with the race detector
+	go test -race ./...
+
+lint: $(GOLANGCI_LINT) ## Run golangci-lint (installed to bin/ on first use)
+	$(GOLANGCI_LINT) run ./...
+
+fmt: ## Fail if any Go file is not gofmt-clean
+	@out="$$(gofmt -l -s .)"; if [ -n "$$out" ]; then echo "gofmt: files need formatting:"; echo "$$out"; exit 1; fi
+
+check: fmt lint test ## fmt + lint + test (the CI gate)
+
+install: ## go install ./cmd/sc with version metadata
+	go install -trimpath -ldflags "$(LDFLAGS)" ./cmd/sc
+
+integration: ## Run tests tagged `integration` (need real bd/git/gh)
+	go test -race -tags integration ./...
+
+clean: ## Remove build output and caches produced by this Makefile
+	rm -rf $(BIN_DIR) dist coverage.out
+
+tools: $(GOLANGCI_LINT) ## Install pinned developer tools into bin/
+
+$(GOLANGCI_LINT):
+	@mkdir -p $(BIN_DIR)
+	GOBIN=$(CURDIR)/$(BIN_DIR) go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_LINT_VERSION)

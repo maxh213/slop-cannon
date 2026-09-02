@@ -1,0 +1,7 @@
+{
+  "data": {
+    "key": "status.custom",
+    "value": "in_review:wip,changes_requested:wip,approved:wip,delivering:wip,escalated:frozen,needs_human:frozen,failed:frozen"
+  },
+  "schema_version": 1
+}

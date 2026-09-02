@@ -1,0 +1,11 @@
+
+Beads Database Information
+===========================
+Database: /tmp/fixture-repo/.beads/embeddeddolt
+Mode: direct
+
+Issue Count: 0
+
+⚠️  Git hooks not installed (5 missing)
+   Run: bd hooks install
+

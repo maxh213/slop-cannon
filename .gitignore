@@ -1,0 +1,15 @@
+# IDE
+.idea/
+
+# Build output
+bin/
+dist/
+
+# Run state (legacy in-repo location, see D-23)
+.slop-cannon/run/
+
+# Logs
+*.log
+
+# Test artifacts
+coverage.out

@@ -1,0 +1,57 @@
+{
+  "data": [
+    {
+      "id": "fx-a0u",
+      "title": "Run r1: fix the two bugs",
+      "description": "Run epic",
+      "status": "open",
+      "priority": 1,
+      "issue_type": "epic",
+      "created_at": "2026-09-02T14:08:25Z",
+      "updated_at": "2026-09-02T14:08:25Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "epic"
+      },
+      "labels": [
+        "sc:run:r1"
+      ],
+      "dependency_type": "parent-child"
+    },
+    {
+      "id": "fx-a0u.2",
+      "title": "Write Median tests",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "task",
+      "owner": "fx@example.com",
+      "created_at": "2026-09-02T14:10:16Z",
+      "created_by": "sc:test",
+      "updated_at": "2026-09-02T14:10:16Z",
+      "labels": [
+        "sc:run:r1"
+      ],
+      "dependency_type": "blocks"
+    },
+    {
+      "id": "fx-0uu",
+      "title": "Fix Max for all-negative input",
+      "description": "stats.Max starts from 0.",
+      "status": "closed",
+      "priority": 2,
+      "issue_type": "bug",
+      "created_at": "2026-09-02T14:08:25Z",
+      "updated_at": "2026-09-02T14:09:48Z",
+      "closed_at": "2026-09-02T14:09:48Z",
+      "close_reason": "done",
+      "metadata": {
+        "sc_run": "r1"
+      },
+      "labels": [
+        "sc:run:r1"
+      ],
+      "dependency_type": "blocks"
+    }
+  ],
+  "schema_version": 1
+}

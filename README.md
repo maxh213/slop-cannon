@@ -45,3 +45,22 @@ defaults
 # dependencies 
 - beads / dolt
 - some kind of cli llm subscription
+
+## Development
+
+Go 1.27+ is required. All day-to-day work goes through the Makefile:
+
+| Target | What it does |
+|---|---|
+| `make build` | Builds `bin/sc` with version, commit, and build date injected via `-ldflags` |
+| `make test` | `go test -race ./...` |
+| `make lint` | Runs `golangci-lint` (auto-installed into `bin/` at the pinned version; config in `.golangci.yml`) |
+| `make fmt` | Fails if any Go file is not `gofmt -s` clean |
+| `make check` | `fmt` + `lint` + `test`; the gate CI runs and every task must pass |
+| `make install` | `go install ./cmd/sc` with the same version metadata |
+| `make integration` | Runs tests tagged `integration` (they need real `bd`, `git`, `gh`) |
+| `make clean` | Removes `bin/`, `dist/`, and coverage output |
+| `make tools` | Installs the pinned developer tools into `bin/` |
+| `make help` | Lists the targets |
+
+CI (`.github/workflows/ci.yml`) runs `make check` on Ubuntu and macOS for every push and pull request, and runs `make integration` in a separate job that is skipped when `bd` is not installed.
