@@ -1,0 +1,59 @@
+{
+  "data": [
+    {
+      "id": "fx-so0",
+      "title": "Fix Mean skipping the first value",
+      "description": "stats.Mean starts its loop at index 1.",
+      "status": "in_progress",
+      "priority": 1,
+      "issue_type": "bug",
+      "assignee": "sc:engineer-1",
+      "created_at": "2026-09-02T18:38:49Z",
+      "updated_at": "2026-09-02T18:38:50Z",
+      "started_at": "2026-09-02T18:38:50Z",
+      "metadata": {
+        "sc_run": "r1"
+      },
+      "labels": [
+        "sc:run:r1"
+      ],
+      "dependencies": [
+        {
+          "id": "fx-nvi",
+          "title": "Run r1: fix the two bugs",
+          "description": "Run epic",
+          "status": "open",
+          "priority": 1,
+          "issue_type": "epic",
+          "created_at": "2026-09-02T18:38:49Z",
+          "updated_at": "2026-09-02T18:38:49Z",
+          "metadata": {
+            "sc_run": "r1",
+            "sc_kind": "epic"
+          },
+          "labels": [
+            "sc:run:r1"
+          ],
+          "dependency_type": "parent-child"
+        }
+      ],
+      "dependents": [
+        {
+          "id": "fx-ctt",
+          "title": "Fix Max for all-negative input",
+          "status": "open",
+          "priority": 2,
+          "issue_type": "bug",
+          "created_at": "0001-01-01T00:00:00Z",
+          "updated_at": "0001-01-01T00:00:00Z",
+          "dependency_type": "blocks"
+        }
+      ],
+      "parent": "fx-nvi",
+      "dependent_count": 1,
+      "dependency_count": 1,
+      "comment_count": 2
+    }
+  ],
+  "schema_version": 1
+}

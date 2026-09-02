@@ -1,0 +1,4 @@
+warning: beads.role not configured (GH#2950).
+  Fix: git config beads.role maintainer
+  Or:  git config beads.role contributor
+Error: validation failed for issue : title is required

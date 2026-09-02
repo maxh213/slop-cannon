@@ -1,0 +1,58 @@
+{
+  "data": [
+    {
+      "id": "fx-ctt",
+      "title": "Fix Max for all-negative input",
+      "description": "stats.Max starts from 0.",
+      "acceptance_criteria": "TestMax passes for negatives",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "bug",
+      "created_at": "2026-09-02T18:38:49Z",
+      "updated_at": "2026-09-02T18:38:53Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_agent": "engineer-1",
+        "sc_lease": "2026-09-02T14:09:32Z",
+        "sc_round": 1,
+        "sc_pr_url": "https://example.com/pr/7",
+        "sc_pr_number": 7
+      },
+      "labels": [
+        "sc:role:engineer",
+        "sc:run:r1"
+      ],
+      "blocked_by_count": 1,
+      "blocked_by": [
+        "fx-so0"
+      ]
+    },
+    {
+      "id": "fx-nvi.1",
+      "title": "Add Median",
+      "description": "README promises Median",
+      "acceptance_criteria": "TestMedian passes",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "task",
+      "owner": "fx@example.com",
+      "created_at": "2026-09-02T18:38:49Z",
+      "created_by": "sc",
+      "updated_at": "2026-09-02T18:38:49Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_round": 0
+      },
+      "labels": [
+        "sc:role:engineer",
+        "sc:run:r1"
+      ],
+      "blocked_by_count": 1,
+      "blocked_by": [
+        "fx-nvi.2"
+      ]
+    }
+  ],
+  "schema_version": 1
+}

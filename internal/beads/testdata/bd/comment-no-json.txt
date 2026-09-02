@@ -1,0 +1,1 @@
+✓ Comment added to fx-so0 — Fix Mean skipping the first value

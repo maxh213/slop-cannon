@@ -1,0 +1,4 @@
+# Beads fork protection (bd init)
+.beads/
+**/RECOVERY*.md
+**/SESSION*.md

@@ -1,0 +1,63 @@
+{
+  "name": "review loop",
+  "detect": {
+    "version": "mock/1.0.0",
+    "auth": "ok"
+  },
+  "rules": [
+    {
+      "name": "plan",
+      "match": {"role": "po", "task": "plan"},
+      "steps": [
+        {"kind": "text", "text": "Researching the repository.\n", "delay": "100ms"},
+        {"kind": "tool_use", "tool": "Read", "tool_id": "r1", "input": "README.md"},
+        {"kind": "tool_result", "tool": "Read", "tool_id": "r1", "output": "# fixture\n"}
+      ],
+      "result": {
+        "structured": {"beads": [{"key": "fix-mean", "title": "Fix Mean"}]}
+      }
+    },
+    {
+      "name": "implement",
+      "match": {"role": "engineer", "task": "implement"},
+      "steps": [
+        {"kind": "text", "text": "Fixing the bug.\n", "delay": "250ms"},
+        {"kind": "write", "path": "FIX.md", "content": "fixed by the mock engineer\n"},
+        {"kind": "exec", "command": "git", "args": ["add", "-A"], "must": true},
+        {"kind": "exec", "command": "git", "args": ["commit", "-q", "-m", "mock: fix"], "must": true}
+      ],
+      "result": {
+        "structured": {"summary": "wrote FIX.md", "files": ["FIX.md"]},
+        "usage": {"input_tokens": 1200, "output_tokens": 300, "cost_usd": 0.02, "has_cost": true, "turns": 3},
+        "session_id": "sess-impl"
+      }
+    },
+    {
+      "name": "qa first round",
+      "match": {"role": "tester", "lens": "qa", "round": 1},
+      "max_uses": 1,
+      "steps": [
+        {"kind": "text", "text": "Found a problem.", "delay": "50ms"}
+      ],
+      "result": {
+        "structured": {"outcome": "changes", "items": [{"severity": "major", "title": "missing test"}]}
+      }
+    },
+    {
+      "name": "approve",
+      "match": {"role": "tester"},
+      "steps": [
+        {"kind": "text", "text": "Looks good."}
+      ],
+      "result": {
+        "structured": {"outcome": "approve", "items": []}
+      }
+    }
+  ],
+  "fallback": {
+    "name": "echo",
+    "match": {},
+    "steps": [{"kind": "echo"}],
+    "result": {}
+  }
+}

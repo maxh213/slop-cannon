@@ -15,7 +15,7 @@ LDFLAGS := -s -w \
 	-X $(MODULE)/internal/cli.Commit=$(COMMIT) \
 	-X $(MODULE)/internal/cli.Date=$(DATE)
 
-.PHONY: help build test lint fmt check install integration clean tools update-golden docs-cli
+.PHONY: help build test lint fmt check install integration clean tools update-golden docs-cli cartridge-conformance
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -46,6 +46,11 @@ update-golden: ## Regenerate testdata/**/*.golden files (and docs/cli.md) from c
 
 docs-cli: ## Regenerate docs/cli.md from the sc command tree
 	go run ./cmd/gendocs -o docs/cli.md
+
+CARTRIDGE ?= mock
+
+cartridge-conformance: ## Run the cartridge conformance suite (CARTRIDGE=mock|claude; a real CLI needs a login, never run in CI)
+	CARTRIDGE=$(CARTRIDGE) go test -count=1 -race -run '^TestConformance$$' -v ./internal/cartridge/conformance/
 
 clean: ## Remove build output and caches produced by this Makefile
 	rm -rf $(BIN_DIR) dist coverage.out

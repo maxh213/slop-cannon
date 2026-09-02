@@ -1,0 +1,3 @@
+```sc-result
+{"outcome": "maybe", "items": [{"title": "", "severity": "huge"}], "extra": true}
+```

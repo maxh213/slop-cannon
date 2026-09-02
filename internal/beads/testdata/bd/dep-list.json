@@ -1,0 +1,38 @@
+{
+  "data": [
+    {
+      "id": "fx-nvi.2",
+      "title": "Write Median tests",
+      "status": "open",
+      "priority": 3,
+      "issue_type": "task",
+      "owner": "fx@example.com",
+      "created_at": "2026-09-02T18:38:50Z",
+      "created_by": "sc",
+      "updated_at": "2026-09-02T18:38:50Z",
+      "labels": [
+        "sc:run:r1"
+      ],
+      "dependency_type": "blocks"
+    },
+    {
+      "id": "fx-nvi",
+      "title": "Run r1: fix the two bugs",
+      "description": "Run epic",
+      "status": "open",
+      "priority": 1,
+      "issue_type": "epic",
+      "created_at": "2026-09-02T18:38:49Z",
+      "updated_at": "2026-09-02T18:38:49Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "epic"
+      },
+      "labels": [
+        "sc:run:r1"
+      ],
+      "dependency_type": "parent-child"
+    }
+  ],
+  "schema_version": 1
+}

@@ -1,0 +1,139 @@
+{
+  "commit_message": "sc: plan 6 beads for run r1",
+  "nodes": [
+    {
+      "key": "a",
+      "title": "Add stats package",
+      "type": "task",
+      "priority": 1,
+      "description": "Package skeleton",
+      "labels": [
+        "sc:run:r1",
+        "sc:role:po"
+      ],
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_round": "0",
+        "sc_size": "s"
+      }
+    },
+    {
+      "key": "b",
+      "title": "Fix Mean",
+      "type": "bug",
+      "priority": 1,
+      "description": "Mean skips the first value",
+      "labels": [
+        "sc:run:r1",
+        "sc:role:po"
+      ],
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_round": "0",
+        "sc_size": "s"
+      }
+    },
+    {
+      "key": "c",
+      "title": "Fix Max",
+      "type": "bug",
+      "priority": 2,
+      "description": "Max starts from 0",
+      "labels": [
+        "sc:run:r1",
+        "sc:role:po"
+      ],
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_round": "0",
+        "sc_size": "m"
+      }
+    },
+    {
+      "key": "d",
+      "title": "Add Median",
+      "type": "feature",
+      "priority": 2,
+      "description": "Median over sorted copy",
+      "labels": [
+        "sc:run:r1",
+        "sc:role:po"
+      ],
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_round": "0",
+        "sc_size": "m"
+      }
+    },
+    {
+      "key": "e",
+      "title": "Document stats",
+      "type": "chore",
+      "priority": 3,
+      "description": "README section",
+      "labels": [
+        "sc:run:r1",
+        "sc:role:po"
+      ],
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_round": "0",
+        "sc_size": "s"
+      }
+    },
+    {
+      "key": "f",
+      "title": "Benchmark stats",
+      "type": "task",
+      "priority": 4,
+      "description": "Benchmarks for the package",
+      "labels": [
+        "sc:run:r1",
+        "sc:role:po"
+      ],
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_round": "0",
+        "sc_size": "l"
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from_key": "b",
+      "to_key": "a",
+      "type": "blocks"
+    },
+    {
+      "from_key": "c",
+      "to_key": "a",
+      "type": "blocks"
+    },
+    {
+      "from_key": "d",
+      "to_key": "b",
+      "type": "blocks"
+    },
+    {
+      "from_key": "d",
+      "to_key": "c",
+      "type": "blocks"
+    },
+    {
+      "from_key": "e",
+      "to_key": "d",
+      "type": "blocks"
+    },
+    {
+      "from_key": "f",
+      "to_key": "e",
+      "type": "blocks"
+    }
+  ]
+}

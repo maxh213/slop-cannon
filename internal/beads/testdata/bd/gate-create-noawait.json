@@ -1,0 +1,16 @@
+{
+  "data": {
+    "id": "fx-96y",
+    "title": "Gate: gh:pr",
+    "description": "Ad-hoc gate blocking fx-8b8",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "gate",
+    "owner": "fx@example.com",
+    "created_at": "2026-09-02T18:57:21.694217892Z",
+    "created_by": "sc:test",
+    "updated_at": "2026-09-02T18:57:21.694217892Z",
+    "await_type": "gh:pr"
+  },
+  "schema_version": 1
+}

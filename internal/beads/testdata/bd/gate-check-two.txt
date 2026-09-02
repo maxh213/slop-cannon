@@ -1,0 +1,14 @@
+○ fx-96y: pending - no PR number specified
+○ fx-8p9: pending - PR 'Fix Max' is still open
+
+Checked 2 gates: 0 resolved, 0 escalated, 0 errors
+{
+  "data": {
+    "checked": 2,
+    "dry_run": false,
+    "errors": 0,
+    "escalated": 0,
+    "resolved": 0
+  },
+  "schema_version": 1
+}

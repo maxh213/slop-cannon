@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sc://schemas/verdict.schema.json",
+  "title": "verdict (test fixture)",
+  "type": "object",
+  "required": ["outcome", "items"],
+  "additionalProperties": false,
+  "properties": {
+    "outcome": { "type": "string", "enum": ["approve", "request_changes"] },
+    "summary": { "type": "string" },
+    "items": {
+      "type": "array",
+      "items": { "$ref": "item.schema.json" }
+    }
+  }
+}

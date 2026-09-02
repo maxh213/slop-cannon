@@ -1,0 +1,63 @@
+{
+  "data": [
+    {
+      "id": "fx-so0",
+      "title": "Fix Mean skipping the first value",
+      "description": "stats.Mean starts its loop at index 1.",
+      "status": "in_progress",
+      "priority": 1,
+      "issue_type": "bug",
+      "assignee": "sc:engineer-1",
+      "created_at": "2026-09-02T18:38:49Z",
+      "updated_at": "2026-09-02T18:38:50Z",
+      "started_at": "2026-09-02T18:38:50Z",
+      "metadata": {
+        "sc_run": "r1"
+      },
+      "labels": [
+        "sc:run:r1"
+      ],
+      "dependencies": [
+        {
+          "id": "fx-nvi",
+          "title": "Run r1: fix the two bugs",
+          "description": "Run epic",
+          "status": "open",
+          "priority": 1,
+          "issue_type": "epic",
+          "created_at": "2026-09-02T18:38:49Z",
+          "updated_at": "2026-09-02T18:38:49Z",
+          "metadata": {
+            "sc_run": "r1",
+            "sc_kind": "epic"
+          },
+          "labels": [
+            "sc:run:r1"
+          ],
+          "dependency_type": "parent-child"
+        }
+      ],
+      "comments": [
+        {
+          "id": "01a0636a-ad0d-7bd0-8fe1-9ddb12501edd",
+          "issue_id": "fx-so0",
+          "author": "sc:engineer-1",
+          "text": "Implementation report\n\n```json\n{\"type\":\"impl_report\",\"summary\":\"fixed Mean\",\"files\":[\"stats/stats.go\"]}\n```",
+          "created_at": "2026-09-02T18:38:51Z"
+        },
+        {
+          "id": "01a0636a-adc6-7523-a1f3-69b9876a7257",
+          "issue_id": "fx-so0",
+          "author": "sc",
+          "text": "Implementation report\n\n```json\n{\"type\":\"impl_report\",\"summary\":\"fixed Mean\",\"files\":[\"stats/stats.go\"]}\n```",
+          "created_at": "2026-09-02T18:38:51Z"
+        }
+      ],
+      "parent": "fx-nvi",
+      "dependent_count": 1,
+      "dependency_count": 1,
+      "comment_count": 2
+    }
+  ],
+  "schema_version": 1
+}

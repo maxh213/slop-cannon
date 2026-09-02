@@ -1,0 +1,2 @@
+Dolt engine: embedded (in-process, no server)
+  Data: /tmp/fixture-repo/.beads/embeddeddolt

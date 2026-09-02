@@ -1,0 +1,4 @@
+Verdict follows.
+
+```sc-result
+{"outcome": "approve", "items": []}

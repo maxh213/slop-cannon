@@ -1,0 +1,8 @@
+{
+  "data": {
+    "key": "dolt.auto-commit",
+    "location": "config.yaml",
+    "value": "on"
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,17 @@
+{
+  "data": {
+    "beads_dir": "/tmp/fixture-repo/.beads",
+    "repo_root": "/tmp/fixture-repo",
+    "cwd_repo_root": "/home/max/workspace/slop-cannon",
+    "is_redirected": true,
+    "is_worktree": false,
+    "backend": "dolt",
+    "dolt_mode": "server",
+    "server_host": "127.0.0.1",
+    "database": "fx",
+    "project_id": "40c805e3-f911-4857-a6ad-435872e0e005",
+    "role": "contributor",
+    "bd_version": "1.2.2"
+  },
+  "schema_version": 1
+}

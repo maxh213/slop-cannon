@@ -1,0 +1,34 @@
+{
+  "data": {
+    "dry_run": true,
+    "node_count": 3,
+    "edge_count": 1,
+    "parent_deps": 2,
+    "validation_notes": [
+      "dry-run validates the graph structure only; live create may still reject parent-child blocking paths after resolving stored dependencies"
+    ],
+    "nodes": [
+      {
+        "key": "epic",
+        "title": "Run r1: fix the two bugs",
+        "type": "epic",
+        "priority": 1
+      },
+      {
+        "key": "mean",
+        "title": "Fix Mean skipping the first value",
+        "type": "bug",
+        "priority": 1,
+        "parent_key": "epic"
+      },
+      {
+        "key": "max",
+        "title": "Fix Max for all-negative input",
+        "type": "bug",
+        "priority": 2,
+        "parent_key": "epic"
+      }
+    ]
+  },
+  "schema_version": 1
+}

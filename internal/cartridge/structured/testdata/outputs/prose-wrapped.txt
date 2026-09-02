@@ -1,0 +1,16 @@
+Here is my verdict after checking the change:
+
+  - the CLI flag is documented
+  - the error message is clear
+
+```sc-result
+{
+  "outcome": "request_changes",
+  "summary": "One blocker.",
+  "items": [
+    {"title": "Missing test for --safety off", "severity": "major", "file": "internal/cli/run.go"}
+  ]
+}
+```
+
+Let me know if you want more detail on the blocker.

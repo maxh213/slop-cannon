@@ -1,0 +1,7 @@
+{
+  "data": {
+    "key": "status.custom",
+    "value": "triage:active,parked:frozen"
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,37 @@
+{
+  "data": [
+    {
+      "issue_id": "fx-nvi.1",
+      "depends_on_id": "fx-nvi.2",
+      "type": "blocks",
+      "created_at": "2026-09-02T19:38:53Z",
+      "created_by": "sc",
+      "metadata": "{}"
+    },
+    {
+      "issue_id": "fx-nvi.1",
+      "depends_on_id": "fx-nvi",
+      "type": "parent-child",
+      "created_at": "2026-09-02T19:38:49Z",
+      "created_by": "sc",
+      "metadata": "{}"
+    },
+    {
+      "issue_id": "fx-ctt",
+      "depends_on_id": "fx-nvi",
+      "type": "parent-child",
+      "created_at": "2026-09-02T19:38:49Z",
+      "created_by": "sc",
+      "metadata": "{}"
+    },
+    {
+      "issue_id": "fx-ctt",
+      "depends_on_id": "fx-so0",
+      "type": "blocks",
+      "created_at": "2026-09-02T19:38:49Z",
+      "created_by": "sc",
+      "metadata": "{}"
+    }
+  ],
+  "schema_version": 1
+}

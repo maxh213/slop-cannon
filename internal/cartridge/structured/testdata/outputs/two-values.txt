@@ -1,0 +1,4 @@
+```sc-result
+{"outcome": "approve", "items": []}
+{"outcome": "approve", "items": []}
+```

@@ -1,0 +1,1 @@
+Final result: {"outcome": "approve", "items": [{"title": "Nit: naming", "severity": "nit"}]} and that is all.

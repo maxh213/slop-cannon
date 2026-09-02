@@ -1,0 +1,5 @@
+Final result:
+
+```json
+{"outcome": "approve", "items": []}
+```

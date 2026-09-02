@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"slop-cannon/internal/beads"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/proc"
 )
@@ -24,22 +24,19 @@ var (
 	// DoctorMinGit is the oldest git that supports every command sc uses.
 	DoctorMinGit = proc.V(2, 30, 0)
 	// DoctorMinBD is the oldest beads release whose CLI contract sc was
-	// verified against (D-21, Appendix A).
-	DoctorMinBD = proc.V(1, 2, 2)
+	// verified against (D-21, Appendix A). It is beads.MinVersion, which
+	// beads.Detect enforces; doctor only reports the outcome (P3-16).
+	DoctorMinBD = beads.MinVersion
 )
 
 // doctorTimeout bounds every probe sc doctor runs; gh auth status talks to
 // the network, so it is longer than proc's default.
 const doctorTimeout = 20 * time.Second
 
-// Install hints printed under failing rows.
+// Install hints printed under failing rows. The bd hints come from
+// internal/beads (beads.InstallHint, beads.PingHint) via CheckError.Hint.
 const (
-	doctorHintGit = "install git 2.30 or newer (https://git-scm.com/downloads)"
-	doctorHintBD  = "install beads 1.2.2 or newer: brew install beads, or the upstream install script " +
-		"(scripts/install.sh at https://github.com/gastownhall/beads); " +
-		"CGO_ENABLED=0 go install builds are server-mode only and cannot run embedded Dolt"
-	doctorHintPing = "embedded Dolt did not answer: CGO_ENABLED=0 go install builds are server-mode only; " +
-		"reinstall with brew install beads or the upstream install script"
+	doctorHintGit       = "install git 2.30 or newer (https://git-scm.com/downloads)"
 	doctorHintGHMissing = "install the GitHub CLI (https://cli.github.com); " +
 		"needed for safety-on gates and external PR review"
 	doctorHintGHAuth   = "run: gh auth login; needed for safety-on gates and external PR review"
@@ -47,9 +44,10 @@ const (
 	doctorHintNoActive = "pick one with: sc cartridge --use NAME"
 	doctorHintRepo     = "pass --repo PATH or run sc from inside a git repository"
 	doctorHintDirty    = "commit or stash first; agents build on whatever is in the tree"
-	doctorHintBeads    = "sc will run bd init --non-interactive --init-if-missing --skip-agents " +
-		"--skip-hooks --setup-exclude on the first run (D-13)"
 )
+
+// doctorHintBeads names the exact init command EnsureInitialised runs (D-13).
+var doctorHintBeads = "sc will run " + beads.InitCommandLine() + " on the first run (D-13)"
 
 // DoctorStatus is the outcome of one sc doctor check.
 type DoctorStatus string
@@ -211,81 +209,40 @@ func doctorGit(ctx context.Context) (DoctorCheck, bool) {
 	return c, true
 }
 
-// bdSpec builds the Spec for one bd call with the D-21 environment.
-func doctorBDSpec(args ...string) proc.Spec {
-	return proc.Spec{
-		Command:    "bd",
-		Args:       args,
-		Env:        map[string]string{"BD_JSON_ENVELOPE": "1", "BD_NON_INTERACTIVE": "1"},
-		InheritEnv: append(append([]string(nil), doctorInherit...), "BEADS_DIR"),
-		Timeout:    doctorTimeout,
-	}
-}
-
 // doctorBD checks bd is present and `bd version --json` reports at least
-// DoctorMinBD. ok reports whether bd can be used for the ping check.
+// beads.MinVersion, through beads.Detect (P3-16). ok reports whether bd can
+// be used for the ping check.
 func doctorBD(ctx context.Context) (DoctorCheck, bool) {
 	c := DoctorCheck{Name: "bd"}
-	path, err := proc.LookPath("bd")
+	info, err := beads.Detect(ctx)
 	if err != nil {
-		c.Status, c.Detail, c.Hint = DoctorFail, "not found on PATH", doctorHintBD
+		c.Status, c.Detail, c.Hint = DoctorFail, err.Error(), doctorBDHint(err, beads.InstallHint)
 		return c, false
 	}
-	res, err := proc.Run(ctx, doctorBDSpec("version", "--json"))
-	if err != nil {
-		c.Status, c.Detail, c.Hint = DoctorFail, "bd version --json failed: "+doctorErr(err), doctorHintBD
-		return c, false
-	}
-	var info struct {
-		Version string `json:"version"`
-		Build   string `json:"build"`
-	}
-	if err := doctorDecodeBD(res.Stdout, &info); err != nil {
-		c.Status, c.Detail, c.Hint = DoctorFail, "bd version --json: "+err.Error(), doctorHintBD
-		return c, false
-	}
-	v, ok := proc.ParseVersion(info.Version)
-	if !ok {
-		c.Status, c.Detail, c.Hint = DoctorFail, fmt.Sprintf("bd version --json reported %q (%s)", info.Version, path), doctorHintBD
-		return c, false
-	}
-	detail := v.String()
-	if info.Build != "" {
-		detail += " (build " + info.Build + ", " + path + ")"
-	} else {
-		detail += " (" + path + ")"
-	}
-	if !v.AtLeast(DoctorMinBD) {
-		c.Status, c.Detail, c.Hint = DoctorFail, fmt.Sprintf("%s is older than %s (%s)", v, DoctorMinBD, path), doctorHintBD
-		return c, false
-	}
-	c.Status, c.Detail = DoctorPass, detail
+	c.Status, c.Detail = DoctorPass, info.String()
 	return c, true
 }
 
 // doctorPing confirms the embedded database answers `bd ping --json` in
-// root, which already has a .beads/ directory.
+// root, which already has a .beads/ directory, through beads.Ping.
 func doctorPing(ctx context.Context, root string) DoctorCheck {
 	c := DoctorCheck{Name: "beads"}
-	res, err := proc.Run(ctx, doctorBDSpec("-C", root, "ping", "--json"))
+	ping, err := beads.Ping(ctx, root)
 	if err != nil {
-		c.Status, c.Detail, c.Hint = DoctorFail, "bd ping failed: "+doctorErr(err), doctorHintPing
-		return c
-	}
-	var ping struct {
-		Status  string `json:"status"`
-		TotalMS int64  `json:"total_ms"`
-	}
-	if err := doctorDecodeBD(res.Stdout, &ping); err != nil {
-		c.Status, c.Detail, c.Hint = DoctorFail, "bd ping --json: "+err.Error(), doctorHintPing
-		return c
-	}
-	if ping.Status != "ok" {
-		c.Status, c.Detail, c.Hint = DoctorFail, fmt.Sprintf("bd ping reported status %q", ping.Status), doctorHintPing
+		c.Status, c.Detail, c.Hint = DoctorFail, err.Error(), doctorBDHint(err, beads.PingHint)
 		return c
 	}
 	c.Status, c.Detail = DoctorPass, fmt.Sprintf("embedded database answered bd ping in %d ms", ping.TotalMS)
 	return c
+}
+
+// doctorBDHint returns the remedy a beads.CheckError carries, else fallback.
+func doctorBDHint(err error, fallback string) string {
+	var ce *beads.CheckError
+	if errors.As(err, &ce) {
+		return ce.Hint()
+	}
+	return fallback
 }
 
 var doctorGHLoggedIn = regexp.MustCompile(`Logged in to (\S+) account (\S+)`)
@@ -427,31 +384,6 @@ func doctorBeadsDir(beadsDir string, exists bool) DoctorCheck {
 	}
 	c.Status, c.Detail, c.Hint = DoctorWarn, "not initialised: "+beadsDir+" is missing", doctorHintBeads
 	return c
-}
-
-// decodeBDJSON decodes the JSON object bd printed on stdout into v. It
-// skips any non-JSON preamble (bd prints a one-time metrics notice and some
-// commands print a text line first) and unwraps the BD_JSON_ENVELOPE=1
-// {"schema_version":1,"data":...} shape when present.
-func doctorDecodeBD(stdout string, v any) error {
-	rest := stdout
-	for {
-		i := strings.IndexByte(rest, '{')
-		if i < 0 {
-			return fmt.Errorf("no JSON object in output %q", strings.TrimSpace(stdout))
-		}
-		var raw map[string]json.RawMessage
-		if err := json.NewDecoder(strings.NewReader(rest[i:])).Decode(&raw); err != nil {
-			rest = rest[i+1:]
-			continue
-		}
-		if data, ok := raw["data"]; ok {
-			if _, versioned := raw["schema_version"]; versioned {
-				return json.Unmarshal(data, v)
-			}
-		}
-		return json.NewDecoder(strings.NewReader(rest[i:])).Decode(v)
-	}
 }
 
 // doctorErr renders a probe failure on one line: the last stderr line when

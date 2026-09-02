@@ -1,0 +1,27 @@
+{
+  "data": [
+    {
+      "id": "fx-ctt",
+      "title": "Fix Max for all-negative input",
+      "description": "stats.Max starts from 0.",
+      "status": "in_review",
+      "priority": 2,
+      "issue_type": "bug",
+      "created_at": "2026-09-02T18:38:49Z",
+      "updated_at": "2026-09-02T18:38:53Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_agent": "engineer-1",
+        "sc_lease": "2026-09-02T14:09:32Z",
+        "sc_round": 1,
+        "sc_pr_url": "https://example.com/pr/7",
+        "sc_pr_number": 7
+      },
+      "labels": [
+        "sc:role:engineer",
+        "sc:run:r1"
+      ]
+    }
+  ],
+  "schema_version": 1
+}

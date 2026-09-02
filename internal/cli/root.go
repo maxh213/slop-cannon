@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"sort"
@@ -13,6 +14,8 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+
+	"slop-cannon/internal/logging"
 )
 
 // commandFactory builds a fresh subcommand. Factories, not commands, are
@@ -83,15 +86,20 @@ func (e *ExitError) Unwrap() error { return e.Err }
 // attached. Output and errors are written to out so tests can capture them;
 // Execute re-points errors at stderr.
 func NewRootCommand(out io.Writer) *cobra.Command {
+	// Run every PersistentPreRun on the path from the root down, so a
+	// subcommand that adds its own hook does not silence rootPreRun (cobra's
+	// default runs only the nearest one).
+	cobra.EnableTraverseRunHooks = true
 	root := &cobra.Command{
-		Use:           "sc [flags] <repo-path>",
-		Short:         "Fire LLM agents at a repository",
-		Long:          rootLong,
-		Example:       indent(rootExamples, "  "),
-		Args:          rootArgs,
-		RunE:          runRoot,
-		SilenceUsage:  true,
-		SilenceErrors: true,
+		Use:               "sc [flags] <repo-path>",
+		Short:             "Fire LLM agents at a repository",
+		Long:              rootLong,
+		Example:           indent(rootExamples, "  "),
+		Args:              rootArgs,
+		PersistentPreRunE: rootPreRun,
+		RunE:              runRoot,
+		SilenceUsage:      true,
+		SilenceErrors:     true,
 		// SuggestionsFor only applies a threshold that is set explicitly;
 		// 2 is cobra's own default for its unknown-command path.
 		SuggestionsMinimumDistance: 2,
@@ -114,6 +122,32 @@ func NewRootCommand(out io.Writer) *cobra.Command {
 	sort.Slice(cmds, func(i, j int) bool { return cmds[i].Name() < cmds[j].Name() })
 	root.AddCommand(cmds...)
 	return root
+}
+
+// LogOptions returns the logging options implied by the --verbose flag:
+// Debug level when verbose, Info otherwise, with the default redactor. The
+// root pre-run uses it for the terminal handler; the run command (P8-01)
+// passes the same options to logging.OpenRunLog and NewMultiHandler so the
+// per-run file under the D-23 run dir shares the terminal's level.
+func LogOptions(verbose bool) logging.Options {
+	return logging.Options{Verbose: verbose}
+}
+
+// rootPreRun is the root's PersistentPreRunE, executed before every command
+// (help output is printed by cobra before hooks run, so it stays untouched).
+// It installs the terminal handler on slog's default logger, writing to the
+// command's stderr at the level chosen by --verbose, so any package can log
+// through slog without being handed a logger. Only the verbose flag is read
+// here: the other global flags are resolved by GlobalOpts in the commands
+// that need them, and a bad --repo must not stop `sc version`.
+func rootPreRun(cmd *cobra.Command, _ []string) error {
+	verbose, err := cmd.Root().PersistentFlags().GetBool(FlagVerbose)
+	if err != nil {
+		return err
+	}
+	slog.SetDefault(logging.NewTerminalLogger(cmd.ErrOrStderr(), LogOptions(verbose)))
+	slog.Debug("verbose logging enabled", "command", cmd.CommandPath())
+	return nil
 }
 
 // rootArgs validates positional arguments on the root. A path-like first

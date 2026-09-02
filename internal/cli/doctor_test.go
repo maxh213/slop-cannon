@@ -355,28 +355,6 @@ esac`)
 	require.Equal(t, `bd ping reported status "degraded"`, report.Checks[2].Detail)
 }
 
-func TestDoctorDecodeBD(t *testing.T) {
-	t.Parallel()
-	var v struct {
-		Version string `json:"version"`
-	}
-	require.NoError(t, doctorDecodeBD(`{"data":{"version":"1.2.2"},"schema_version":1}`, &v))
-	require.Equal(t, "1.2.2", v.Version)
-
-	v.Version = ""
-	require.NoError(t, doctorDecodeBD("{\n  \"build\": \"dev\",\n  \"schema_version\": 1,\n  \"version\": \"1.2.3\"\n}\n", &v))
-	require.Equal(t, "1.2.3", v.Version, "flat shape without BD_JSON_ENVELOPE")
-
-	v.Version = ""
-	require.NoError(t, doctorDecodeBD("notice {not json}\nmore text\n{\"data\":{\"version\":\"1.2.4\"},\"schema_version\":1}\ntrailing\n", &v))
-	require.Equal(t, "1.2.4", v.Version, "preamble containing braces is skipped")
-
-	err := doctorDecodeBD("Error: no beads database found\n", &v)
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "no JSON object in output")
-	require.Error(t, doctorDecodeBD("", &v))
-}
-
 func TestDoctorCartridges(t *testing.T) {
 	doctorEnv(t)
 	repo := doctorRepoDir(t, true, false)

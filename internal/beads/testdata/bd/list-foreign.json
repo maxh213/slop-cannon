@@ -1,0 +1,97 @@
+{
+  "data": [
+    {
+      "id": "fx-nvi",
+      "title": "Run r1: fix the two bugs",
+      "description": "Run epic",
+      "status": "open",
+      "priority": 1,
+      "issue_type": "epic",
+      "created_at": "2026-09-02T18:38:49Z",
+      "updated_at": "2026-09-02T18:38:49Z",
+      "metadata": {"sc_run": "r1", "sc_kind": "epic"},
+      "labels": ["sc:run:r1"]
+    },
+    {
+      "id": "fx-ctt",
+      "title": "Fix Max for all-negative input",
+      "description": "stats.Max starts from 0.",
+      "status": "in_review",
+      "priority": 2,
+      "issue_type": "bug",
+      "assignee": "sc:engineer-1",
+      "created_at": "2026-09-02T18:38:49Z",
+      "updated_at": "2026-09-02T18:38:53Z",
+      "started_at": "2026-09-02T18:38:50Z",
+      "metadata": {"sc_run": "r1", "sc_kind": "work", "sc_round": 1, "sc_size": "m"},
+      "labels": ["sc:role:engineer", "sc:run:r1"],
+      "dependencies": [
+        {"issue_id": "fx-ctt", "depends_on_id": "fx-nvi", "type": "parent-child", "created_at": "2026-09-02T19:38:49Z", "created_by": "sc", "metadata": "{}"},
+        {"issue_id": "fx-ctt", "depends_on_id": "fx-so0", "type": "blocks", "created_at": "2026-09-02T19:38:49Z", "created_by": "sc", "metadata": "{}"}
+      ],
+      "parent": "fx-nvi"
+    },
+    {
+      "id": "fx-t1a",
+      "title": "Triage: flaky CI on Windows",
+      "status": "triage",
+      "priority": 3,
+      "issue_type": "bug",
+      "owner": "fx@example.com",
+      "created_at": "2026-09-01T09:00:00Z",
+      "created_by": "maintainer",
+      "updated_at": "2026-09-01T09:00:00Z"
+    },
+    {
+      "id": "fx-p2b",
+      "title": "Parked: rewrite the parser",
+      "status": "parked",
+      "priority": 4,
+      "issue_type": "feature",
+      "created_at": "2026-08-30T09:00:00Z",
+      "created_by": "maintainer",
+      "updated_at": "2026-08-30T09:00:00Z"
+    },
+    {
+      "id": "fx-s3c",
+      "title": "Shipped: release 1.0",
+      "status": "shipped",
+      "priority": 2,
+      "issue_type": "milestone",
+      "created_at": "2026-08-20T09:00:00Z",
+      "created_by": "maintainer",
+      "updated_at": "2026-08-29T09:00:00Z"
+    },
+    {
+      "id": "fx-b4d",
+      "title": "Blocked by upstream",
+      "status": "blocked",
+      "priority": 2,
+      "issue_type": "task",
+      "created_at": "2026-08-28T09:00:00Z",
+      "created_by": "maintainer",
+      "updated_at": "2026-08-28T09:00:00Z"
+    },
+    {
+      "id": "fx-h5e",
+      "title": "On a hook",
+      "status": "hooked",
+      "priority": 2,
+      "issue_type": "convoy",
+      "created_at": "2026-08-28T10:00:00Z",
+      "created_by": "maintainer",
+      "updated_at": "2026-08-28T10:00:00Z"
+    },
+    {
+      "id": "fx-u6f",
+      "title": "Status nobody registered",
+      "status": "mystery",
+      "priority": 2,
+      "issue_type": "task",
+      "created_at": "2026-08-28T11:00:00Z",
+      "created_by": "maintainer",
+      "updated_at": "2026-08-28T11:00:00Z"
+    }
+  ],
+  "schema_version": 1
+}

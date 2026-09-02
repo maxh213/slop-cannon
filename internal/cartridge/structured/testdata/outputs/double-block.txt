@@ -1,0 +1,11 @@
+First I thought the result was:
+
+```sc-result
+{"outcome": "approve", "items": []}
+```
+
+but after running the tests again I found a regression, so my final verdict is:
+
+```sc-result
+{"outcome": "request_changes", "items": [{"title": "Regression in TestRun", "severity": "blocker"}]}
+```

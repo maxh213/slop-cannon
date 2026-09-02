@@ -1,0 +1,19 @@
+{
+  "data": [
+    {
+      "id": "01a0636a-ad0d-7bd0-8fe1-9ddb12501edd",
+      "issue_id": "fx-so0",
+      "author": "sc:engineer-1",
+      "text": "Implementation report\n\n```json\n{\"type\":\"impl_report\",\"summary\":\"fixed Mean\",\"files\":[\"stats/stats.go\"]}\n```",
+      "created_at": "2026-09-02T18:38:51Z"
+    },
+    {
+      "id": "01a0636a-adc6-7523-a1f3-69b9876a7257",
+      "issue_id": "fx-so0",
+      "author": "sc",
+      "text": "Implementation report\n\n```json\n{\"type\":\"impl_report\",\"summary\":\"fixed Mean\",\"files\":[\"stats/stats.go\"]}\n```",
+      "created_at": "2026-09-02T18:38:51Z"
+    }
+  ],
+  "schema_version": 1
+}

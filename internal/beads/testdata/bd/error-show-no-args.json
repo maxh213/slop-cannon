@@ -1,0 +1,6 @@
+{
+  "data": {
+    "error": "at least one issue ID is required (use positional args, --id flag, or --current)"
+  },
+  "schema_version": 1
+}

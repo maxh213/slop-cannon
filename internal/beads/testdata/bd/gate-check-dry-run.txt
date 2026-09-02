@@ -1,0 +1,13 @@
+○ fx-qba: pending - PR 'Fix Max' is still open
+
+Checked 1 gates: 0 resolved, 0 escalated, 0 errors
+{
+  "data": {
+    "checked": 1,
+    "dry_run": true,
+    "errors": 0,
+    "escalated": 0,
+    "resolved": 0
+  },
+  "schema_version": 1
+}

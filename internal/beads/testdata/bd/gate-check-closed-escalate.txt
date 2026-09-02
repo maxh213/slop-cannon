@@ -1,0 +1,13 @@
+⚠ fx-8p9: ESCALATE - PR 'Fix Max' was closed without merging
+
+Checked 1 gates: 0 resolved, 1 escalated, 0 errors
+{
+  "data": {
+    "checked": 1,
+    "dry_run": false,
+    "errors": 0,
+    "escalated": 1,
+    "resolved": 0
+  },
+  "schema_version": 1
+}

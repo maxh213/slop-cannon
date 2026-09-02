@@ -1,0 +1,61 @@
+{
+  "data": [
+    {
+      "id": "c-plan",
+      "issue_id": "fx-nvi",
+      "author": "sc:po-r1",
+      "text": "Plan: 2 beads - fix the two stats bugs\n\n```json\n{\n  \"type\": \"plan\",\n  \"brief\": \"fix the two stats bugs\",\n  \"beads\": [\n    {\"key\": \"mean\", \"title\": \"Fix Mean\", \"acceptance\": \"TestMean passes\", \"priority\": 1, \"size\": \"s\"},\n    {\"key\": \"max\", \"title\": \"Fix Max\", \"acceptance\": \"TestMax passes\", \"deps\": [\"mean\"]}\n  ]\n}\n```",
+      "created_at": "2026-09-02T18:38:49Z"
+    },
+    {
+      "id": "c-impl",
+      "issue_id": "fx-so0",
+      "author": "sc:engineer-1",
+      "text": "Implementation report: fixed Mean (1 file)\n\n```json\n{\"type\":\"impl_report\",\"summary\":\"fixed Mean\",\"files_changed\":[\"stats/stats.go\"],\"how_to_verify\":\"go test ./...\",\"commit\":\"abc1234\"}\n```",
+      "created_at": "2026-09-02T18:38:51Z"
+    },
+    {
+      "id": "c-prose",
+      "issue_id": "fx-so0",
+      "author": "maintainer",
+      "text": "Looks fine to me, but please keep the loop bounds obvious.",
+      "created_at": "2026-09-02T18:38:52Z"
+    },
+    {
+      "id": "c-verdict",
+      "issue_id": "fx-so0",
+      "author": "sc:tester-qa-1",
+      "text": "Verdict (qa, round 1): changes requested, 1 item\n\nSome prose before the block.\n\n```json\n{\"type\":\"verdict\",\"lens\":\"qa\",\"round\":1,\"outcome\":\"changes\",\"summary\":\"one edge case\",\"items\":[{\"id\":\"qa-r1-1\",\"severity\":\"major\",\"title\":\"empty slice panics\",\"file\":\"stats/stats.go\",\"line\":12,\"status\":\"open\"}]}\n```\n\nAnd prose after it.",
+      "created_at": "2026-09-02T18:38:53Z"
+    },
+    {
+      "id": "c-response",
+      "issue_id": "fx-so0",
+      "author": "sc:engineer-1",
+      "text": "Responses: 1 item (1 fixed)\n\n```json\n{\"type\":\"response\",\"responses\":[{\"item_id\":\"qa-r1-1\",\"action\":\"fixed\",\"rationale\":\"guarded the empty case\"}]}\n```",
+      "created_at": "2026-09-02T18:38:54Z"
+    },
+    {
+      "id": "c-arbitration",
+      "issue_id": "fx-so0",
+      "author": "sc:po-r1",
+      "text": "Arbitration on qa-r1-1: uphold_tester\n\n```json\n{\"type\":\"arbitration\",\"item_id\":\"qa-r1-1\",\"ruling\":\"uphold_tester\",\"rationale\":\"a panic is never acceptable\"}\n```",
+      "created_at": "2026-09-02T18:38:55Z"
+    },
+    {
+      "id": "c-bad",
+      "issue_id": "fx-so0",
+      "author": "sc:tester-ux-1",
+      "text": "```json\n{\"type\":\"verdict\",\"outcome\":\"maybe\"}\n```",
+      "created_at": "2026-09-02T18:38:55Z"
+    },
+    {
+      "id": "c-escalation",
+      "issue_id": "fx-so0",
+      "author": "sc:po-r1",
+      "text": "Escalation: approve_with_notes\n\n```json\n{\"type\":\"escalation\",\"outcome\":\"approve_with_notes\",\"notes\":\"good enough for the release\"}\n```",
+      "created_at": "2026-09-02T18:38:56Z"
+    }
+  ],
+  "schema_version": 1
+}

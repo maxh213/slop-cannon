@@ -1,0 +1,5 @@
+I reviewed the diff and ran the tests; everything passes.
+
+```sc-result
+{"outcome": "approve", "summary": "Looks good.", "items": []}
+```

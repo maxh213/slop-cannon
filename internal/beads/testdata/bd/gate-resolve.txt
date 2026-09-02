@@ -1,0 +1,2 @@
+✓ Gate resolved: fx-96y
+  Reason: done

@@ -1,0 +1,20 @@
+  Repository ID: a684048d
+  Clone ID: b3bcf1e524ed15e1
+
+✓ Added to .git/info/exclude:
+  .beads/
+  **/RECOVERY*.md
+  **/SESSION*.md
+
+Note: .git/info/exclude is local-only and won't affect upstream.
+
+✓ bd initialized successfully!
+
+  Backend: dolt
+  Mode: embedded
+  Database: fx
+  Issue prefix: fx
+  Issues will be named: fx-<hash> (e.g., fx-a3f2dd)
+
+Run bd quickstart to get started.
+

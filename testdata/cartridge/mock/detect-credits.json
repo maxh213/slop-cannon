@@ -1,0 +1,15 @@
+{
+  "name": "out of credits",
+  "detect": {
+    "version": "mock/2",
+    "delay": "1s",
+    "failure": {"kind": "credits_exhausted", "message": "billing hard limit reached"}
+  },
+  "rules": [],
+  "fallback": {
+    "name": "dead",
+    "match": {},
+    "steps": [{"kind": "fail", "failure": {"kind": "credits_exhausted"}}],
+    "result": {}
+  }
+}

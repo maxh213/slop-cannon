@@ -1,0 +1,10 @@
+{
+  "data": {
+    "id": "01a0636a-ad0d-7bd0-8fe1-9ddb12501edd",
+    "issue_id": "fx-so0",
+    "author": "sc:engineer-1",
+    "text": "Implementation report\n\n```json\n{\"type\":\"impl_report\",\"summary\":\"fixed Mean\",\"files\":[\"stats/stats.go\"]}\n```",
+    "created_at": "2026-09-02T18:38:50.636158685Z"
+  },
+  "schema_version": 1
+}

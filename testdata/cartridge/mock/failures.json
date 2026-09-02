@@ -1,0 +1,30 @@
+{
+  "name": "failure injection",
+  "detect": {},
+  "rules": [
+    {"name": "crash", "match": {"bead": "crash"},
+     "steps": [{"kind": "text", "text": "partial output"}, {"kind": "fail", "failure": {"kind": "crash", "message": "segfault in tool loop", "exit_code": 134}}],
+     "result": {}},
+    {"name": "timeout", "match": {"bead": "timeout"},
+     "steps": [{"kind": "text", "text": "thinking..."}, {"kind": "fail", "failure": {"kind": "timeout"}}],
+     "result": {}},
+    {"name": "rate limited", "match": {"bead": "rate_limited"},
+     "steps": [{"kind": "fail", "failure": {"kind": "rate_limited", "message": "429 too many requests", "retry_after": "30s"}}],
+     "result": {}},
+    {"name": "credits exhausted", "match": {"bead": "credits_exhausted"},
+     "steps": [{"kind": "fail", "failure": {"kind": "credits_exhausted", "message": "your credit balance is too low"}}],
+     "result": {}},
+    {"name": "auth", "match": {"bead": "auth"},
+     "steps": [{"kind": "fail", "failure": {"kind": "auth", "message": "not logged in"}}],
+     "result": {}},
+    {"name": "killed", "match": {"bead": "killed"},
+     "steps": [{"kind": "fail", "failure": {"kind": "killed"}}],
+     "result": {}},
+    {"name": "not installed", "match": {"bead": "not_installed"},
+     "steps": [{"kind": "fail", "failure": {"kind": "not_installed"}}],
+     "result": {}},
+    {"name": "malformed", "match": {"bead": "malformed"},
+     "steps": [{"kind": "text", "text": "Here is the result:\n"}, {"kind": "fail", "failure": {"kind": "malformed"}}],
+     "result": {}}
+  ]
+}

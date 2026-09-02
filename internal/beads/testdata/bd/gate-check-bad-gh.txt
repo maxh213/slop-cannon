@@ -1,0 +1,12 @@
+
+Checked 1 gates: 0 resolved, 0 escalated, 1 errors
+{
+  "data": {
+    "checked": 1,
+    "dry_run": false,
+    "errors": 1,
+    "escalated": 0,
+    "resolved": 0
+  },
+  "schema_version": 1
+}

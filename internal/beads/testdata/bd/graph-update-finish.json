@@ -1,0 +1,26 @@
+{
+  "data": [
+    {
+      "id": "px-we1",
+      "title": "Add stats package",
+      "description": "Package skeleton",
+      "acceptance_criteria": "acceptance a",
+      "status": "open",
+      "priority": 1,
+      "issue_type": "task",
+      "created_at": "2026-09-02T19:20:43Z",
+      "updated_at": "2026-09-02T19:20:44Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_size": "s",
+        "sc_round": "0"
+      },
+      "labels": [
+        "sc:role:po",
+        "sc:run:r1"
+      ]
+    }
+  ],
+  "schema_version": 1
+}

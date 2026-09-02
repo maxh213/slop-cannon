@@ -1,0 +1,6 @@
+{
+  "data": {
+    "error": "adding dependency would create a cycle"
+  },
+  "schema_version": 1
+}

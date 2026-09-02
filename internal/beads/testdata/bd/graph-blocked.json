@@ -1,0 +1,131 @@
+{
+  "data": [
+    {
+      "id": "px-euc",
+      "title": "Fix Mean",
+      "description": "Mean skips the first value",
+      "acceptance_criteria": "acceptance b",
+      "status": "open",
+      "priority": 1,
+      "issue_type": "bug",
+      "created_at": "2026-09-02T19:20:41Z",
+      "updated_at": "2026-09-02T19:20:42Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_size": "s",
+        "sc_round": "0"
+      },
+      "labels": [
+        "sc:role:po",
+        "sc:run:r1"
+      ],
+      "blocked_by_count": 1,
+      "blocked_by": [
+        "px-69u"
+      ]
+    },
+    {
+      "id": "px-kvb",
+      "title": "Fix Max",
+      "description": "Max starts from 0",
+      "acceptance_criteria": "acceptance c",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "bug",
+      "created_at": "2026-09-02T19:20:41Z",
+      "updated_at": "2026-09-02T19:20:42Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_size": "m",
+        "sc_round": "0"
+      },
+      "labels": [
+        "sc:role:po",
+        "sc:run:r1"
+      ],
+      "blocked_by_count": 1,
+      "blocked_by": [
+        "px-69u"
+      ]
+    },
+    {
+      "id": "px-vey",
+      "title": "Add Median",
+      "description": "Median over sorted copy",
+      "acceptance_criteria": "acceptance d",
+      "status": "open",
+      "priority": 2,
+      "issue_type": "feature",
+      "created_at": "2026-09-02T19:20:41Z",
+      "updated_at": "2026-09-02T19:20:42Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_size": "m",
+        "sc_round": "0"
+      },
+      "labels": [
+        "sc:role:po",
+        "sc:run:r1"
+      ],
+      "blocked_by_count": 2,
+      "blocked_by": [
+        "px-kvb",
+        "px-euc"
+      ]
+    },
+    {
+      "id": "px-19j",
+      "title": "Document stats",
+      "description": "README section",
+      "acceptance_criteria": "acceptance e",
+      "status": "open",
+      "priority": 3,
+      "issue_type": "chore",
+      "created_at": "2026-09-02T19:20:41Z",
+      "updated_at": "2026-09-02T19:20:42Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_size": "s",
+        "sc_round": "0"
+      },
+      "labels": [
+        "sc:role:po",
+        "sc:run:r1"
+      ],
+      "blocked_by_count": 1,
+      "blocked_by": [
+        "px-vey"
+      ]
+    },
+    {
+      "id": "px-0st",
+      "title": "Benchmark stats",
+      "description": "Benchmarks for the package",
+      "acceptance_criteria": "acceptance f",
+      "status": "open",
+      "priority": 4,
+      "issue_type": "task",
+      "created_at": "2026-09-02T19:20:41Z",
+      "updated_at": "2026-09-02T19:20:43Z",
+      "metadata": {
+        "sc_run": "r1",
+        "sc_kind": "work",
+        "sc_size": "l",
+        "sc_round": "0"
+      },
+      "labels": [
+        "sc:role:po",
+        "sc:run:r1"
+      ],
+      "blocked_by_count": 1,
+      "blocked_by": [
+        "px-19j"
+      ]
+    }
+  ],
+  "schema_version": 1
+}

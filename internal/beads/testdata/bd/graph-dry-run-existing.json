@@ -1,0 +1,50 @@
+{
+  "data": {
+    "dry_run": true,
+    "node_count": 6,
+    "edge_count": 6,
+    "parent_deps": 0,
+    "validation_notes": [
+      "dry-run validates the graph structure only; live create may still reject parent-child blocking paths after resolving stored dependencies"
+    ],
+    "nodes": [
+      {
+        "key": "a",
+        "title": "Add stats package",
+        "type": "task",
+        "priority": 1
+      },
+      {
+        "key": "b",
+        "title": "Fix Mean",
+        "type": "bug",
+        "priority": 1
+      },
+      {
+        "key": "c",
+        "title": "Fix Max",
+        "type": "bug",
+        "priority": 2
+      },
+      {
+        "key": "d",
+        "title": "Add Median",
+        "type": "feature",
+        "priority": 2
+      },
+      {
+        "key": "e",
+        "title": "Document stats",
+        "type": "chore",
+        "priority": 3
+      },
+      {
+        "key": "f",
+        "title": "Benchmark stats",
+        "type": "task",
+        "priority": 4
+      }
+    ]
+  },
+  "schema_version": 1
+}
