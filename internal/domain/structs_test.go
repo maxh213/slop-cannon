@@ -93,6 +93,42 @@ func TestBeadJSON(t *testing.T) {
 		require.Error(t, err)
 		assert.ErrorIs(t, err, ErrUnknownValue)
 	})
+
+	t.Run("accepts every bd built-in status and issue type", func(t *testing.T) {
+		// Values bd 1.2.2 returns from a pre-existing repo or a safety-on run
+		// (statuses-builtin.json, gate-list.json, export.jsonl).
+		for _, state := range []string{"blocked", "deferred", "hooked", "pinned", "open", "in_progress", "closed"} {
+			var b Bead
+			require.NoError(t, json.Unmarshal([]byte(`{"id":"x","title":"t","state":"`+state+`"}`), &b), state)
+			assert.True(t, b.State.Valid(), state)
+		}
+		for _, typ := range []string{"gate", "event", "epic", "decision", "spike", "story", "milestone"} {
+			var b Bead
+			require.NoError(t, json.Unmarshal([]byte(`{"id":"x","title":"t","type":"`+typ+`"}`), &b), typ)
+			assert.True(t, b.Type.Valid(), typ)
+		}
+		shape := roundTrip(t, Bead{ID: "fx-jts", Title: "Gate: gh:pr 1", Type: BeadTypeGate, Priority: PriorityDefault, State: BeadStateBlocked})
+		assert.Equal(t, "gate", shape["type"])
+		assert.Equal(t, "blocked", shape["state"])
+	})
+
+	t.Run("missing priority decodes as the default", func(t *testing.T) {
+		var b Bead
+		require.NoError(t, json.Unmarshal([]byte(`{"id":"sc-1","title":"t","state":"open"}`), &b))
+		assert.Equal(t, PriorityDefault, b.Priority)
+		require.NoError(t, json.Unmarshal([]byte(`{"id":"sc-1","title":"t","state":"open","priority":0}`), &b))
+		assert.Equal(t, PriorityHighest, b.Priority, "explicit 0 is kept")
+		require.NoError(t, json.Unmarshal([]byte(`{"id":"sc-1","title":"t","state":"open","priority":null}`), &b))
+		assert.Equal(t, PriorityDefault, b.Priority, "null means default")
+		require.NoError(t, json.Unmarshal([]byte(`{"id":"sc-2","title":"t2","description":"d","acceptance":"a","type":"bug","size":"m","deps":["x"],"state":"open","assignee":"me","labels":["l"],"round":3,"pr_url":"u","pr_number":9}`), &b))
+		assert.Equal(t, Bead{ID: "sc-2", Title: "t2", Description: "d", Acceptance: "a", Type: BeadTypeBug, Priority: PriorityDefault, Size: SizeM, Deps: []BeadID{"x"}, State: BeadStateOpen, Assignee: "me", Labels: []string{"l"}, Round: 3, PRURL: "u", PRNumber: 9}, b, "every field passes through the custom unmarshaller")
+	})
+
+	t.Run("zero-priority bead round trips", func(t *testing.T) {
+		// A Go-constructed Bead with the zero Priority marshals 0 and decodes
+		// back to 0: the default applies only when the field is absent.
+		roundTrip(t, Bead{ID: "sc-1", Title: "t", State: BeadStateOpen})
+	})
 }
 
 func TestAgentJSON(t *testing.T) {

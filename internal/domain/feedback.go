@@ -379,6 +379,13 @@ type ImplReport struct {
 
 // MessageType tags the fenced JSON block inside a bead comment so readers
 // know which struct to decode (D-06).
+//
+// Deviation note (P0-05): D-06 lists impl_report, verdict, response,
+// arbitration and plan. This package adds escalation, because the PO's
+// ruling on a bead that exhausted its review rounds (D-08, Escalation) is a
+// distinct message from a per-item Arbitration and must also survive a
+// resume. P3-03's comment reader has to accept all six; the D-06 list should
+// be read as including escalation until the Decisions section records it.
 type MessageType string
 
 // Message types, matching the `type` field in bead comments.
@@ -393,7 +400,8 @@ const (
 	MessageResponse MessageType = "response"
 	// MessageArbitration wraps an Arbitration.
 	MessageArbitration MessageType = "arbitration"
-	// MessageEscalation wraps an Escalation.
+	// MessageEscalation wraps an Escalation. Not in the D-06 list; see the
+	// deviation note on MessageType.
 	MessageEscalation MessageType = "escalation"
 )
 

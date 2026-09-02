@@ -1,9 +1,11 @@
 package domain
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 )
 
 // ErrInvalidPlan is wrapped by every Plan.Validate failure.
@@ -12,7 +14,9 @@ var ErrInvalidPlan = errors.New("invalid plan")
 // PlanBead is one proposed bead in a PO plan. Keys are plan-local; the
 // beads client maps them to minted BeadIDs when the plan is applied (D-22).
 type PlanBead struct {
-	// Key is the plan-local identifier other beads use in Deps.
+	// Key is the plan-local identifier other beads use in Deps. It must be
+	// non-empty and contain no whitespace; it becomes the graph-plan node
+	// key and the from_key/to_key of every edge (D-24).
 	Key string `json:"key"`
 	// Title is the one-line summary.
 	Title string `json:"title"`
@@ -20,14 +24,42 @@ type PlanBead struct {
 	Description string `json:"description,omitempty"`
 	// Acceptance holds the acceptance criteria; must not be empty.
 	Acceptance string `json:"acceptance"`
-	// Type is the bd issue type; empty means task.
+	// Type is the bd issue type; empty means task. Only Plannable types
+	// (task, bug, feature, chore) are allowed.
 	Type BeadType `json:"type,omitempty"`
-	// Priority is on bd's 0 (highest) to 4 (lowest) scale.
+	// Priority is on bd's 0 (highest) to 4 (lowest) scale. When decoded from
+	// JSON a missing, null or empty value means PriorityDefault (D-22).
 	Priority Priority `json:"priority"`
 	// Size is the S/M/L estimate.
 	Size Size `json:"size,omitempty"`
-	// Deps lists the keys this bead depends on.
+	// Deps lists the keys this bead depends on, each at most once.
 	Deps []string `json:"deps,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler. It decodes like the plain struct
+// except that a missing "priority" yields PriorityDefault rather than
+// PriorityHighest, so a PO plan that omits priorities is not silently
+// top-urgency (D-22).
+func (b *PlanBead) UnmarshalJSON(data []byte) error {
+	type plain PlanBead // no methods, so the default decoder is used
+	v := plain{Priority: PriorityDefault}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	*b = PlanBead(v)
+	return nil
+}
+
+// DependencyCount returns the number of dependency edges in the plan: the
+// sum of len(Deps) over all beads. P3-10 checks it against the edge_count
+// reported by `bd create --graph --dry-run` (D-24); Validate guarantees the
+// two agree by rejecting duplicate and dangling dependencies.
+func (p Plan) DependencyCount() int {
+	n := 0
+	for _, b := range p.Beads {
+		n += len(b.Deps)
+	}
+	return n
 }
 
 // Plan is the PO's proposal: a short brief plus the beads to create.
@@ -39,19 +71,25 @@ type Plan struct {
 }
 
 // Validate checks the structural rules a plan must satisfy before it is
-// turned into beads: keys and titles present, keys unique, acceptance
-// criteria non-empty, priorities in range, enums valid, every dependency
-// naming a key in the plan, and no dependency cycles. An empty plan is valid
-// (autopilot uses it to mean "nothing to add", D-18). Every error wraps
-// ErrInvalidPlan.
+// turned into beads: keys present, free of whitespace and unique; titles
+// present; acceptance criteria non-empty; priorities in range; types
+// Plannable and sizes valid; every dependency naming a key in the plan, no
+// bead depending on itself or listing the same dependency twice; and no
+// dependency cycles. An empty plan is valid (autopilot uses it to mean
+// "nothing to add", D-18). Every error wraps ErrInvalidPlan. Validate never
+// normalises values: a key with surrounding whitespace is rejected, not
+// trimmed, so the keys the caller sees are the keys bd will see.
 func (p Plan) Validate() error {
 	var errs []error
 	index := make(map[string]int, len(p.Beads))
 	for i, b := range p.Beads {
 		where := fmt.Sprintf("bead %d", i)
-		if strings.TrimSpace(b.Key) == "" {
+		switch {
+		case strings.TrimSpace(b.Key) == "":
 			errs = append(errs, fmt.Errorf("%s: empty key", where))
-		} else {
+		case strings.ContainsFunc(b.Key, unicode.IsSpace):
+			errs = append(errs, fmt.Errorf("%s: malformed key %q (must not contain whitespace)", where, b.Key))
+		default:
 			where = fmt.Sprintf("bead %q", b.Key)
 			if _, dup := index[b.Key]; dup {
 				errs = append(errs, fmt.Errorf("%s: duplicate key", where))
@@ -68,20 +106,27 @@ func (p Plan) Validate() error {
 		if !b.Priority.Valid() {
 			errs = append(errs, fmt.Errorf("%s: priority %d out of range %d..%d", where, b.Priority, PriorityHighest, PriorityLowest))
 		}
-		if b.Type != "" && !b.Type.Valid() {
-			errs = append(errs, fmt.Errorf("%s: unknown type %q", where, string(b.Type)))
+		if b.Type != "" && !b.Type.Plannable() {
+			errs = append(errs, fmt.Errorf("%s: type %q is not allowed in a plan (want one of %s)", where, string(b.Type), joinBeadTypes(PlannableBeadTypes())))
 		}
 		if b.Size != "" && !b.Size.Valid() {
 			errs = append(errs, fmt.Errorf("%s: unknown size %q", where, string(b.Size)))
 		}
 	}
 	for _, b := range p.Beads {
+		seen := make(map[string]bool, len(b.Deps))
 		for _, d := range b.Deps {
-			if _, ok := index[d]; !ok {
-				errs = append(errs, fmt.Errorf("bead %q: dependency %q is not a key in the plan", b.Key, d))
-			} else if d == b.Key {
+			switch {
+			case seen[d]:
+				errs = append(errs, fmt.Errorf("bead %q: duplicate dependency %q", b.Key, d))
+			case d == b.Key:
 				errs = append(errs, fmt.Errorf("bead %q: depends on itself", b.Key))
+			default:
+				if _, ok := index[d]; !ok {
+					errs = append(errs, fmt.Errorf("bead %q: dependency %q is not a key in the plan", b.Key, d))
+				}
 			}
+			seen[d] = true
 		}
 	}
 	if len(errs) == 0 {
@@ -138,4 +183,13 @@ func (p Plan) findCycle(index map[string]int) []string {
 		}
 	}
 	return nil
+}
+
+// joinBeadTypes renders types for error messages.
+func joinBeadTypes(ts []BeadType) string {
+	parts := make([]string, len(ts))
+	for i, t := range ts {
+		parts[i] = string(t)
+	}
+	return strings.Join(parts, ", ")
 }

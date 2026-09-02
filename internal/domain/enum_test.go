@@ -2,7 +2,6 @@ package domain
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -100,7 +99,7 @@ func checkEnum[T stringEnum, PT interface {
 
 			_, err = json.Marshal(T("bogus"))
 			require.Error(t, err, "marshalling an invalid value fails")
-			assert.True(t, errors.Is(err, ErrUnknownValue) || strings.Contains(err.Error(), "unknown value"))
+			assert.ErrorIs(t, err, ErrUnknownValue, "*json.MarshalerError unwraps to the enum error")
 		})
 
 		t.Run("zero value round trips as empty string", func(t *testing.T) {
@@ -128,7 +127,7 @@ func TestEnums(t *testing.T) {
 	})
 	checkEnum[BeadState, *BeadState](t, enumCase[BeadState]{
 		name: "BeadState", all: BeadStates, parse: ParseBeadState,
-		want: []string{"open", "in_progress", "in_review", "changes_requested", "approved", "delivering", "closed", "escalated", "needs_human", "failed"},
+		want: []string{"open", "in_progress", "in_review", "changes_requested", "approved", "delivering", "closed", "escalated", "needs_human", "failed", "blocked", "hooked", "deferred", "pinned"},
 	})
 	checkEnum[StateCategory, *StateCategory](t, enumCase[StateCategory]{
 		name: "StateCategory", all: StateCategories, parse: ParseStateCategory,
@@ -136,7 +135,7 @@ func TestEnums(t *testing.T) {
 	})
 	checkEnum[BeadType, *BeadType](t, enumCase[BeadType]{
 		name: "BeadType", all: BeadTypes, parse: ParseBeadType,
-		want: []string{"task", "bug", "feature", "chore", "epic"},
+		want: []string{"task", "bug", "feature", "chore", "epic", "decision", "spike", "story", "milestone", "gate", "event"},
 	})
 	checkEnum[Size, *Size](t, enumCase[Size]{
 		name: "Size", all: Sizes, parse: ParseSize,
@@ -183,29 +182,62 @@ func TestEnums(t *testing.T) {
 func TestBeadStateHelpers(t *testing.T) {
 	tests := []struct {
 		state    BeadState
+		workflow bool
 		custom   bool
 		terminal bool
 		category StateCategory
 	}{
-		{BeadStateOpen, false, false, CategoryActive},
-		{BeadStateInProgress, false, false, CategoryWIP},
-		{BeadStateInReview, true, false, CategoryWIP},
-		{BeadStateChangesRequested, true, false, CategoryWIP},
-		{BeadStateApproved, true, false, CategoryWIP},
-		{BeadStateDelivering, true, false, CategoryWIP},
-		{BeadStateClosed, false, true, CategoryDone},
-		{BeadStateEscalated, true, false, CategoryFrozen},
-		{BeadStateNeedsHuman, true, true, CategoryFrozen},
-		{BeadStateFailed, true, true, CategoryFrozen},
-		{BeadState("bogus"), false, false, ""},
-		{BeadState(""), false, false, ""},
+		{BeadStateOpen, true, false, false, CategoryActive},
+		{BeadStateInProgress, true, false, false, CategoryWIP},
+		{BeadStateInReview, true, true, false, CategoryWIP},
+		{BeadStateChangesRequested, true, true, false, CategoryWIP},
+		{BeadStateApproved, true, true, false, CategoryWIP},
+		{BeadStateDelivering, true, true, false, CategoryWIP},
+		{BeadStateClosed, true, false, true, CategoryDone},
+		{BeadStateEscalated, true, true, false, CategoryFrozen},
+		{BeadStateNeedsHuman, true, true, true, CategoryFrozen},
+		{BeadStateFailed, true, true, true, CategoryFrozen},
+		// bd built-ins the cannon reads but never sets (Appendix A).
+		{BeadStateBlocked, false, false, false, CategoryWIP},
+		{BeadStateHooked, false, false, false, CategoryWIP},
+		{BeadStateDeferred, false, false, false, CategoryFrozen},
+		{BeadStatePinned, false, false, false, CategoryFrozen},
+		{BeadState("bogus"), false, false, false, ""},
+		{BeadState(""), false, false, false, ""},
 	}
 	for _, tc := range tests {
 		t.Run(string(tc.state), func(t *testing.T) {
+			assert.Equal(t, tc.workflow, tc.state.Workflow(), "Workflow")
 			assert.Equal(t, tc.custom, tc.state.Custom(), "Custom")
 			assert.Equal(t, tc.terminal, tc.state.Terminal(), "Terminal")
 			assert.Equal(t, tc.category, tc.state.Category(), "Category")
 		})
+	}
+
+	// Every valid state has a category, and the two listings agree.
+	for _, s := range BeadStates() {
+		assert.True(t, s.Category().Valid(), "%s has a category", s)
+		if s.Custom() {
+			assert.True(t, s.Workflow(), "%s: custom statuses are workflow states", s)
+		}
+	}
+	assert.Equal(t, BeadStates()[:len(WorkflowBeadStates())], WorkflowBeadStates(), "workflow states lead BeadStates in flow order")
+	wf := WorkflowBeadStates()
+	wf[0] = "clobbered"
+	assert.Equal(t, BeadStateOpen, WorkflowBeadStates()[0], "WorkflowBeadStates returns a copy")
+
+	// The bd 1.2.2 built-in status list, as captured in
+	// internal/testutil/testdata/bd/statuses-builtin.json, all parse and have
+	// bd's categories.
+	builtin := map[string]StateCategory{
+		"open": CategoryActive, "in_progress": CategoryWIP, "blocked": CategoryWIP, "hooked": CategoryWIP,
+		"deferred": CategoryFrozen, "pinned": CategoryFrozen, "closed": CategoryDone,
+	}
+	for name, cat := range builtin {
+		s, err := ParseBeadState(name)
+		require.NoError(t, err, name)
+		assert.Equal(t, cat, s.Category(), name)
+		assert.False(t, s.Custom(), "%s is a bd built-in", name)
 	}
 
 	// D-07's registration string, reconstructed from the model.
@@ -216,6 +248,34 @@ func TestBeadStateHelpers(t *testing.T) {
 	assert.Equal(t,
 		"in_review:wip,changes_requested:wip,approved:wip,delivering:wip,escalated:frozen,needs_human:frozen,failed:frozen",
 		strings.Join(parts, ","))
+}
+
+func TestBeadTypePlannable(t *testing.T) {
+	want := map[BeadType]bool{
+		BeadTypeTask: true, BeadTypeBug: true, BeadTypeFeature: true, BeadTypeChore: true,
+		BeadTypeEpic: false, BeadTypeDecision: false, BeadTypeSpike: false, BeadTypeStory: false,
+		BeadTypeMilestone: false, BeadTypeGate: false, BeadTypeEvent: false,
+		BeadType(""): false, BeadType("bogus"): false,
+	}
+	for _, bt := range BeadTypes() {
+		_, listed := want[bt]
+		assert.True(t, listed, "test table misses %s", bt)
+	}
+	for bt, plannable := range want {
+		assert.Equal(t, plannable, bt.Plannable(), string(bt))
+	}
+	assert.Equal(t, []BeadType{BeadTypeTask, BeadTypeBug, BeadTypeFeature, BeadTypeChore}, PlannableBeadTypes())
+	assert.Equal(t, BeadTypes()[:4], PlannableBeadTypes(), "plannable types lead BeadTypes")
+	pl := PlannableBeadTypes()
+	pl[0] = "clobbered"
+	assert.Equal(t, BeadTypeTask, PlannableBeadTypes()[0], "PlannableBeadTypes returns a copy")
+
+	// Everything bd 1.2.2 mints (Appendix A, and the gate-list/export
+	// fixtures) parses.
+	for _, name := range []string{"task", "bug", "feature", "chore", "epic", "decision", "spike", "story", "milestone", "gate", "event"} {
+		_, err := ParseBeadType(name)
+		assert.NoError(t, err, name)
+	}
 }
 
 func TestAgentStateTerminal(t *testing.T) {
@@ -262,6 +322,58 @@ func TestPriorityValid(t *testing.T) {
 	assert.False(t, Priority(-1).Valid())
 	assert.False(t, Priority(5).Valid())
 	assert.True(t, PriorityDefault.Valid())
+}
+
+func TestPriorityJSON(t *testing.T) {
+	t.Run("marshals as a bare number", func(t *testing.T) {
+		for p := PriorityHighest; p <= PriorityLowest; p++ {
+			data, err := json.Marshal(p)
+			require.NoError(t, err)
+			assert.Equal(t, fmt.Sprint(int(p)), string(data))
+		}
+	})
+
+	decode := []struct {
+		in   string
+		want Priority
+	}{
+		{"0", PriorityHighest},
+		{"2", PriorityDefault},
+		{"4", PriorityLowest},
+		{" 3 ", 3},
+		{"null", PriorityDefault},
+		{`""`, PriorityDefault},
+		{`"  "`, PriorityDefault},
+		{`"1"`, 1},
+		{`" 4 "`, 4},
+		{"7", 7}, // out of range decodes; Plan.Validate rejects it
+	}
+	for _, tc := range decode {
+		t.Run(tc.in, func(t *testing.T) {
+			p := Priority(-99)
+			require.NoError(t, json.Unmarshal([]byte(tc.in), &p))
+			assert.Equal(t, tc.want, p)
+		})
+	}
+
+	for _, bad := range []string{`"high"`, `"1.5"`, `1.5`, `true`, `[1]`, `{}`} {
+		t.Run("invalid "+bad, func(t *testing.T) {
+			var p Priority
+			err := json.Unmarshal([]byte(bad), &p)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrUnknownValue)
+		})
+	}
+
+	t.Run("malformed string called directly", func(t *testing.T) {
+		// encoding/json validates syntax before calling UnmarshalJSON, but
+		// other decoders may not; an unterminated string must still fail.
+		var p Priority
+		err := p.UnmarshalJSON([]byte(`"unterminated`))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrUnknownValue)
+		assert.Equal(t, Priority(0), p, "receiver untouched on error")
+	})
 }
 
 func TestIDStringers(t *testing.T) {

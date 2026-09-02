@@ -1,5 +1,12 @@
 package domain
 
+import (
+	"encoding/json"
+	"fmt"
+	"strconv"
+	"strings"
+)
+
 // BeadID is the identifier bd mints for an issue, for example "sc-68s" or the
 // hierarchical "sc-dml.1". It is opaque to slop-cannon.
 type BeadID string
@@ -7,16 +14,22 @@ type BeadID string
 // String returns the id as bd prints it.
 func (id BeadID) String() string { return string(id) }
 
-// BeadState is the workflow state of a bead. Per D-07 every state maps one to
-// one onto a bd status: open, in_progress and closed are bd built-ins; the
-// rest are custom statuses that slop-cannon registers at run start.
+// BeadState is a bd status as slop-cannon understands it. Per D-07 every
+// workflow state maps one to one onto a bd status: open, in_progress and
+// closed are bd built-ins; in_review … failed are custom statuses that
+// slop-cannon registers at run start. bd 1.2.2 also ships blocked, hooked,
+// deferred and pinned (Appendix A); slop-cannon never sets those, but a bead
+// carrying one must still decode because `bd list --all`, `bd show` and
+// `bd export` return them from any repository the cannon is fired at. Use
+// Workflow to tell the two groups apart.
 //
 // Flow: open → in_progress → in_review → (changes_requested → in_progress …)
 // → approved → delivering → closed, with escalated, needs_human and failed as
 // side exits.
 type BeadState string
 
-// Bead states, in the order they normally occur.
+// Bead states: the D-07 workflow states in the order they normally occur,
+// followed by the remaining bd built-ins.
 const (
 	// BeadStateOpen means the bead is ready to be claimed (bd built-in).
 	BeadStateOpen BeadState = "open"
@@ -41,16 +54,42 @@ const (
 	BeadStateNeedsHuman BeadState = "needs_human"
 	// BeadStateFailed means the bead was abandoned after unrecoverable errors.
 	BeadStateFailed BeadState = "failed"
+
+	// BeadStateBlocked is bd's built-in "blocked by a dependency" status
+	// (category wip). slop-cannon never sets it (D-07).
+	BeadStateBlocked BeadState = "blocked"
+	// BeadStateHooked is bd's built-in "attached to an agent's hook" status
+	// (category wip). slop-cannon never sets it.
+	BeadStateHooked BeadState = "hooked"
+	// BeadStateDeferred is bd's built-in "put on ice for later" status
+	// (category frozen). slop-cannon never sets it (D-07).
+	BeadStateDeferred BeadState = "deferred"
+	// BeadStatePinned is bd's built-in "stays open indefinitely" status
+	// (category frozen). slop-cannon never sets it.
+	BeadStatePinned BeadState = "pinned"
 )
 
-var beadStateEnum = enum[BeadState]{kind: "bead state", values: []BeadState{
+// workflowBeadStates are the D-07 states, in flow order.
+var workflowBeadStates = []BeadState{
 	BeadStateOpen, BeadStateInProgress, BeadStateInReview, BeadStateChangesRequested,
 	BeadStateApproved, BeadStateDelivering, BeadStateClosed,
 	BeadStateEscalated, BeadStateNeedsHuman, BeadStateFailed,
-}}
+}
 
-// BeadStates returns every valid BeadState in workflow order.
+var beadStateEnum = enum[BeadState]{kind: "bead state", values: append(
+	append([]BeadState(nil), workflowBeadStates...),
+	BeadStateBlocked, BeadStateHooked, BeadStateDeferred, BeadStatePinned,
+)}
+
+// BeadStates returns every valid BeadState: the D-07 workflow states in flow
+// order, then the bd-only built-ins (blocked, hooked, deferred, pinned).
 func BeadStates() []BeadState { return beadStateEnum.all() }
+
+// WorkflowBeadStates returns only the D-07 states, in flow order: the ones
+// the orchestrator's state machine moves beads through.
+func WorkflowBeadStates() []BeadState {
+	return append([]BeadState(nil), workflowBeadStates...)
+}
 
 // CustomBeadStates returns the states that are not bd built-ins and must be
 // registered with `bd config set status.custom` at run start (D-07).
@@ -73,14 +112,27 @@ func (s BeadState) String() string { return string(s) }
 // Valid reports whether s is one of the declared states.
 func (s BeadState) Valid() bool { return beadStateEnum.valid(s) }
 
-// Custom reports whether s is a slop-cannon custom status rather than one of
-// bd's built-in open / in_progress / closed.
+// Workflow reports whether s is one of the D-07 states the cannon moves beads
+// through, as opposed to a bd built-in it only ever reads (blocked, hooked,
+// deferred, pinned) or an invalid value.
+func (s BeadState) Workflow() bool {
+	for _, w := range workflowBeadStates {
+		if w == s {
+			return true
+		}
+	}
+	return false
+}
+
+// Custom reports whether s is a slop-cannon custom status, i.e. a workflow
+// state that is not one of bd's built-ins and therefore has to be registered
+// with `bd config set status.custom` (D-07).
 func (s BeadState) Custom() bool {
 	switch s {
 	case BeadStateOpen, BeadStateInProgress, BeadStateClosed:
 		return false
 	default:
-		return s.Valid()
+		return s.Workflow()
 	}
 }
 
@@ -102,11 +154,12 @@ func (s BeadState) Category() StateCategory {
 	case BeadStateOpen:
 		return CategoryActive
 	case BeadStateInProgress, BeadStateInReview, BeadStateChangesRequested,
-		BeadStateApproved, BeadStateDelivering:
+		BeadStateApproved, BeadStateDelivering, BeadStateBlocked, BeadStateHooked:
 		return CategoryWIP
 	case BeadStateClosed:
 		return CategoryDone
-	case BeadStateEscalated, BeadStateNeedsHuman, BeadStateFailed:
+	case BeadStateEscalated, BeadStateNeedsHuman, BeadStateFailed,
+		BeadStateDeferred, BeadStatePinned:
 		return CategoryFrozen
 	default:
 		return ""
@@ -171,11 +224,15 @@ func (c *StateCategory) UnmarshalText(b []byte) error {
 	return nil
 }
 
-// BeadType is the bd issue type slop-cannon uses. bd has more core types;
-// these are the ones the PO may emit (P5-02) plus the run epic (D-22).
+// BeadType is a bd issue type. The list covers everything bd 1.2.2 returns
+// (Appendix A): the core types a person or the PO may create, plus the gate
+// and event beads bd mints itself (`bd gate create`, which slop-cannon uses
+// under D-20, and `bd set-state`). Only the Plannable types may appear in a
+// PO plan (P5-02); the run epic is created separately (D-22).
 type BeadType string
 
-// Bead types.
+// Bead types: the four plannable core types first, then the rest of bd's
+// core types, then the two bd-minted infrastructure types.
 const (
 	// BeadTypeTask is generic work; the default.
 	BeadTypeTask BeadType = "task"
@@ -185,16 +242,50 @@ const (
 	BeadTypeFeature BeadType = "feature"
 	// BeadTypeChore is maintenance with no user-visible change.
 	BeadTypeChore BeadType = "chore"
-	// BeadTypeEpic is the parent bead each run owns (D-22).
+	// BeadTypeEpic is a parent bead; each run owns one (D-22).
 	BeadTypeEpic BeadType = "epic"
+	// BeadTypeDecision is a bd core type recording a decision to be made.
+	BeadTypeDecision BeadType = "decision"
+	// BeadTypeSpike is a bd core type for time-boxed research.
+	BeadTypeSpike BeadType = "spike"
+	// BeadTypeStory is a bd core type for a user story.
+	BeadTypeStory BeadType = "story"
+	// BeadTypeMilestone is a bd core type marking a milestone.
+	BeadTypeMilestone BeadType = "milestone"
+	// BeadTypeGate is minted by `bd gate create`; slop-cannon creates one per
+	// pull request with safety on (D-20).
+	BeadTypeGate BeadType = "gate"
+	// BeadTypeEvent is minted by `bd set-state` for each state-cache change;
+	// slop-cannon never creates one but may list them with --include-infra.
+	BeadTypeEvent BeadType = "event"
 )
 
-var beadTypeEnum = enum[BeadType]{kind: "bead type", values: []BeadType{
-	BeadTypeTask, BeadTypeBug, BeadTypeFeature, BeadTypeChore, BeadTypeEpic,
-}}
+// plannableBeadTypes are the types the PO may emit in a plan (P5-02).
+var plannableBeadTypes = []BeadType{BeadTypeTask, BeadTypeBug, BeadTypeFeature, BeadTypeChore}
+
+var beadTypeEnum = enum[BeadType]{kind: "bead type", values: append(
+	append([]BeadType(nil), plannableBeadTypes...),
+	BeadTypeEpic, BeadTypeDecision, BeadTypeSpike, BeadTypeStory, BeadTypeMilestone,
+	BeadTypeGate, BeadTypeEvent,
+)}
 
 // BeadTypes returns every valid BeadType in declaration order.
 func BeadTypes() []BeadType { return beadTypeEnum.all() }
+
+// PlannableBeadTypes returns the types a PO plan may use: task, bug, feature
+// and chore.
+func PlannableBeadTypes() []BeadType { return append([]BeadType(nil), plannableBeadTypes...) }
+
+// Plannable reports whether t may appear in a PO plan (Plan.Validate
+// enforces this). The run epic and bd's infrastructure types are not.
+func (t BeadType) Plannable() bool {
+	for _, p := range plannableBeadTypes {
+		if p == t {
+			return true
+		}
+	}
+	return false
+}
 
 // ParseBeadType parses a type name leniently; see ParseRole for the rules.
 func ParseBeadType(s string) (BeadType, error) { return beadTypeEnum.parse(s) }
@@ -259,7 +350,15 @@ func (s *Size) UnmarshalText(b []byte) error {
 }
 
 // Priority uses bd's scale: 0 is the most urgent, 4 the least, 2 the default
-// (D-22). It is a plain int so it marshals exactly as bd expects.
+// (D-22). It marshals as a plain JSON number, exactly as bd expects.
+//
+// The Go zero value is PriorityHighest, not the default, so code that builds
+// a Bead or PlanBead by hand must set Priority explicitly (PriorityDefault
+// when it has no opinion). JSON is safer: a "priority" field that is absent,
+// null or an empty string decodes to PriorityDefault when the enclosing Bead
+// or PlanBead is unmarshalled, so a PO plan that omits priorities creates
+// default-urgency beads rather than top-urgency ones. A quoted number such as
+// "1" is accepted too, since LLM output is not always well typed.
 type Priority int
 
 // Priority bounds and default on bd's scale.
@@ -275,10 +374,43 @@ const (
 // Valid reports whether p lies within bd's 0–4 range.
 func (p Priority) Valid() bool { return p >= PriorityHighest && p <= PriorityLowest }
 
+// UnmarshalJSON implements json.Unmarshaler. A JSON number is taken as is
+// (range is checked by Plan.Validate, not here); null and "" mean
+// PriorityDefault; a quoted integer such as "1" is parsed. Anything else is
+// an error wrapping ErrUnknownValue.
+func (p *Priority) UnmarshalJSON(data []byte) error {
+	text := strings.TrimSpace(string(data))
+	if text == "null" {
+		*p = PriorityDefault
+		return nil
+	}
+	if strings.HasPrefix(text, "\"") {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return fmt.Errorf("%w: priority %s: %w", ErrUnknownValue, text, err)
+		}
+		s = strings.TrimSpace(s)
+		if s == "" {
+			*p = PriorityDefault
+			return nil
+		}
+		text = s
+	}
+	n, err := strconv.Atoi(text)
+	if err != nil {
+		return fmt.Errorf("%w: priority %s (want an integer %d..%d)", ErrUnknownValue, string(data), PriorityHighest, PriorityLowest)
+	}
+	*p = Priority(n)
+	return nil
+}
+
 // Bead is one unit of work: an issue in the target repository's beads
 // database, as slop-cannon sees it. The beads client (P3-02) converts bd's
 // JSON into this shape; sc_* metadata such as the round and PR are surfaced
-// as first-class fields.
+// as first-class fields. Bead is not a byte-for-byte image of a bd issue:
+// field names differ (state for status, type for issue_type, acceptance for
+// acceptance_criteria) and bd's bookkeeping fields are dropped, but State and
+// Type accept every status and issue type bd 1.2.2 returns.
 type Bead struct {
 	// ID is the bd-minted identifier.
 	ID BeadID `json:"id"`
@@ -309,4 +441,17 @@ type Bead struct {
 	PRURL string `json:"pr_url,omitempty"`
 	// PRNumber is the pull request number, if any (sc_pr_number).
 	PRNumber int `json:"pr_number,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler. It decodes like the plain struct
+// except that a missing "priority" yields PriorityDefault rather than
+// PriorityHighest (see Priority).
+func (b *Bead) UnmarshalJSON(data []byte) error {
+	type plain Bead // no methods, so the default decoder is used
+	v := plain{Priority: PriorityDefault}
+	if err := json.Unmarshal(data, &v); err != nil {
+		return err
+	}
+	*b = Bead(v)
+	return nil
 }
