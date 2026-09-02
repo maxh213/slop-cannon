@@ -1,0 +1,12 @@
+FAIL  git               2.29.2 is older than 2.30.0 (/fake/bin/git)
+                        hint: install git 2.30 or newer (https://git-scm.com/downloads)
+FAIL  bd                1.1.0 is older than 1.2.2 (/fake/bin/bd)
+                        hint: install beads 1.2.2 or newer: brew install beads, or the upstream install script (scripts/install.sh at https://github.com/gastownhall/beads); CGO_ENABLED=0 go install builds are server-mode only and cannot run embedded Dolt
+warn  gh                2.98.0 (/fake/bin/gh), not authenticated: You are not logged into any GitHub hosts. To log in, run: gh auth login
+                        hint: run: gh auth login; needed for safety-on gates and external PR review
+warn  cartridge         no cartridge configured
+                        hint: add one with: sc cartridge --add claude --model <model>
+pass  repo              clean working tree at /repo
+pass  .beads            /repo/.beads present
+
+2 passed, 2 warnings, 2 failed

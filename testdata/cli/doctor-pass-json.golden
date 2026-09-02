@@ -1,0 +1,44 @@
+{
+  "repo": "/repo",
+  "checks": [
+    {
+      "name": "git",
+      "status": "pass",
+      "detail": "2.55.0 (/fake/bin/git)"
+    },
+    {
+      "name": "bd",
+      "status": "pass",
+      "detail": "1.2.2 (build dev, /fake/bin/bd)"
+    },
+    {
+      "name": "beads",
+      "status": "pass",
+      "detail": "embedded database answered bd ping in 11 ms"
+    },
+    {
+      "name": "gh",
+      "status": "pass",
+      "detail": "2.98.0 (/fake/bin/gh), authenticated as octocat on github.com"
+    },
+    {
+      "name": "cartridge:claude",
+      "status": "pass",
+      "detail": "active: 2.1.258 (/fake/bin/claude)"
+    },
+    {
+      "name": "repo",
+      "status": "pass",
+      "detail": "clean working tree at /repo"
+    },
+    {
+      "name": ".beads",
+      "status": "pass",
+      "detail": "/repo/.beads present"
+    }
+  ],
+  "passed": 7,
+  "warnings": 0,
+  "failed": 0,
+  "ok": true
+}

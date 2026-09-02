@@ -15,7 +15,7 @@ LDFLAGS := -s -w \
 	-X $(MODULE)/internal/cli.Commit=$(COMMIT) \
 	-X $(MODULE)/internal/cli.Date=$(DATE)
 
-.PHONY: help build test lint fmt check install integration clean tools
+.PHONY: help build test lint fmt check install integration clean tools update-golden docs-cli
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -40,6 +40,12 @@ install: ## go install ./cmd/sc with version metadata
 
 integration: ## Run tests tagged `integration` (need real bd/git/gh)
 	go test -race -tags integration ./...
+
+update-golden: ## Regenerate testdata/**/*.golden files (and docs/cli.md) from current output
+	UPDATE_GOLDEN=1 go test -count=1 ./...
+
+docs-cli: ## Regenerate docs/cli.md from the sc command tree
+	go run ./cmd/gendocs -o docs/cli.md
 
 clean: ## Remove build output and caches produced by this Makefile
 	rm -rf $(BIN_DIR) dist coverage.out

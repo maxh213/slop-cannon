@@ -1,0 +1,73 @@
+{
+  "run": {
+    "id": "20260902-010203-abcd",
+    "repo_path": "<tmp>/repo",
+    "state_dir": "<state>/runs/20260902-010203-abcd",
+    "mode": "brief",
+    "brief": "fix the bugs",
+    "started_at": "2026-09-02T01:02:03Z",
+    "config": {
+      "ammo": 10,
+      "safety": true,
+      "cartridge": "claude",
+      "model": "fable",
+      "review_prs": false,
+      "headless": false
+    }
+  },
+  "resume": false,
+  "no_anim": false,
+  "cartridge_name": "claude",
+  "cartridge": {
+    "model": "fable"
+  },
+  "allocation": {
+    "ammo": 10,
+    "po": 1,
+    "max_engineers": 2,
+    "max_testers": 7
+  },
+  "effective": {
+    "config": {
+      "active_cartridge": "claude",
+      "cartridges": {
+        "claude": {
+          "model": "fable"
+        }
+      },
+      "ammo": 10,
+      "safety": true,
+      "vibes": [],
+      "rules": [],
+      "check_command": "",
+      "idle_replan_interval": "10m",
+      "limits": {
+        "max_review_rounds": 5,
+        "max_pushback_rounds": 2,
+        "agent_timeout": "30m"
+      },
+      "roles": {}
+    },
+    "sources": {
+      "active_cartridge": "global",
+      "ammo": "default",
+      "cartridges": "global",
+      "cartridges.claude": "global",
+      "check_command": "default",
+      "idle_replan_interval": "default",
+      "limits.agent_timeout": "default",
+      "limits.max_cost_usd": "default",
+      "limits.max_pushback_rounds": "default",
+      "limits.max_review_rounds": "default",
+      "limits.max_tokens": "default",
+      "rules": "default",
+      "safety": "default",
+      "vibes": "default"
+    },
+    "global_path": "<tmp>/home/.config/slop-cannon/config.toml",
+    "global_exists": true,
+    "repo_root": "<tmp>/repo",
+    "repo_path": "<tmp>/repo/.slop-cannon/config.toml",
+    "repo_exists": false
+  }
+}

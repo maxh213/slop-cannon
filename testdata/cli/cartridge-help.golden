@@ -1,0 +1,39 @@
+A cartridge is an LLM CLI subscription sc can fire: the CLI to run and the
+model to pass it. Cartridges are subscriptions, so they always live in the
+global config, never in a repository (--global and --repo make no difference
+here).
+
+The first cartridge added becomes the active one; --use switches. Removing
+the active cartridge promotes the next configured one, or leaves the cannon
+without an active cartridge (a run refuses to start until one is added).
+Re-adding a configured cartridge updates its model.
+
+Only "claude" (Claude Code) is supported for now; more cartridges are
+planned. Any other name is rejected. Without flags the configured
+cartridges are listed.
+
+Usage:
+  sc cartridge [flags]
+
+Examples:
+  sc cartridge --add claude --model fable
+  sc cartridge --remove claude
+  sc cartridge --add animus
+  sc cartridge --add kimi --model 3
+  sc cartridge --use claude
+  sc cartridge --list
+
+Flags:
+      --add NAME      add cartridge NAME (or update its model); the first one added becomes active
+  -h, --help          help for cartridge
+      --list          list the configured cartridges (the default)
+      --model M       model M to pass to the cartridge's CLI (with --add)
+      --remove NAME   remove cartridge NAME
+      --use NAME      make cartridge NAME the active one
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

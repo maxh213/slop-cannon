@@ -1,0 +1,14 @@
+Print the sc version, commit, and build date
+
+Usage:
+  sc version [flags]
+
+Flags:
+  -h, --help   help for version
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

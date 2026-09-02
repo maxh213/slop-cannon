@@ -1,0 +1,18 @@
+active_cartridge                  default
+ammo                        10    default
+safety                      true  default
+vibes                       []    default
+rules                       []    default
+check_command                     default
+idle_replan_interval        10m   default
+limits.max_review_rounds    5     default
+limits.max_pushback_rounds  2     default
+limits.agent_timeout        30m   default
+limits.max_tokens           0     default
+limits.max_cost_usd         0     default
+roles.po.cartridge                default
+roles.engineer.cartridge          default
+roles.tester.cartridge            default
+
+global config  <tmp>/home/.config/slop-cannon/config.toml (not found)
+repo config    <tmp>/repo/.slop-cannon/config.toml (not found)

@@ -1,0 +1,42 @@
+Print a shell completion script for sc to stdout. Source it (or install it
+where your shell looks for completions) and tab completion works for every
+sc command and flag.
+
+bash (needs bash-completion; bash 4 or newer):
+  # once, for the current shell:
+  source <(sc completion bash)
+  # permanently:
+  sc completion bash > /etc/bash_completion.d/sc                # Linux
+  sc completion bash > $(brew --prefix)/etc/bash_completion.d/sc  # macOS
+
+zsh:
+  # once, for the current shell:
+  source <(sc completion zsh)
+  # permanently (then start a new shell; add "autoload -U compinit; compinit"
+  # to ~/.zshrc if completions are not enabled yet):
+  sc completion zsh > "${fpath[1]}/_sc"
+
+fish:
+  # once, for the current shell:
+  sc completion fish | source
+  # permanently:
+  sc completion fish > ~/.config/fish/completions/sc.fish
+
+Usage:
+  sc completion bash|zsh|fish
+
+Examples:
+  sc completion bash
+  sc completion zsh > "${fpath[1]}/_sc"
+  sc completion fish > ~/.config/fish/completions/sc.fish
+
+Flags:
+  -h, --help              help for completion
+      --no-descriptions   omit command descriptions from the completion script
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

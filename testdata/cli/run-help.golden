@@ -1,0 +1,40 @@
+Fire the cannon at a repository. PATH may be the repository root or any
+directory inside it. Without -m the product owner researches the repository
+and invents the work itself (autopilot, which never stops on its own); with
+-m it decomposes your brief into beads and finishes when they are all
+settled.
+
+The run needs an active cartridge (sc cartridge --add claude --model M) and
+PATH must be inside a git repository. --ammo, --safety and --cartridge
+override the config files for this run only; everything else comes from the
+effective configuration (sc config show). --resume continues the most
+recent run recorded for the repository instead of starting a new one.
+
+This is the same as the bare form "sc PATH [flags]".
+
+Usage:
+  sc run [PATH] [flags]
+
+Examples:
+  sc ./repo-path
+  sc ./repo-path -m "here's what I want done"
+  sc run ./repo-path --headless --safety off --ammo 6
+  sc ./repo-path --resume
+
+Flags:
+      --ammo N           override ammo for this run (N agents at once, minimum 3)
+      --cartridge NAME   fire cartridge NAME instead of the active one
+      --headless         no TUI: render events as log lines (for CI and scripts)
+  -h, --help             help for run
+  -m, --message BRIEF    start work with this BRIEF; without it the run is full autopilot
+      --no-anim          disable the cannon animations in the TUI
+      --resume           continue the most recent run of this repository instead of starting a new one
+      --review-prs       also review open pull requests sc did not create (needs gh and a remote) (default true)
+      --safety on|off    override safety for this run (on|off): on opens PRs, off merges to the default branch
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

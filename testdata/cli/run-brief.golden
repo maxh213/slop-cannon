@@ -1,0 +1,14 @@
+run        20260902-010203-abcd (new)
+mode       brief
+brief      here's what I want done
+repo       <tmp>/repo
+state      <state>/runs/20260902-010203-abcd
+started    2026-09-02T01:02:03Z
+cartridge  claude (model fable, command claude) (from global)
+ammo       8 → 1 PO, up to 1 engineer, up to 6 testers (from flag)
+safety     off (from flag): finished beads are rebased onto the default branch, the check command is run, then they are fast-forward merged and pushed when a remote exists
+vibes      [<tmp>/repo/vibes.md] (from repo)
+rules      [] (from default)
+review-prs true
+headless   true
+animation  off

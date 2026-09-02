@@ -1,0 +1,26 @@
+Check that everything a run needs is installed and configured:
+
+  git        present and at least 2.30
+  bd         present and at least 1.2.2 (the beads CLI with embedded Dolt)
+  beads      bd ping answers when the repo already has a .beads/ directory
+  gh         present and authenticated (warning only; needed for safety-on
+             gates and external PR review)
+  cartridge  every configured cartridge CLI is on PATH (failure when the
+             active one is missing)
+  repo       --repo is a git repository with a clean working tree (warning)
+  .beads     present (warning: it is initialised on the first run)
+
+Rows are pass, warn, or fail. The exit status is 1 when any row fails.
+
+Usage:
+  sc doctor [flags]
+
+Flags:
+  -h, --help   help for doctor
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

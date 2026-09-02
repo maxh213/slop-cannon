@@ -1,0 +1,9 @@
+pass  git               2.55.0 (/fake/bin/git)
+pass  bd                1.2.2 (build dev, /fake/bin/bd)
+pass  beads             embedded database answered bd ping in 11 ms
+pass  gh                2.98.0 (/fake/bin/gh), authenticated as octocat on github.com
+pass  cartridge:claude  active: 2.1.258 (/fake/bin/claude)
+pass  repo              clean working tree at /repo
+pass  .beads            /repo/.beads present
+
+7 passed, 0 warnings, 0 failed

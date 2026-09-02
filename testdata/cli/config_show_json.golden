@@ -1,0 +1,141 @@
+{
+  "config": {
+    "active_cartridge": "claude",
+    "cartridges": {
+      "claude": {
+        "model": "fable"
+      }
+    },
+    "ammo": 12,
+    "safety": false,
+    "vibes": [
+      "<tmp>/repo/vibes.md"
+    ],
+    "rules": [
+      "<tmp>/home/rules.md",
+      "<tmp>/repo/docs/rules.md"
+    ],
+    "check_command": "make check",
+    "idle_replan_interval": "10m",
+    "limits": {
+      "max_review_rounds": 3,
+      "max_pushback_rounds": 2,
+      "agent_timeout": "30m"
+    },
+    "roles": {
+      "tester": "claude"
+    }
+  },
+  "sources": {
+    "active_cartridge": "global",
+    "ammo": "repo",
+    "cartridges": "global",
+    "cartridges.claude": "global",
+    "check_command": "repo",
+    "idle_replan_interval": "default",
+    "limits.agent_timeout": "default",
+    "limits.max_cost_usd": "default",
+    "limits.max_pushback_rounds": "default",
+    "limits.max_review_rounds": "repo",
+    "limits.max_tokens": "default",
+    "roles.tester": "repo",
+    "rules": "global+repo",
+    "safety": "repo",
+    "vibes": "repo"
+  },
+  "global_path": "<tmp>/home/.config/slop-cannon/config.toml",
+  "global_exists": true,
+  "repo_root": "<tmp>/repo",
+  "repo_path": "<tmp>/repo/.slop-cannon/config.toml",
+  "repo_exists": true,
+  "warnings": [
+    "<tmp>/repo/.slop-cannon/config.toml: cartridges and active_cartridge are ignored here; they live in the global config <tmp>/home/.config/slop-cannon/config.toml (D-03)"
+  ],
+  "entries": [
+    {
+      "key": "active_cartridge",
+      "value": "claude",
+      "source": "global"
+    },
+    {
+      "key": "cartridges.claude.model",
+      "value": "fable",
+      "source": "global"
+    },
+    {
+      "key": "cartridges.claude.command",
+      "value": "claude",
+      "source": "global"
+    },
+    {
+      "key": "ammo",
+      "value": "12",
+      "source": "repo"
+    },
+    {
+      "key": "safety",
+      "value": "false",
+      "source": "repo"
+    },
+    {
+      "key": "vibes",
+      "value": "[<tmp>/repo/vibes.md]",
+      "source": "repo"
+    },
+    {
+      "key": "rules",
+      "value": "[<tmp>/home/rules.md, <tmp>/repo/docs/rules.md]",
+      "source": "global+repo"
+    },
+    {
+      "key": "check_command",
+      "value": "make check",
+      "source": "repo"
+    },
+    {
+      "key": "idle_replan_interval",
+      "value": "10m",
+      "source": "default"
+    },
+    {
+      "key": "limits.max_review_rounds",
+      "value": "3",
+      "source": "repo"
+    },
+    {
+      "key": "limits.max_pushback_rounds",
+      "value": "2",
+      "source": "default"
+    },
+    {
+      "key": "limits.agent_timeout",
+      "value": "30m",
+      "source": "default"
+    },
+    {
+      "key": "limits.max_tokens",
+      "value": "0",
+      "source": "default"
+    },
+    {
+      "key": "limits.max_cost_usd",
+      "value": "0",
+      "source": "default"
+    },
+    {
+      "key": "roles.po.cartridge",
+      "value": "",
+      "source": "default"
+    },
+    {
+      "key": "roles.engineer.cartridge",
+      "value": "",
+      "source": "default"
+    },
+    {
+      "key": "roles.tester.cartridge",
+      "value": "claude",
+      "source": "repo"
+    }
+  ]
+}

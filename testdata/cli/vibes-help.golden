@@ -1,0 +1,41 @@
+Vibes are files of stylistic preferences (tone, naming, formatting, the
+libraries you like) that are appended to every agent prompt as soft
+guidance. Rules (sc rules) are the hard constraints; vibes are taste.
+
+--add FILE appends FILE (resolved from the current directory) to the vibes
+list of the repo config when --repo (default: the current directory) is
+inside a git repository, otherwise of the global config; --global always
+writes the global config. The file must exist, be UTF-8 text, and be at
+most 64 KiB. Paths are stored relative to the config file's directory when
+the file lives inside that tree, otherwise absolute, and a file listed
+twice is kept once. --remove FILE drops it again from the same config file;
+removing a file that is not listed is an error.
+
+--list prints the effective vibes list (global entries first, then repo
+entries, in the order the agents see them) with where each entry comes from;
+--show prints the concatenated content of those files. Both honour --global
+by looking at the global config only. With no flags, --list is assumed.
+
+Usage:
+  sc vibes [--add FILE | --remove FILE | --list | --show] [flags]
+
+Examples:
+  sc vibes --add vibes.md
+  sc --global vibes --add ~/vibes.md
+  sc vibes --list
+  sc vibes --show
+  sc vibes --remove vibes.md
+
+Flags:
+      --add FILE      add FILE to the vibes list (repeatable)
+  -h, --help          help for vibes
+      --list          print the effective vibes files and their sources
+      --remove FILE   remove FILE from the vibes list (repeatable)
+      --show          print the concatenated content of the vibes files
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

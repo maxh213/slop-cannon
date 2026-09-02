@@ -61,6 +61,8 @@ Go 1.27+ is required. All day-to-day work goes through the Makefile:
 | `make integration` | Runs tests tagged `integration` (they need real `bd`, `git`, `gh`) |
 | `make clean` | Removes `bin/`, `dist/`, and coverage output |
 | `make tools` | Installs the pinned developer tools into `bin/` |
+| `make update-golden` | Regenerates `testdata/**/*.golden` and `docs/cli.md` from the current output (`UPDATE_GOLDEN=1 go test ./...`) |
+| `make docs-cli` | Regenerates `docs/cli.md` from the `sc` command tree |
 | `make help` | Lists the targets |
 
 CI (`.github/workflows/ci.yml`) runs `make check` on Ubuntu and macOS for every push and pull request, and runs `make integration` in a separate job that is skipped when `bd` is not installed.

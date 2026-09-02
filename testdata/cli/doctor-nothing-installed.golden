@@ -1,0 +1,14 @@
+FAIL  git               not found on PATH
+                        hint: install git 2.30 or newer (https://git-scm.com/downloads)
+FAIL  bd                not found on PATH
+                        hint: install beads 1.2.2 or newer: brew install beads, or the upstream install script (scripts/install.sh at https://github.com/gastownhall/beads); CGO_ENABLED=0 go install builds are server-mode only and cannot run embedded Dolt
+warn  gh                not found on PATH
+                        hint: install the GitHub CLI (https://cli.github.com); needed for safety-on gates and external PR review
+FAIL  cartridge:claude  active: "claude" not found on PATH
+                        hint: install the claude CLI, or set [cartridges.claude] command in the global config
+warn  repo              not a git repository: /repo
+                        hint: pass --repo PATH or run sc from inside a git repository
+warn  .beads            not initialised: /repo/.beads is missing
+                        hint: sc will run bd init --non-interactive --init-if-missing --skip-agents --skip-hooks --setup-exclude on the first run (D-13)
+
+0 passed, 3 warnings, 3 failed

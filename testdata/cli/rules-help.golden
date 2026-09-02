@@ -1,0 +1,42 @@
+Rules are files of hard constraints (what agents MUST and MUST NOT do:
+branches to leave alone, commands never to run, APIs that are frozen) that
+are appended to every agent prompt. Vibes (sc vibes) are taste; rules are
+law.
+
+--add FILE appends FILE (resolved from the current directory) to the rules
+list of the repo config when --repo (default: the current directory) is
+inside a git repository, otherwise of the global config; --global always
+writes the global config. The file must exist, be UTF-8 text, and be at
+most 64 KiB. Paths are stored relative to the config file's directory when
+the file lives inside that tree, otherwise absolute, and a file listed
+twice is kept once. --remove FILE drops it again from the same config file;
+removing a file that is not listed is an error.
+
+--list prints the effective rules list (global entries first, then repo
+entries, in the order the agents see them) with where each entry comes from;
+--show prints the concatenated content of those files. Both honour --global
+by looking at the global config only. With no flags, --list is assumed.
+
+Usage:
+  sc rules [--add FILE | --remove FILE | --list | --show] [flags]
+
+Examples:
+  sc rules --add rules.md
+  sc --global rules --add ~/rules.md
+  sc rules --list
+  sc rules --show
+  sc rules --remove rules.md
+
+Flags:
+      --add FILE      add FILE to the rules list (repeatable)
+  -h, --help          help for rules
+      --list          print the effective rules files and their sources
+      --remove FILE   remove FILE from the rules list (repeatable)
+      --show          print the concatenated content of the rules files
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

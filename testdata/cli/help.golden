@@ -1,0 +1,61 @@
+Slop Cannon (sc) fires a crew of LLM agents at a git repository: a product
+owner plans the work as beads (bd issues), engineers implement each bead in
+its own worktree, and UX/QA/test reviewers loop feedback until every tester
+is satisfied. Run it with a repo path and watch the TUI, or add -m to start
+from a written brief.
+
+  safety     PRs (on, the default) or straight to the default branch (off)
+  cartridge  the CLI LLM subscription that gets used (blank until you add one)
+  ammo       number of sub agents (minimum 3, default 10)
+  vibes      stylistic choices communicated to all agents
+  rules      rules communicated to all agents
+  -m         start work with this brief; a bare repo path means full autopilot
+
+Usage:
+  sc [flags] <repo-path>
+  sc [command]
+
+Examples:
+  sc ./repo-path
+
+  sc ./repo-path -m "here's what I want done"
+
+  sc cartridge --add claude --model fable
+  sc cartridge --remove claude
+  sc cartridge --add animus
+  sc cartridge --add kimi --model 3
+  sc ammo 12
+  sc vibes --add vibes.md
+  sc rules --add rules.md
+  sc safety off
+
+Available Commands:
+  ammo        Set how many agents run at once (minimum 3, default 10)
+  cartridge   Add, remove, list, or switch the LLM CLI subscriptions
+  completion  Print a shell completion script (bash, zsh, or fish)
+  config      Show, locate, or edit the configuration files
+  doctor      Check that git, bd, gh, and the cartridge CLIs are ready
+  help        Help about any command
+  rules       Manage the rule files every agent must follow
+  run         Fire the cannon at a repository (same as `sc PATH`)
+  safety      Open PRs (on, the default) or merge straight to the default branch (off)
+  version     Print the sc version, commit, and build date
+  vibes       Manage the style files every agent is given
+
+Flags:
+      --ammo N           override ammo for this run (N agents at once, minimum 3)
+      --cartridge NAME   fire cartridge NAME instead of the active one
+      --global           read and write the global config only, not the repo config
+      --headless         no TUI: render events as log lines (for CI and scripts)
+  -h, --help             help for sc
+      --json             print machine-readable JSON instead of text
+  -m, --message BRIEF    start work with this BRIEF; without it the run is full autopilot
+      --no-anim          disable the cannon animations in the TUI
+      --no-color         disable colour output (also honours NO_COLOR)
+      --repo PATH        target repository PATH (default ".")
+      --resume           continue the most recent run of this repository instead of starting a new one
+      --review-prs       also review open pull requests sc did not create (needs gh and a remote) (default true)
+      --safety on|off    override safety for this run (on|off): on opens PRs, off merges to the default branch
+  -v, --verbose          enable debug logging
+
+Use "sc [command] --help" for more information about a command.

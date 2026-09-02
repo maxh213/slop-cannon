@@ -1,0 +1,20 @@
+active_cartridge            claude      global
+cartridges.claude.model     fable       global
+cartridges.claude.command   claude      global
+ammo                        12          repo
+safety                      false       repo
+vibes                       []          default
+rules                       []          default
+check_command               make check  repo
+idle_replan_interval        10m         default
+limits.max_review_rounds    3           repo
+limits.max_pushback_rounds  2           default
+limits.agent_timeout        30m         default
+limits.max_tokens           0           default
+limits.max_cost_usd         0           default
+roles.po.cartridge                      default
+roles.engineer.cartridge                default
+roles.tester.cartridge      claude      repo
+
+global config  <tmp>/home/.config/slop-cannon/config.toml
+repo config    <tmp>/repo/.slop-cannon/config.toml
