@@ -37,7 +37,7 @@ Last regenerated from README: 2026-09-02.
 | Phase | Name | Status | Notes |
 |---|---|---|---|
 | 0 | Foundations & domain model | done (round 2, wf-p0, `09e4986`) | Round 2 closed the P0-05 review gaps (priority default, bd vocabulary, plan validation). `make check` green locally at `09e4986`; `go mod tidy` is a no-op; `go run ./cmd/sc version` prints; coverage domain 100%, events 97.7%; every P0-01…P0-09 "Done when" re-verified against the code. CI green-on-push still unobserved (no git remote); workflow re-validated with actionlint v1.7.12. |
-| 1 | CLI & configuration | not started | |
+| 1 | CLI & configuration | done (round 1, wf-p1, `c7a00b7`) | `make check` green at `c7a00b7`; `go mod tidy` is a no-op after dropping the cobra/go-toml/testify pins from `deps.go`; every README example command run against the built binary in a temp `XDG_CONFIG_HOME` + temp git repo behaves as intended (`--add animus`/`--add kimi --model 3` fail with the D-19 text, `ammo 2` fails with the D-05 text); `sc config show` prints merged config with per-key sources; `sc doctor` exits 1 with bd hidden from `PATH`; every P1-01…P1-09 "Done when" re-verified; cli coverage 91%, config 94%. Open Phase-1-numbered discovered tasks: P1-11 (slog wiring), P1-13. |
 | 2 | Cartridges (LLM CLI adapters) | not started | |
 | 3 | Beads integration (task graph) | not started | |
 | 4 | Git, worktrees, PRs & safety | not started | |
@@ -156,31 +156,31 @@ Recorded defaults so agents never block on unspecified points. Change only via a
 **Goal**: every command in the README parses, validates, persists, and prints sensibly, without any orchestration yet.
 **Exit criteria**: all README example commands succeed or fail with the intended message; `sc config show` displays merged config with sources; `sc doctor` exits non-zero on a machine without `bd`.
 
-- [ ] **P1-01 — Root command and global flags** (deps: P0-03; size: S)
+- [x] **P1-01 — Root command and global flags** (deps: P0-03; size: S) (done: wf-p1 c7a00b7) — subcommands register factories from `init()` (`register(func() *cobra.Command)`) so every `NewRootCommand` call gets fresh flags; adds shared plumbing `GlobalOpts`, `writeJSON`, `ExitError`, `ExecuteContext` (SIGINT/SIGTERM cancel the context); root accepts a path-like positional as the run target (P1-08). Help Examples mirror the README block (test parses `README.md`; the README line `sc ./repo-path ` has a trailing space that is trimmed). Goldens in `testdata/cli/`, regenerated with `make update-golden`.
   - Do: `internal/cli`: cobra root `sc` with `--repo PATH` (default cwd), `--global`, `--verbose`, `--json`, `--no-color`; `sc version`; help text whose examples mirror the README block verbatim. Unknown subcommand suggests nearest.
   - Done when: `sc --help` and `sc version` work; help golden test.
-- [ ] **P1-02 — Config schema, load, merge, save** (deps: P1-01, P0-05; size: M)
+- [x] **P1-02 — Config schema, load, merge, save** (deps: P1-01, P0-05; size: M) (done: wf-p1 c7a00b7) — `vibes`/`rules` are **unioned** global-then-repo (source `global+repo`), not replaced; `[cartridges]` in a repo file is ignored with an `Effective.Warnings` entry rather than an error; `Load` walks up for `.git` (`FindRepoRoot`, no git binary); durations are a `Duration` struct so bare integers are rejected (go-toml gives that error no line number, see P1-13); `RemoveCartridge` promotes the next name in sorted order; `limits.*` also carries `agent_timeout`, `max_tokens`, `max_cost_usd` (D-18/P9-01); `re_review_threshold` (D-09) is not a key yet; prompt-file paths are stored relative to the config dir when under the repo root (`../vibes.md`). Also `RepoID`/`StateDir`/`RunDir` (D-23) and `RunConfig` (P1-08).
   - Do: `internal/config`: TOML schema (`[cartridges.<name>] model, command, args, env`, `active_cartridge`, `ammo`, `safety`, `vibes[]`, `rules[]`, `check_command`, `limits.*` from D-08/D-18, `idle_replan_interval`, `[roles.<role>] cartridge` (parsed per D-12, inert until a second adapter exists)). `Load(repoPath) (Effective, error)` implementing D-03 with per-key source tracking; `SaveGlobal`, `SaveRepo`; atomic writes; schema version key with migration hook. Defaults per D-04.
   - Done when: tests cover precedence for every key, missing files, malformed TOML error message with line number, atomic write; `docs/config.md` documents every key.
-- [ ] **P1-03 — `sc cartridge` commands** (deps: P1-02; size: M)
+- [x] **P1-03 — `sc cartridge` commands** (deps: P1-02; size: M) (done: wf-p1 c7a00b7) — re-adding without `--model` keeps the existing model; `--list`/bare `sc cartridge` never create the global file; `--json` prints the state after the action. `CartridgeAddHint` is the shared hint text.
   - Do: `--add NAME [--model M]`, `--remove NAME`, `--list`, `--use NAME`. Known name: `claude` only (D-19). Any other name, including `kimi` and `animus`, is rejected with the D-19 message. Adding the first cartridge sets it active; removing the active one promotes the next or leaves it blank with a warning. Always writes global config (D-03).
   - Done when: README examples `sc cartridge --add claude --model fable` and `--remove claude` pass an integration test on a temp `XDG_CONFIG_HOME`; `--add kimi --model 3` and `--add animus` fail with the D-19 message.
-- [ ] **P1-04 — `sc ammo N`** (deps: P1-02; size: S)
+- [x] **P1-04 — `sc ammo N`** (deps: P1-02; size: S) (done: wf-p1 c7a00b7) — also `sc ammo` with no argument reports the effective value and its source; negative numbers need `sc ammo -- -1`.
   - Do: validate integer ≥ 3 (error: `ammo must be at least 3: one engineer, one tester, one product owner`); print the D-05 allocation it implies (`ammo 12 → 1 PO, up to 2 engineers, up to 9 testers`).
   - Done when: tests for 2, 3, 10, 12, non-integer.
-- [ ] **P1-05 — `sc vibes` and `sc rules`** (deps: P1-02; size: S)
+- [x] **P1-05 — `sc vibes` and `sc rules`** (deps: P1-02; size: S) (done: wf-p1 c7a00b7) — one implementation (`vibes.go`) parameterised for both commands; `--add`/`--remove`/`--list`/`--show` are mutually exclusive; adding an already-listed file prints "nothing added" and exits 0; `--show` prints raw content only (blank line between files).
   - Do: `--add FILE`, `--remove FILE`, `--list`, `--show` (prints concatenated content). Store paths relative to the config file's directory when inside it, else absolute. Validate the file exists and is UTF-8 text ≤ 64 KiB; dedupe.
   - Done when: README examples `sc vibes --add vibes.md`, `sc rules --add rules.md` pass tests; removing a non-listed file is a clear error.
-- [ ] **P1-06 — `sc safety` and `sc config`** (deps: P1-02; size: S)
+- [x] **P1-06 — `sc safety` and `sc config`** (deps: P1-02; size: S) (done: wf-p1 c7a00b7) — `sc safety` with no argument reports the effective value; `config edit` falls back to `$VISUAL`, splits the editor string, creates the file when missing, opens a broken file for repair and validates afterwards; `config path` adds a `writes` line with the D-03 target.
   - Do: `sc safety on|off` (also accepts `true/false`, prints the D-10 meaning). `sc config show` prints effective config with a source column; `sc config path` prints both file paths; `sc config edit` opens `$EDITOR`.
   - Done when: golden test of `config show` output with `--json` and without.
-- [ ] **P1-07 — `sc doctor`** (deps: P1-02, P0-08; size: M)
+- [x] **P1-07 — `sc doctor`** (deps: P1-02, P0-08; size: M) (done: wf-p1 c7a00b7) — "not a git repository" is a warn (doctor stays useful anywhere); the `bd ping` row is omitted when `.beads/` is absent or bd is unusable; no ANSI colour yet; `RunDoctor(ctx, repo) *DoctorReport` is reusable (P8-06). bd detection/decoding should move to `internal/beads` in P3-01 (P3-16).
   - Do: checks with pass/warn/fail rows: `git ≥ 2.30`; `bd` present and `bd version --json` ≥ 1.2.2 (fail otherwise, hint: `brew install beads` or the upstream install script; note that `CGO_ENABLED=0 go install` builds are server-mode only and cannot run embedded Dolt); embedded capability confirmed by `bd ping --json` when `.beads/` exists (the standalone `dolt` binary is **not** required and is not checked); `gh` present + authenticated (warn only; required for safety-on gates and external PR review); each configured cartridge CLI present (fail if active one missing); repo at `--repo` is a git repo with a clean tree (warn); `.beads/` present (warn: will be initialised per D-13). Exit 1 on any fail.
   - Done when: tests using `FakeBin` shims for each row; output golden.
-- [ ] **P1-08 — Run command parsing (no orchestration)** (deps: P1-03…P1-06; size: M)
+- [x] **P1-08 — Run command parsing (no orchestration)** (deps: P1-03…P1-06; size: M) (done: wf-p1 c7a00b7) — `RunConfig` lives in `internal/config` (domain cannot import config); `sc run [PATH]` is an alias of the root form sharing one flag set; a path inside a repo resolves to the enclosing git root; `-m` with `--resume` is rejected; `--resume` only locates the latest run dir and re-resolves config (frozen-snapshot restore is P6-11); `cli.ResolveRun` is exported for P8-01/P8-06.
   - Do: `sc <path> [-m|--message BRIEF] [--headless] [--resume] [--ammo N] [--safety on|off] [--cartridge NAME] [--no-anim] [--review-prs=true|false]`. Resolve `RunConfig` (domain.Run + effective config). Refuse when no cartridge is active with: `no cartridge loaded — add one with: sc cartridge --add claude --model <model>`. Refuse when path is not a git repo. For now print the resolved RunConfig and exit 0.
   - Done when: tests for all flag/config interactions; README examples `sc ./repo-path` and `sc ./repo-path -m "..."` resolve correctly.
-- [ ] **P1-09 — Completions and CLI docs** (deps: P1-08; size: S)
+- [x] **P1-09 — Completions and CLI docs** (deps: P1-08; size: S) (done: wf-p1 c7a00b7) — docs generator is hand-written Markdown in `internal/cli/docs.go` + `cmd/gendocs` (cobra/doc would pull go-md2man/yaml into go.mod); `TestCLIDocsAreCurrent` fails when `docs/cli.md` is stale and `make update-golden` also rewrites it; cobra's default completion command is replaced.
   - Do: `sc completion bash|zsh|fish`; `make docs-cli` generates `docs/cli.md` from cobra.
   - Done when: generated doc is committed and a test fails if it is stale.
 
@@ -490,10 +490,10 @@ Recorded defaults so agents never block on unspecified points. Change only via a
 
 Add tasks found during implementation here using the next free ID in the relevant phase. Keep the same format. Move them into the phase section only if you are also the one implementing them; otherwise leave them here so others can find them.
 
-- [ ] **P0-10 — Remove `cmd/sc/deps.go`** (deps: P1-01, P1-02, P7-01, P7-06; size: S)
+- [ ] **P0-10 — Remove `cmd/sc/deps.go`** (deps: P1-01, P1-02, P7-01, P7-06; size: S) — Phase 1 removed the cobra, go-toml and testify pins (imported by `internal/cli`/`internal/config`); bubbletea, lipgloss, bubbles, harmonica and teatest remain until Phase 7.
   - Do: once real packages import cobra, go-toml, bubbletea, lipgloss, bubbles, harmonica, testify and teatest, delete the `deps`-tagged pin file (or the imports that are no longer needed) and run `go mod tidy`.
   - Done when: `go mod tidy` leaves go.mod unchanged without the file.
-- [ ] **P1-10 — Keep `cli.Version/Commit/Date` in sync with the Makefile ldflags** (deps: P1-01; size: S)
+- [x] **P1-10 — Keep `cli.Version/Commit/Date` in sync with the Makefile ldflags** (deps: P1-01; size: S) (done: wf-p1 c7a00b7) — P1-01 kept the names and `TestVersionPrintsInjectedValues` sets them; the integrator added `TestVersionLdflagsMatchMakefile`, which reads the Makefile so a rename on either side fails.
   - Do: the Makefile injects `-X slop-cannon/internal/cli.{Version,Commit,Date}`; P1-01 must keep those variable names or update `LDFLAGS`, and a test should assert `sc version` prints the injected values (build with `-ldflags` in the test or check the variables directly).
   - Done when: renaming any of the three fails a test.
 - [ ] **P1-11 — Wire `--verbose` and the logging handlers into the CLI root** (deps: P1-01, P0-07; size: S)
@@ -520,6 +520,23 @@ Add tasks found during implementation here using the next free ID in the relevan
 - [ ] **P3-15 — Use `Plan.DependencyCount()` for the D-24 `edge_count` check** (deps: P3-10, P3-11; size: S)
   - Do: `Plan.Validate` now guarantees no duplicate or dangling deps, so `Plan.DependencyCount()` equals the number of `edges[]` P3-10 emits; compare it to the `edge_count` in the `--dry-run` result and fail the plan build on a mismatch (D-24). Fold into P3-10 if that task is not started yet.
   - Done when: P3-10's diamond-plan test asserts `edge_count == plan.DependencyCount()` and a mismatching dry-run sample fails loudly.
+
+- [x] **P1-12 — Document `make update-golden` and `make docs-cli` in the README Development table** (deps: P1-09; size: S) (done: wf-p1 c7a00b7) — found by P1-01; the two targets existed in the Makefile but not in `README.md`.
+- [ ] **P1-13 — Line numbers for malformed duration values** (deps: P1-02; size: S)
+  - Do: go-toml v2 returns `TextUnmarshaler` errors without a position, so `idle_replan_interval = 10` or `"soon"` reports the file but no `line:col`. Decode duration keys as raw strings in `config.Parse` and parse them with the key path (or upstream a fix) so every `ParseError` carries a line. Fold into P9-08's error audit if convenient.
+  - Done when: a malformed duration test asserts `<path>:<line>:<col>` in the message.
+- [ ] **P3-16 — Move bd detection and JSON decoding from `sc doctor` into `internal/beads`** (deps: P3-01; size: S)
+  - Do: `internal/cli/doctor.go` carries `doctorDecodeBD` (preamble/envelope-tolerant decode) and `doctorBDSpec` (D-21 env, `-C`, timeout). When `beads.Detect` lands (P3-01) lift both there, keep `DoctorMinBD` in one place, and have doctor call them so the minimum-version rule and hints are not duplicated.
+  - Done when: doctor's bd rows are produced through `internal/beads` and its tests still pass against `FakeBD`.
+- [ ] **P6-11 — `--resume` restores the frozen `ConfigSnapshot` from the run's state file** (deps: P6-01, P1-08; size: S)
+  - Do: P1-08's `--resume` only finds the latest run dir (`config.LatestRunID`) and rebuilds `RunConfig` from the current config files. `domain.ConfigSnapshot` promises a resumed run behaves like the original, so P6-01's state loader must replace `Run.Config`, the brief and the mode in `cli.ResolveRun` when `Resume` is set (and refuse `--ammo`/`--safety`/`--cartridge` overrides on resume, or document that they win).
+  - Done when: a test resumes a run after changing `ammo` in the config file and the resolved snapshot still has the original value.
+- [ ] **P8-08 — Mock cartridge selection for end-to-end tests** (deps: P8-01, P2-02; size: S)
+  - Do: P8-01's "Done when" uses `--cartridge mock`, but `--cartridge` validates against `config.KnownCartridges` (D-19, only `claude`). Add a hidden flag or a test-only registration (like `cartridgeAllowMock` in `cartridge_test.go`) so the mock adapter can be selected without loosening D-19 for users.
+  - Done when: `sc <fixture> --cartridge mock --headless` runs in tests and `sc cartridge --add mock` still fails for users with the D-19 message.
+- [ ] **P8-09 — First-run experience reuses `cli.RunDoctor`** (deps: P8-06, P1-07; size: S)
+  - Do: `RunDoctor(ctx, repo)` returns a structured `DoctorReport` without printing; P8-06 should show only failing rows or the cartridge hint from it instead of re-implementing the checks. Fold into P8-06 if it is not started yet.
+  - Done when: P8-06's first-run test asserts the hint text comes from `DoctorReport` rows.
 
 ---
 
@@ -592,3 +609,4 @@ Unknown fields are silently dropped with a warning on stderr; `--dry-run` valida
 - 2026-09-02 — Human confirmed all assumptions. Added D-17 (animus deferred; P2-05 blocked) and D-18 (autopilot never stops except user stop or all cartridges out of credits); removed bead/runtime caps; added `ErrCreditsExhausted` handling to P2-01, P2-02, P6-05, P6-07, P8-03, P9-01.
 - 2026-09-02 — Phase 0 round 1 integrated (wf-p0, commit `be10e4e`): P0-01…P0-09 done; D-01 confirmed with module path `slop-cannon`; added D-24 (graph-plan edges) after the bd 1.2.2 capture in P0-09 contradicted the D-22/Appendix A node schema; discovered tasks P0-10, P1-10, P1-11, P3-11, P3-12, P3-13, P7-11, P9-09 recorded.
 - 2026-09-02 — Phase 0 round 2 integrated (wf-p0, commit `09e4986`): P0-05 review gaps closed (priority JSON default, full bd status/type vocabulary with `Workflow()`/`Plannable()`, stricter `Plan.Validate`, `Plan.DependencyCount()`); added D-25 (`escalation` message type amends D-06); every Phase 0 "Done when" re-verified; discovered tasks P3-14, P3-15 recorded.
+- 2026-09-02 — Phase 1 round 1 integrated (wf-p1, commit `c7a00b7`): P1-01…P1-09, P1-10 and P1-12 done; `cmd/sc/deps.go` trimmed to the Phase 7 libraries (P0-10 note); discovered tasks P1-13, P3-16, P6-11, P8-08, P8-09 recorded; D-01 unchanged.
