@@ -69,7 +69,7 @@ func TestBeadsCheck_PassesThroughTheShim(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, rep.Passed(), rep.Table())
 	res := conformanceResult(t, rep, CheckBeads)
-	assert.Equal(t, StatusPass, res.Status)
+	assert.Equal(t, StatusPass, res.Status, rep.Table())
 	assert.Contains(t, res.Detail, "bd update refused through the shim")
 
 	// The session ran with the shim directory first on PATH, in a workdir
