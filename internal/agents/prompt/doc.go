@@ -27,5 +27,14 @@
 //
 // Every prompt is written to <runDir>/prompts/<agent-id>.md for debugging
 // (D-23: runDir is the caller's run directory under XDG_STATE_HOME, never
-// anything inside the target repository); see [Prompt.Write].
+// anything inside the target repository). Building a prompt does not write
+// it: the caller that fires the agent must call [Prompt.Write] with its run
+// directory, and a caller that does not leaves the run with no debug copy.
+//
+// Quoted context — the tree summary, the README head, a diff — is wrapped
+// with [Fenced], which picks a fence longer than any run of backticks inside
+// the content. Prompt layers assembled elsewhere ([Section] bodies) should
+// use it too: a three-backtick wrapper around a README or a Markdown diff
+// lets the content close the block early and turns the rest of the prompt
+// into structure the agent misreads.
 package prompt

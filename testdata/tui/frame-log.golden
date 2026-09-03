@@ -1,5 +1,5 @@
-▄█▓═▶  slop-cannon · run demo-20260101-120000 · autopilot · ammo 0/10 · safety o
- 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+▄█▓═▶  demo-20260101-120000 · autopilot · ammo 0/10 · safety off · finished
+ 1 Graph  2 Agents  3 Feedback  4 PRs [1m 5 Log [0m
 ────────────────────────────────────────────────────────────────────────────────
   12:01:24 warning              warning [gates] gh not found, pull-request gates
   12:01:27 bead_updated         bead demo-2 updated (round, state)

@@ -269,6 +269,20 @@ func readReadme(root string, limit int) (name, head string, truncated bool) {
 	return "", "", false
 }
 
+// cutAtRune drops a trailing partial rune left behind by a cut on a byte
+// boundary. A correctly encoded U+FFFD is kept: only a one-byte decode
+// error, which is what half a multi-byte rune looks like, is dropped.
+func cutAtRune(s string) string {
+	for s != "" {
+		r, size := utf8.DecodeLastRuneInString(s)
+		if r != utf8.RuneError || size > 1 {
+			break
+		}
+		s = s[:len(s)-size]
+	}
+	return s
+}
+
 // cutAtLine drops the last, probably partial, line of a truncated file.
 func cutAtLine(s string) string {
 	if i := strings.LastIndexByte(s, '\n'); i > 0 {

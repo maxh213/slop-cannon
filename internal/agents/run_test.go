@@ -12,11 +12,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/cartridge"
 	"slop-cannon/internal/cartridge/mock"
 	"slop-cannon/internal/cartridge/structured"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
+	"slop-cannon/internal/gitx"
 )
 
 // runReport is a minimal impl_report the schema accepts.
@@ -379,8 +381,12 @@ func TestRunAgentRefusesAFiringTheCartridgeCannotHold(t *testing.T) {
 	a, err := mock.NewAdapter("run-no-controls", mock.DefaultScenario())
 	require.NoError(t, err)
 
+	// A product owner planning firing, which read_only is the right policy
+	// for, so the refusal is the enforcement one and not CheckPolicy's.
 	run := runAgentRun(t, a, nil)
+	run.Agent.Role, run.Task = domain.RolePO, events.TaskPlan
 	run.Spec.ToolPolicy = cartridge.ToolReadOnly
+	require.NoError(t, run.CheckPolicy())
 	_, tr, err := RunAgent[domain.Plan](context.Background(), run)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrCopyWorktreeUnimplemented)
@@ -606,4 +612,341 @@ func TestDefaultSchemaRetriesIsOne(t *testing.T) {
 	assert.Equal(t, 0, AgentRun{SchemaRetries: -3}.retries())
 	assert.Equal(t, 2, AgentRun{SchemaRetries: 2}.retries())
 	assert.Equal(t, DefaultTranscriptLines, AgentRun{}.maxLines())
+}
+
+// --- Rule checks (P5-08): the role validators run inside the retry loop. ---
+
+// runCyclicPlan is schema-valid and rule-invalid: a depends on b, b on a.
+var runCyclicPlan = json.RawMessage(`{"beads":[` +
+	`{"key":"a","title":"A","acceptance":"a works","deps":["b"]},` +
+	`{"key":"b","title":"B","acceptance":"b works","deps":["a"]}]}`)
+
+// runGoodPlan is the corrected plan the retry produces.
+var runGoodPlan = json.RawMessage(`{"brief":"One small step.","beads":[{"key":"a","title":"A","acceptance":"a works"}]}`)
+
+// runPlanRequest is a minimal valid planning request over a throwaway repo.
+func runPlanRequest(t *testing.T) PlanRequest {
+	t.Helper()
+	return PlanRequest{
+		Run:     "run-1",
+		AgentID: "po-1",
+		Mode:    domain.RunModeAutopilot,
+		Repo:    prompt.RepoContext{Root: t.TempDir(), DefaultBranch: "main"},
+	}
+}
+
+// runPlanRun is the standard firing recast as a product owner planning one,
+// so the tool policy the role and task are entitled to is read_only.
+func runPlanRun(t *testing.T, c cartridge.Cartridge, bus *events.Bus) AgentRun {
+	t.Helper()
+	run := runAgentRun(t, c, bus)
+	run.Agent.ID, run.Agent.Role, run.Agent.Bead = "po-1", domain.RolePO, ""
+	run.Task, run.Message = events.TaskPlan, domain.MessagePlan
+	run.Spec.ToolPolicy = cartridge.ToolReadOnly
+	run.Check = PlanCheck(runPlanRequest(t))
+	return run
+}
+
+func TestRunAgentRetriesARuleFailureTheSchemaCannotSee(t *testing.T) {
+	t.Parallel()
+	s := mock.NewScenario("plan")
+	s.Rule("cyclic", mock.Match{}).Once().Say("Here is the plan.").Structured(runCyclicPlan)
+	s.Rule("acyclic", mock.Match{}).Say("Corrected.").Structured(runGoodPlan)
+	a := runMockAdapter(t, s)
+
+	bus := events.NewBus()
+	t.Cleanup(bus.Close)
+	collect := runBusSink(t, bus)
+
+	plan, tr, err := RunAgent[domain.Plan](context.Background(), runPlanRun(t, a, bus))
+	require.NoError(t, err)
+	require.Len(t, plan.Beads, 1, "the corrected plan is what RunAgent returns")
+
+	require.Len(t, tr.Attempts, 2)
+	assert.Equal(t, 1, tr.Retries())
+	assert.False(t, tr.Failed())
+	first := tr.Attempts[0]
+	require.Error(t, first.Err)
+	assert.ErrorIs(t, first.Err, ErrPlanRejected, "a broken planning rule is a contract failure")
+	assert.ErrorIs(t, first.Err, domain.ErrInvalidPlan)
+	assert.ErrorIs(t, first.Err, structured.ErrSchema)
+	assert.Equal(t, events.FailureBadOutput, first.Failure)
+	assert.NoError(t, tr.Attempts[1].Err)
+
+	// The retry quotes the broken rule, not just "no usable result".
+	assert.Contains(t, tr.Attempts[1].Prompt, "dependency cycle: a -> b -> a")
+	stderr := strings.Join(runLinesOn(collect(), events.StreamStderr), "\n")
+	assert.Contains(t, stderr, "[retry 2]")
+	assert.Contains(t, stderr, "plan")
+}
+
+func TestRunAgentGivesUpOnAStubbornRuleFailure(t *testing.T) {
+	t.Parallel()
+	s := mock.NewScenario("plan")
+	s.Otherwise("cyclic").Say("Here is the plan.").Structured(runCyclicPlan)
+	a := runMockAdapter(t, s)
+
+	_, tr, err := RunAgent[domain.Plan](context.Background(), runPlanRun(t, a, nil))
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPlanRejected)
+
+	var ae *AgentError
+	require.ErrorAs(t, err, &ae)
+	assert.Equal(t, events.FailureBadOutput, ae.Failure)
+	assert.Equal(t, 2, ae.Attempts, "a rule failure is retried exactly once")
+	assert.False(t, ae.Retryable())
+	assert.Contains(t, ae.Feedback(), "dependency cycle: a -> b -> a")
+	assert.Equal(t, "plan", ae.Contract)
+	require.Len(t, tr.Attempts, 2)
+	assert.True(t, tr.Failed())
+	assert.Len(t, a.Calls(), 2)
+}
+
+func TestRunAgentWithoutACheckAcceptsARuleFailure(t *testing.T) {
+	t.Parallel()
+	// Without AgentRun.Check the schema is the whole contract, which is why
+	// every role has to hand its own rules to RunAgent.
+	s := mock.NewScenario("plan")
+	s.Otherwise("cyclic").Say("Here is the plan.").Structured(runCyclicPlan)
+	a := runMockAdapter(t, s)
+
+	run := runPlanRun(t, a, nil)
+	run.Check = nil
+	plan, tr, err := RunAgent[domain.Plan](context.Background(), run)
+	require.NoError(t, err)
+	assert.Len(t, plan.Beads, 2)
+	assert.Len(t, tr.Attempts, 1)
+}
+
+// runRoleCheckCase is one role's rule check fired through RunMessage.
+type runRoleCheckCase struct {
+	name    string
+	role    domain.Role
+	lens    domain.Lens
+	task    events.Task
+	policy  cartridge.ToolPolicy
+	message domain.MessageType
+	check   func(t *testing.T) structured.ResultCheck
+	bad     json.RawMessage
+	want    string
+}
+
+func runRoleCheckCases() []runRoleCheckCase {
+	item := domain.FeedbackItem{ID: "qa-r1-1", Severity: domain.SeverityBlocker, Title: "Nil deref", Category: domain.CategoryRules}
+	return []runRoleCheckCase{
+		{
+			name: "product owner plan", role: domain.RolePO, task: events.TaskPlan,
+			policy: cartridge.ToolReadOnly, message: domain.MessagePlan,
+			check: func(t *testing.T) structured.ResultCheck { return PlanCheck(runPlanRequest(t)) },
+			bad:   runCyclicPlan,
+			want:  "dependency cycle: a -> b -> a",
+		},
+		{
+			name: "tester verdict", role: domain.RoleTester, lens: domain.LensQA, task: events.TaskReview,
+			policy: cartridge.ToolReadExec, message: domain.MessageVerdict,
+			check: func(*testing.T) structured.ResultCheck {
+				return TesterVerdictCheck(TesterRequest{
+					Mode: TesterModeReview, Lens: domain.LensQA, Round: 1,
+					Bead: prompt.BeadContext{Bead: domain.Bead{ID: "sc-1a2b"}},
+					Diff: &gitx.Diff{},
+				})
+			},
+			bad:  json.RawMessage(`{"outcome":"changes","items":[{"id":"qa-r1-1","severity":"blocker","title":"Nil deref","status":"overruled"}]}`),
+			want: "only the product owner overrules an item",
+		},
+		{
+			name: "engineer responses", role: domain.RoleEngineer, task: events.TaskAddressFeedback,
+			policy: cartridge.ToolReadWrite, message: domain.MessageResponse,
+			check: func(t *testing.T) structured.ResultCheck {
+				return EngineerResultCheck(EngineerRequest{
+					Mode: EngineerAddressFeedback, AgentID: "eng-1",
+					Bead:  prompt.BeadContext{Bead: domain.Bead{ID: "sc-1a2b"}, Worktree: t.TempDir()},
+					Items: []domain.FeedbackItem{item},
+				})
+			},
+			bad:  json.RawMessage(`{"responses":[{"item_id":"ghost","action":"fixed","rationale":"Fixed it."}]}`),
+			want: "is not one of the feedback items you were given",
+		},
+		{
+			name: "product owner arbitration", role: domain.RolePO, task: events.TaskArbitrate,
+			policy: cartridge.ToolReadOnly, message: domain.MessageArbitration,
+			check: func(*testing.T) structured.ResultCheck {
+				return ArbitrationCheck(ArbitrationRequest{Dispute: ItemDispute{Item: item}})
+			},
+			bad:  json.RawMessage(`{"item_id":"qa-r1-9","ruling":"uphold_tester"}`),
+			want: "the disputed item is",
+		},
+		{
+			name: "product owner escalation", role: domain.RolePO, task: events.TaskEscalate,
+			policy: cartridge.ToolReadOnly, message: domain.MessageEscalation,
+			check: func(*testing.T) structured.ResultCheck {
+				return EscalationCheck(EscalationRequest{Round: 5, Unresolved: []ItemDispute{{Item: item}}})
+			},
+			bad:  json.RawMessage(`{"outcome":"approve_with_notes","notes":"Shipping as it stands."}`),
+			want: "a rules file, which is a hard constraint",
+		},
+	}
+}
+
+func TestRunMessageRetriesEveryRoleRuleCheck(t *testing.T) {
+	t.Parallel()
+	for _, tc := range runRoleCheckCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			s := mock.NewScenario("rule-failure")
+			s.Otherwise("bad").Say("Here is my answer.").Structured(tc.bad)
+			a := runMockAdapter(t, s)
+
+			run := runAgentRun(t, a, nil)
+			run.Agent.Role, run.Agent.Lens, run.Agent.ID = tc.role, tc.lens, "agent-1"
+			run.Task, run.Message, run.Spec.ToolPolicy = tc.task, tc.message, tc.policy
+			run.Check = tc.check(t)
+			require.NoError(t, run.Validate())
+
+			_, tr, err := RunMessage(context.Background(), run)
+			require.Error(t, err)
+			var ae *AgentError
+			require.ErrorAs(t, err, &ae)
+			assert.Equal(t, events.FailureBadOutput, ae.Failure)
+			assert.Equal(t, 2, ae.Attempts, "the rule failure was retried exactly once")
+			assert.False(t, ae.Retryable())
+			assert.Contains(t, ae.Feedback(), tc.want)
+
+			require.Len(t, tr.Attempts, 2)
+			assert.Equal(t, events.FailureBadOutput, tr.Attempts[0].Failure)
+			assert.Contains(t, tr.Attempts[1].Prompt, tc.want, "the retry quotes the broken rule")
+			assert.Len(t, a.Calls(), 2)
+		})
+	}
+}
+
+func TestRunAgentReportsANonContractCheckFailure(t *testing.T) {
+	t.Parallel()
+	// A check that fails with a plain error is still a contract failure: the
+	// model gets the message back and the firing ends as bad output.
+	s := mock.NewScenario("report")
+	s.Otherwise("ok").Say("done").Structured(runReport)
+	a := runMockAdapter(t, s)
+
+	run := runAgentRun(t, a, nil)
+	run.Check = func(p structured.Parsed, output string) error {
+		assert.Equal(t, "impl_report", p.Contract)
+		assert.Contains(t, output, "sc-result")
+		return errors.New("the report names no files")
+	}
+	_, tr, err := RunAgent[domain.ImplReport](context.Background(), run)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, structured.ErrSchema)
+	var ae *AgentError
+	require.ErrorAs(t, err, &ae)
+	assert.Equal(t, events.FailureBadOutput, ae.Failure)
+	assert.Contains(t, ae.Feedback(), "the report names no files")
+	assert.Len(t, tr.Attempts, 2)
+}
+
+func TestRunAgentRefusesAPolicyTheFiringWasNotGiven(t *testing.T) {
+	t.Parallel()
+	a := runMockAdapter(t, mock.DefaultScenario())
+
+	// A tester's review firing carrying an engineer's write tools: the spec
+	// never went through ApplyPolicy, so nothing may start.
+	run := runAgentRun(t, a, nil)
+	run.Agent.Role, run.Agent.Lens = domain.RoleTester, domain.LensQA
+	run.Task, run.Message = events.TaskReview, domain.MessageVerdict
+	run.Spec.ToolPolicy = cartridge.ToolReadWrite
+
+	err := run.Validate()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidAgentRun)
+	assert.Contains(t, err.Error(), `role "tester" on task "review" runs "read_exec"`)
+
+	_, tr, ferr := RunAgent[domain.Verdict](context.Background(), run)
+	require.Error(t, ferr)
+	assert.ErrorIs(t, ferr, ErrInvalidAgentRun)
+	assert.Empty(t, tr.Attempts)
+	assert.Empty(t, a.Calls(), "nothing fires under a policy nobody chose")
+
+	t.Run("ApplyPolicy makes the same firing valid", func(t *testing.T) {
+		fixed := run
+		require.NoError(t, ApplyPolicy(&fixed.Spec, fixed.Agent.Role, fixed.Task))
+		assert.Equal(t, cartridge.ToolReadExec, fixed.Spec.ToolPolicy)
+		require.NoError(t, fixed.Validate())
+	})
+
+	t.Run("a role fired on another role's task", func(t *testing.T) {
+		crossed := run
+		crossed.Task = events.TaskImplement // an engineer's task
+		err := crossed.Validate()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidAgentRun)
+		assert.ErrorIs(t, err, domain.ErrUnknownValue)
+		assert.Contains(t, err.Error(), `belongs to role "engineer"`)
+	})
+
+	t.Run("a task with no declared policy", func(t *testing.T) {
+		unknown := run
+		unknown.Task = "meditate"
+		err := unknown.Validate()
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrInvalidAgentRun)
+		assert.Contains(t, err.Error(), "has no tool policy")
+	})
+
+	t.Run("a run with neither role nor task keeps its policy", func(t *testing.T) {
+		bare := run
+		bare.Agent.Role, bare.Agent.Lens, bare.Task = "", "", ""
+		require.NoError(t, bare.CheckPolicy())
+		require.NoError(t, bare.Validate())
+	})
+
+	t.Run("a role with no task uses the role's own policy", func(t *testing.T) {
+		roleOnly := run
+		roleOnly.Task = ""
+		require.Error(t, roleOnly.CheckPolicy(), "a tester never runs read_write")
+		roleOnly.Spec.ToolPolicy = cartridge.ToolReadExec
+		require.NoError(t, roleOnly.CheckPolicy())
+	})
+
+	t.Run("a task with no role uses the task's own policy", func(t *testing.T) {
+		taskOnly := run
+		taskOnly.Agent.Role, taskOnly.Agent.Lens = "", ""
+		err := taskOnly.CheckPolicy()
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `task "review" runs "read_exec"`)
+		taskOnly.Spec.ToolPolicy = cartridge.ToolReadExec
+		require.NoError(t, taskOnly.CheckPolicy())
+	})
+}
+
+func TestRunMessageDecodeMismatchIsABadOutput(t *testing.T) {
+	t.Parallel()
+	// `round` is an unbounded integer in the schema but an int in Go, so
+	// this block validates and still cannot be decoded: the drift must read
+	// as bad output, not as a cartridge crash the supervisor would re-fire.
+	s := mock.NewScenario("verdict")
+	s.Otherwise("huge").Say("done").
+		Structured(json.RawMessage(`{"outcome":"approve","round":99999999999999999999}`))
+	a := runMockAdapter(t, s)
+
+	run := runAgentRun(t, a, nil)
+	run.Agent.Role, run.Agent.Lens = domain.RoleTester, domain.LensQA
+	run.Task, run.Message = events.TaskReview, domain.MessageVerdict
+	run.Spec.ToolPolicy = cartridge.ToolReadExec
+
+	payload, tr, err := RunMessage(context.Background(), run)
+	require.Error(t, err)
+	assert.Nil(t, payload)
+
+	var ae *AgentError
+	require.ErrorAs(t, err, &ae)
+	assert.Equal(t, events.FailureBadOutput, ae.Failure, "a payload that will not decode is bad output")
+	assert.Equal(t, events.FailureBadOutput, FailureOf(err))
+	assert.Empty(t, ae.Kind, "a contract failure has no cartridge kind")
+	assert.False(t, ae.Retryable())
+	assert.ErrorIs(t, err, structured.ErrSchema)
+	assert.Contains(t, ae.Feedback(), "verdict")
+
+	require.Len(t, tr.Attempts, 1)
+	assert.True(t, tr.Failed(), "the last attempt is no longer marked successful")
+	assert.Equal(t, events.FailureBadOutput, tr.Attempts[0].Failure)
 }

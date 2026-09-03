@@ -197,8 +197,11 @@ var stateColors = map[domain.BeadState]Color{
 	domain.BeadStatePinned:           {TrueColor: "#7F8C8D", ANSI256: "244", ANSI: "8"},
 }
 
-// stateGlyphs is the second, colour-free channel for a bead state. Every
-// glyph is one cell wide so a node box keeps its width in any profile.
+// stateGlyphs is the second, colour-free channel for a bead state. Each
+// glyph is one cell wide on a terminal that treats East-Asian ambiguous
+// characters as narrow, which is every terminal unless it is told otherwise;
+// [PadGlyph] pads the column to [GlyphCells] so the glyphs still line up
+// where they are not, and a node box keeps its width in any profile.
 var stateGlyphs = map[domain.BeadState]string{
 	domain.BeadStateOpen:             "○",
 	domain.BeadStateInProgress:       "◐",
@@ -274,6 +277,64 @@ var lensColors = map[domain.Lens]Color{
 // UnknownGlyph marks a value the palette does not know, so an unexpected bd
 // status still renders instead of leaving a hole in the layout.
 const UnknownGlyph = "?"
+
+// glyphCells is the width of the glyph column: the widest glyph in the
+// palette, measured once with the same function the renderer lays a frame
+// out with.
+//
+// It is 1 wherever East-Asian ambiguous characters are narrow, which is the
+// default of every terminal and of the width library the renderer uses. A
+// terminal configured for ambiguous-width 2 tells the process so with
+// RUNEWIDTH_EASTASIAN=1, which that library reads once at start-up and
+// cannot be changed afterwards; there the geometric glyphs (○ ● ▲ …) are two
+// cells and the dingbats (✓ ✗ ⚑ …) are still one. Padding every glyph out to
+// this width is what keeps a status column, a card and a node box the same
+// shape in either configuration — the glyph channel must not shift the
+// layout depending on which state a bead happens to be in.
+var glyphCells = widestGlyph()
+
+// widestGlyph measures the palette. It runs once, at package
+// initialisation, because the width mode cannot change while the process is
+// alive.
+func widestGlyph() int {
+	w := lipgloss.Width(UnknownGlyph)
+	consider := func(g string) {
+		if n := lipgloss.Width(g); n > w {
+			w = n
+		}
+	}
+	for _, g := range stateGlyphs {
+		consider(g)
+	}
+	for _, g := range severityGlyphs {
+		consider(g)
+	}
+	for _, g := range agentStateGlyphs {
+		consider(g)
+	}
+	for _, g := range roleGlyphs {
+		consider(g)
+	}
+	return w
+}
+
+// GlyphCells returns how many terminal cells one glyph of the palette
+// occupies. It is 1 on every terminal that has not been configured for
+// ambiguous-width 2; see [PadGlyph].
+func GlyphCells() int { return glyphCells }
+
+// PadGlyph pads g on the right to [GlyphCells], so every glyph the palette
+// hands out is the same width. On a normal terminal it returns g unchanged,
+// which is why a frame is byte-for-byte the same there as it has always
+// been. Each of [StateGlyph], [SeverityGlyph], [AgentStateGlyph] and
+// [RoleGlyph] already applies it; call it on a glyph of your own that shares
+// the same column.
+func PadGlyph(g string) string {
+	if n := lipgloss.Width(g); n < glyphCells {
+		return g + strings.Repeat(" ", glyphCells-n)
+	}
+	return g
+}
 
 // Theme is the TUI's single source of colour and glyphs. It owns a Lip Gloss
 // renderer pinned to one [Profile], so the styles it hands out render the
@@ -401,14 +462,15 @@ func (t *Theme) StateStyle(s domain.BeadState) lipgloss.Style {
 	return st
 }
 
-// StateGlyph returns the one-cell marker for a bead state: the channel that
-// survives NO_COLOR and colour blindness. Unknown statuses get
-// [UnknownGlyph].
+// StateGlyph returns the marker for a bead state: the channel that survives
+// NO_COLOR and colour blindness. It is [GlyphCells] wide — one cell on any
+// ordinary terminal — whatever the state, so it never shifts a column.
+// Unknown statuses get [UnknownGlyph].
 func StateGlyph(s domain.BeadState) string {
 	if g, ok := stateGlyphs[s]; ok {
-		return g
+		return PadGlyph(g)
 	}
-	return UnknownGlyph
+	return PadGlyph(UnknownGlyph)
 }
 
 // StateLabel renders "<glyph> <status>" in the state's style, e.g. "✓ approved".
@@ -433,12 +495,13 @@ func (t *Theme) SeverityStyle(s domain.Severity) lipgloss.Style {
 	return st
 }
 
-// SeverityGlyph returns the one-cell marker for a feedback severity.
+// SeverityGlyph returns the [GlyphCells]-wide marker for a feedback
+// severity.
 func SeverityGlyph(s domain.Severity) string {
 	if g, ok := severityGlyphs[s]; ok {
-		return g
+		return PadGlyph(g)
 	}
-	return UnknownGlyph
+	return PadGlyph(UnknownGlyph)
 }
 
 // SeverityLabel renders "<glyph> <severity>" in the severity's style.
@@ -459,12 +522,13 @@ func (t *Theme) AgentStateStyle(s domain.AgentState) lipgloss.Style {
 	return t.Style(t.AgentStateColor(s))
 }
 
-// AgentStateGlyph returns the one-cell marker for an agent lifecycle state.
+// AgentStateGlyph returns the [GlyphCells]-wide marker for an agent
+// lifecycle state.
 func AgentStateGlyph(s domain.AgentState) string {
 	if g, ok := agentStateGlyphs[s]; ok {
-		return g
+		return PadGlyph(g)
 	}
-	return UnknownGlyph
+	return PadGlyph(UnknownGlyph)
 }
 
 // RoleColor returns the palette entry for an agent role.
@@ -478,13 +542,13 @@ func (t *Theme) RoleColor(r domain.Role) Color {
 // RoleStyle returns the style for an agent role.
 func (t *Theme) RoleStyle(r domain.Role) lipgloss.Style { return t.Style(t.RoleColor(r)) }
 
-// RoleGlyph returns the one-cell marker for an agent role: ◆ product owner,
-// ■ engineer, ▲ tester.
+// RoleGlyph returns the [GlyphCells]-wide marker for an agent role:
+// ◆ product owner, ■ engineer, ▲ tester.
 func RoleGlyph(r domain.Role) string {
 	if g, ok := roleGlyphs[r]; ok {
-		return g
+		return PadGlyph(g)
 	}
-	return UnknownGlyph
+	return PadGlyph(UnknownGlyph)
 }
 
 // LensColor returns the palette entry for a tester's lens.

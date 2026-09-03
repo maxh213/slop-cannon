@@ -3,6 +3,7 @@ package tui_test
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"testing"
@@ -218,28 +219,86 @@ func TestThemeStateColorsAreDistinctPerProfile(t *testing.T) {
 	}
 }
 
-func TestThemeGlyphsAreOneCellAndDistinct(t *testing.T) {
+// TestThemeGlyphsFillOneColumnAndAreDistinct pins the colour-free channel:
+// every glyph the palette hands out is exactly [tui.GlyphCells] wide, so the
+// column a status, severity, role or agent state is drawn in never changes
+// width with the value in it, and no two states of a set share a glyph.
+//
+// The column is one cell wherever East-Asian ambiguous characters are
+// narrow, which is every terminal that has not been told otherwise; a
+// process started with RUNEWIDTH_EASTASIAN=1 gets a two-cell column instead,
+// and [tui.PadGlyph] is what keeps the mixed geometric (○ ● ▲) and dingbat
+// (✓ ✗ ⚑) glyphs the same width there.
+// TestThemeGlyphColumnHoldsUnderEastAsianWidth runs this whole file in that
+// mode, so both are covered.
+func TestThemeGlyphsFillOneColumnAndAreDistinct(t *testing.T) {
 	t.Parallel()
+
+	if !themeEastAsianWidth() {
+		require.Equal(t, 1, tui.GlyphCells(),
+			"an ordinary terminal must get a one-cell glyph column")
+	}
+	require.Positive(t, tui.GlyphCells())
 
 	seen := map[string]domain.BeadState{}
 	for _, s := range domain.BeadStates() {
 		g := tui.StateGlyph(s)
-		require.Equalf(t, 1, lipgloss.Width(g), "glyph %q of %s must be one cell", g, s)
+		require.Equalf(t, tui.GlyphCells(), lipgloss.Width(g),
+			"glyph %q of %s must fill the glyph column", g, s)
 		prev, dup := seen[g]
 		require.Falsef(t, dup, "%s and %s share the glyph %q", prev, s, g)
 		seen[g] = s
 	}
-	require.Equal(t, tui.UnknownGlyph, tui.StateGlyph(domain.BeadState("not-a-status")))
+	require.Equal(t, tui.PadGlyph(tui.UnknownGlyph), tui.StateGlyph(domain.BeadState("not-a-status")))
 
 	for _, s := range domain.Severities() {
-		require.Equal(t, 1, lipgloss.Width(tui.SeverityGlyph(s)))
+		require.Equal(t, tui.GlyphCells(), lipgloss.Width(tui.SeverityGlyph(s)))
 	}
 	for _, s := range domain.AgentStates() {
-		require.Equal(t, 1, lipgloss.Width(tui.AgentStateGlyph(s)))
+		require.Equal(t, tui.GlyphCells(), lipgloss.Width(tui.AgentStateGlyph(s)))
 	}
 	for _, r := range domain.Roles() {
-		require.Equal(t, 1, lipgloss.Width(tui.RoleGlyph(r)))
+		require.Equal(t, tui.GlyphCells(), lipgloss.Width(tui.RoleGlyph(r)))
 	}
+	// Padding is a suffix, never a replacement: the glyph itself is intact.
+	require.Equal(t, "?", strings.TrimRight(tui.PadGlyph(tui.UnknownGlyph), " "))
+	require.Equal(t, "xx", tui.PadGlyph("xx"), "a glyph already wide enough is left alone")
+}
+
+// themeEAChildEnv marks the re-executed test binary of
+// [TestThemeGlyphColumnHoldsUnderEastAsianWidth], so the child does not
+// spawn a child of its own.
+const themeEAChildEnv = "SC_TUI_THEME_EASTASIAN_CHILD"
+
+// themeEastAsianWidth reports whether this process was started in the width
+// mode where East-Asian ambiguous characters take two cells. The width
+// library reads the variable once, at start-up, so this is fixed for the
+// life of the process — which is why the test below needs a second one.
+func themeEastAsianWidth() bool {
+	v, err := strconv.ParseBool(os.Getenv("RUNEWIDTH_EASTASIAN"))
+	return err == nil && v
+}
+
+// TestThemeGlyphColumnHoldsUnderEastAsianWidth re-runs every theme test in a
+// child process started with RUNEWIDTH_EASTASIAN=1, the setting a terminal
+// configured for ambiguous-width 2 exports. There the geometric glyphs are
+// two cells and the dingbats are one, so a palette that assumed one cell
+// everywhere would shift a status column and stretch a node box; the child
+// proves the glyph column and the chrome hold up in both modes.
+//
+// It has to be a child: the width mode is read at package initialisation,
+// so it cannot be changed from inside a running test.
+func TestThemeGlyphColumnHoldsUnderEastAsianWidth(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv(themeEAChildEnv) != "" {
+		t.Skip("already the re-executed child")
+	}
+	cmd := exec.CommandContext(t.Context(), os.Args[0], //nolint:gosec // re-runs this very test binary
+		"-test.run", "^TestTheme", "-test.count=1", "-test.timeout=5m")
+	cmd.Env = append(os.Environ(), "RUNEWIDTH_EASTASIAN=1", themeEAChildEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "the theme tests fail with RUNEWIDTH_EASTASIAN=1:\n%s", out)
 }
 
 func TestThemeRendersSeveritiesRolesLensesAndAgentStates(t *testing.T) {
@@ -297,10 +356,19 @@ func TestThemeChromeStylesFollowTheProfile(t *testing.T) {
 			require.True(t, themeIsBold(th.Title().Render("x")))
 			require.True(t, themeIsBold(th.Selected().Render("x")))
 
-			// The box adds a rounded border, so it is three lines tall.
+			// The box adds a rounded border, so it is three lines tall,
+			// and one cell of padding on each side. Its width is measured
+			// rather than written down: the border is drawn with box
+			// characters, which a terminal configured for ambiguous-width 2
+			// gives two cells each. Lip Gloss lays the box out with the same
+			// measure, so the frame is still square there — it is only the
+			// arithmetic in a test that would go wrong.
+			border := lipgloss.RoundedBorder()
 			box := th.Box().Render("x")
 			require.Len(t, strings.Split(box, "\n"), 3)
-			require.Equal(t, 5, lipgloss.Width(box)) // 1 padding + 1 cell + 1 padding + 2 borders
+			require.Equal(t,
+				lipgloss.Width(border.Left)+1+lipgloss.Width("x")+1+lipgloss.Width(border.Right),
+				lipgloss.Width(box))
 
 			// Base is bound to the theme's renderer, not the global one.
 			require.Equal(t, "x", th.Base().Render("x"))
@@ -317,9 +385,9 @@ func TestThemeUnknownValuesFallBackToMuted(t *testing.T) {
 	require.Equal(t, tui.ColorMuted, th.AgentStateColor(domain.AgentState("nope")))
 	require.Equal(t, tui.ColorMuted, th.RoleColor(domain.Role("nope")))
 	require.Equal(t, tui.ColorMuted, th.LensColor(domain.Lens("nope")))
-	require.Equal(t, tui.UnknownGlyph, tui.SeverityGlyph(domain.Severity("nope")))
-	require.Equal(t, tui.UnknownGlyph, tui.AgentStateGlyph(domain.AgentState("nope")))
-	require.Equal(t, tui.UnknownGlyph, tui.RoleGlyph(domain.Role("nope")))
+	require.Equal(t, tui.PadGlyph(tui.UnknownGlyph), tui.SeverityGlyph(domain.Severity("nope")))
+	require.Equal(t, tui.PadGlyph(tui.UnknownGlyph), tui.AgentStateGlyph(domain.AgentState("nope")))
+	require.Equal(t, tui.PadGlyph(tui.UnknownGlyph), tui.RoleGlyph(domain.Role("nope")))
 }
 
 func TestThemeColorResolve(t *testing.T) {

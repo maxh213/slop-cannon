@@ -1,14 +1,14 @@
-▄█▓═▶  slop-cannon · run demo-20260101-120000 · autopilot · 
- 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+▄█▓═▶  demo-20260101-120000 · safety off · finished
+ 1 Graph [1m 2 Agents [0m 3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────
-HISTORY · 7 ────────────────────────────────────────────────
-▌ ✘ engineer · demo-3 · timeout (agent timeout after 1 15m0s
-  ✔ tester/qa · demo-2 · verdict (exit 0)                33s
-  ✔ engineer · demo-2 · response (exit 0)              1m14s
-  ✔ tester/ux · demo-2 · verdict (exit 0)                41s
-  ✔ tester/qa · demo-2 · verdict (exit 0)                58s
-  ✔ engineer · demo-2 · impl_report (exit 0)           1m36s
-  ✔ po · - · plan (exit 0)                               12s
+[1mHISTORY · 7 · ENTER TRANSCRIPT[0m ─────────────────────────────
+▌ ✗ [1mengineer[0m · demo-3 · timeout (agent timeout after 1 15m0s
+  ✓ [1mtester/qa[0m · demo-2 · verdict (exit 0)                33s
+  ✓ [1mengineer[0m · demo-2 · response (exit 0)              1m14s
+  ✓ [1mtester/ux[0m · demo-2 · verdict (exit 0)                41s
+  ✓ [1mtester/qa[0m · demo-2 · verdict (exit 0)                58s
+  ✓ [1mengineer[0m · demo-2 · impl_report (exit 0)           1m36s
+  ✓ [1mpo[0m · - · plan (exit 0)                               12s
 
 
 tab next view • 1…5 jump to view • ↑/k up • ↓/j down …

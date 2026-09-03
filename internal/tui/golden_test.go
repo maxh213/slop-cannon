@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/exp/teatest"
+	"github.com/muesli/termenv"
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/events"
@@ -22,16 +23,21 @@ import (
 // P7-09 — whole-frame golden tests of the TUI.
 //
 // Every frame here is rendered from the scripted demo run ([tui.DemoEvents]),
-// which carries fixed UTC timestamps, at a fixed terminal size and with
-// colour off, so a frame is byte-for-byte reproducible on any machine. The
-// per-view goldens (agents-*, graph-*, feedback-*, prs-*, anim-*) belong to
-// the tasks that own those views; these are the composed frames: chrome,
-// pane and overlays together, exactly as the user sees them.
+// which carries fixed UTC timestamps, at a fixed terminal size and through
+// the no-colour theme, so a frame is byte-for-byte reproducible on any
+// machine. "Any machine" is enforced, not hoped for: [TestMain] pins the
+// global Lip Gloss renderer and the animation environment variable, and
+// [TestGoldenFramesIgnoreTheGlobalRenderer] re-renders every frame under
+// every colour profile a terminal can present. The per-view goldens
+// (agents-*, graph-*, feedback-*, prs-*, anim-*, headless*) belong to the
+// tasks that own those views and are listed in gfViewGoldens so no stale one
+// can survive; these are the composed frames: chrome, pane and overlays
+// together, exactly as the user sees them.
 //
 // Updating: `make update-golden-tui` (or UPDATE_GOLDEN=1 go test
 // ./internal/tui/...) rewrites the files; `make check-golden` is the check
-// that they are current, and `make check` (what CI runs) fails on a stale
-// frame like any other test failure.
+// that they are current — CI runs it as its own step — and `make check`
+// fails on a stale frame like any other test failure.
 
 // gfGoldenDir is where the golden frames live, relative to this file.
 const gfGoldenDir = "../../testdata/tui"
@@ -58,6 +64,29 @@ var gfDemo = tui.DemoOptions{Delay: -1}
 // gfBrief is the same script as a brief run with safety on, so the header
 // and the delivery it renders differ from the autopilot frames.
 var gfBrief = tui.DemoOptions{Delay: -1, Brief: "make the http client retry", Safety: true}
+
+// TestMain pins the ambient rendering environment before a single frame is
+// drawn, so the whole package renders the same way on every machine.
+//
+// Two things leak in otherwise. The global Lip Gloss renderer detects a
+// colour profile from the process's stdout: Ascii under a piped `go test`,
+// but ANSI or truecolor under CLICOLOR_FORCE, or whenever the compiled test
+// binary is run on a tty. Nothing in this package may build a style from
+// that renderer — every style comes from a [tui.Theme], which pins its own
+// profile — so the profile is set here to the *most* colourful one: a style
+// that slipped through would emit a truecolor escape and fail
+// [TestGoldenFramesCarryNoEscapes] loudly, instead of silently rendering
+// plain for whoever happens to run the suite through a pipe. The second leak
+// is SC_NO_ANIM, which would otherwise switch the animated frame off in a
+// shell that exports it (P7-09).
+func TestMain(m *testing.M) {
+	lipgloss.SetColorProfile(termenv.TrueColor)
+	lipgloss.SetHasDarkBackground(true)
+	if err := os.Unsetenv(tui.NoAnimEnv); err != nil {
+		panic(err)
+	}
+	os.Exit(m.Run())
+}
 
 // gfScenario is one golden frame: a model built from the scripted run,
 // rendered at a fixed size.
@@ -165,6 +194,22 @@ func gfScenarios() []gfScenario {
 		name: "tiny",
 		w:    24, h: 5,
 		build: func(t *testing.T) tui.Model { return gfWhole(t, gfDemo, 24, 5) },
+	}, {
+		// Shorter than the chrome itself: the frame must still be exactly
+		// the terminal, so the display does not scroll.
+		name: "shortest",
+		w:    40, h: 2,
+		build: func(t *testing.T) tui.Model { return gfWhole(t, gfDemo, 40, 2) },
+	}, {
+		// The animation layer on: sprites are composited over the finished
+		// chrome, so a projectile that drew past the pane or trampled the
+		// header would change this frame. The layer reads no clock and seeds
+		// its particles from a constant, so stepping it by hand is exact.
+		name: "anim",
+		build: func(t *testing.T) tui.Model {
+			m := gfFeed(gfNewAnim(t, gfDemo, gfWidth, gfHeight), gfUntil(gfDemo, events.KindAgentSpawned))
+			return gfAnimTick(t, m)
+		},
 	}}
 }
 
@@ -199,29 +244,69 @@ func TestGoldenFramesAreDeterministic(t *testing.T) {
 	}
 }
 
-// gfColorEscape matches an SGR sequence that sets a colour: 30–37, 40–47,
-// 90–97, 100–107, and the 38/48 extended forms.
-var gfColorEscape = regexp.MustCompile(`\x1b\[[0-9;]*(?:3[0-79]|4[0-79]|9[0-7]|10[0-7])[0-9;]*m`)
+// gfAttrEscape matches an SGR sequence built only from the attributes a
+// no-colour frame is allowed to carry: reset (0), bold (1), underline (4)
+// and the two that switch them off again (22, 24). Anything else — a colour
+// in any of its forms, a cursor move, an erase — does not match, so the test
+// below rejects it.
+var gfAttrEscape = regexp.MustCompile(`^\x1b\[(?:0|1|4|22|24)?(?:;(?:0|1|4|22|24))*m$`)
 
 // TestGoldenFramesCarryNoEscapes proves the frames the goldens hold carry no
-// colour: with [tui.Options.NoColor] set nothing may emit a colour escape, so
-// a golden reads the same on a truecolor terminal, under NO_COLOR, and in a
-// CI log. Bold survives, deliberately: it is how the cursor and the selected
-// box stay visible when colour is gone (P7-07).
+// colour: with the no-colour theme nothing may emit a colour escape, so a
+// golden reads the same on a truecolor terminal, under NO_COLOR, and in a CI
+// log. Bold and underline survive, deliberately: they are how the cursor,
+// the selected box and the active tab stay visible when colour is gone
+// (P7-07).
+//
+// [TestMain] pins the global Lip Gloss renderer to truecolor, so this is
+// also the check that no style escaped the theme: such a style would render
+// its colour here and be caught, whatever terminal the suite is run from.
 func TestGoldenFramesCarryNoEscapes(t *testing.T) {
 	t.Parallel()
 	for _, sc := range gfScenarios() {
 		t.Run(sc.name, func(t *testing.T) {
 			t.Parallel()
 			frame := sc.build(t).View()
-			require.Empty(t, gfColorEscape.FindAllString(frame, -1),
-				"frame %q was rendered with colour escapes", sc.name)
 			for _, esc := range gfAnyEscape.FindAllString(frame, -1) {
-				require.Contains(t, []string{"\x1b[1m", "\x1b[0m"}, esc,
-					"frame %q carries an escape that is neither bold nor reset", sc.name)
+				require.Regexp(t, gfAttrEscape, esc,
+					"frame %q carries %q: an escape that is not bold, underline or reset", sc.name, esc)
 			}
 		})
 	}
+}
+
+// TestGoldenFramesIgnoreTheGlobalRenderer is the direct proof of the promise
+// the goldens make. It flips the global Lip Gloss renderer through every
+// colour profile a terminal can present — the Ascii a piped `go test` sees,
+// the ANSI of CLICOLOR_FORCE, and the truecolor of a modern tty — and
+// requires every frame to come out identical. It cannot run in parallel with
+// anything, because the renderer it moves is process-wide.
+func TestGoldenFramesIgnoreTheGlobalRenderer(t *testing.T) {
+	restore := termenv.TrueColor
+	t.Cleanup(func() { lipgloss.SetColorProfile(restore) })
+
+	for _, sc := range gfScenarios() {
+		lipgloss.SetColorProfile(termenv.Ascii)
+		want := sc.build(t).View()
+		for _, p := range []termenv.Profile{termenv.ANSI, termenv.ANSI256, termenv.TrueColor} {
+			lipgloss.SetColorProfile(p)
+			require.Equal(t, want, sc.build(t).View(),
+				"frame %q changed with the global renderer profile; build every style from the theme", sc.name)
+		}
+	}
+}
+
+// TestGoldenFrameWithAnimationDrawsSprites proves the animated scenario is
+// worth pinning: the layer really did composite something over the chrome,
+// so the golden would notice a projectile that drew in the wrong place.
+func TestGoldenFrameWithAnimationDrawsSprites(t *testing.T) {
+	t.Parallel()
+	evs := gfUntil(gfDemo, events.KindAgentSpawned)
+	still := gfFeed(gfNew(t, gfDemo, gfWidth, gfHeight), evs).View()
+	animated := gfAnimTick(t, gfFeed(gfNewAnim(t, gfDemo, gfWidth, gfHeight), evs)).View()
+	require.NotEqual(t, still, animated, "the animated frame draws no sprites")
+	require.Equal(t, len(strings.Split(still, "\n")), len(strings.Split(animated, "\n")),
+		"the animation layer changed the height of the frame")
 }
 
 // gfAnyEscape matches any ANSI escape sequence.
@@ -231,28 +316,68 @@ var gfAnyEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
 // user reads rather than how the renderer chose to group its SGR runs.
 func gfPlain(s string) string { return gfAnyEscape.ReplaceAllString(s, "") }
 
-// TestGoldenFrameFilesAreReadable guards the golden files themselves: a
-// frame is text, never empty, and never carries a carriage return that would
-// make the comparison platform-dependent.
+// gfViewGoldens is the inventory of the per-view goldens in the same
+// directory: one component's pane or one headless render, each owned by the
+// task that wrote it (graph P7-02, agents P7-03, feedback P7-04, PRs P7-05,
+// anim P7-06, headless P7-08). The composed frame- files are not listed
+// because [gfScenarios] already names them.
+//
+// It is here so that renaming or dropping a per-view scenario cannot leave a
+// stale file behind: [TestGoldenFrameFilesAreReadable] requires the
+// directory to hold exactly these plus one frame per scenario. Adding a
+// scenario to any view means adding its file here in the same change.
+var gfViewGoldens = []string{
+	"agents-empty", "agents-history", "agents-killed", "agents-live",
+	"agents-narrow", "agents-transcript", "agents-transcript-scrolled", "agents-wide",
+	"anim-burst", "anim-confetti", "anim-disabled", "anim-over-frame",
+	"anim-queue", "anim-ricochet", "anim-shot", "anim-shot-tab",
+	"anim-smoke", "feedback", "feedback-arbitration", "feedback-changes",
+	"feedback-details", "feedback-empty", "feedback-escalation", "feedback-narrow",
+	"feedback-pushback", "feedback-rereview", "feedback-rules", "feedback-scrolled",
+	"graph-50-200x50", "graph-50-80x24", "graph-chain-200x50", "graph-chain-80x24",
+	"graph-cursor", "graph-cycle", "graph-cycle-narrow", "graph-detail",
+	"graph-detail-scrolled", "graph-diamond-200x50", "graph-diamond-80x24", "graph-empty",
+	"graph-fanout-200x50", "graph-fanout-80x24", "graph-narrow", "graph-skip",
+	"graph-skip-vertical", "graph-vertical", "headless", "headless-json",
+	"headless-sparse", "prs", "prs-empty", "prs-external",
+	"prs-narrow", "prs-safety-off",
+}
+
+// TestGoldenFrameFilesAreReadable guards the golden files themselves, every
+// one in testdata/tui and not only the composed frames: a golden is text,
+// never empty, never carries a carriage return that would make the
+// comparison platform-dependent, and is produced by something. A file no
+// test writes any more is an orphan, and a scenario with no file has never
+// been generated; both fail here.
 func TestGoldenFrameFilesAreReadable(t *testing.T) {
 	t.Parallel()
-	matches, err := filepath.Glob(filepath.Join(gfGoldenDir, gfPrefix+"*.golden"))
+	matches, err := filepath.Glob(filepath.Join(gfGoldenDir, "*.golden"))
 	require.NoError(t, err)
-	require.NotEmpty(t, matches, "no composed frames in %s; run `make update-golden-tui`", gfGoldenDir)
+	require.NotEmpty(t, matches, "no goldens in %s; run `make update-golden-tui`", gfGoldenDir)
 
-	want := make(map[string]bool, len(gfScenarios()))
+	want := make(map[string]bool, len(gfScenarios())+len(gfViewGoldens))
 	for _, sc := range gfScenarios() {
 		want[filepath.Join(gfGoldenDir, gfPrefix+sc.name+".golden")] = true
 	}
+	for _, name := range gfViewGoldens {
+		require.False(t, strings.HasPrefix(name, gfPrefix),
+			"%q is a composed frame; gfScenarios already owns it", name)
+		path := filepath.Join(gfGoldenDir, name+".golden")
+		require.False(t, want[path], "%q is listed twice", name)
+		want[path] = true
+	}
+
 	for _, path := range matches {
 		body, err := os.ReadFile(path) //nolint:gosec // a test-owned path
 		require.NoError(t, err)
 		require.NotEmpty(t, body, "%s is empty", path)
 		require.True(t, utf8.Valid(body), "%s is not valid UTF-8", path)
 		require.NotContains(t, string(body), "\r", "%s has a carriage return", path)
-		require.True(t, want[path], "%s is not produced by any scenario; delete it or add the scenario back", path)
+		require.True(t, want[path],
+			"%s is not produced by any scenario; delete it, or add it to gfScenarios or gfViewGoldens", path)
 	}
-	require.Len(t, matches, len(want), "every scenario needs a golden; run `make update-golden-tui`")
+	require.Len(t, matches, len(want),
+		"every scenario needs a golden; run `make update-golden` and check gfViewGoldens")
 }
 
 // TestGoldenFramesMatchTheProgram runs the real Bubble Tea program over the
@@ -268,6 +393,7 @@ func TestGoldenFramesMatchTheProgram(t *testing.T) {
 		Bus:     bus,
 		Run:     tui.DemoRun(gfDemo),
 		NoColor: true,
+		Theme:   tui.ThemeFor(tui.ProfileNoColor),
 		NoAnim:  true,
 		Now:     gfClock,
 	})
@@ -325,13 +451,47 @@ func (sc gfScenario) size() (int, int) {
 // animation off so the frame is reproducible.
 func gfNew(t *testing.T, demo tui.DemoOptions, w, h int) tui.Model {
 	t.Helper()
+	return gfBuild(t, demo, w, h, true)
+}
+
+// gfNewAnim is [gfNew] with the animation layer on. The layer reads no clock
+// and seeds its particles from a constant, so a frame taken between two
+// hand-driven ticks is still exact.
+func gfNewAnim(t *testing.T, demo tui.DemoOptions, w, h int) tui.Model {
+	t.Helper()
+	return gfBuild(t, demo, w, h, false)
+}
+
+// gfBuild is the model constructor both of those share. The theme is pinned
+// explicitly rather than left to the environment: a frame must not change
+// because the machine running the test has NO_COLOR, COLORTERM or a tty.
+func gfBuild(t *testing.T, demo tui.DemoOptions, w, h int, noAnim bool) tui.Model {
+	t.Helper()
 	m := tui.New(t.Context(), tui.Options{
 		Run:     tui.DemoRun(demo),
 		NoColor: true,
-		NoAnim:  true,
+		Theme:   tui.ThemeFor(tui.ProfileNoColor),
+		NoAnim:  noAnim,
 		Now:     gfClock,
 	})
 	return gfSend(m, tea.WindowSizeMsg{Width: w, Height: h})
+}
+
+// gfAnimTick advances the animation layer by one frame. The ticker
+// generation is not exported, so the helper tries the handful a freshly fed
+// model can be on and keeps the tick that changed the frame; a model with
+// nothing queued fails the test rather than pinning a still frame that says
+// nothing about the overlay.
+func gfAnimTick(t *testing.T, m tui.Model) tui.Model {
+	t.Helper()
+	before := m.View()
+	for gen := range uint64(4) {
+		if next := gfSend(m, tui.AnimTickMsg{Gen: gen}); next.View() != before {
+			return next
+		}
+	}
+	t.Fatal("no animation tick changed the frame: nothing was queued, or the layer is disabled")
+	return m
 }
 
 // gfClock is the fixed clock the frames are rendered against, so an elapsed

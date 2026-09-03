@@ -1,9 +1,9 @@
-▄█▓═▶  slop-cannon · run demo-20260101-120000 · autopilot · ammo 0/10 · safety o
- 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+▄█▓═▶  demo-20260101-120000 · autopilot · ammo 0/10 · safety off · finished
+ 1 Graph  2 Agents  3 Feedback [1m 4 PRs [0m 5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 safety off · merged straight to the default branch · 1 delivered, 1 merged
-  BEAD       PR       STATUS            CHECKS    REF
-[1m▌ [0mdemo-2     #42      ✔ merged          passed    https://example.invalid/demo/p
+  BEAD       PR       STATUS            CHECKS
+[1m▌ [0mdemo-2     #42      ✔ merged          passed
 
 
 
@@ -20,5 +20,5 @@ safety off · merged straight to the default branch · 1 delivered, 1 merged
 
 
 
-demo-2  "Retry failed HTTP requests"  merged 2b7d5e6, pushed  o open
+demo-2  "Retry failed HTTP reque…"  https://example.invalid/demo/pull/42  o open
 tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

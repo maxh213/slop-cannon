@@ -18,7 +18,9 @@ import (
 // CheckBeads is the read-only shim check: with the bd shim (P3-09) first on the session's
 // PATH, `bd update` inside a read_exec session is refused with bd's
 // read-only message while `bd ready` still works. Skipped when bd or git is
-// not installed or the platform has no POSIX shell.
+// not installed, when bd is older than beads.MinVersion (its CLI differs, so
+// the check would fail for an environment reason), or when the platform has
+// no POSIX shell.
 const CheckBeads = "beads-readonly"
 
 // beadsMarker starts the beads check's prompt (MockScenario matches on it).
@@ -55,7 +57,8 @@ func skipf(format string, args ...any) error {
 
 // runBeads is CheckBeads. It initialises a beads project in the check's
 // workdir (bd refuses everything with "no beads database found" before it
-// looks at --readonly otherwise), installs the shim under the suite's base
+// looks at --readonly otherwise), after checking that bd is new enough to
+// have the CLI this suite drives, installs the shim under the suite's base
 // directory, verifies the shim chain directly, and then fires a read_exec
 // session with the shim first on PATH. The session must surface
 // beads.ReadOnlyMessage("update") in a tool result or its final output.
@@ -70,6 +73,9 @@ func runBeads(ctx context.Context, e *env) (string, cartridge.Usage, error) {
 		if err != nil {
 			return "", cartridge.Usage{}, skipf("bd is not installed: %v", err)
 		}
+	}
+	if err := beadsVersionOK(ctx, real); err != nil {
+		return "", cartridge.Usage{}, err
 	}
 	if _, err := proc.LookPath("git"); err != nil {
 		return "", cartridge.Usage{}, skipf("git is not installed: %v", err)
@@ -107,6 +113,36 @@ func runBeads(ctx context.Context, e *env) (string, cartridge.Usage, error) {
 		return detail, o.res.Usage, fmt.Errorf("the session never reported the read-only refusal %q (output: %q)", want, o.res.Output)
 	}
 	return "bd update refused through the shim; " + detail, o.res.Usage, nil
+}
+
+// beadsVersionOK skips the check unless real satisfies beads.MinVersion.
+// The check drives the bd CLI directly (`bd init` with the D-13 flags, then
+// the shim), and an older bd has a different CLI — 1.0.5 has no
+// `--init-if-missing`, so beadsProject would fail with "unknown flag" —
+// which is an environment problem, not a cartridge failure, so it must not
+// be reported as one. It mirrors beads.Detect, which cannot be used here
+// because it always resolves bd on PATH while the check honours Options.BD.
+func beadsVersionOK(ctx context.Context, real string) error {
+	spec := beads.Spec(beads.CallOptions{Timeout: beadsSetupTimeout}, "version", "--json")
+	spec.Command = real
+	res, err := proc.Run(ctx, spec)
+	if err != nil {
+		return skipf("bd version failed (%s): %s", real, beads.ErrorSummary(err))
+	}
+	var reported struct {
+		Version string `json:"version"`
+	}
+	if err := beads.Decode(res.Stdout, &reported); err != nil {
+		return skipf("bd version printed no version (%s): %v", real, err)
+	}
+	v, ok := proc.ParseVersion(reported.Version)
+	if !ok {
+		return skipf("bd reported version %q (%s)", reported.Version, real)
+	}
+	if !v.AtLeast(beads.MinVersion) {
+		return skipf("bd %s is older than %s (%s); %s", v, beads.MinVersion, real, beads.InstallHint)
+	}
+	return nil
 }
 
 // beadsProject turns dir into a git repository with an initialised beads

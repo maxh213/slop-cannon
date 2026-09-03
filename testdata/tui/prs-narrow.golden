@@ -1,7 +1,7 @@
-▄█▓═▶  slop-cannon · run sc-prs-0001 · brief · ammo 0/4 · safety
- 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+▄█▓═▶  run sc-prs-0001 · brief · ammo 0/4 · safety on
+ 1 Graph  2 Agents  3 Feedback [1m 4 PRs [0m 5 Log 
 ────────────────────────────────────────────────────────────────
-safety on · a human merges every PR (D-20) · 4 delivered, 2 merg
+safety on · 4 delivered, 2 merged, 2 in flight, 1 external
   BEAD       PR       STATUS            CHECKS
 [1m▌ [0msc-1a2b    #42      ✔ merged          passed
   sc-3c4d    #43      ⧗ awaiting merge  pending

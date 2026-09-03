@@ -19,7 +19,9 @@ import (
 
 // integrationEnv isolates HOME and the XDG directories (bd keeps its own
 // state under ~/.config/bd, ~/.beads and ~/.dolt) and skips when the real
-// bd is not installed.
+// bd is not installed, or is older than MinVersion: D-21 requires bd
+// MinVersion or newer and the older CLI rejects the D-13 init flags, so an
+// old binary is an environment problem, not a failure of the code.
 func integrationEnv(t *testing.T) {
 	t.Helper()
 	if _, err := testutil.RealBinary("bd"); err != nil {
@@ -29,6 +31,9 @@ func integrationEnv(t *testing.T) {
 		t.Skip("git not installed")
 	}
 	envIsolate(t)
+	if _, err := Detect(context.Background()); err != nil {
+		t.Skipf("bd is unusable for the integration suite: %v; %s", err, InstallHint)
+	}
 }
 
 // integrationSnapshot captures everything about the fixture that init must

@@ -53,6 +53,14 @@ type Options struct {
 	Now func() time.Time
 	// NoColor renders without any ANSI colour (--no-color, NO_COLOR).
 	NoColor bool
+	// Theme overrides the palette; nil means [EnvTheme] for NoColor. Every
+	// style the TUI draws with comes from it, so a frame never depends on
+	// the global Lip Gloss renderer's profile.
+	Theme *Theme
+	// Open replaces the OS opener the PRs view's `o` key hands a pull
+	// request URL to (P7-05); nil means [OpenURL]. A test passes its own so
+	// nothing ever launches a browser.
+	Open URLOpener
 	// OnStop is called when the user confirms a stop. P7-10 points it at the
 	// orchestrator; until then it is how `sc tui-demo` reports the request.
 	OnStop func()
@@ -76,6 +84,15 @@ func (o Options) keyMap() KeyMap {
 	return DefaultKeyMap()
 }
 
+// theme returns the palette every part of the TUI renders through: the one
+// [Options.Theme] names, or the process theme for [Options.NoColor].
+func (o Options) theme() *Theme {
+	if o.Theme != nil {
+		return o.Theme
+	}
+	return EnvTheme(o.NoColor)
+}
+
 // buffer returns the subscription buffer to use.
 func (o Options) buffer() int {
 	if o.Buffer > 0 {
@@ -89,21 +106,24 @@ func (o Options) buffer() int {
 // the program exits; the model then keeps rendering the state it has and
 // says "disconnected" in the header.
 func New(ctx context.Context, opts Options) Model {
+	theme := opts.theme()
 	m := Model{
 		opts:   opts,
 		keys:   opts.keyMap(),
-		help:   newHelpModel(opts.NoColor),
-		styles: newStyles(opts.NoColor),
+		theme:  theme,
+		help:   newHelpModel(theme),
+		styles: newStyles(theme),
 		state:  NewState(opts.Run),
 		follow: true,
 	}
-	m.graph = NewGraphModel(GraphOptions{NoColor: opts.NoColor})
-	m.agents = NewAgentsModel(AgentsOptions{NoColor: opts.NoColor, Now: opts.Now})
-	m.feedback = NewFeedbackModel(FeedbackOptions{NoColor: opts.NoColor})
-	m.prs = NewPRsModel(PRsOptions{NoColor: opts.NoColor})
+	m.graph = NewGraphModel(GraphOptions{NoColor: opts.NoColor, Theme: theme})
+	m.agents = NewAgentsModel(AgentsOptions{NoColor: opts.NoColor, Theme: theme, Now: opts.Now})
+	m.feedback = NewFeedbackModel(FeedbackOptions{NoColor: opts.NoColor, Theme: theme})
+	m.prs = NewPRsModel(PRsOptions{NoColor: opts.NoColor, Theme: theme, Open: opts.Open})
 	m.anim = NewAnimator(AnimOptions{
 		Disabled: AnimDisabled(opts.NoAnim, nil),
 		NoColor:  opts.NoColor,
+		Theme:    theme,
 		Tab:      m.tab,
 	})
 	m.resizeViews()
@@ -169,27 +189,30 @@ func (c chanSubscription) Events() <-chan events.Event { return c.ch }
 func (c chanSubscription) Dropped() uint64 { return 0 }
 
 // newHelpModel builds the bubbles help renderer used by the footer and the
-// `?` overlay, stripped of colour when the caller asked for none.
-func newHelpModel(noColor bool) help.Model {
+// `?` overlay. Every style comes from t, so the help line renders for t's
+// colour profile rather than for whatever profile the global Lip Gloss
+// renderer happened to detect (P7-09).
+func newHelpModel(t *Theme) help.Model {
 	h := help.New()
 	h.ShowAll = false
-	if noColor {
-		plain := lipgloss.NewStyle()
-		h.Styles = help.Styles{
-			Ellipsis:       plain,
-			ShortKey:       plain,
-			ShortDesc:      plain,
-			ShortSeparator: plain,
-			FullKey:        plain,
-			FullDesc:       plain,
-			FullSeparator:  plain,
-		}
+	sep, key, desc := t.Muted(), t.Accent(), t.Text()
+	h.Styles = help.Styles{
+		Ellipsis:       sep,
+		ShortKey:       key,
+		ShortDesc:      desc,
+		ShortSeparator: sep,
+		FullKey:        key,
+		FullDesc:       desc,
+		FullSeparator:  sep,
 	}
 	return h
 }
 
-// styles is the TUI's Lip Gloss palette. P7-07 replaces it with the full
-// colour-blind-safe theme; the skeleton needs only the chrome.
+// styles names the chrome the [Model] itself draws: the header, the tab bar,
+// the rule, the cursor, the dropped-event notice and the two overlays. Every
+// entry is a semantic style of the [Theme] (P7-07), so the chrome is drawn
+// from the same colour-blind-safe palette as the views and pins the same
+// renderer profile.
 type styles struct {
 	// Title is the emphasised text of the header and the overlays.
 	Title lipgloss.Style
@@ -203,7 +226,11 @@ type styles struct {
 	Status lipgloss.Style
 	// Tab is an inactive tab label.
 	Tab lipgloss.Style
-	// TabActive is the current tab's label.
+	// TabActive is the current tab's label. It is bold rather than
+	// underlined: Lip Gloss underlines each space with its own escape run,
+	// which both bloats a golden frame and confuses width measurement, and
+	// bold already separates it from the muted inactive labels with colour
+	// and without.
 	TabActive lipgloss.Style
 	// Rule is the line between the tab bar and the main pane.
 	Rule lipgloss.Style
@@ -217,37 +244,22 @@ type styles struct {
 	Box lipgloss.Style
 }
 
-// newStyles returns the palette. With noColor every style is plain, so the
-// rendering is identical to a NO_COLOR terminal.
-func newStyles(noColor bool) styles {
-	if noColor {
-		plain := lipgloss.NewStyle()
-		return styles{
-			Title: plain.Bold(true), Value: plain, Sep: plain, Cannon: plain, Status: plain,
-			Tab: plain, TabActive: plain.Bold(true).Underline(true), Rule: plain,
-			Cursor: plain, Muted: plain, Warn: plain,
-			Box: plain.Border(lipgloss.RoundedBorder()).Padding(0, 2),
-		}
-	}
-	const (
-		fg     = lipgloss.Color("15")
-		accent = lipgloss.Color("12")
-		dim    = lipgloss.Color("8")
-		warn   = lipgloss.Color("11")
-		fire   = lipgloss.Color("9")
-	)
+// newStyles returns the chrome palette, bound to t's renderer. Nothing here
+// may call [lipgloss.NewStyle]: that style would use the global renderer and
+// so the frame would depend on the ambient terminal (P7-09).
+func newStyles(t *Theme) styles {
 	return styles{
-		Title:     lipgloss.NewStyle().Bold(true).Foreground(fg),
-		Value:     lipgloss.NewStyle().Foreground(accent),
-		Sep:       lipgloss.NewStyle().Foreground(dim),
-		Cannon:    lipgloss.NewStyle().Foreground(fire),
-		Status:    lipgloss.NewStyle().Foreground(warn),
-		Tab:       lipgloss.NewStyle().Foreground(dim),
-		TabActive: lipgloss.NewStyle().Bold(true).Foreground(fg).Underline(true),
-		Rule:      lipgloss.NewStyle().Foreground(dim),
-		Cursor:    lipgloss.NewStyle().Foreground(accent),
-		Muted:     lipgloss.NewStyle().Foreground(dim),
-		Warn:      lipgloss.NewStyle().Foreground(warn),
-		Box:       lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(dim).Padding(0, 2),
+		Title:     t.Title(),
+		Value:     t.Accent(),
+		Sep:       t.Muted(),
+		Cannon:    t.Fire(),
+		Status:    t.Warning(),
+		Tab:       t.Muted(),
+		TabActive: t.Title(),
+		Rule:      t.Rule(),
+		Cursor:    t.Accent(),
+		Muted:     t.Muted(),
+		Warn:      t.Warning(),
+		Box:       t.Box().Padding(0, 2),
 	}
 }

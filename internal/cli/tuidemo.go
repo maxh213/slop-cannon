@@ -2,8 +2,10 @@ package cli
 
 import (
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
 	"slop-cannon/internal/events"
@@ -18,6 +20,7 @@ const (
 	FlagDemoSafety    = "safety"
 	FlagDemoAmmo      = "ammo"
 	FlagDemoAltScreen = "alt-screen"
+	FlagDemoNoAnim    = "no-anim"
 )
 
 const tuiDemoLong = `Render the TUI against a scripted event stream instead of a real run.
@@ -31,6 +34,7 @@ The command is hidden: it is a development tool, not part of the interface.`
 
 const tuiDemoExamples = `sc tui-demo
 sc tui-demo --delay 0 --safety
+sc tui-demo --no-anim
 sc tui-demo --events`
 
 func init() { register(newTUIDemoCommand) }
@@ -54,6 +58,7 @@ func newTUIDemoCommand() *cobra.Command {
 	f.Bool(FlagDemoSafety, false, "script a safety-on run (pull request) instead of a direct merge")
 	f.Int(FlagDemoAmmo, tui.DemoAmmo, "ammo shown in the header (`N` agents at once)")
 	f.Bool(FlagDemoAltScreen, true, "draw on the alternate screen buffer")
+	f.Bool(FlagDemoNoAnim, false, "disable the cannon animations (also honours SC_NO_ANIM), like `sc run --no-anim`")
 	return cmd
 }
 
@@ -79,10 +84,18 @@ func runTUIDemo(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return err
 	}
+	noAnim, err := f.GetBool(FlagDemoNoAnim)
+	if err != nil {
+		return err
+	}
+	if err := requireTerminal(); err != nil {
+		return err
+	}
 
 	stopped := false
-	err = tui.Demo(cmd.Context(), demo, tui.Options{
+	err = demoTUI(cmd.Context(), demo, tui.Options{
 		NoColor:   opts.NoColor,
+		NoAnim:    noAnim,
 		AltScreen: alt,
 		OnStop:    func() { stopped = true },
 	})
@@ -93,6 +106,27 @@ func runTUIDemo(cmd *cobra.Command, _ []string) error {
 		_, err = fmt.Fprintln(cmd.ErrOrStderr(), "sc: stop confirmed (the demo has no orchestrator to stop; P7-10 wires the real one)")
 	}
 	return err
+}
+
+// demoTUI is [tui.Demo], and isTerminal reports whether a file is a
+// terminal. They are variables so a test can drive the command's TUI branch,
+// which otherwise needs a real terminal to reach at all.
+var (
+	demoTUI    = tui.Demo
+	isTerminal = func(f *os.File) bool { return term.IsTerminal(f.Fd()) }
+)
+
+// requireTerminal refuses to start a Bubble Tea program when stdin or stdout
+// is not a terminal. Without this the program fails deep inside its input
+// reader ("error creating cancelreader"), which says nothing about what to
+// do instead; D-15's headless path and `--events` are what a pipe, a CI job
+// or a test wants.
+func requireTerminal() error {
+	if isTerminal(os.Stdin) && isTerminal(os.Stdout) {
+		return nil
+	}
+	return fmt.Errorf("tui-demo needs a terminal: stdin and stdout are not a TTY (use --%s to print the scripted stream as JSONL, or `sc run --%s` for a run without a TUI)",
+		FlagDemoEvents, FlagRunHeadless)
 }
 
 // demoOptionsFrom reads the script flags.

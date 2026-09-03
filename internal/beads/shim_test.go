@@ -53,24 +53,61 @@ done
 printf '%s\n' "$@"
 `
 
-// shimWeakScript builds a shim like the ones the P3-09 review rejected, to
-// prove Shim.Verify catches them: one that only relies on bd's --readonly
-// (denied=false), and one that refuses the ShimDenied commands but still
-// lets a --readonly override through (denied=true).
-func shimWeakScript(t *testing.T, real string, denied bool) Shim {
+// shimWeakMode names the flawed shims TestShimVerifyCatchesWeakerShims
+// builds, one per gap the P3-09 reviews found.
+type shimWeakMode int
+
+const (
+	// shimWeakReadonlyOnly leaves everything to bd's --readonly.
+	shimWeakReadonlyOnly shimWeakMode = iota
+	// shimWeakDenyList is the round-2 shim: the deny-list that missed
+	// `config set-many`, `backup`, `federation` and `audit`.
+	shimWeakDenyList
+	// shimWeakNoOverride is today's allow-list shim with the --readonly
+	// override guard cut out.
+	shimWeakNoOverride
+	// shimWeakRefusesReads denies every command except `version`, the
+	// shape an over-broad allow-list edit would produce.
+	shimWeakRefusesReads
+)
+
+// shimWeakScript writes a flawed shim of the given mode in front of real,
+// so Shim.Verify can be shown to reject it.
+func shimWeakScript(t *testing.T, real string, mode shimWeakMode) Shim {
 	t.Helper()
 	body := "#!/bin/sh\n" + ShimHeader + "\n"
-	if denied {
+	switch mode {
+	case shimWeakReadonlyOnly:
+	case shimWeakDenyList:
 		body += "case \"$1\" in branch|vc|dolt|hooks|import|init|metrics|rename|restore|setup)" +
 			" echo \"Error: operation '$1' is not allowed in read-only mode\" >&2; exit 1 ;; esac\n" +
 			"case \"$1 $2\" in 'config set'|'config unset')" +
 			" echo \"Error: operation '$1 $2' is not allowed in read-only mode\" >&2; exit 1 ;; esac\n"
+	case shimWeakRefusesReads:
+		body += "case \"$1\" in version) ;; *)" +
+			" echo \"Error: operation '$1' is not allowed in read-only mode\" >&2; exit 1 ;; esac\n"
+	case shimWeakNoOverride:
+		body = shimScriptWithoutOverrideGuard(t, real)
 	}
-	body += "exec '" + real + "' --readonly \"$@\"\n"
+	if mode != shimWeakNoOverride {
+		body += "exec '" + real + "' --readonly \"$@\"\n"
+	}
 	dir := t.TempDir()
 	path := filepath.Join(dir, "bd")
 	require.NoError(t, os.WriteFile(path, []byte(body), 0o755))
 	return Shim{Dir: dir, Path: path, Real: real}
+}
+
+// shimScriptWithoutOverrideGuard returns the generated shim with the
+// --readonly refusal block removed, leaving the allow-list intact.
+func shimScriptWithoutOverrideGuard(t *testing.T, real string) string {
+	t.Helper()
+	script := ShimScript(real)
+	start := strings.Index(script, "if [ -n \"$_sc_bad\"")
+	require.GreaterOrEqual(t, start, 0, "the override guard moved")
+	end := strings.Index(script[start:], "\nfi\n")
+	require.GreaterOrEqual(t, end, 0, "the override guard moved")
+	return script[:start] + script[start+end+len("\nfi\n"):]
 }
 
 // shimRun executes the shim script by path from dir with the given
@@ -197,12 +234,19 @@ func TestShimPrependsReadonlyAndPassesEverythingThrough(t *testing.T) {
 	assert.Equal(t, "--readonly\n", out)
 }
 
-func TestShimRelaysBDRefusal(t *testing.T) {
+// TestShimRefusesTheWriteItself pins the message an agent sees for the
+// write it is most likely to try: identical to bd's own refusal (the
+// conformance check and beads.KindOf both key on it), but produced by the
+// shim, so bd never runs. bd's --readonly stays the second line of defence,
+// checked by Shim.Verify.
+func TestShimRefusesTheWriteItself(t *testing.T) {
 	s, fake := shimInstall(t)
-	_, errOut, code := shimRun(t, s, t.TempDir(), nil, "update", "sc-1", "-s", "closed")
+	out, errOut, code := shimRun(t, s, t.TempDir(), nil, "update", "sc-1", "-s", "closed")
 	assert.Equal(t, 1, code)
-	assert.Equal(t, "Error: "+ReadOnlyMessage("update")+"\n", errOut)
-	assert.Len(t, fake.Invocations(t), 1, "bd itself refused")
+	assert.Empty(t, out)
+	assert.Equal(t, "Error: "+ReadOnlyMessage("update"), strings.SplitN(errOut, "\n", 2)[0])
+	assert.Contains(t, errOut, ShimDeniedHint)
+	assert.Empty(t, fake.Invocations(t), "bd never runs")
 	assert.ErrorIs(t, KindOf("", StderrMessage(errOut)), ErrReadOnly)
 }
 
@@ -241,7 +285,86 @@ func TestShimDeniesCommandsBDDoesNotBlock(t *testing.T) {
 			out, errOut, code := shimRun(t, s, t.TempDir(), nil, tc.args...)
 			assert.Equal(t, 1, code)
 			assert.Empty(t, out)
-			assert.Equal(t, "Error: "+ReadOnlyMessage(tc.op)+"\n", errOut)
+			lines := strings.Split(strings.TrimRight(errOut, "\n"), "\n")
+			require.Len(t, lines, 2)
+			assert.Equal(t, "Error: "+ReadOnlyMessage(tc.op), lines[0])
+			assert.Equal(t, ShimDeniedHint, lines[1])
+			assert.Equal(t, ReadOnlyMessage(tc.op), StderrMessage(errOut), "the hint does not confuse the parser")
+			assert.Empty(t, fake.Invocations(t), "bd never runs")
+			assert.ErrorIs(t, KindOf("", StderrMessage(errOut)), ErrReadOnly)
+		})
+	}
+}
+
+// TestShimAllowsOnlyReadCommands covers the P3-09 review's major gap: a
+// deny-list only closed the bd families someone had checked, so
+// `bd config set-many status.custom=pwned:wip` still rewrote the D-07
+// status registry through the shim, `bd backup init`/`bd backup sync`
+// pushed the whole database off-machine, `bd federation add-peer`
+// persisted a peer and `bd audit record` appended to
+// `.beads/interactions.jsonl` — all reproduced live. ShimAllowed is an
+// allow-list, so every command that is not a read is refused, whether or
+// not anyone thought of it.
+func TestShimAllowsOnlyReadCommands(t *testing.T) {
+	s, fake := shimInstall(t)
+	cases := []struct {
+		args []string
+		op   string
+	}{
+		// The commands the review drove through the old deny-list.
+		{[]string{"config", "set-many", "status.custom=pwned:wip"}, "config set-many"},
+		{[]string{"config", "apply"}, "config apply"},
+		{[]string{"backup", "init", "file:///tmp/x"}, "backup"},
+		{[]string{"backup", "sync"}, "backup"},
+		{[]string{"federation", "add-peer", "evil", "http://evil.example"}, "federation"},
+		{[]string{"audit", "record", "--kind", "label"}, "audit"},
+		// Issue-level writes bd blocks itself; the shim gets there first.
+		{[]string{"update", "sc-1", "-s", "closed"}, "update"},
+		{[]string{"close", "sc-1"}, "close"},
+		{[]string{"create", "sneaky", "-t", "task"}, "create"},
+		{[]string{"comment", "sc-1", "hi"}, "comment"},
+		{[]string{"comments", "add", "sc-1", "hi"}, "comments add"},
+		{[]string{"label", "add", "sc-1", "x"}, "label"},
+		{[]string{"dep", "add", "sc-1", "sc-2"}, "dep add"},
+		{[]string{"dep", "remove", "sc-1", "sc-2"}, "dep remove"},
+		{[]string{"kv", "set", "k", "v"}, "kv"},
+		{[]string{"note", "sc-1", "text"}, "note"},
+		{[]string{"batch"}, "batch"},
+		// Maintenance and integrations an agent has no business running.
+		{[]string{"sql", "select 1"}, "sql"},
+		{[]string{"admin", "reset"}, "admin"},
+		{[]string{"gc"}, "gc"},
+		{[]string{"prune"}, "prune"},
+		{[]string{"purge"}, "purge"},
+		{[]string{"compact"}, "compact"},
+		{[]string{"flatten"}, "flatten"},
+		{[]string{"migrate", "schema"}, "migrate"},
+		{[]string{"worktree", "create", "sc-1"}, "worktree"},
+		{[]string{"merge-slot", "acquire"}, "merge-slot"},
+		{[]string{"swarm", "create"}, "swarm"},
+		{[]string{"rename-prefix", "sc"}, "rename-prefix"},
+		{[]string{"doctor", "--fix"}, "doctor"},
+		{[]string{"bootstrap"}, "bootstrap"},
+		{[]string{"upgrade"}, "upgrade"},
+		{[]string{"remember", "x"}, "remember"},
+		{[]string{"forget", "x"}, "forget"},
+		{[]string{"jira", "sync"}, "jira"},
+		{[]string{"github", "sync"}, "github"},
+		{[]string{"ship", "x"}, "ship"},
+		{[]string{"mol", "wisp"}, "mol"},
+		{[]string{"rules", "compact"}, "rules"},
+		// A verb no one has heard of yet is refused by default.
+		{[]string{"brand-new-verb", "--force"}, "brand-new-verb"},
+		{[]string{"-C", "/repo", "--json", "brand-new-verb"}, "brand-new-verb"},
+	}
+	for _, tc := range cases {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			fake.Reset(t)
+			out, errOut, code := shimRun(t, s, t.TempDir(), nil, tc.args...)
+			assert.Equal(t, 1, code)
+			assert.Empty(t, out)
+			assert.Equal(t, ReadOnlyMessage(tc.op), StderrMessage(errOut))
+			assert.Contains(t, errOut, ShimDeniedHint)
 			assert.Empty(t, fake.Invocations(t), "bd never runs")
 			assert.ErrorIs(t, KindOf("", StderrMessage(errOut)), ErrReadOnly)
 		})
@@ -327,20 +450,36 @@ func TestShimIgnoresCommandsAfterDoubleDash(t *testing.T) {
 	assert.Equal(t, []string{"--readonly", "--", "config", "set", "a", "b"}, calls[0].Args)
 }
 
-func TestShimAllowsReadsOfDeniedCommandFamilies(t *testing.T) {
+func TestShimAllowsReadCommands(t *testing.T) {
 	s, fake := shimInstall(t)
 	cases := [][]string{
-		{"config", "get", "status.custom"},
-		{"config", "list"},
-		{"-C", "/repo", "config", "get", "x"},
-		{"--actor", "config", "get", "x"}, // the flag value is skipped, not read as the command
+		{"ready", "--json", "-n", "0"},
 		{"show", "sc-1", "--json", "--include-comments"},
 		{"list", "--json", "-n", "0", "--flat", "--all"},
 		{"blocked", "--json"},
 		{"dep", "list", "sc-1", "--json"},
+		{"dep", "tree", "sc-1"},
+		{"dep", "cycles"},
 		{"comments", "sc-1", "--json"},
+		{"children", "sc-1"},
+		{"count", "--status", "open"},
+		{"export", "--json"},
+		{"graph", "--all"},
+		{"history", "sc-1"},
+		{"query", "status=open"},
+		{"search", "mean"},
+		{"stale"},
+		{"statuses"},
+		{"types"},
+		{"config", "get", "status.custom"},
+		{"config", "list"},
+		{"config", "show"},
+		{"-C", "/repo", "config", "get", "x"},
+		{"--actor", "sc:engineer-1", "config", "get", "x"},
 		{"version", "--json"},
+		{"help", "ready"},
 		{"--version"},
+		{"--help"},
 		{"-C", "init"}, // "init" is the -C value, not a command
 	}
 	for _, args := range cases {
@@ -359,10 +498,10 @@ func TestShimScriptQuotesRealPath(t *testing.T) {
 	real := "/opt/it's here/bd"
 	script := ShimScript(real)
 	assert.Contains(t, script, `exec '/opt/it'\''s here/bd' --readonly "$@"`)
-	for _, d := range ShimDenied {
-		assert.Contains(t, script, "'"+d+"'")
+	for _, a := range ShimAllowed {
+		assert.Contains(t, script, "'"+a+"'")
 	}
-	// The denied list and the message are what bd prints itself.
+	// The message is what bd prints itself.
 	assert.Equal(t, "operation 'config set' is not allowed in read-only mode", ReadOnlyMessage("config set"))
 }
 
@@ -401,10 +540,15 @@ func TestShimVerify(t *testing.T) {
 		dir := t.TempDir()
 		require.NoError(t, s.Verify(context.Background(), dir))
 		calls := fake.Invocations(t)
-		require.Len(t, calls, 2)
+		require.Len(t, calls, 4)
 		assert.Equal(t, []string{"--readonly", "version", "--json"}, calls[0].Args)
-		assert.Equal(t, []string{"--readonly", "update", "sc-shim-probe", "-s", "open"}, calls[1].Args)
-		assert.Equal(t, dir, calls[1].Dir)
+		assert.Equal(t, []string{"--readonly", "ready", "--json", "-n", "0"}, calls[1].Args, "reads must work")
+		assert.Equal(t, []string{"--readonly", "show", "sc-shim-probe", "--json"}, calls[2].Args)
+		assert.Equal(t, []string{"--readonly", "update", "sc-shim-probe", "-s", "open"}, calls[3].Args,
+			"bd itself is checked directly, because the shim refuses the write first")
+		for _, c := range calls {
+			assert.Equal(t, dir, c.Dir, "runs where the agent would")
+		}
 	})
 	t.Run("fails when bd accepts the write", func(t *testing.T) {
 		testutil.FakeBin(t, "bd", `printf '{"schema_version":1,"data":{"version":"1.2.2"}}\n'`)
@@ -413,6 +557,7 @@ func TestShimVerify(t *testing.T) {
 		err = s.Verify(context.Background(), t.TempDir())
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "was not refused")
+		assert.Contains(t, err.Error(), "does not enforce --readonly itself")
 	})
 	t.Run("fails when the refusal is something else", func(t *testing.T) {
 		testutil.FakeBin(t, "bd", `case "$*" in *version*) printf '{"schema_version":1,"data":{"version":"1.2.2"}}\n';; *) echo "Error: no beads project found" >&2; exit 1;; esac`)
@@ -445,6 +590,18 @@ func TestShimVerify(t *testing.T) {
 		err := s.Verify(ctx, t.TempDir())
 		require.Error(t, err)
 		assert.True(t, errors.Is(err, context.Canceled) || strings.Contains(err.Error(), "cannot run bd"), err)
+	})
+	t.Run("accepts a workdir with no beads database", func(t *testing.T) {
+		// The read probes must not turn bd's own "no beads database found"
+		// into a shim failure: Verify checks the shim, not the project.
+		testutil.FakeBin(t, "bd", `case "$*" in
+  *version*) printf '{"schema_version":1,"data":{"version":"1.2.2"}}\n'; exit 0 ;;
+  *update*) echo "Error: operation 'update' is not allowed in read-only mode" >&2; exit 1 ;;
+esac
+echo "Error: no beads database found" >&2; exit 1`)
+		s, err := WriteShim(t.TempDir(), ShimOptions{})
+		require.NoError(t, err)
+		assert.NoError(t, s.Verify(context.Background(), t.TempDir()))
 	})
 }
 
@@ -479,61 +636,98 @@ func TestShimBlocksOverrideAgainstAnOverridableBD(t *testing.T) {
 	require.NoError(t, s.Verify(context.Background(), t.TempDir()))
 }
 
-// TestShimVerifyCatchesWeakerShims proves the extended self-check: a shim
-// that leaves the ShimDenied commands to bd, or one that lets a --readonly
-// override through, is rejected before an agent uses it.
+// TestShimVerifyCatchesWeakerShims proves the extended self-check rejects
+// every shim shape the P3-09 reviews found wanting: one that trusts bd's
+// --readonly alone, the round-2 deny-list that let `config set-many`
+// through, one without the --readonly override guard, and one so strict it
+// refuses the reads agents need.
 func TestShimVerifyCatchesWeakerShims(t *testing.T) {
 	cases := []struct {
-		name   string
-		denied bool
-		want   string
+		name string
+		mode shimWeakMode
+		want []string
 	}{
-		{"no command denials", false, "bd config set"},
-		{"no override guard", true, "--readonly=false"},
+		{"only bd's --readonly", shimWeakReadonlyOnly, []string{"bd config set", "was not refused"}},
+		{"an out-of-date deny list", shimWeakDenyList, []string{"bd config set-many", "was not refused"}},
+		{"no override guard", shimWeakNoOverride, []string{"--readonly=false", "was refused as"}},
+		{"refuses the reads too", shimWeakRefusesReads, []string{"refuses the read", "bd ready"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			fake := testutil.FakeBin(t, "bd", shimOverridableFakeScript)
-			s := shimWeakScript(t, fake.Path, tc.denied)
+			s := shimWeakScript(t, fake.Path, tc.mode)
 			err := s.Verify(context.Background(), t.TempDir())
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), tc.want)
-			assert.Contains(t, err.Error(), "was not refused")
+			for _, want := range tc.want {
+				assert.Contains(t, err.Error(), want)
+			}
 		})
 	}
 }
 
-// TestShimVerifyProbesEveryMechanism pins what Verify checks: bd runs only
-// for the version and update probes, and the shim's own refusals (the
-// commands bd 1.2.2 does not block, and a --readonly override) never reach
-// the binary, so the check is cheap and cannot change a database.
+// TestShimVerifyProbesEveryMechanism pins what Verify checks: the reads an
+// agent needs, a refusal for every mechanism (the allow-list, its
+// exceptions, and a --readonly override), and bd's own --readonly. Only the
+// reads and the bd-side probe start the binary, so the check is cheap and
+// cannot change a database.
 func TestShimVerifyProbesEveryMechanism(t *testing.T) {
 	s, fake := shimInstall(t)
 	require.NoError(t, s.Verify(context.Background(), t.TempDir()))
-	calls := fake.Invocations(t)
-	require.Len(t, calls, 2)
-	assert.Equal(t, []string{"--readonly", "version", "--json"}, calls[0].Args)
-	assert.Equal(t, []string{"--readonly", "update", "sc-shim-probe", "-s", "open"}, calls[1].Args)
+	require.Len(t, fake.Invocations(t), 4, "only the reads and bd's own gate run the binary")
 
 	var ops []string
 	for _, p := range shimProbes {
 		ops = append(ops, p.op)
 	}
-	assert.Equal(t, []string{"config set", "branch", "vc", "--readonly=false"}, ops)
+	assert.Equal(t, []string{
+		"update", "config set", "config set-many", "backup", "federation",
+		"audit", "import", "branch", "vc", "comments add", "--readonly=false",
+	}, ops)
 	for _, p := range shimProbes {
+		fake.Reset(t)
 		_, errOut, code := shimRun(t, s, t.TempDir(), nil, p.args...)
 		assert.Equal(t, 1, code, strings.Join(p.args, " "))
 		assert.Equal(t, ReadOnlyMessage(p.op), StderrMessage(errOut), strings.Join(p.args, " "))
+		assert.Empty(t, fake.Invocations(t), "the shim refuses without running bd")
+	}
+	for _, args := range shimReadProbes {
+		fake.Reset(t)
+		_, errOut, code := shimRun(t, s, t.TempDir(), nil, args...)
+		assert.Equal(t, 0, code, errOut)
+		assert.Len(t, fake.Invocations(t), 1, strings.Join(args, " "))
 	}
 }
 
 // TestShimDirFor pins the per-worktree layout: the shim sits beside the
-// run's worktrees, never inside one (D-23).
+// run's worktrees, never inside one and never outside the run (D-23).
 func TestShimDirFor(t *testing.T) {
-	assert.Equal(t, filepath.Join("/state", "runs", "r1", "bin", "sc-1"),
-		ShimDirFor(filepath.Join("/state", "runs", "r1", "wt", "sc-1")))
-	assert.Equal(t, filepath.Join("/state", "runs", "r1", "bin", "sc-1"),
-		ShimDirFor(filepath.Join("/state", "runs", "r1", "wt", "sc-1")+string(filepath.Separator)))
+	wt := filepath.Join("/state", "runs", "r1", WorktreesDirName, "sc-1")
+	want := filepath.Join("/state", "runs", "r1", ShimDirName, "sc-1")
+	got, err := ShimDirFor(wt)
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+	got, err = ShimDirFor(wt + string(filepath.Separator))
+	require.NoError(t, err)
+	assert.Equal(t, want, got)
+
+	// Anything but <run-dir>/wt/<bead-id> would put the shim outside the
+	// run directory, so it is refused instead: climbing two levels from
+	// /home/me/proj lands on /home/bin/proj.
+	for _, bad := range []string{
+		"",
+		filepath.Join("relative", WorktreesDirName, "sc-1"),
+		"/home/me/proj",
+		filepath.Join("/state", "runs", "r1", "worktrees", "sc-1"),
+		"/",
+		filepath.Join("/", WorktreesDirName),
+	} {
+		t.Run("rejects "+bad, func(t *testing.T) {
+			dir, err := ShimDirFor(bad)
+			require.Error(t, err)
+			assert.ErrorIs(t, err, ErrShimLayout)
+			assert.Empty(t, dir)
+		})
+	}
 }
 
 // TestInstallForWorktree covers the production entry point an orchestrator
@@ -546,16 +740,16 @@ func TestInstallForWorktree(t *testing.T) {
 	t.Run("installs, verifies and leaves the worktree clean", func(t *testing.T) {
 		fake := testutil.FakeBin(t, "bd", shimFakeScript)
 		run := t.TempDir()
-		wt := filepath.Join(run, "wt", "sc-1")
+		wt := filepath.Join(run, WorktreesDirName, "sc-1")
 		require.NoError(t, os.MkdirAll(wt, 0o755))
 
 		s, err := InstallForWorktree(ctx, wt, ShimOptions{})
 		require.NoError(t, err)
-		assert.Equal(t, filepath.Join(run, "bin", "sc-1"), s.Dir)
-		assert.Equal(t, filepath.Join(run, "bin", "sc-1", "bd"), s.Path)
+		assert.Equal(t, filepath.Join(run, ShimDirName, "sc-1"), s.Dir)
+		assert.Equal(t, filepath.Join(run, ShimDirName, "sc-1", "bd"), s.Path)
 		assert.Equal(t, fake.Path, s.Real)
 		assert.True(t, IsShim(s.Path))
-		assert.Len(t, fake.Invocations(t), 2, "Verify ran")
+		assert.Len(t, fake.Invocations(t), 4, "Verify ran")
 
 		entries, err := os.ReadDir(wt)
 		require.NoError(t, err)
@@ -568,7 +762,7 @@ func TestInstallForWorktree(t *testing.T) {
 	t.Run("honours Dir and SkipVerify", func(t *testing.T) {
 		fake := testutil.FakeBin(t, "bd", shimFakeScript)
 		dir := filepath.Join(t.TempDir(), "custom")
-		s, err := InstallForWorktree(ctx, filepath.Join(t.TempDir(), "wt", "sc-1"), ShimOptions{Dir: dir, SkipVerify: true})
+		s, err := InstallForWorktree(ctx, filepath.Join(t.TempDir(), "elsewhere"), ShimOptions{Dir: dir, SkipVerify: true})
 		require.NoError(t, err)
 		assert.Equal(t, dir, s.Dir)
 		assert.Empty(t, fake.Invocations(t), "no self-check")
@@ -577,14 +771,25 @@ func TestInstallForWorktree(t *testing.T) {
 		testutil.FakeBin(t, "bd", shimFakeScript)
 		_, err := InstallForWorktree(ctx, "", ShimOptions{})
 		assert.Error(t, err)
-		_, err = InstallForWorktree(ctx, filepath.Join("relative", "wt", "sc-1"), ShimOptions{})
+		_, err = InstallForWorktree(ctx, filepath.Join("relative", WorktreesDirName, "sc-1"), ShimOptions{})
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "not absolute")
+	})
+	t.Run("rejects a path that is not a run worktree", func(t *testing.T) {
+		testutil.FakeBin(t, "bd", shimFakeScript)
+		home := filepath.Join(t.TempDir(), "me", "proj")
+		require.NoError(t, os.MkdirAll(home, 0o755))
+		_, err := InstallForWorktree(ctx, home, ShimOptions{})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrShimLayout)
+		// Nothing was created two levels up, where ShimDirFor's arithmetic
+		// would have put the directory.
+		assert.NoDirExists(t, filepath.Join(filepath.Dir(filepath.Dir(home)), ShimDirName))
 	})
 	t.Run("propagates a failed self-check", func(t *testing.T) {
 		testutil.FakeBin(t, "bd", `printf '{"schema_version":1,"data":{"version":"1.2.2"}}\n'`)
 		run := t.TempDir()
-		wt := filepath.Join(run, "wt", "sc-1")
+		wt := filepath.Join(run, WorktreesDirName, "sc-1")
 		require.NoError(t, os.MkdirAll(wt, 0o755))
 		_, err := InstallForWorktree(ctx, wt, ShimOptions{})
 		require.Error(t, err)

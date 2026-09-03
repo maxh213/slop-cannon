@@ -1,0 +1,260 @@
+frame 000  active 1  queued 0  recoil 2  flash 0
+▄█▶✸  ◆run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2        r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+
+frame 003  active 1  queued 0  recoil 1  flash -1
+▄█▓▶   run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Grap·  2 Agents  3 Feedback  4 PRs  5 Log 
+───────•◆───────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2        r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+
+frame 006  active 1  queued 0  recoil 0  flash -1
+▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━•━━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2        r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+
+frame 009  active 1  queued 0  recoil 0  flash -1
+▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━·•━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2        r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+
+frame 012  active 1  queued 0  recoil 0  flash -1
+▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2 ·◆     r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+
+frame 015  active 1  queued 0  recoil 0  flash -1
+▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+
+frame 018  active 1  queued 0  recoil 0  flash -1
+▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+
+frame 021  active 1  queued 0  recoil 0  flash -1
+▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+
+frame 024  active 1  queued 0  recoil 0  flash -1
+▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+
+frame 027  active 1  queued 0  recoil 0  flash -1
+▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
+┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
+┃ Retry failed HTTP …┃    │ Document the retry…│
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+

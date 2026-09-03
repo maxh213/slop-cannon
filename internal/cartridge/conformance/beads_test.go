@@ -159,6 +159,33 @@ func TestBeadsCheck_SkipsWithoutBD(t *testing.T) {
 	assert.Contains(t, rep.Table(), "SKIP")
 }
 
+// TestBeadsCheck_SkipsWithOldBD covers the P3-09 review's version gate: a bd
+// below beads.MinVersion has a different CLI (1.0.5 rejects
+// `bd init --init-if-missing`), so the check must skip with an install hint
+// instead of failing for an environment reason.
+func TestBeadsCheck_SkipsWithOldBD(t *testing.T) {
+	t.Parallel()
+	const token = "sc-beadsoldbd"
+	a, err := NewMock("", token)
+	require.NoError(t, err)
+	opts := conformanceFastOptions(t, token)
+	bd := filepath.Join(t.TempDir(), "bd")
+	script := strings.Replace(conformanceFakeBDScript, `"version":"1.2.2"`, `"version":"1.0.5"`, 1)
+	require.NotEqual(t, conformanceFakeBDScript, script)
+	require.NoError(t, os.WriteFile(bd, []byte(script), 0o755))
+	opts.BD = bd
+	opts.Checks = []string{CheckDetect, CheckBeads}
+	rep, err := Run(context.Background(), a, opts)
+	require.NoError(t, err)
+	assert.True(t, rep.Passed(), rep.Table())
+	res := conformanceResult(t, rep, CheckBeads)
+	assert.Equal(t, StatusSkip, res.Status)
+	assert.Contains(t, res.Detail, "older than "+beads.MinVersion.String())
+	assert.Contains(t, res.Detail, "install beads")
+	assert.NoError(t, res.Err)
+	assert.Empty(t, a.Calls(), "no session runs for an unusable bd")
+}
+
 func TestRetryTextBusy(t *testing.T) {
 	t.Parallel()
 	t.Run("retries ETXTBSY until it clears", func(t *testing.T) {

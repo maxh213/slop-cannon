@@ -1,0 +1,20 @@
+▄█▓═▶  run sc-graph-001 · brief · ammo 0/4 · safety on
+[1m 1 Graph [0m 2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────
+4 beads · 2 levels · 0 ready · 4 blocked · 0 closed · 1 cycle · 
+  level 0 (1)
+[1m▌ [0m○ sc-free          Document the queue  ← sc-out1
+  cycle (3)
+  ○ sc-loop          Rewrite the scheduler  ← sc-back
+  ◐ sc-back     r1   Rewrite the queue  ← sc-loop
+  ○ sc-heir          Benchmark both halves  ← sc-loop
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • 

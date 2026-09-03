@@ -196,9 +196,12 @@ func (m *Manager) Create(ctx context.Context, bead domain.Bead) (*Worktree, erro
 	for _, wt := range all {
 		switch {
 		case samePath(wt.Path, path) && wt.Prunable:
-			// The directory vanished (crash, cleanup by hand): drop the
-			// stale registration and start over.
-			if _, err := m.repo.Git(ctx, "worktree", "prune"); err != nil {
+			// The directory vanished (crash, cleanup by hand): drop this
+			// one stale registration and start over. "worktree remove"
+			// addresses a single path; "worktree prune" would also drop
+			// the registrations of worktrees the user keeps elsewhere
+			// (D-23).
+			if _, err := m.repo.Git(ctx, "worktree", "remove", "--force", "--force", wt.Path); err != nil {
 				return nil, err
 			}
 		case samePath(wt.Path, path):
@@ -358,10 +361,20 @@ func (m *Manager) DeleteBranch(ctx context.Context, bead domain.Bead) error {
 
 // Prune drops registrations whose directories no longer exist
 // ("git worktree prune") and removes empty leftover directories under Dir.
+// The git command is repository-wide: it also drops the stale
+// registrations of worktrees the user keeps outside the run directory. Use
+// it only when that is intended; the run-finish pass prunes just its own
+// (see pruneRun).
 func (m *Manager) Prune(ctx context.Context) error {
 	if _, err := m.repo.Git(ctx, "worktree", "prune"); err != nil {
 		return err
 	}
+	return m.removeHusks()
+}
+
+// removeHusks deletes the empty leftover directories under Dir, the husks
+// an interrupted removal leaves behind. Non-empty directories are kept.
+func (m *Manager) removeHusks() error {
 	entries, err := os.ReadDir(m.dir)
 	if err != nil {
 		if os.IsNotExist(err) {

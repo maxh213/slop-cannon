@@ -59,10 +59,12 @@ func WriteFile(runDir string, id domain.AgentID, text string) (string, error) {
 }
 
 // Write saves the prompt for debugging under runDir and records where it
-// went in Path (D-23). It is a pointer method because it sets that field;
-// failing to write a debug copy is reported, never silently ignored, so a
-// caller can decide whether an unwritable state directory should stop the
-// run.
+// went in Path (D-23). Build does not call it: whoever fires the agent is
+// the one that knows the run directory, so the firing path must call Write
+// for the debug copy to exist. It is a pointer method because it sets that
+// field; failing to write a debug copy is reported, never silently ignored,
+// so a caller can decide whether an unwritable state directory should stop
+// the run.
 func (p *Prompt) Write(runDir string) error {
 	path, err := WriteFile(runDir, p.AgentID, p.Text)
 	if err != nil {

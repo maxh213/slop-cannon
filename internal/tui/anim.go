@@ -35,6 +35,15 @@ const AnimFrame = time.Second / AnimFPS
 // events cannot turn the pane into noise.
 const AnimMaxActive = 4
 
+// AnimMaxQueued is how many animations wait for a slot by default. The queue
+// is bounded as tightly as the active set: an orchestrator that publishes a
+// thousand events in a second must not leave the layer ticking at [AnimFPS]
+// for minutes after the run went quiet, which is exactly what an unbounded
+// queue would do to the phase's idle-CPU budget. Once it is full the oldest
+// animation still waiting is dropped, because the newest events are the ones
+// the viewer is watching; [Animator.Dropped] counts them.
+const AnimMaxQueued = 4
+
 // NoAnimEnv disables the animations when it is set to anything but an empty
 // value, "0" or "false". The `--no-anim` flag does the same.
 const NoAnimEnv = "SC_NO_ANIM"
@@ -121,8 +130,9 @@ type Target struct {
 }
 
 // TargetFunc resolves a bead to the cell of its node in the current frame.
-// The graph view (P7-02) supplies one so projectiles land on the right node;
-// returning false sends the animation to the tab indicator instead.
+// [GraphTargets] builds one from the graph view (P7-02) so projectiles land
+// on the right node; returning false sends the animation to the tab indicator
+// instead.
 type TargetFunc func(bead domain.BeadID) (Target, bool)
 
 // AnimTickMsg advances the animation layer one frame. Gen identifies the
@@ -148,6 +158,9 @@ type AnimOptions struct {
 	Width, Height int
 	// Max is how many animations play at once; zero means [AnimMaxActive].
 	Max int
+	// MaxQueued is how many animations wait for a free slot; zero means
+	// [AnimMaxQueued]. A full queue drops its oldest entry.
+	MaxQueued int
 	// Targets resolves a bead to the cell of its graph node; nil aims every
 	// animation at the tab indicators.
 	Targets TargetFunc
@@ -180,9 +193,13 @@ type pending struct {
 	seq   uint64
 }
 
-// Animator is the cannon's animation layer: a queue of animations, a frame
-// ticker that only runs while one is playing, and an overlay that composites
-// the sprites onto a rendered frame.
+// Animator is the cannon's animation layer: a bounded queue of animations, a
+// frame ticker that only runs while one is playing, and an overlay that
+// composites the sprites onto a rendered frame.
+//
+// Both bounds matter: at most [AnimMaxActive] animations are on screen and at
+// most [AnimMaxQueued] wait behind them, so the layer drains within about two
+// seconds of the last event no matter how many arrived.
 //
 // It is a value, like the other Bubble Tea components in this package: the
 // mutators return the new animator and never write through a copy.
@@ -192,12 +209,14 @@ type Animator struct {
 	width     int
 	height    int
 	maxActive int
+	maxQueued int
 	targets   TargetFunc
 	tab       Tab
 	seed      uint64
 
 	active  []animation
 	queue   []pending
+	dropped uint64
 	seq     uint64
 	gen     uint64
 	ticking bool
@@ -216,6 +235,7 @@ func NewAnimator(opts AnimOptions) Animator {
 		width:     opts.Width,
 		height:    opts.Height,
 		maxActive: opts.Max,
+		maxQueued: opts.MaxQueued,
 		targets:   opts.Targets,
 		tab:       opts.Tab,
 		seed:      opts.Seed,
@@ -228,6 +248,9 @@ func NewAnimator(opts AnimOptions) Animator {
 	}
 	if a.maxActive <= 0 {
 		a.maxActive = AnimMaxActive
+	}
+	if a.maxQueued <= 0 {
+		a.maxQueued = AnimMaxQueued
 	}
 	if !a.tab.Valid() {
 		a.tab = TabGraph
@@ -272,6 +295,14 @@ func (a Animator) Active() int { return len(a.active) }
 
 // Queued returns how many animations are waiting for a slot.
 func (a Animator) Queued() int { return len(a.queue) }
+
+// Dropped returns how many animations were thrown away because the queue was
+// already full. It is the price of the bound: a run that publishes faster
+// than 30 frames a second gets the newest animations, not all of them.
+func (a Animator) Dropped() uint64 { return a.dropped }
+
+// Capacity returns how many animations play at once and how many wait.
+func (a Animator) Capacity() (active, queued int) { return a.maxActive, a.maxQueued }
 
 // Playing describes one animation currently on screen.
 type Playing struct {
@@ -350,6 +381,13 @@ func (a Animator) SetTargets(f TargetFunc) Animator {
 // changes-requested one a ricochet, a bead reaching a terminal state confetti,
 // and [events.AgentFailed] a puff of smoke. Every other event is ignored.
 //
+// Deviation from the P7-06 task text, which asks for a misfire puff on every
+// [events.AgentFailed]: an agent killed on purpose
+// ([events.FailureKilled] — a pause, a stop, an ammo limit) plays nothing.
+// The cannon did not misfire, the operator stopped it, and a puff of smoke
+// for every agent torn down by `q` would make a clean stop look like a
+// failure.
+//
 // The returned command is the frame ticker, and is nil unless this call woke
 // an idle layer.
 func (a Animator) Apply(ev events.Event) (Animator, tea.Cmd) {
@@ -392,14 +430,25 @@ func (a Animator) Fire(kind AnimKind, bead domain.BeadID) (Animator, tea.Cmd) {
 }
 
 // fire queues an animation, starting it at once when a slot is free.
+//
+// Both the active set and the queue are bounded ([AnimMaxActive],
+// [AnimMaxQueued]): when the queue is full the animation that has waited
+// longest is dropped to make room, so however many events arrive at once the
+// layer always drains within a couple of seconds of the last one.
 func (a Animator) fire(kind AnimKind, bead domain.BeadID, agent domain.AgentID) (Animator, tea.Cmd) {
 	a.seq++
 	p := pending{kind: kind, bead: bead, agent: agent, seq: a.seq}
 	if len(a.active) < a.maxActive {
 		a = a.start(p)
-	} else {
-		a.queue = append(append(make([]pending, 0, len(a.queue)+1), a.queue...), p)
+		return a.wake()
 	}
+	q := append(make([]pending, 0, len(a.queue)+1), a.queue...)
+	q = append(q, p)
+	if drop := len(q) - a.maxQueued; drop > 0 {
+		q = q[drop:]
+		a.dropped += uint64(drop)
+	}
+	a.queue = q
 	return a.wake()
 }
 
@@ -443,7 +492,7 @@ func (a Animator) resolve(kind AnimKind, bead domain.BeadID) Target {
 
 // inPane reports whether a cell is inside the main pane of the current frame.
 func (a Animator) inPane(t Target) bool {
-	return t.Col >= 0 && t.Col < a.width && t.Row >= chromeHeight-1 && t.Row <= a.height-2
+	return t.Col >= 0 && t.Col < a.width && t.Row >= animPaneTop && t.Row <= a.height-2
 }
 
 // tabIndicator is the middle cell of a tab's label in the tab bar.
@@ -470,6 +519,68 @@ func tabLabelColumn(t Tab) int {
 		col += tabLabelWidth(x)
 	}
 	return col
+}
+
+// --- aiming at a real node ------------------------------------------------
+
+// animPaneTop is the frame row the main pane starts on: the header, the tab
+// bar and the rule are above it.
+const animPaneTop = chromeHeight - 1
+
+// animGraphTop is the frame row the graph view's canvas starts on. The view
+// spends its first pane line on the counts summary, so the boxes begin one
+// line further down.
+const animGraphTop = animPaneTop + 1
+
+// GraphTargets returns the resolver that aims an animation at a bead's node:
+// it maps a bead to the middle of its box in the graph view's boxed layout,
+// in the whole-frame coordinates [Sprite] uses. [Model] hands one to the
+// animator, which is how a projectile reaches the node it was fired at
+// instead of the tab indicator (P7-06).
+//
+// It resolves nothing — so the animation falls back to the tab indicator —
+// when the view is showing the bead detail panel or the indented list of a
+// narrow terminal, when the run has no such bead, or when the bead's box is
+// scrolled off the pane.
+func GraphTargets(g GraphModel, st *State) TargetFunc {
+	return func(bead domain.BeadID) (Target, bool) { return graphNodeCell(g, st, bead) }
+}
+
+// graphNodeCell is the resolution itself, done at the moment an animation
+// starts so it sees the graph the viewer is actually looking at.
+func graphNodeCell(g GraphModel, st *State, bead domain.BeadID) (Target, bool) {
+	if st == nil || bead == "" || g.ShowingDetail() {
+		return Target{}, false
+	}
+	orientation := g.Orientation()
+	if orientation == GraphIndentedList {
+		return Target{}, false
+	}
+	lay := BuildGraphLayout(st)
+	idx, ok := lay.Index(bead)
+	if !ok {
+		return Target{}, false
+	}
+	cursor := clampIndex(g.Cursor(), lay.Len())
+	_, boxes := g.paint(lay, orientation == GraphTopToBottom, cursor)
+	offX, offY := g.scroll(boxes[cursor])
+	b := boxes[idx]
+	x, y := b.midX()-offX, b.midY()-offY
+	w, h := g.Size()
+	if x < 0 || x >= w || y < 0 || y >= max(h-1, 1) {
+		return Target{}, false // scrolled out of the pane
+	}
+	return Target{Row: animGraphTop + y, Col: x}, true
+}
+
+// animTargets is the resolver the model aims with: the graph view's nodes
+// while the graph is the pane on screen, and none while an overlay covers it,
+// so a projectile is never fired into the help box or the stop prompt.
+func (m Model) animTargets() TargetFunc {
+	if m.tab != TabGraph || m.showHelp || m.confirmStop {
+		return nil
+	}
+	return GraphTargets(m.graph, m.state)
 }
 
 // wake starts the frame ticker when something is on screen and no ticker is

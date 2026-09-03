@@ -104,6 +104,12 @@ var (
 	ErrNotFastForward = errors.New("gitx: default branch cannot be fast-forwarded")
 	// ErrWrongBranch means the bead's worktree is not on the bead's branch.
 	ErrWrongBranch = errors.New("gitx: worktree is not on the bead's branch")
+	// ErrNothingToDeliver means the bead's branch never received a commit,
+	// so there is nothing to land on the default branch and the bead must
+	// not be closed (D-20). An empty sc/ branch is trivially an ancestor of
+	// the default branch, which is why the delivery proves the branch moved
+	// past its base rather than trusting ancestry (P4-13).
+	ErrNothingToDeliver = errors.New("gitx: branch has no commit to deliver")
 	// ErrNonLinearBranch means the rebased branch still carries a merge
 	// commit, so fast-forwarding the default branch onto it would put one
 	// there. The delivery stops instead: the default branch never receives
@@ -131,6 +137,11 @@ type DeliveryError struct {
 	// before the failure (push and close stages): the work has landed
 	// locally even though the delivery did not complete.
 	MergeSHA string
+	// Check is the check command's outcome when the failure happened at
+	// [StageCheck]: which command ran, whether it was configured or
+	// autodetected, its exit code and how long it took. Output holds the
+	// same tail as Check.Output. It is nil for every other stage.
+	Check *CheckResult
 	// Err is the underlying error.
 	Err error
 }
@@ -163,6 +174,11 @@ type BeadCloser interface {
 	Update(ctx context.Context, id domain.BeadID, p beads.Patch) (beads.Issue, error)
 	// Close closes the bead with a reason.
 	Close(ctx context.Context, id domain.BeadID, reason string) (beads.Issue, error)
+	// Show reads the beads back. A delivery only calls it when the rebase
+	// produced no new commit, to tell a retry of an already landed delivery
+	// (the bead carries sc_merge_sha) from a branch that never received one
+	// (see [MergeOptions.BaseSHA]).
+	Show(ctx context.Context, ids ...domain.BeadID) ([]beads.Issue, error)
 }
 
 // MergeOptions configures [Manager.DeliverMerge].
@@ -174,6 +190,15 @@ type MergeOptions struct {
 	// CheckTimeout bounds the check command; zero or negative means
 	// [DefaultCheckTimeout].
 	CheckTimeout time.Duration
+	// BaseSHA is the revision the bead's branch was created from
+	// (P4-13's sc_base_sha metadata), and is how a delivery whose rebase
+	// produced no new commit tells "already landed, only the close failed"
+	// from "this branch never received a commit": the branch must carry at
+	// least one commit beyond it. When it is empty the bead's recorded
+	// sc_merge_sha is consulted instead, and when that is missing too the
+	// delivery fails with [ErrNothingToDeliver] rather than closing a bead
+	// whose code never landed (D-20).
+	BaseSHA string
 	// Beads, when set, receives the sc_merge_sha metadata and the close
 	// after a successful merge (and push, when there is a remote). Nil
 	// skips the close stage; the caller then owns the bead's state.
@@ -215,8 +240,15 @@ type MergeResult struct {
 	// Head is the default branch tip after the merge: the rebased branch
 	// tip, recorded on the bead as sc_merge_sha.
 	Head string
-	// Commits is the number of commits that landed.
+	// Commits is the number of commits this delivery added to the default
+	// branch; zero on a retry whose merge had already landed (see
+	// AlreadyLanded).
 	Commits int
+	// AlreadyLanded is true when the rebase produced no new commit because
+	// the branch's work was already on the default branch: an earlier
+	// attempt merged (and possibly pushed) it and failed later, so this run
+	// only finishes the remaining stages.
+	AlreadyLanded bool
 	// Rebased is true when the rebase rewrote the branch (its tip changed).
 	Rebased bool
 	// Check is the check command's outcome; nil when no command was
@@ -255,6 +287,14 @@ type MergeResult struct {
 // rebaseConfig), the result is checked for merge commits
 // ([ErrNonLinearBranch]), and the branch only ever reaches the default
 // branch through a fast-forward.
+//
+// A bead is closed only when its code has landed (D-20). When the rebase
+// leaves nothing new for the default branch, the delivery finishes an
+// earlier attempt that already merged — proved by [MergeOptions.BaseSHA] or
+// by the sc_merge_sha an earlier attempt recorded, and reported as
+// [MergeResult.AlreadyLanded] — and otherwise fails with
+// [ErrNothingToDeliver] rather than closing a bead whose branch never
+// received a commit.
 func (m *Manager) DeliverMerge(ctx context.Context, bead domain.Bead, opts MergeOptions) (*MergeResult, error) {
 	if bead.ID == "" {
 		return nil, stageErr(StagePrepare, errors.New("gitx: DeliverMerge: bead has no id"), "")
@@ -355,8 +395,34 @@ func (m *Manager) DeliverMerge(ctx context.Context, bead domain.Bead, opts Merge
 				return nil, err
 			}
 		}
-		// Stage push.
-		if remote != "" {
+	} else {
+		// The rebase produced nothing for the default branch. Either an
+		// earlier attempt already merged this branch and failed in a later
+		// stage (finish it), or the branch never received a commit — an
+		// empty sc/ branch is trivially an ancestor of the default branch,
+		// and closing its bead would break D-20 and unblock its dependents
+		// with sc_merge_sha pointing at a commit the bead never produced.
+		landed, err := m.alreadyLanded(ctx, bead.ID, tipBefore, res.Before, opts)
+		if err != nil {
+			return nil, err
+		}
+		if !landed {
+			return nil, &DeliveryError{
+				Stage: StageMerge,
+				Err:   fmt.Errorf("%w: %s carries no commit beyond %s", ErrNothingToDeliver, branch, shortSHA(res.Before)),
+			}
+		}
+		res.AlreadyLanded = true
+	}
+
+	// Stage push. It also runs for an already landed delivery whose push
+	// was the stage that failed, so a retry finishes it.
+	if remote != "" {
+		push, err := m.needsPush(ctx, remote, target, head)
+		if err != nil {
+			return nil, err
+		}
+		if push {
 			src := "refs/heads/" + target
 			if !local {
 				src = "refs/heads/" + branch
@@ -403,6 +469,96 @@ func (m *Manager) assertLinear(ctx context.Context, base, head string) error {
 		}
 	}
 	return nil
+}
+
+// alreadyLanded reports whether a delivery whose rebase produced no new
+// commit is a retry of one that already landed, as opposed to a bead whose
+// branch never received a commit at all. Ancestry cannot tell the two
+// apart — after the fast-forward the branch tip and the default branch tip
+// are the same commit, and an empty branch's tip is an ancestor of it too —
+// so the answer comes from a record made before the delivery:
+//
+//   - [MergeOptions.BaseSHA] (P4-13's sc_base_sha, written when the branch
+//     was created): the branch must carry at least one commit beyond it.
+//     It is authoritative; an unknown revision is ignored.
+//   - failing that, the sc_merge_sha the previous attempt stamped on the
+//     bead before it called bd close: it must be contained in the default
+//     branch. A bead bd cannot find carries no such record.
+//
+// With neither, the delivery cannot prove the code landed and the bead
+// stays open (D-20).
+//
+// tip is the branch's tip before the rebase (the rebase moves an empty
+// branch onto the default branch tip, which would make it look delivered),
+// and defaultTip is the default branch tip the delivery started from.
+func (m *Manager) alreadyLanded(ctx context.Context, id domain.BeadID, tip, defaultTip string, opts MergeOptions) (bool, error) {
+	if base := strings.TrimSpace(opts.BaseSHA); base != "" {
+		sha, err := m.repo.RevParse(ctx, base)
+		switch {
+		case errors.Is(err, ErrUnknownRevision):
+			// The recorded base is gone (history rewritten, or a bad
+			// value); fall back to the bead's own record.
+		case err != nil:
+			return false, stageErr(StageMerge, err, "")
+		default:
+			out, err := m.repo.Git(ctx, "rev-list", "--count", sha+".."+tip)
+			if err != nil {
+				return false, stageErr(StageMerge, err, "")
+			}
+			n, err := strconv.Atoi(strings.TrimSpace(out))
+			if err != nil {
+				return false, stageErr(StageMerge, fmt.Errorf("gitx: unexpected rev-list output %q", out), "")
+			}
+			return n > 0, nil
+		}
+	}
+	if opts.Beads == nil {
+		return false, nil
+	}
+	issues, err := opts.Beads.Show(ctx, id)
+	if err != nil && !errors.Is(err, beads.ErrNotFound) {
+		return false, stageErr(StageMerge, err, "")
+	}
+	for _, issue := range issues {
+		if issue.ID != id {
+			continue
+		}
+		merged := strings.TrimSpace(issue.MergeSHA())
+		if merged == "" {
+			return false, nil
+		}
+		sha, err := m.repo.RevParse(ctx, merged)
+		if errors.Is(err, ErrUnknownRevision) {
+			return false, nil
+		}
+		if err != nil {
+			return false, stageErr(StageMerge, err, "")
+		}
+		on, err := m.repo.isAncestor(ctx, sha, defaultTip)
+		if err != nil {
+			return false, stageErr(StageMerge, err, "")
+		}
+		return on, nil
+	}
+	return false, nil
+}
+
+// needsPush reports whether the default branch has to be pushed to remote:
+// when the remote-tracking branch does not exist yet, or does not already
+// contain head.
+func (m *Manager) needsPush(ctx context.Context, remote, target, head string) (bool, error) {
+	tracking, err := m.repo.RevParse(ctx, remote+"/"+target)
+	if errors.Is(err, ErrUnknownRevision) {
+		return true, nil
+	}
+	if err != nil {
+		return false, stageErr(StagePush, err, head)
+	}
+	contains, err := m.repo.isAncestor(ctx, head, tracking)
+	if err != nil {
+		return false, stageErr(StagePush, err, head)
+	}
+	return !contains, nil
 }
 
 // syncDefault fetches remote and fast-forwards the local default branch to
@@ -480,7 +636,11 @@ func (m *Manager) fastForward(ctx context.Context, target, sha, ref string) erro
 		return stageErr(StageMerge, err, "")
 	}
 	if current == target {
-		_, err = m.repo.Git(ctx, gitArgs(mergeConfig, "merge", "--ff-only", "--quiet", "--no-verify", ref)...)
+		// No --no-verify: "git merge" only learned that flag in git 2.36
+		// and DoctorMinGit is 2.30. It would be redundant anyway — a
+		// fast-forward creates no commit, so no commit-msg or
+		// pre-merge-commit hook can run.
+		_, err = m.repo.Git(ctx, gitArgs(mergeConfig, "merge", "--ff-only", "--quiet", ref)...)
 	} else {
 		// "git fetch ." refuses a non-fast-forward update without a
 		// leading "+", and never creates a commit of its own.
@@ -666,8 +826,11 @@ func (r *Repo) runCheck(ctx context.Context, command string, timeout time.Durati
 			check.ExitCode = -1
 		}
 		// Every failure — a non-zero exit, a timeout, or sh not starting
-		// at all — carries whatever the command managed to print.
-		return check, &DeliveryError{Stage: StageCheck, Output: check.Output, Err: fmt.Errorf("%w: %w", ErrCheckFailed, err)}
+		// at all — carries whatever the command managed to print, plus the
+		// CheckResult itself so the caller can report the command, its exit
+		// code and its duration. The caller stamps Detected on the same
+		// value before the error travels on.
+		return check, &DeliveryError{Stage: StageCheck, Output: check.Output, Check: check, Err: fmt.Errorf("%w: %w", ErrCheckFailed, err)}
 	}
 	return check, nil
 }
@@ -740,10 +903,16 @@ func hasNPMTestScript(dir string) bool {
 	return strings.TrimSpace(manifest.Scripts["test"]) != ""
 }
 
-var makeTestTarget = regexp.MustCompile(`^test\s*:`)
+// makeTestTarget matches a line declaring the "test" target: "test:",
+// "test :" or the double-colon "test::", each optionally followed by
+// prerequisites or a recipe. A colon that is part of an assignment
+// operator ("test := ...", "test:=1", "test ::= ...") is not a target, so
+// the character after the colons must be neither "=" nor another ":".
+var makeTestTarget = regexp.MustCompile(`^test[ \t]*:{1,2}(?:[^=:]|$)`)
 
 // hasMakeTestTarget reports whether a Makefile in dir defines a "test"
-// target.
+// target. A Makefile that only assigns a "test" variable does not, and
+// "make test" would fail on it with "No rule to make target".
 func hasMakeTestTarget(dir string) bool {
 	for _, name := range []string{"GNUmakefile", "makefile", "Makefile"} {
 		f, err := os.Open(filepath.Join(dir, name))

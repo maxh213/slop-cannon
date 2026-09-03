@@ -1,5 +1,5 @@
-▄█▓═▶  slop-cannon · run sc-feedback-0001 · brief · ammo 0/4 · safety on
- 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+▄█▓═▶  [1mslop-cannon[0m · run sc-feedback-0001 · brief · ammo 0/4 · safety on
+ 1 Graph  2 Agents [1m 3 Feedback [0m 4 PRs  5 Log 
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 open items
   BEAD       U Q T │ sc-g7h8  Bump the client timeout
@@ -13,14 +13,14 @@
                    │   ✓ test approve fine
                    │
                    │ [1mround 2[0m · review · 708192a · qa
+                   │   ↩ pushback qa-r1-1   the config layer already rejects a negative timeout
                    │   ✗ qa   changes still want the guard
                    │     ▲ major   qa-r1-1   Validate the timeout before use [held]
+                   │   ⚖ uphold_engineer  qa-r1-1   config validation covers it; a second check is dead code
                    │
                    │ [1mround 3[0m · review · 8192a3b · qa
                    │   ✓ qa   approve ruling accepted
                    │     ▲ major   qa-r1-1   Validate the timeout before use [overruled]
-                   │       ↩ pushback the config layer already rejects a negative timeout
-                   │       ⚖ uphold_engineer config validation covers it; a second check is dead code
                    │
                    │
 tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

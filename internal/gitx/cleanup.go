@@ -2,6 +2,7 @@ package gitx
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/domain"
+	"slop-cannon/internal/logging"
 )
 
 // Cleanup and resume (P4-08). When a run finishes, the worktrees of closed
@@ -25,6 +27,12 @@ import (
 // before the crash closes the bead, a pull request that merged does the
 // same through its gate, and a pull request closed without merging hands
 // the bead to a human (D-20).
+//
+// Both passes address the branch a bead's work is actually on rather than
+// the one [BranchName] derives from its (mutable) title: git's own
+// worktree registration names it, and it outlives the directory. See
+// resolveBranch; P4-12 records the branch in the bead's metadata and makes
+// the search unnecessary.
 
 // CleanupAction says what [Manager.Cleanup] did with one bead's worktree.
 type CleanupAction string
@@ -189,9 +197,11 @@ func (r *CleanupResult) byAction(a CleanupAction) []CleanupEntry {
 // still in flight when the run was stopped, so a resumed run can reattach
 // it; a worktree of a bead the caller did not list is kept as well.
 // Registrations whose directory vanished and empty leftover directories
-// are pruned; a closed bead among them still has its merged branch
-// deleted. The result names every kept path, and is printed to
-// [CleanupOptions.Out] when one is set; see [CleanupResult.Summary]. Only
+// are pruned, the run's own only (D-23: worktrees the user keeps outside
+// the run directory keep their registrations); a closed bead among them
+// still has its merged branch deleted. The result names every kept path,
+// and is printed to [CleanupOptions.Out] when one is set; see
+// [CleanupResult.Summary]. Only
 // a failure to inspect the repository as a whole (listing or pruning its
 // worktrees, reading the default branch) is returned as an error; per-bead
 // failures are in the entries and [CleanupResult.Err].
@@ -214,13 +224,8 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 	// to delete the branch of a worktree it still has on file, so a closed
 	// bead whose directory vanished would otherwise keep its merged branch
 	// forever. The listing above still remembers which ones were prunable.
-	for _, wt := range worktrees {
-		if wt.Prunable {
-			if err := m.Prune(ctx); err != nil {
-				return nil, err
-			}
-			break
-		}
+	if err := m.pruneRun(ctx); err != nil {
+		return nil, err
 	}
 	res := &CleanupResult{}
 	if res.Default, err = m.repo.DefaultBranch(ctx); err != nil && !errors.Is(err, ErrNoDefaultBranch) {
@@ -271,8 +276,7 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 		if seen[id] || bead.State != domain.BeadStateClosed {
 			continue
 		}
-		branch := BranchName(bead)
-		exists, err := m.repo.BranchExists(ctx, branch)
+		branch, exists, err := m.resolveBranch(ctx, bead, "")
 		if err != nil {
 			// One unreadable ref must not abandon the rest of the pass.
 			res.Entries = append(res.Entries, CleanupEntry{
@@ -290,7 +294,7 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 		res.Entries = append(res.Entries, e)
 	}
 
-	if err := m.Prune(ctx); err != nil {
+	if err := m.pruneRun(ctx); err != nil {
 		return nil, err
 	}
 	sort.Slice(res.Entries, func(i, j int) bool { return res.Entries[i].BeadID < res.Entries[j].BeadID })
@@ -303,11 +307,17 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 // cleanupBranch deletes the closed bead's branch when it is fully merged
 // into one of bases and keep is false, recording the outcome on e. names
 // are the short names of bases, used in the reason. The branch is the one
-// the worktree actually held when that is known, and BranchName(bead)
-// otherwise: a bead retitled mid-run no longer names its own branch.
+// the worktree actually held when e.Branch says so, and resolveBranch's
+// answer otherwise: a bead retitled mid-run no longer names its own
+// branch.
 func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domain.Bead, bases, names []string, keep bool) {
 	if e.Branch == "" {
-		e.Branch = BranchName(bead)
+		branch, _, err := m.resolveBranch(ctx, bead, "")
+		if err != nil {
+			e.Err = err
+			return
+		}
+		e.Branch = branch
 	}
 	branch := e.Branch
 	if keep {
@@ -324,6 +334,7 @@ func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domai
 		return
 	}
 	if !exists {
+		e.Reason += fmt.Sprintf("; branch %s is already gone", branch)
 		return
 	}
 	mergedInto := ""
@@ -348,6 +359,96 @@ func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domai
 	}
 	e.BranchDeleted = true
 	e.Reason += fmt.Sprintf("; branch %s deleted (merged into %s)", branch, mergedInto)
+}
+
+// resolveBranch finds the branch a bead's work is on and whether the
+// repository still has it. BranchName(bead) slugs the bead's title, which
+// the product owner can change mid-run, so on its own it is a guess
+// (P4-12): the branch git records for the bead's worktree is the truth,
+// even when only a stale registration of a vanished directory is left, and
+// wtBranch carries it when there is one. Without it the "sc/<bead-id>"
+// namespace is searched for the single branch the bead can own. The guess
+// is returned with exists false when nothing is found or the namespace
+// holds several candidates, so callers always have a name to report.
+func (m *Manager) resolveBranch(ctx context.Context, bead domain.Bead, wtBranch string) (branch string, exists bool, err error) {
+	if wtBranch != "" {
+		exists, err = m.repo.BranchExists(ctx, wtBranch)
+		return wtBranch, exists, err
+	}
+	guess := BranchName(bead)
+	exists, err = m.repo.BranchExists(ctx, guess)
+	if err != nil || exists {
+		return guess, exists, err
+	}
+	found, err := m.beadBranches(ctx, bead.ID)
+	if err != nil {
+		return guess, false, err
+	}
+	if len(found) == 1 {
+		return found[0], true, nil
+	}
+	return guess, false, nil
+}
+
+// beadBranches lists the existing branches [BranchName] can produce for a
+// bead id: "sc/<id>" and "sc/<id>-<slug>" for any title the bead ever
+// carried. Another bead's branch never matches, because the id is followed
+// by a dash or by nothing at all.
+func (m *Manager) beadBranches(ctx context.Context, id domain.BeadID) ([]string, error) {
+	stem := "refs/heads/" + BranchPrefix + logging.SafeFileName(string(id))
+	out, err := m.repo.Git(ctx, "for-each-ref", "--format=%(refname:short)", stem, stem+"-*")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, line := range strings.Split(out, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			names = append(names, line)
+		}
+	}
+	return names, nil
+}
+
+// beadOnBranch returns a copy of bead for which [BranchName] reports
+// branch, so [Manager.Create] checks out the branch the work is actually
+// on instead of cutting a new one from the default branch. It reports
+// false when no title yields branch; the caller must then refuse rather
+// than orphan committed work. P4-12 removes the need for it by recording
+// the branch in the bead's metadata when the worktree is created.
+func beadOnBranch(bead domain.Bead, branch string) (domain.Bead, bool) {
+	suffix, ok := strings.CutPrefix(branch, BranchPrefix+logging.SafeFileName(string(bead.ID)))
+	if !ok {
+		return bead, false
+	}
+	out := bead
+	out.Title = strings.TrimPrefix(suffix, "-")
+	if BranchName(out) != branch {
+		return bead, false
+	}
+	return out, true
+}
+
+// pruneRun drops the stale registrations of the run's own worktrees and
+// deletes the empty husks under the manager's directory. Unlike
+// [Manager.Prune] it never runs a repository-wide "git worktree prune":
+// "git worktree remove" addresses one path, so the registrations of
+// worktrees the user keeps outside the run directory are left alone (D-23:
+// a run mutates nothing of the user's beyond its own).
+func (m *Manager) pruneRun(ctx context.Context) error {
+	all, err := m.listAll(ctx)
+	if err != nil {
+		return err
+	}
+	for _, wt := range all {
+		if !wt.Prunable || samePath(m.dir, wt.Path) || !isWithin(m.dir, wt.Path) {
+			continue
+		}
+		// Twice: once for a dirty tree, once for a locked one.
+		if _, err := m.repo.Git(ctx, "worktree", "remove", "--force", "--force", wt.Path); err != nil {
+			return err
+		}
+	}
+	return m.removeHusks()
 }
 
 // defaultBases returns the revisions a branch counts as landed on when it
@@ -459,8 +560,13 @@ type ResumeEntry struct {
 	// Err is the failure that stopped reattaching or applying, or nil.
 	Err error
 
-	// prLookedUp is true when gh was asked about the branch and answered.
+	// prLookedUp is true when gh was asked about the pull request and
+	// answered.
 	prLookedUp bool
+	// recreatedFresh is true when the recreated worktree was cut from the
+	// default branch because the bead had no branch yet, rather than
+	// checked out from one that already held work.
+	recreatedFresh bool
 }
 
 // Changed reports whether reconciliation moved the bead to another state.
@@ -683,7 +789,12 @@ func (r *Resumer) Resume(ctx context.Context, beadList []domain.Bead) (*ResumeRe
 	for _, b := range beadList {
 		listed[b.ID] = true
 	}
+	// The registrations git still holds, prunable ones included: they name
+	// the branch a bead's worktree was created on even when its directory
+	// is gone, which the bead's (mutable) title no longer does.
+	regs := make(map[domain.BeadID]Worktree, len(worktrees))
 	for _, wt := range worktrees {
+		regs[wt.BeadID] = wt
 		if !listed[wt.BeadID] {
 			res.Orphans = append(res.Orphans, wt)
 		}
@@ -691,7 +802,7 @@ func (r *Resumer) Resume(ctx context.Context, beadList []domain.Bead) (*ResumeRe
 
 	ghUsable := !r.noGH && remote != ""
 	for _, bead := range beadList {
-		e := r.inspect(ctx, bead, bases, &ghUsable, res)
+		e := r.inspect(ctx, bead, bases, regs, &ghUsable, res)
 		r.reconcile(&e, def)
 		r.apply(ctx, &e, def)
 		r.logger.InfoContext(ctx, "resume: reconciled bead",
@@ -702,10 +813,73 @@ func (r *Resumer) Resume(ctx context.Context, beadList []domain.Bead) (*ResumeRe
 	return res, nil
 }
 
+// findPR asks gh about the bead's pull request. The number the bead
+// already records is used when there is one: a head branch is derived from
+// the bead's title and stops naming the pull request the moment the title
+// changes (P4-12), while a number never moves. Otherwise the branch is
+// queried. state is "OPEN" or "MERGED", and the pull request is nil when
+// there is none in either state.
+func (r *Resumer) findPR(ctx context.Context, bead domain.Bead, branch string) (*PullRequest, string, error) {
+	number := bead.PRNumber
+	if number <= 0 {
+		// beads.PRMetadata leaves a zero number out, so an older bead can
+		// carry the url alone.
+		number = prNumberFromURL(bead.PRURL)
+	}
+	if number > 0 {
+		return r.gh.prByNumber(ctx, number)
+	}
+	return r.gh.FindPR(ctx, branch)
+}
+
+// prNumberFromURL reads the number out of a pull request URL
+// (".../pull/<n>", with any fragment or query ignored). It returns 0 when
+// the URL is empty or shaped differently.
+func prNumberFromURL(url string) int {
+	_, tail, ok := strings.Cut(url, "/pull/")
+	if !ok {
+		return 0
+	}
+	tail, _, _ = strings.Cut(tail, "/")
+	tail, _, _ = strings.Cut(tail, "#")
+	tail, _, _ = strings.Cut(tail, "?")
+	n, err := strconv.Atoi(tail)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	return n
+}
+
+// prByNumber looks one pull request up by number with
+// "gh pr view <n> --json ...", the query that does not depend on a branch
+// name. state is "OPEN" or "MERGED"; a pull request closed without merging
+// is reported as nil, like [GH.FindPR], so a retry opens a fresh one.
+func (g *GH) prByNumber(ctx context.Context, number int) (*PullRequest, string, error) {
+	if number <= 0 {
+		return nil, "", fmt.Errorf("gitx: prByNumber: %d is not a pull request number", number)
+	}
+	out, err := g.run(ctx, "", "pr", "view", strconv.Itoa(number), "--json", "number,url,state,title,headRefName")
+	if err != nil {
+		return nil, "", err
+	}
+	var ref struct {
+		ghPRRef
+		HeadRefName string `json:"headRefName"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &ref); err != nil {
+		return nil, "", fmt.Errorf("gitx: gh pr view %d: unexpected output %q: %w", number, out, err)
+	}
+	state := strings.ToUpper(strings.TrimSpace(ref.State))
+	if state != "OPEN" && state != "MERGED" {
+		return nil, "", nil
+	}
+	return &PullRequest{Number: ref.Number, URL: ref.URL, Title: ref.Title, HeadRef: ref.HeadRefName}, state, nil
+}
+
 // inspect gathers the git facts of one bead: branch, tip, landed, the
 // worktree (reattached or recreated), and the pull request when gh can
 // be used.
-func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string, ghUsable *bool, res *ResumeResult) ResumeEntry {
+func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string, regs map[domain.BeadID]Worktree, ghUsable *bool, res *ResumeResult) ResumeEntry {
 	repo := r.m.Repo()
 	e := ResumeEntry{Bead: bead, State: bead.State, Branch: BranchName(bead), WorktreeStatus: WorktreeMissing}
 	if bead.ID == "" {
@@ -714,16 +888,16 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 	}
 
 	// Worktree: reattach, or recreate for a bead that still needs one.
+	// git's registration is the authority on which branch the work is on,
+	// and it survives the directory: a bead retitled mid-run must not be
+	// reconciled against the branch its new title would name (P4-12).
+	wtBranch := regs[bead.ID].Branch
 	wt, err := r.m.Reattach(ctx, bead.ID)
 	switch {
 	case err == nil:
 		e.Worktree, e.WorktreeStatus = wt, WorktreeAttached
-		if wt.Branch != "" && wt.Branch != e.Branch {
-			// The bead's title changed since the worktree was created, so
-			// BranchName no longer names the branch the work is on. The
-			// worktree is the authority: reconcile the branch it holds
-			// rather than reporting a non-existent one as gone.
-			e.Branch = wt.Branch
+		if wt.Branch != "" {
+			wtBranch = wt.Branch
 		}
 	case !errors.Is(err, ErrWorktreeMissing):
 		e.Err = err
@@ -731,12 +905,12 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 	}
 
 	// Branch facts.
-	exists, err := repo.BranchExists(ctx, e.Branch)
+	branch, exists, err := r.m.resolveBranch(ctx, bead, wtBranch)
 	if err != nil {
 		e.Err = err
 		return e
 	}
-	e.BranchExists = exists
+	e.Branch, e.BranchExists = branch, exists
 	if exists {
 		if e.Head, err = repo.RevParse(ctx, "refs/heads/"+e.Branch); err != nil {
 			e.Err = err
@@ -769,7 +943,7 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 	// the pull request it was pushed to is still open or already merged, so
 	// gh is asked either way.
 	if *ghUsable && (bead.State == domain.BeadStateDelivering || bead.PRURL != "" || bead.PRNumber != 0) {
-		pr, state, err := r.gh.FindPR(ctx, e.Branch)
+		pr, state, err := r.findPR(ctx, bead, e.Branch)
 		if reason, ok := ghUnavailable(err); ok {
 			*ghUsable = false
 			res.Warnings = append(res.Warnings, "pull requests were not checked: "+reason)
@@ -784,17 +958,29 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 		}
 	}
 
-	// Recreate a vanished worktree when the bead will be worked on again.
+	// Recreate a vanished worktree when the bead will be worked on again,
+	// on the branch that holds its work: Manager.Create derives the branch
+	// from the bead's title, so a retitled bead would otherwise get a fresh
+	// branch cut from the default branch and its commits would be orphaned
+	// (P4-12). When no title can name that branch the worktree is left
+	// missing and the entry says why.
 	landedForGood := e.Landed && bead.State == domain.BeadStateDelivering
 	if e.WorktreeStatus == WorktreeMissing && activeOnResume(bead.State) && !landedForGood && (exists || bead.State == domain.BeadStateInProgress) {
-		wt, err := r.m.Create(ctx, bead)
-		if err != nil {
-			e.Err = fmt.Errorf("recreating the worktree: %w", err)
-		} else {
-			e.Worktree, e.WorktreeStatus = wt, WorktreeRecreated
-			if !exists {
-				e.BranchExists = true
-				e.Head = wt.Head
+		target, ok := beadOnBranch(bead, e.Branch)
+		switch {
+		case !ok:
+			e.Err = fmt.Errorf("recreating the worktree: the work is on branch %s, which the bead's title no longer names (P4-12)", e.Branch)
+		default:
+			wt, err := r.m.Create(ctx, target)
+			if err != nil {
+				e.Err = fmt.Errorf("recreating the worktree: %w", err)
+			} else {
+				e.Worktree, e.WorktreeStatus = wt, WorktreeRecreated
+				e.recreatedFresh = !exists
+				if !exists {
+					e.BranchExists = true
+					e.Head = wt.Head
+				}
 			}
 		}
 	}
@@ -827,17 +1013,18 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 // reconcile decides the bead's state from the facts inspect gathered.
 func (r *Resumer) reconcile(e *ResumeEntry, def string) {
 	bead := e.Bead
-	if e.Err != nil && e.Head == "" {
+	if e.Err != nil {
+		// Half the facts are missing, so any state this could name would be
+		// a guess. The entry carries the error for the caller.
+		e.Reason = "the bead could not be inspected, so its state is left alone"
 		return
 	}
 	switch {
 	case bead.State == domain.BeadStateClosed:
 		e.Reason = "already closed"
-	case e.PRState == "MERGED":
-		e.State = domain.BeadStateDelivering
+	case bead.State == domain.BeadStateDelivering && e.PRState == "MERGED":
 		e.Reason = fmt.Sprintf("PR #%d merged; re-run the PR delivery so its gate resolves and closes the bead", e.PR.Number)
-	case e.PRState == "OPEN":
-		e.State = domain.BeadStateDelivering
+	case bead.State == domain.BeadStateDelivering && e.PRState == "OPEN":
 		e.Reason = fmt.Sprintf("PR #%d is open; re-run the PR delivery to confirm its gate", e.PR.Number)
 	case bead.State == domain.BeadStateDelivering && e.Landed:
 		e.State, e.MergeSHA = domain.BeadStateClosed, e.Head
@@ -852,10 +1039,17 @@ func (r *Resumer) reconcile(e *ResumeEntry, def string) {
 		e.Reason = "the delivery did not complete; deliver again"
 	case e.Conflict:
 		e.Reason = fmt.Sprintf("the worktree is mid-rebase with conflicts in %s", strings.Join(e.ConflictFiles, ", "))
+	case e.WorktreeStatus == WorktreeRecreated && e.recreatedFresh:
+		e.Reason = fmt.Sprintf("the bead had no branch yet, so the worktree was created from %s", def)
 	case e.WorktreeStatus == WorktreeRecreated:
-		e.Reason = "the worktree was recreated from its branch"
+		e.Reason = fmt.Sprintf("the worktree was recreated from branch %s", e.Branch)
 	case e.WorktreeStatus == WorktreeMissing && activeOnResume(bead.State):
 		e.Reason = "the worktree is missing"
+	case e.PRState != "":
+		// A pull request recorded on a bead that is not delivering (a
+		// review round after a delivery attempt) is reported, never acted
+		// on: the bead stays in the loop it is in.
+		e.Reason = fmt.Sprintf("PR #%d is %s; the bead stays %s", e.PR.Number, strings.ToLower(e.PRState), bead.State)
 	default:
 		e.Reason = "unchanged"
 	}

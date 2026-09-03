@@ -1,8 +1,8 @@
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ ⚙ engineer · av-2 · claude/fable · implement r1                       2m0s ⠋ │
+│ ■ [1mengineer[0m · av-2 · claude/fable · implement r1                       2m0s ⠋ │
 │ warning: no test command configured                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-TRANSCRIPT · 1-14/14 · FOLLOWING ───────────────────────────────────────────────
+[1mTRANSCRIPT · 1-14/14 · FOLLOWING · F FOLLOW · ESC BACK[0m ─────────────────────────
 · fired engineer(claude/fable) at av-2 "Retry failed HTTP requests"
   step 01: editing internal/http/client.go
   step 02: editing internal/http/client.go

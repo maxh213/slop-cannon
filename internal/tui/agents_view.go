@@ -28,10 +28,26 @@ const (
 // [AgentsModel.Tick].
 var agentsSpinner = [...]string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
+// AgentsFrame is how long one spinner frame lasts: ten frames, so the
+// spinner turns once a second. Every frame is also what re-renders the
+// elapsed time of a live card, so the clock on a card never stands still
+// while an agent runs.
+const AgentsFrame = 100 * time.Millisecond
+
+// AgentsTickMsg advances the Agents view one spinner frame. Gen identifies
+// the ticker that produced it, so a tick left over from a ticker that has
+// already stopped is ignored rather than starting a second one.
+type AgentsTickMsg struct {
+	// Gen is the ticker generation the message was scheduled by.
+	Gen uint64
+}
+
 // AgentsOptions configure the Agents view.
 type AgentsOptions struct {
 	// NoColor renders without any ANSI colour, like --no-color and NO_COLOR.
 	NoColor bool
+	// Theme overrides the palette; nil means [EnvTheme] for NoColor.
+	Theme *Theme
 	// Now is the clock the elapsed time of a live agent is measured against;
 	// nil means [time.Now]. Tests pass a fixed clock so frames are stable.
 	Now func() time.Time
@@ -139,8 +155,9 @@ type agentsLine struct {
 // new model. The transcripts it collects are shared between copies, so a
 // copy made before an [AgentsModel.Apply] still sees the line.
 //
-// [Model] drives it with four calls: [AgentsModel.Resize] on a
-// [tea.WindowSizeMsg], [AgentsModel.Apply] on every [EventMsg],
+// [Model] drives it with six calls: [AgentsModel.Resize] on a
+// [tea.WindowSizeMsg], [AgentsModel.Apply] and [AgentsModel.Wake] on every
+// [EventMsg], [AgentsModel.Tick] on every [AgentsTickMsg],
 // [AgentsModel.Update] on a key press while [TabAgents] is up (before the
 // global bindings, so the transcript pane can claim up and down), and
 // [AgentsModel.View] for the main pane.
@@ -153,10 +170,21 @@ type AgentsModel struct {
 
 	width, height int
 	cursor        int
+	selected      domain.AgentID
 	detail        bool
 	follow        bool
 	offset        int
 	frame         int
+	ticking       bool
+	gen           uint64
+}
+
+// theme returns the palette the view renders with.
+func (o AgentsOptions) theme() *Theme {
+	if o.Theme != nil {
+		return o.Theme
+	}
+	return EnvTheme(o.NoColor)
 }
 
 // NewAgentsModel builds the Agents view. The zero [AgentsOptions] is valid.
@@ -174,7 +202,7 @@ func NewAgentsModel(opts AgentsOptions) AgentsModel {
 		maxLines = AgentsTranscriptLines
 	}
 	return AgentsModel{
-		styles:   newAgentsStyles(opts.NoColor),
+		styles:   newAgentsStyles(opts.theme()),
 		keys:     keys,
 		now:      now,
 		maxLines: maxLines,
@@ -192,12 +220,64 @@ func (v AgentsModel) Resize(w, h int) AgentsModel {
 	return v
 }
 
-// Tick advances the spinner of the live cards by one frame. P7-06 calls it
-// from the animation ticker; a still frame never calls it, so goldens are
-// reproducible.
-func (v AgentsModel) Tick() AgentsModel {
+// Wake starts the spinner ticker when st has at least one live agent and no
+// ticker is already in flight, and returns the command that schedules the
+// first frame (nil when there is nothing to animate). [Model] calls it after
+// folding every event, so the ticker the last exit stopped starts again on
+// the next spawn.
+func (v AgentsModel) Wake(st *State) (AgentsModel, tea.Cmd) {
+	if v.ticking || !agentsAnyLive(st) {
+		return v, nil
+	}
+	v.gen++
+	v.ticking = true
+	return v, v.tickCmd()
+}
+
+// Ticking reports whether a spinner ticker is in flight.
+func (v AgentsModel) Ticking() bool { return v.ticking }
+
+// Generation is the ticker generation the view accepts an [AgentsTickMsg]
+// from. It goes up every time the ticker is restarted, so a tick scheduled
+// by a ticker that has since stopped is ignored.
+func (v AgentsModel) Generation() uint64 { return v.gen }
+
+// tickCmd schedules the next spinner frame for this ticker generation.
+func (v AgentsModel) tickCmd() tea.Cmd {
+	gen := v.gen
+	return tea.Tick(AgentsFrame, func(time.Time) tea.Msg { return AgentsTickMsg{Gen: gen} })
+}
+
+// Tick advances the spinner of the live cards by one frame and returns the
+// command that schedules the next one. It stops (returning a nil command)
+// once nothing is live, so an idle run costs nothing. ok is false for a tick
+// from a ticker that has already been superseded or stopped, which the
+// caller should drop without redrawing.
+//
+// A still frame never ticks, so goldens stay reproducible.
+func (v AgentsModel) Tick(msg AgentsTickMsg, st *State) (AgentsModel, tea.Cmd, bool) {
+	if !v.ticking || msg.Gen != v.gen {
+		return v, nil, false
+	}
+	if !agentsAnyLive(st) {
+		v.ticking = false
+		return v, nil, true
+	}
 	v.frame = (v.frame + 1) % len(agentsSpinner)
-	return v
+	return v, v.tickCmd(), true
+}
+
+// agentsAnyLive reports whether any agent's subprocess is still running.
+func agentsAnyLive(st *State) bool {
+	if st == nil {
+		return false
+	}
+	for _, a := range st.Agents {
+		if a.Live() {
+			return true
+		}
+	}
+	return false
 }
 
 // Apply records what an event says about an agent's transcript: its output
@@ -226,7 +306,7 @@ func (v AgentsModel) push(id domain.AgentID, kind agentsStreamKind, text string)
 	if id == "" || v.lines == nil {
 		return
 	}
-	got := append(v.lines[id], agentsLine{kind: kind, text: text})
+	got := append(v.lines[id], agentsLine{kind: kind, text: agentsSanitize(text)})
 	if len(got) > v.maxLines {
 		got = append(got[:0], got[len(got)-v.maxLines:]...)
 	}
@@ -253,19 +333,20 @@ func (v AgentsModel) Update(msg tea.Msg, st *State, keys KeyMap) (AgentsModel, b
 		return v, false
 	}
 	order := agentsOrder(st)
-	v.cursor = clampIndex(v.cursor, len(order))
+	v.cursor = v.index(order)
 	if v.detail {
 		return v.updateTranscript(km, st, keys)
 	}
 	switch {
 	case key.Matches(km, keys.Up):
-		v.cursor = clampIndex(v.cursor-1, len(order))
+		v.moveTo(v.cursor-1, order)
 	case key.Matches(km, keys.Down):
-		v.cursor = clampIndex(v.cursor+1, len(order))
+		v.moveTo(v.cursor+1, order)
 	case key.Matches(km, v.keys.Open):
 		if len(order) == 0 {
 			return v, true
 		}
+		v.moveTo(v.cursor, order)
 		v.detail, v.follow, v.offset = true, true, 0
 	default:
 		return v, false
@@ -349,16 +430,51 @@ const agentsCardHeight = 4
 // Selected returns the agent the cursor is on.
 func (v AgentsModel) Selected(st *State) (AgentView, bool) {
 	order := agentsOrder(st)
-	i := clampIndex(v.cursor, len(order))
 	if len(order) == 0 {
 		return AgentView{}, false
 	}
-	return order[i], true
+	return order[v.index(order)], true
 }
 
-// Cursor returns the index of the selected agent in the view's own order:
-// the live agents in spawn order, then the finished ones, newest first.
+// index is the position of the selected agent in order: the position of the
+// pinned agent id while that agent is still listed, and the clamped cursor
+// otherwise. The order changes under the cursor — a live agent that ends
+// leaves the live section and joins the head of the history — so the pinned
+// id, not the index, is what keeps the selection (and an open transcript) on
+// the same agent.
+func (v AgentsModel) index(order []AgentView) int {
+	if v.selected != "" {
+		for i, a := range order {
+			if a.ID == v.selected {
+				return i
+			}
+		}
+	}
+	return clampIndex(v.cursor, len(order))
+}
+
+// moveTo puts the cursor on the i-th agent of order (clamped) and pins the
+// selection to that agent's id.
+func (v *AgentsModel) moveTo(i int, order []AgentView) {
+	v.cursor = clampIndex(i, len(order))
+	if len(order) > 0 {
+		v.selected = order[v.cursor].ID
+	}
+}
+
+// Cursor returns the index of the selected agent in the view's own order —
+// the live agents in spawn order, then the finished ones, newest first — as
+// of the last key press. [AgentsModel.Selected] is what follows the pinned
+// agent through a reordering; this is the row number the chrome asks for.
 func (v AgentsModel) Cursor() int { return v.cursor }
+
+// SelectedID returns the agent id the selection is pinned to, empty until
+// the cursor has been moved or a transcript opened.
+func (v AgentsModel) SelectedID() domain.AgentID { return v.selected }
+
+// Keys returns the view's own bindings, which [Model] adds to the `?`
+// overlay while the Agents view is up.
+func (v AgentsModel) Keys() AgentsKeyMap { return v.keys }
 
 // ShowingTranscript reports whether the transcript pane is open.
 func (v AgentsModel) ShowingTranscript() bool { return v.detail }
@@ -402,7 +518,7 @@ type agentsBlock struct {
 // selected entry is visible.
 func (v AgentsModel) cardList(st *State, w, h int) []string {
 	order := agentsOrder(st)
-	cursor := clampIndex(v.cursor, len(order))
+	cursor := v.index(order)
 	used, total := st.Ammo()
 
 	blocks := make([]agentsBlock, 0, len(order)+2)
@@ -412,14 +528,20 @@ func (v AgentsModel) cardList(st *State, w, h int) []string {
 			live++
 		}
 	}
+	// The first heading carries the hint for the key that opens a
+	// transcript: the pane is where the binding is discovered, since the
+	// footer has no room for the per-view keys (the `?` overlay lists them
+	// all).
+	hint := []key.Binding{v.keys.Open}
 	if live > 0 {
-		blocks = append(blocks, agentsBlock{lines: []string{v.heading(fmt.Sprintf("live · ammo %d/%d", used, total), w)}, index: -1})
+		blocks = append(blocks, agentsBlock{lines: []string{v.heading(agentsWithHint(fmt.Sprintf("live · ammo %d/%d", used, total), w, hint...), w)}, index: -1})
+		hint = nil
 	}
 	for i := 0; i < live; i++ {
 		blocks = append(blocks, agentsBlock{lines: v.card(order[i], w, i == cursor), index: i})
 	}
 	if past := len(order) - live; past > 0 {
-		blocks = append(blocks, agentsBlock{lines: []string{v.heading(fmt.Sprintf("history · %d", past), w)}, index: -1})
+		blocks = append(blocks, agentsBlock{lines: []string{v.heading(agentsWithHint(fmt.Sprintf("history · %d", past), w, hint...), w)}, index: -1})
 		for i := live; i < len(order); i++ {
 			blocks = append(blocks, agentsBlock{lines: []string{v.historyRow(order[i], w, i == cursor)}, index: i})
 		}
@@ -447,6 +569,27 @@ func agentsWindow(blocks []agentsBlock, cursor, h int) []string {
 	}
 	top = min(top, start)
 	return all[top:min(top+h, len(all))]
+}
+
+// agentsWithHint appends "<key> <what it does>" for each binding to a
+// heading, so the transcript keys are on screen rather than only in the
+// help overlay. A pane too narrow to show the hint and still leave room for
+// the heading's rule keeps the bare heading.
+func agentsWithHint(text string, w int, hints ...key.Binding) string {
+	parts := make([]string, 0, len(hints))
+	for _, b := range hints {
+		if h := b.Help(); h.Key != "" {
+			parts = append(parts, h.Key+" "+h.Desc)
+		}
+	}
+	if len(parts) == 0 {
+		return text
+	}
+	full := text + " · " + strings.Join(parts, " · ")
+	if lipgloss.Width(full)+4 > w {
+		return text
+	}
+	return full
 }
 
 // heading renders a section title with a rule filling the rest of the line.
@@ -479,7 +622,7 @@ func (v AgentsModel) card(a AgentView, w int, selected bool) []string {
 // truncating every field in the middle of a word.
 func (v AgentsModel) cardLeft(a AgentView, w int) string {
 	fields := []string{
-		v.styles.Glyph.Render(agentsGlyph(a)) + " " + v.styles.Who.Render(roleOf(a.Agent)),
+		v.styles.For(a).Render(agentsGlyph(a)) + " " + v.styles.Who.Render(roleOf(a.Agent)),
 		v.styles.Value.Render(orDash(string(a.Bead))),
 	}
 	if w >= agentsCartridgeWidth {
@@ -517,7 +660,7 @@ func (v AgentsModel) historyRow(a AgentView, w int, selected bool) string {
 		outcome = agentsShortOutcome(a)
 	}
 	left := strings.Join([]string{
-		v.styles.State(a.State).Render(agentsGlyph(a)) + " " + v.styles.Who.Render(roleOf(a.Agent)),
+		v.styles.For(a).Render(agentsGlyph(a)) + " " + v.styles.Who.Render(roleOf(a.Agent)),
 		v.styles.Value.Render(orDash(string(a.Bead))),
 		v.styles.Muted.Render(outcome),
 	}, v.styles.Muted.Render(" · "))
@@ -536,7 +679,7 @@ func (v AgentsModel) transcriptPane(st *State, w int) []string {
 	lines := v.lines[a.ID]
 	body := v.transcriptHeight()
 	top := v.viewport(len(lines), body)
-	out = append(out, v.heading(agentsScrollLabel(len(lines), top, body, v.follow), w))
+	out = append(out, v.heading(agentsWithHint(agentsScrollLabel(len(lines), top, body, v.follow), w, v.keys.Follow, v.keys.Close), w))
 	if len(lines) == 0 {
 		return append(out, v.styles.Muted.Render("no output yet"))
 	}
@@ -642,26 +785,110 @@ func agentsShortOutcome(a AgentView) string {
 	}
 }
 
-// agentsGlyph is the role glyph of a live agent and the outcome glyph of one
-// that ended.
+// agentsGlyph is the role glyph of a live agent and the lifecycle glyph of
+// one that ended. Both come from the theme (P7-07), so an agent reads the
+// same in this view as in the Graph tab; an agent with no role yet gets a
+// neutral dot rather than the theme's question mark, because its role is not
+// unknown, only unreported.
 func agentsGlyph(a AgentView) string {
 	switch a.State {
-	case domain.AgentStateFinished:
-		return "✔"
-	case domain.AgentStateFailed:
-		return "✘"
-	case domain.AgentStateKilled:
-		return "⊘"
+	case domain.AgentStateFinished, domain.AgentStateFailed, domain.AgentStateKilled:
+		return AgentStateGlyph(a.State)
 	}
-	switch a.Role {
-	case domain.RolePO:
-		return "◆"
-	case domain.RoleEngineer:
-		return "⚙"
-	case domain.RoleTester:
-		return "◎"
+	if g := RoleGlyph(a.Role); g != UnknownGlyph {
+		return g
+	}
+	return "•"
+}
+
+// agentsSanitize makes one line of subprocess output safe to draw. A
+// cartridge is a CLI, so its output can carry ANSI escape sequences,
+// carriage returns and other control characters; Lip Gloss counts all of
+// them as zero width, so a single such line would repaint or corrupt the
+// whole frame instead of staying inside its row. The view therefore keeps
+// printable text only: escape sequences go, a carriage return is honoured
+// the way a terminal honours it (what was written after the last one wins),
+// tabs become spaces, and the remaining control characters are dropped.
+func agentsSanitize(s string) string {
+	if s == "" {
+		return s
+	}
+	s = agentsApplyCR(agentsStripEscapes(s))
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\t':
+			b.WriteString("    ")
+		case r < 0x20, r == 0x7f, r >= 0x80 && r <= 0x9f:
+			// C0 controls, DEL and the C1 range: never printable.
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// agentsStripEscapes removes every ANSI escape sequence from s.
+func agentsStripEscapes(s string) string {
+	if !strings.ContainsRune(s, 0x1b) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if s[i] != 0x1b {
+			b.WriteByte(s[i])
+			i++
+			continue
+		}
+		i = agentsSkipEscape(s, i)
+	}
+	return b.String()
+}
+
+// agentsSkipEscape returns the index just past the escape sequence that
+// starts at i, which must be an ESC: a CSI sequence (ESC [ … final byte), an
+// OSC string (ESC ] … BEL or ST) or a two-character sequence.
+func agentsSkipEscape(s string, i int) int {
+	i++
+	if i >= len(s) {
+		return i
+	}
+	switch s[i] {
+	case '[':
+		for i++; i < len(s) && (s[i] < 0x40 || s[i] > 0x7e); i++ {
+		}
+		return min(i+1, len(s))
+	case ']':
+		for i++; i < len(s); i++ {
+			if s[i] == 0x07 {
+				return i + 1
+			}
+			if s[i] == 0x1b && i+1 < len(s) && s[i+1] == '\\' {
+				return i + 2
+			}
+		}
+		return i
 	default:
-		return "•"
+		return i + 1
+	}
+}
+
+// agentsApplyCR keeps only what a terminal would still show after the last
+// carriage return, so a progress line that rewrites itself lands as its
+// final state rather than as one very long line.
+func agentsApplyCR(s string) string {
+	for {
+		i := strings.LastIndexByte(s, '\r')
+		switch {
+		case i < 0:
+			return s
+		case i == len(s)-1:
+			s = s[:i] // a trailing CR wrote nothing after itself
+		default:
+			return s[i+1:]
+		}
 	}
 }
 
@@ -697,9 +924,8 @@ func clampIndex(i, n int) int {
 	return min(max(i, 0), n-1)
 }
 
-// agentsStyles is the palette of the Agents view. It is the view's own so
-// P7-07's theme work and this view can land independently; the colours are
-// the same 256-colour indices the chrome uses.
+// agentsStyles is the palette of the Agents view: the semantic entries of
+// the shared [Theme], named for what this view draws with them.
 type agentsStyles struct {
 	// Heading is a section title (live, history, transcript).
 	Heading lipgloss.Style
@@ -711,7 +937,9 @@ type agentsStyles struct {
 	Value lipgloss.Style
 	// Muted is de-emphasised text: cartridge, task, last line.
 	Muted lipgloss.Style
-	// Glyph is the role glyph of a live agent.
+	// Glyph is the fallback style of an agent's glyph, used only by a zero
+	// value that has no theme; every constructed palette colours a glyph by
+	// role or by state through the theme.
 	Glyph lipgloss.Style
 	// Spinner is the live-agent spinner.
 	Spinner lipgloss.Style
@@ -727,22 +955,34 @@ type agentsStyles struct {
 	Err lipgloss.Style
 	// Meta is a transcript note the view wrote itself.
 	Meta lipgloss.Style
-	// Good, Bad and Stopped colour the outcome glyph of a history row.
-	Good, Bad, Stopped lipgloss.Style
+	// theme is where the per-agent colours come from, so an agent state and
+	// a role read the same here as in every other view.
+	theme *Theme
 }
 
-// State returns the style of a finished agent's glyph.
+// State returns the theme's style for an agent lifecycle state.
 func (s agentsStyles) State(st domain.AgentState) lipgloss.Style {
-	switch st {
-	case domain.AgentStateFinished:
-		return s.Good
-	case domain.AgentStateFailed:
-		return s.Bad
-	case domain.AgentStateKilled:
-		return s.Stopped
-	default:
+	if s.theme == nil {
 		return s.Glyph
 	}
+	return s.theme.AgentStateStyle(st)
+}
+
+// Role returns the theme's style for an agent role.
+func (s agentsStyles) Role(r domain.Role) lipgloss.Style {
+	if s.theme == nil {
+		return s.Glyph
+	}
+	return s.theme.RoleStyle(r)
+}
+
+// For returns the style of an agent's glyph: its role while it is live, and
+// how it ended once it has.
+func (s agentsStyles) For(a AgentView) lipgloss.Style {
+	if a.Live() {
+		return s.Role(a.Role)
+	}
+	return s.State(a.State)
 }
 
 // Line returns the style of one transcript line.
@@ -757,44 +997,25 @@ func (s agentsStyles) Line(k agentsStreamKind) lipgloss.Style {
 	}
 }
 
-// newAgentsStyles returns the palette; with noColor every style is plain, so
-// the frame is identical to a NO_COLOR terminal.
-func newAgentsStyles(noColor bool) agentsStyles {
-	plain := lipgloss.NewStyle()
-	if noColor {
-		return agentsStyles{
-			Heading: plain.Bold(true), Rule: plain, Who: plain.Bold(true), Value: plain,
-			Muted: plain, Glyph: plain, Spinner: plain, Cursor: plain,
-			Card:         plain.Border(lipgloss.RoundedBorder()).Padding(0, 1),
-			CardSelected: plain.Border(lipgloss.RoundedBorder()).Padding(0, 1),
-			Out:          plain, Err: plain, Meta: plain,
-			Good: plain, Bad: plain, Stopped: plain,
-		}
-	}
-	const (
-		fg     = lipgloss.Color("15")
-		accent = lipgloss.Color("12")
-		dim    = lipgloss.Color("8")
-		warn   = lipgloss.Color("11")
-		good   = lipgloss.Color("10")
-		bad    = lipgloss.Color("9")
-	)
+// newAgentsStyles returns the palette, bound to t's renderer. Nothing here
+// may call [lipgloss.NewStyle]: that style would use the global renderer and
+// the view would then render for the ambient terminal rather than for t
+// (P7-09).
+func newAgentsStyles(t *Theme) agentsStyles {
 	return agentsStyles{
-		Heading:      lipgloss.NewStyle().Bold(true).Foreground(fg),
-		Rule:         lipgloss.NewStyle().Foreground(dim),
-		Who:          lipgloss.NewStyle().Bold(true).Foreground(fg),
-		Value:        lipgloss.NewStyle().Foreground(accent),
-		Muted:        lipgloss.NewStyle().Foreground(dim),
-		Glyph:        lipgloss.NewStyle().Foreground(accent),
-		Spinner:      lipgloss.NewStyle().Foreground(accent),
-		Cursor:       lipgloss.NewStyle().Foreground(accent),
-		Card:         lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(dim).Padding(0, 1),
-		CardSelected: lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(accent).Padding(0, 1),
-		Out:          lipgloss.NewStyle().Foreground(fg),
-		Err:          lipgloss.NewStyle().Foreground(warn),
-		Meta:         lipgloss.NewStyle().Foreground(dim),
-		Good:         lipgloss.NewStyle().Foreground(good),
-		Bad:          lipgloss.NewStyle().Foreground(bad),
-		Stopped:      lipgloss.NewStyle().Foreground(warn),
+		Heading:      t.Title(),
+		Rule:         t.Rule(),
+		Who:          t.Title(),
+		Value:        t.Accent(),
+		Muted:        t.Muted(),
+		Glyph:        t.Accent(),
+		Spinner:      t.Accent(),
+		Cursor:       t.Accent(),
+		Card:         t.Box(),
+		CardSelected: t.Box().BorderForeground(ColorAccent.Resolve(t.Profile())),
+		Out:          t.Text(),
+		Err:          t.Warning(),
+		Meta:         t.Muted(),
+		theme:        t,
 	}
 }

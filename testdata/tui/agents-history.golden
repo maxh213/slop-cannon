@@ -1,8 +1,8 @@
-HISTORY · 4 ────────────────────────────────────────────────────────────────────
-▌ ✘ tester/ux · av-2 · timeout (agent timeout after 15m)                   15m0s
-  ✔ tester/qa · av-2 · verdict (exit 0)                                      58s
-  ✔ engineer · av-2 · impl_report (exit 0)                                 1m36s
-  ✔ po · - · plan (exit 0)                                                   42s
+[1mHISTORY · 4 · ENTER TRANSCRIPT[0m ─────────────────────────────────────────────────
+▌ ✗ [1mtester/ux[0m · av-2 · timeout (agent timeout after 15m)                   15m0s
+  ✓ [1mtester/qa[0m · av-2 · verdict (exit 0)                                      58s
+  ✓ [1mengineer[0m · av-2 · impl_report (exit 0)                                 1m36s
+  ✓ [1mpo[0m · - · plan (exit 0)                                                   42s
 
 
 

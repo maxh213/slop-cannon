@@ -77,20 +77,27 @@ func (t TesterStatus) style(th *Theme) lipgloss.Style {
 	}
 }
 
-// FeedbackItemView is one feedback item together with everything said about
-// it later: the engineer's response and the product owner's ruling, which
-// arrive in their own events and are matched back onto the item by id.
+// FeedbackItemView is one statement of a feedback item — the same id raised
+// again in a later round is a separate occurrence — together with the
+// answers that occurrence drew: the engineer's response and the product
+// owner's ruling, which arrive in their own events in a later round and are
+// matched back onto the occurrence they reply to.
 type FeedbackItemView struct {
 	domain.FeedbackItem
 	// Lens is the tester that raised the item.
 	Lens domain.Lens
 	// Round is the review round the item was raised in.
 	Round int
-	// Response is the engineer's answer, when one arrived.
+	// Response is the engineer's answer to this occurrence, when one arrived.
 	Response *domain.Response
-	// Ruling is the product owner's arbitration, when the item was disputed
-	// all the way to one (D-08).
+	// ResponseRound is the round Response was given in, which is always later
+	// than Round; 0 when there is no response.
+	ResponseRound int
+	// Ruling is the product owner's arbitration on this occurrence, when the
+	// item was disputed all the way to one (D-08).
 	Ruling *domain.Arbitration
+	// RulingRound is the round Ruling was given in, 0 when there is none.
+	RulingRound int
 }
 
 // Blocking reports whether the item still stands between the bead and an
@@ -145,6 +152,45 @@ func (t FeedbackThread) occurrence(round int, lens domain.Lens, id string) (Feed
 	return t.Items[i], true
 }
 
+// feedbackStatedBy returns the index of the newest occurrence of the item
+// with the given id stated before round, or at it when inclusive, and -1
+// when the item was never stated that early. It is how an answer given in
+// one round finds the occurrence it replies to.
+func feedbackStatedBy(items []FeedbackItemView, round int, id string, inclusive bool) int {
+	best := -1
+	for i, it := range items {
+		if it.ID != id || it.Round > round || (!inclusive && it.Round == round) {
+			continue
+		}
+		if best < 0 || it.Round >= items[best].Round {
+			best = i
+		}
+	}
+	return best
+}
+
+// Answered returns the occurrence an engineer's response given in the given
+// round replies to: the newest statement of the item from an earlier round,
+// because the engineer answers the round it has just been handed.
+func (t FeedbackThread) Answered(round int, id string) (FeedbackItemView, bool) {
+	i := feedbackStatedBy(t.Items, round, id, false)
+	if i < 0 {
+		return FeedbackItemView{}, false
+	}
+	return t.Items[i], true
+}
+
+// Ruled returns the occurrence a product owner's ruling given in the given
+// round settles: the newest statement of the item up to and including that
+// round, because arbitration follows the verdict that held it (D-08).
+func (t FeedbackThread) Ruled(round int, id string) (FeedbackItemView, bool) {
+	i := feedbackStatedBy(t.Items, round, id, true)
+	if i < 0 {
+		return FeedbackItemView{}, false
+	}
+	return t.Items[i], true
+}
+
 // Latest returns the newest round of the thread.
 func (t FeedbackThread) Latest() (Round, bool) {
 	if len(t.Rounds) == 0 {
@@ -155,7 +201,10 @@ func (t FeedbackThread) Latest() (Round, bool) {
 
 // Item returns the most recent occurrence of the item with the given id: a
 // tester that repeats an item in a later round restates its status, so the
-// last one is the one that counts.
+// last one is the one that counts. Answers stay on the occurrence they
+// replied to, so the returned occurrence carries a response or a ruling
+// only when that is the one it answered; use [FeedbackThread.Answered] and
+// [FeedbackThread.Ruled] to walk the other way.
 func (t FeedbackThread) Item(id string) (FeedbackItemView, bool) {
 	for i := len(t.Items) - 1; i >= 0; i-- {
 		if t.Items[i].ID == id {
@@ -196,23 +245,6 @@ func feedbackBuildThread(s *State, th FeedbackThread) FeedbackThread {
 	if b, ok := s.Bead(th.Bead); ok {
 		th.Title, th.BeadState = b.Title, b.State
 	}
-	// Responses and rulings name the item they answer, not the round it was
-	// raised in, so they are collected across the whole thread first; the
-	// latest word on an item wins.
-	responses := make(map[string]domain.Response)
-	rulings := make(map[string]domain.Arbitration)
-	for _, r := range th.Rounds {
-		for _, resp := range r.Responses {
-			responses[resp.ItemID] = resp
-		}
-		for _, rule := range r.Rulings {
-			rulings[rule.ItemID] = rule
-		}
-		if r.Escalation != nil {
-			esc := *r.Escalation
-			th.Escalation = &esc
-		}
-	}
 	th.at = make(map[string]int)
 	latest := make(map[string]int)
 	for _, r := range th.Rounds {
@@ -225,16 +257,32 @@ func feedbackBuildThread(s *State, th FeedbackThread) FeedbackThread {
 			}
 		}
 	}
+	// Responses and rulings name the item they answer but not the occurrence
+	// of it, so each one is matched onto the statement it replied to: the
+	// newest one raised before the round the engineer spoke in, and — for a
+	// ruling, which follows the verdict that held the item (D-08) — the
+	// newest one up to and including its own round. Keying them by item id
+	// alone would let a later round overwrite what was said in an earlier
+	// one and lose the round it was said in.
+	for _, r := range th.Rounds {
+		for _, resp := range r.Responses {
+			if i := feedbackStatedBy(th.Items, r.Number, resp.ItemID, false); i >= 0 {
+				th.Items[i].Response, th.Items[i].ResponseRound = &resp, r.Number
+			}
+		}
+		for _, rule := range r.Rulings {
+			if i := feedbackStatedBy(th.Items, r.Number, rule.ItemID, true); i >= 0 {
+				th.Items[i].Ruling, th.Items[i].RulingRound = &rule, r.Number
+			}
+		}
+		if r.Escalation != nil {
+			esc := *r.Escalation
+			th.Escalation = &esc
+		}
+	}
 	// A tester that restates an item in a later round restates where it
-	// stands, so only its latest occurrence carries the answers it has
-	// collected since and only that status counts as open.
+	// stands, so only its latest occurrence's status counts as open.
 	for _, i := range latest {
-		if resp, ok := responses[th.Items[i].ID]; ok {
-			th.Items[i].Response = &resp
-		}
-		if rule, ok := rulings[th.Items[i].ID]; ok {
-			th.Items[i].Ruling = &rule
-		}
 		if !th.Items[i].Status.Settled() {
 			th.Open++
 		}
@@ -715,9 +763,12 @@ func (v FeedbackModel) roundHead(r Round) string {
 		t.Muted().Render(" · "+strings.Join(fields, " · "))
 }
 
-// roundBody renders everything said in one round: the engineer's report,
-// each tester's verdict with its items, and the product owner's escalation.
-// The newest round also names the testers it is still waiting for.
+// roundBody renders everything said in one round, in the order it was said:
+// the engineer's report, its responses to the items the previous round
+// raised, each tester's verdict with its items, the product owner's rulings
+// and its escalation. Answers are drawn in the round they were given, not
+// in the round the item they answer was raised in. The newest round also
+// names the testers it is still waiting for.
 func (v FeedbackModel) roundBody(th FeedbackThread, r Round, last bool, w int) []string {
 	t := v.theme
 	out := make([]string, 0, 8)
@@ -738,8 +789,20 @@ func (v FeedbackModel) roundBody(th FeedbackThread, r Round, last bool, w int) [
 		}
 	}
 
+	for _, resp := range r.Responses {
+		out = append(out, v.responseLine(resp, w))
+		answered, ok := th.Answered(r.Number, resp.ItemID)
+		out = append(out, v.answerRef(answered, ok, w)...)
+	}
+
 	for _, verdict := range r.Verdicts {
 		out = append(out, v.verdictLines(th, r.Number, verdict, w)...)
+	}
+
+	for _, rule := range r.Rulings {
+		out = append(out, v.rulingLine(rule, w))
+		ruled, ok := th.Ruled(r.Number, rule.ItemID)
+		out = append(out, v.answerRef(ruled, ok, w)...)
 	}
 
 	if r.Escalation != nil {
@@ -819,17 +882,13 @@ func (v FeedbackModel) itemLines(iv FeedbackItemView, w int) []string {
 		}
 	}
 
-	if iv.Response != nil {
-		add("      " + v.responseLine(*iv.Response, w))
-	}
-	if iv.Ruling != nil {
-		add("      " + v.rulingLine(*iv.Ruling, w))
-	}
 	return out
 }
 
-// responseLine renders the engineer's answer to an item: the arrow marks a
-// fix, the hook marks a pushback (D-08) and the circle a wontfix.
+// responseLine renders the engineer's answer to one item, in the round the
+// engineer gave it: the arrow marks a fix, the hook marks a pushback (D-08)
+// and the circle a wontfix. The item id says which item is being answered;
+// [FeedbackModel.answerRef] spells the occurrence out in the details view.
 func (v FeedbackModel) responseLine(r domain.Response, w int) string {
 	t := v.theme
 	glyph, style := "→", t.Success()
@@ -839,19 +898,19 @@ func (v FeedbackModel) responseLine(r domain.Response, w int) string {
 	case domain.ActionWontfix:
 		glyph, style = "⊘", t.Muted()
 	}
-	line := style.Render(glyph + " " + prsPad(r.Action.String(), 8))
+	line := "  " + style.Render(glyph+" "+prsPad(r.Action.String(), 8)) + " " + t.Muted().Render(prsPad(r.ItemID, 9))
 	if r.Rationale != "" {
 		rationale := r.Rationale
 		if !v.details {
-			rationale = prsTruncate(rationale, max(w-lipgloss.Width(line)-7, 0))
+			rationale = prsTruncate(rationale, max(w-lipgloss.Width(line)-1, 0))
 		}
 		line += " " + t.Muted().Render(rationale)
 	}
-	return line
+	return clip(line, w)
 }
 
 // rulingLine renders the product owner's binding decision on a disputed
-// item (D-08).
+// item (D-08), in the round the ruling was made.
 func (v FeedbackModel) rulingLine(a domain.Arbitration, w int) string {
 	t := v.theme
 	style := t.Accent()
@@ -861,18 +920,31 @@ func (v FeedbackModel) rulingLine(a domain.Arbitration, w int) string {
 	case domain.RulingUpholdEngineer:
 		style = t.Success()
 	}
-	line := style.Render("⚖ " + prsPad(a.Ruling.String(), 15))
+	line := "  " + style.Render("⚖ "+prsPad(a.Ruling.String(), 16)) + " " + t.Muted().Render(prsPad(a.ItemID, 9))
 	tail := a.Instruction
 	if tail == "" {
 		tail = a.Rationale
 	}
 	if tail != "" {
 		if !v.details {
-			tail = prsTruncate(tail, max(w-lipgloss.Width(line)-7, 0))
+			tail = prsTruncate(tail, max(w-lipgloss.Width(line)-1, 0))
 		}
 		line += " " + t.Muted().Render(tail)
 	}
-	return line
+	return clip(line, w)
+}
+
+// answerRef names the occurrence a response or a ruling replies to, so the
+// details view can point back at the round and the wording of the item that
+// drew it. It renders nothing outside the details view, and nothing when
+// the answer names an item no verdict raised.
+func (v FeedbackModel) answerRef(iv FeedbackItemView, ok bool, w int) []string {
+	if !v.details || !ok {
+		return nil
+	}
+	t := v.theme
+	ref := fmt.Sprintf("re: round %d · %s · %s · %s", iv.Round, iv.Lens, iv.Severity, iv.Title)
+	return []string{clip("      "+t.Muted().Render(ref), w)}
 }
 
 // escalationLines render the product owner's ruling after the review round

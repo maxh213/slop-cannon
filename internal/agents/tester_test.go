@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -870,4 +871,239 @@ func TestTesterPromptShowsOrchestratorNotes(t *testing.T) {
 	p, err = agents.BuildTesterPrompt(req)
 	require.NoError(t, err)
 	assert.NotContains(t, p.Text, "Notes from the orchestrator", "blank notes add no section")
+}
+
+// tsLargePatch builds a plausible unified diff of at least n bytes, so the
+// prompt budget has something real to push back on.
+func tsLargePatch(n int) string {
+	var b strings.Builder
+	b.WriteString("--- a/stats/stats.go\n+++ b/stats/stats.go\n@@ -40,6 +40,17 @@\n")
+	for i := 0; b.Len() < n; i++ {
+		fmt.Fprintf(&b, "+\tsum += xs[%d] * weights[%d] // accumulate the weighted sample %d\n", i, i, i)
+	}
+	return b.String()
+}
+
+// tsLargeDiff is a diff whose patch is under gitx's byte cap — so gitx does
+// not mark it truncated — but far over any sane prompt budget.
+func tsLargeDiff(n int) *gitx.Diff {
+	d := tsDiff()
+	d.Patch = tsLargePatch(n)
+	d.Bytes = len(d.Patch)
+	return d
+}
+
+// TestTesterReReviewRefusesASettledRulesItem is the re-review half of the
+// rules rule: a `rules` blocker can never be accepted, whichever mode is
+// judging it, and it may not be rewritten into something smaller either.
+func TestTesterReReviewRefusesASettledRulesItem(t *testing.T) {
+	t.Parallel()
+	items := tsItems(domain.LensQA)
+	rules := items[1] // qa-r1-2, category rules, severity blocker
+
+	cases := []struct {
+		name    string
+		items   []domain.FeedbackItem
+		outcome domain.VerdictOutcome
+		want    string
+	}{
+		{
+			name:    "accepting the rules item",
+			outcome: domain.VerdictApprove,
+			items: []domain.FeedbackItem{
+				tsWithStatus(items[0], domain.ItemResolved, "Median now copies before sorting."),
+				tsWithStatus(rules, domain.ItemAccepted, "Fair enough, the name says it all."),
+			},
+			want: "cannot be accepted",
+		},
+		{
+			name:    "downgrading the rules item and calling it resolved",
+			outcome: domain.VerdictApprove,
+			items: []domain.FeedbackItem{
+				tsWithStatus(items[0], domain.ItemResolved, "Median now copies before sorting."),
+				func() domain.FeedbackItem {
+					it := tsWithStatus(rules, domain.ItemResolved, "Downgraded to taste.")
+					it.Category = "style"
+					it.Severity = domain.SeverityNit
+					return it
+				}(),
+			},
+			want: "original severity",
+		},
+		{
+			name:    "dropping the rules category off a carried item",
+			outcome: domain.VerdictChanges,
+			items: []domain.FeedbackItem{
+				tsWithStatus(items[0], domain.ItemOpen, "still sorts in place"),
+				func() domain.FeedbackItem {
+					it := tsWithStatus(rules, domain.ItemAccepted, "Not really a rules thing.")
+					it.Category = "docs"
+					return it
+				}(),
+			},
+			want: "original category",
+		},
+		{
+			name:    "a new item born settled",
+			outcome: domain.VerdictApprove,
+			items: []domain.FeedbackItem{
+				tsWithStatus(items[0], domain.ItemResolved, "Median now copies before sorting."),
+				tsWithStatus(rules, domain.ItemResolved, "The doc comment is there now."),
+				{ID: "qa-r2-9", Severity: domain.SeverityMajor, Title: "New thing", Detail: "Noticed in passing.", Status: domain.ItemAccepted},
+			},
+			want: "a new problem starts open",
+		},
+		{
+			name:    "holding a carried item without a reason",
+			outcome: domain.VerdictChanges,
+			items: []domain.FeedbackItem{
+				tsWithStatus(items[0], domain.ItemResolved, "Median now copies before sorting."),
+				tsWithStatus(rules, domain.ItemHeld, "   "),
+			},
+			want: "gives no reason",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			req := tsRequest(domain.LensQA, agents.TesterModeReReview)
+			v := domain.Verdict{Outcome: tc.outcome, Summary: "Round two.", Items: tc.items}
+
+			err := agents.ValidateTesterVerdict(req, agents.NormaliseTesterVerdict(req, v))
+			require.Error(t, err, "the verdict must not validate")
+			assert.Contains(t, err.Error(), tc.want)
+			pe, ok := structured.AsParseError(err)
+			require.True(t, ok, "want a *structured.ParseError so P5-08 can retry: %v", err)
+			assert.NotEmpty(t, pe.Feedback())
+
+			_, _, err = agents.ParseTesterVerdict(req, tsOutput(t, v))
+			require.Error(t, err, "ParseTesterVerdict must refuse what ValidateTesterVerdict refuses")
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+// TestTesterReReviewAcceptsAWellFormedRound is the positive half: an
+// ordinary item may be accepted on a re-review, a new item may be raised as
+// long as it is open, and a carried item that does not restate its category
+// is not treated as a rewrite.
+func TestTesterReReviewAcceptsAWellFormedRound(t *testing.T) {
+	t.Parallel()
+	req := tsRequest(domain.LensUX, agents.TesterModeReReview)
+	items := tsItems(domain.LensUX)
+	carried := tsWithStatus(items[0], domain.ItemAccepted, "The pushback is right: callers do own the slice.")
+	carried.Category = "" // the schema lets a tester omit it
+
+	v := domain.Verdict{Outcome: domain.VerdictChanges, Summary: "One left.", Items: []domain.FeedbackItem{
+		carried,
+		tsWithStatus(items[1], domain.ItemOpen, "The doc comment is still missing."),
+		{ID: "ux-r2-1", Severity: domain.SeverityMinor, Title: "The error text has no next step", Detail: "Say what to do.", Status: domain.ItemOpen},
+	}}
+	got, _, err := agents.ParseTesterVerdict(req, tsOutput(t, v))
+	require.NoError(t, err)
+	assert.Equal(t, "correctness", got.Items[0].Category, "an omitted category is filled in from the item you were given")
+	assert.Equal(t, domain.ItemAccepted, got.Items[0].Status)
+	require.Len(t, agents.TesterOpenItems(got), 2)
+}
+
+// TestTesterReReviewPromptSaysRulesCannotBeAccepted pins the wording that
+// keeps the model out of the hole the validator now closes.
+func TestTesterReReviewPromptSaysRulesCannotBeAccepted(t *testing.T) {
+	t.Parallel()
+	for _, lens := range domain.Lenses() {
+		p, err := agents.BuildTesterPrompt(tsRequest(lens, agents.TesterModeReReview))
+		require.NoError(t, err)
+		assert.Contains(t, p.Text, "cannot be `accepted` and cannot be downgraded", lens)
+		assert.Contains(t, p.Text, "**original id**, `severity` and `category`", lens)
+		assert.Contains(t, p.Text, "only an item you raised before may be settled", lens)
+	}
+}
+
+// TestTesterPromptShrinksAnOversizedDiff covers the diff ladder: a patch
+// under gitx's cap but over the prompt budget is cut down rather than fired
+// whole, and what was cut is reported in Truncations.
+func TestTesterPromptShrinksAnOversizedDiff(t *testing.T) {
+	t.Parallel()
+	req := tsRequest(domain.LensQA, agents.TesterModeReview)
+	req.Diff = tsLargeDiff(150 << 10)
+	require.False(t, req.Diff.Truncated, "gitx keeps a patch this size, so only the prompt budget can bound it")
+
+	p, err := agents.BuildTesterPrompt(req)
+	require.NoError(t, err)
+	assert.True(t, p.Fits(), "the ladder must bring the prompt inside the budget: %d/%d", p.Tokens, p.MaxTokens)
+	assert.LessOrEqual(t, p.Tokens, p.MaxTokens)
+	assert.Less(t, len(p.Text), len(req.Diff.Patch), "the whole patch is still in the prompt")
+	assert.Contains(t, p.Text, "too large for this prompt's budget")
+	assert.Contains(t, strings.Join(p.Truncations, "\n"), "diff patch",
+		"the caller must be told the diff was cut: %v", p.Truncations)
+
+	t.Run("the summary survives when even a slice does not fit", func(t *testing.T) {
+		t.Parallel()
+		small := tsRequest(domain.LensQA, agents.TesterModeReview)
+		small.Diff = tsLargeDiff(150 << 10)
+		small.Budget = prompt.Budget{MaxTokens: 2500}
+		p, err := agents.BuildTesterPrompt(small)
+		require.NoError(t, err)
+		assert.NotContains(t, p.Text, "```diff", "the patch is gone")
+		assert.Contains(t, p.Text, "M stats/stats.go  +12 -1", "the per-file summary stays")
+		assert.Contains(t, strings.Join(p.Truncations, "\n"), "diff patch omitted")
+	})
+
+	t.Run("a diff that fits is untouched", func(t *testing.T) {
+		t.Parallel()
+		p, err := agents.BuildTesterPrompt(tsRequest(domain.LensQA, agents.TesterModeReview))
+		require.NoError(t, err)
+		assert.Contains(t, p.Text, "func Median(xs []float64) float64 {")
+		assert.NotContains(t, p.Text, "too large for this prompt's budget")
+		assert.Empty(t, p.Truncations)
+	})
+}
+
+// TestTesterRunSpecRefusesAnOverBudgetPrompt is the other half of the budget
+// fix: when even the most degraded prompt is over budget the caller is told,
+// rather than firing a prompt nobody measured.
+func TestTesterRunSpecRefusesAnOverBudgetPrompt(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	req := tsRequest(domain.LensQA, agents.TesterModeReview)
+	req.Workdir = dir
+	req.Diff = tsLargeDiff(150 << 10)
+	req.Budget = prompt.Budget{MaxTokens: 200}
+
+	p, err := agents.BuildTesterPrompt(req)
+	require.NoError(t, err)
+	require.False(t, p.Fits(), "the fixture must be over budget for this test to mean anything")
+
+	spec, p, err := agents.TesterRunSpec(req)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, agents.ErrPromptOverBudget)
+	assert.Contains(t, err.Error(), "200")
+	assert.NoError(t, spec.Validate(), "the spec is still usable; the caller decides whether to fire it")
+	assert.Equal(t, p.Text, spec.Prompt)
+
+	t.Run("the firing checks the tool policy first", func(t *testing.T) {
+		t.Parallel()
+		adapter, err := mock.NewAdapter(mock.Name, mock.NewScenario("over budget"))
+		require.NoError(t, err)
+		spec, _, en, err := agents.TesterFiring(req, adapter)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, agents.ErrPromptOverBudget)
+		assert.Equal(t, cartridge.ToolReadExec, en.Policy)
+		assert.NoError(t, en.Check(), "the policy holds; only the budget does not")
+		assert.NoError(t, spec.Validate())
+
+		_, _, _, err = agents.TesterFiring(req, tsToollessCartridge{})
+		require.Error(t, err)
+		assert.ErrorIs(t, err, agents.ErrCopyWorktreeUnimplemented,
+			"an unenforceable policy outranks an over-budget prompt")
+	})
+
+	t.Run("a prompt inside its budget fires without an error", func(t *testing.T) {
+		t.Parallel()
+		ok := tsRequest(domain.LensQA, agents.TesterModeReview)
+		ok.Workdir = dir
+		_, p, err := agents.TesterRunSpec(ok)
+		require.NoError(t, err)
+		assert.True(t, p.Fits())
+	})
 }

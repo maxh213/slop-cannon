@@ -785,7 +785,7 @@ func renderEngineerConflict(c EngineerConflict) string {
 	}
 	fmt.Fprintf(&b, "- Resume the rebase with: `%s`\n", c.continueCommand())
 	if out := strings.TrimRight(strings.TrimSpace(c.Output), "\n"); out != "" {
-		fmt.Fprintf(&b, "\nWhat git reported:\n\n```\n%s\n```\n", out)
+		fmt.Fprintf(&b, "\nWhat git reported:\n\n%s", prompt.Fenced("", out))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }

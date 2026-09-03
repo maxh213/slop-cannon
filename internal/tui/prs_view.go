@@ -151,9 +151,18 @@ type PRRow struct {
 	// [ChecksUnknown] for an external pull request, which has [PRRow.Review]
 	// instead.
 	Checks CheckStatus
-	// Review is the outcome of the review the cannon posted on an external
-	// pull request; it is empty until a verdict has arrived.
+	// Review is the outcome of the consolidated review the cannon posted on
+	// an external pull request (D-11). It stays empty while the round is
+	// still collecting verdicts, because a review is posted once, for the
+	// whole round: reporting the outcome of a half-finished round would show
+	// a review that was never posted and could still flip.
 	Review domain.VerdictOutcome
+	// ReviewsIn is how many of the round's verdicts have arrived.
+	ReviewsIn int
+	// ReviewsExpected is how many the round announced it was waiting for; it
+	// is 0 when the round never said, so the view cannot tell whether the
+	// review is complete.
+	ReviewsExpected int
 }
 
 // PR renders the pull-request column: "#42", "ext #77" for a pull request
@@ -172,15 +181,24 @@ func (r PRRow) PR() string {
 }
 
 // Note renders the CHECKS column: the check status for the cannon's own
-// deliveries, and the posted review outcome for external pull requests.
+// deliveries, and for an external pull request the outcome of the review the
+// cannon posted on it. While the review round is still running it shows how
+// many verdicts are in ("1/3", or "1/?" when the round never announced its
+// lenses) rather than an outcome that has not been posted.
 func (r PRRow) Note() string {
-	if r.External {
-		if r.Review == "" {
-			return "-"
-		}
-		return r.Review.String()
+	if !r.External {
+		return r.Checks.String()
 	}
-	return r.Checks.String()
+	switch {
+	case r.Review != "":
+		return r.Review.String()
+	case r.ReviewsExpected > 0:
+		return fmt.Sprintf("%d/%d", r.ReviewsIn, r.ReviewsExpected)
+	case r.ReviewsIn > 0:
+		return fmt.Sprintf("%d/?", r.ReviewsIn)
+	default:
+		return "-"
+	}
 }
 
 // Ref renders the REF column: the pull request URL when there is one, else
@@ -224,13 +242,22 @@ func prRow(s *State, d Delivery) PRRow {
 	if b, ok := s.Bead(d.Bead); ok {
 		r.Title, r.BeadState = b.Title, b.State
 	}
-	r.Review = prReviewOutcome(s, d)
+	outcome, in, expected := prReviewProgress(s, d)
+	r.ReviewsIn, r.ReviewsExpected = in, expected
+	// The review is posted once, when the round is complete; a closed review
+	// bead is complete whatever the round said it was waiting for.
+	if prReviewPosted(in, expected) || r.BeadState == domain.BeadStateClosed {
+		r.Review = outcome
+	}
 	r.Status = prStatus(s, r)
 	r.Checks = prChecks(s, r)
 	return r
 }
 
-// prStatus picks the status word for a row.
+// prStatus picks the status word for a row. An external pull request only
+// counts as reviewed once [PRRow.Review] is set, that is once the round it
+// is being reviewed in has finished and the consolidated review has gone
+// out; until then it is still being reviewed.
 func prStatus(s *State, r PRRow) DeliveryStatus {
 	switch {
 	case r.External:
@@ -269,6 +296,11 @@ func prChecks(s *State, r PRRow) CheckStatus {
 	switch {
 	case r.Merged && r.Number > 0:
 		return ChecksPassed
+	// Nothing is running on a delivery nobody is working on any more, so an
+	// abandoned or parked pull request keeps its last known check status
+	// (failing, conflict) and otherwise says nothing.
+	case r.Status == DeliveryFailed || r.Status == DeliveryNeedsHuman:
+		return ChecksUnknown
 	case r.URL != "":
 		return ChecksPending
 	default:
@@ -289,28 +321,41 @@ func prLastRoundKind(s *State, bead domain.BeadID) events.RoundKind {
 	return kind
 }
 
-// prReviewOutcome consolidates the verdicts of the bead's latest round the
-// way gitx.BuildReview does: one "changes" verdict makes the posted review a
-// request for changes, otherwise it is an approval. It returns "" while no
-// verdict has arrived.
-func prReviewOutcome(s *State, d Delivery) domain.VerdictOutcome {
+// prReviewProgress consolidates the verdicts of the bead's latest round the
+// way gitx.BuildReview does — one "changes" verdict makes the whole review a
+// request for changes, otherwise it is an approval — and reports how far the
+// round has got: how many verdicts arrived and how many the round said it
+// was waiting for (0 when it never announced its lenses). The outcome is
+// only what the verdicts so far add up to; [prReviewPosted] says whether it
+// is the review that was actually posted.
+func prReviewProgress(s *State, d Delivery) (outcome domain.VerdictOutcome, received, expected int) {
 	best, found := 0, false
-	var verdicts []domain.Verdict
+	var round Round
 	for _, rd := range s.Rounds {
 		if rd.Bead != d.Bead || len(rd.Verdicts) == 0 || rd.Number < best {
 			continue
 		}
-		best, found, verdicts = rd.Number, true, rd.Verdicts
+		best, found, round = rd.Number, true, rd
 	}
 	if !found {
-		return ""
+		return "", 0, 0
 	}
-	for _, v := range verdicts {
+	outcome = domain.VerdictApprove
+	for _, v := range round.Verdicts {
 		if v.Outcome == domain.VerdictChanges {
-			return domain.VerdictChanges
+			outcome = domain.VerdictChanges
+			break
 		}
 	}
-	return domain.VerdictApprove
+	return outcome, len(round.Verdicts), len(round.Lenses)
+}
+
+// prReviewPosted reports whether a round with the given verdict counts is
+// finished, which is when the testers' single consolidated review goes out
+// (D-11). A round that never announced its lenses can never be known to be
+// finished, so it is not posted on that evidence alone.
+func prReviewPosted(received, expected int) bool {
+	return expected > 0 && received >= expected
 }
 
 // PRsKeyMap are the bindings the PRs view adds to the global [KeyMap].
@@ -372,10 +417,6 @@ const (
 	prsDefaultHeight = 20
 )
 
-// prsWideWidth is the pane width at which the list shows the REF column in
-// full; below it the reference moves to the detail line.
-const prsWideWidth = 80
-
 // Column widths of the list, in the order the columns appear. The status
 // column carries a glyph as well as a word.
 const (
@@ -384,6 +425,27 @@ const (
 	prsStatusWidth = 17
 	prsNoteWidth   = 9
 )
+
+// prsCursorWidth is the two cells every row spends on the cursor marker.
+const prsCursorWidth = 2
+
+// prsRefColumn is the column the REF field starts in: the four fixed
+// columns plus the single space between each of them.
+const prsRefColumn = prsBeadWidth + prsPRWidth + prsStatusWidth + prsNoteWidth + 4
+
+// prsMinRef is the narrowest REF column worth having. A pull request URL is
+// around forty columns ("https://github.com/acme/app/pull/1234"), and a REF
+// column that cuts every URL is worse than none: the detail line shows the
+// whole URL instead, where it can be read and copied.
+const prsMinRef = 40
+
+// prsWideWidth is the pane width at which the list shows the REF column;
+// below it the reference moves to the detail line. At the canonical 80×24
+// terminal there is no room for it, so 80 columns is a narrow pane.
+const prsWideWidth = prsCursorWidth + prsRefColumn + prsMinRef
+
+// prsRefWidth is how many columns the REF field has in a pane w wide.
+func prsRefWidth(w int) int { return w - prsCursorWidth - prsRefColumn }
 
 // PRsModel is the PRs view (P7-05): the safety indicator, the deliveries of
 // the run with their pull request, check status and merge, the external
@@ -503,7 +565,7 @@ func (v PRsModel) OpenCmd(st *State) tea.Cmd {
 func (v PRsModel) View(st *State) string {
 	w, h := v.width, v.height
 	rows := PRRows(st)
-	head := v.summary(st, rows)
+	head := v.summary(st, rows, w)
 	if len(rows) == 0 {
 		return fit(head+"\n"+v.theme.Muted().Render(emptyText[TabPRs]), w, h)
 	}
@@ -532,38 +594,60 @@ func (v PRsModel) View(st *State) string {
 }
 
 // summary renders the safety indicator, what safety means for a delivery,
-// and the counts.
-func (v PRsModel) summary(st *State, rows []PRRow) string {
+// and the counts. When all three do not fit in w the sentence explaining
+// safety gives way, because it is the only part the counts cannot replace
+// and the only part that is the same on every run.
+func (v PRsModel) summary(st *State, rows []PRRow, w int) string {
 	safety := st != nil && st.Run.Config.Safety
-	fields := []string{"safety " + v.theme.Accent().Render(onOff(safety))}
+	indicator := "safety " + v.theme.Accent().Render(onOff(safety))
+	explain := "merged straight to the default branch"
 	if safety {
-		fields = append(fields, v.theme.Muted().Render("a human merges every PR (D-20)"))
-	} else {
-		fields = append(fields, v.theme.Muted().Render("merged straight to the default branch"))
+		explain = "a human merges every PR (D-20)"
 	}
-	var merged, waiting, external int
+	counts := prsCounts(rows)
+	sep := v.theme.Rule().Render(" · ")
+	full := strings.Join([]string{indicator, v.theme.Muted().Render(explain), counts}, sep)
+	if lipgloss.Width(full) <= w {
+		return full
+	}
+	return strings.Join([]string{indicator, counts}, sep)
+}
+
+// prsCounts renders the delivery counts. Work nobody is pushing any more is
+// counted apart from the work in flight: an abandoned or parked delivery is
+// not on its way anywhere.
+func prsCounts(rows []PRRow) string {
+	var merged, inFlight, parked, abandoned, external int
 	for _, r := range rows {
 		switch {
 		case r.External:
 			external++
 		case r.Status == DeliveryMerged || r.Status == DeliveryClosed:
 			merged++
+		case r.Status == DeliveryNeedsHuman:
+			parked++
+		case r.Status == DeliveryFailed:
+			abandoned++
 		default:
-			waiting++
+			inFlight++
 		}
 	}
 	counts := []string{fmt.Sprintf("%d delivered", len(rows)-external)}
-	if merged > 0 {
-		counts = append(counts, fmt.Sprintf("%d merged", merged))
+	for _, c := range []struct {
+		n    int
+		word string
+	}{
+		{merged, "merged"},
+		{inFlight, "in flight"},
+		{parked, "needs a human"},
+		{abandoned, "abandoned"},
+		{external, "external"},
+	} {
+		if c.n > 0 {
+			counts = append(counts, fmt.Sprintf("%d %s", c.n, c.word))
+		}
 	}
-	if waiting > 0 {
-		counts = append(counts, fmt.Sprintf("%d in flight", waiting))
-	}
-	if external > 0 {
-		counts = append(counts, fmt.Sprintf("%d external", external))
-	}
-	fields = append(fields, strings.Join(counts, ", "))
-	return strings.Join(fields, v.theme.Rule().Render(" · "))
+	return strings.Join(counts, ", ")
 }
 
 // prsHeaderLine renders the column header, matching rowLine's widths.
@@ -603,18 +687,28 @@ func (v PRsModel) rowLine(r PRRow, wide bool) string {
 }
 
 // detail renders the pane's last line: what the selected row is, and whether
-// `o` has a URL to open. The wide layout leaves the URL out because the REF
-// column of the selected row already shows it; the narrow layout, which has
-// no REF column, puts it here. The title gives way first when the line still
-// does not fit.
+// `o` has a URL to open. The URL goes here whenever the row cannot show it in
+// full — always in the narrow layout, which has no REF column, and in the
+// wide layout when the URL is longer than the REF column — so it can always
+// be read and copied off the screen somewhere. The title gives way first when
+// the line still does not fit.
 func (v PRsModel) detail(r PRRow, w int, wide bool) string {
 	var tail []string
 	u, hasURL := r.OpenURL()
 	if wide {
-		// The REF column already carries the URL, so spend the line on what
-		// the columns cannot say.
+		if hasURL && lipgloss.Width(u) > prsRefWidth(w) {
+			tail = append(tail, u)
+		}
+		// The REF column carries the rest, so spend the line on what the
+		// columns cannot say.
 		if r.External {
-			tail = append(tail, "external PR: reviewed, never merged")
+			// D-11: the cannon reviews a pull request it did not open and
+			// never merges it, so say which of the two it has got to.
+			state := "reviewing"
+			if r.Review != "" {
+				state = "reviewed"
+			}
+			tail = append(tail, "external PR: "+state+", never merged")
 		}
 		if r.Merged && r.SHA != "" {
 			landed := "merged " + shortSHA(r.SHA)

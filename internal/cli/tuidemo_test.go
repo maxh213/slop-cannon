@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"context"
 	"io"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -90,4 +92,97 @@ func TestTUIDemoDelayFlagDefaultsToTheScriptPacing(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, tui.DemoDelay, d)
 	require.Equal(t, tui.DemoDelay, 250*time.Millisecond)
+}
+
+// tuiDemoFakeTerminal makes the `sc tui-demo` terminal check answer tty for
+// the rest of the test, so the TUI branch can be reached without a pty.
+func tuiDemoFakeTerminal(t *testing.T, tty bool) {
+	t.Helper()
+	prev := isTerminal
+	isTerminal = func(*os.File) bool { return tty }
+	t.Cleanup(func() { isTerminal = prev })
+}
+
+// tuiDemoCall records what the command asked the TUI to render.
+type tuiDemoCall struct {
+	calls int
+	demo  tui.DemoOptions
+	opts  tui.Options
+}
+
+// tuiDemoFakeTUI replaces the TUI entry point for the rest of the test. When
+// stop is set the fake confirms a stop, the way `q` then `y` does.
+func tuiDemoFakeTUI(t *testing.T, stop bool) *tuiDemoCall {
+	t.Helper()
+	rec := &tuiDemoCall{}
+	prev := demoTUI
+	demoTUI = func(ctx context.Context, demo tui.DemoOptions, opts tui.Options) error {
+		require.NotNil(t, ctx, "the demo must run under the command's context")
+		rec.calls++
+		rec.demo, rec.opts = demo, opts
+		if stop && opts.OnStop != nil {
+			opts.OnStop()
+		}
+		return nil
+	}
+	t.Cleanup(func() { demoTUI = prev })
+	return rec
+}
+
+func TestTUIDemoStartsTheTUIWithTheFlagsItWasGiven(t *testing.T) {
+	tuiDemoFakeTerminal(t, true)
+	rec := tuiDemoFakeTUI(t, false)
+
+	_, err := rootRun(t, "tui-demo", "--alt-screen=false", "--no-anim", "--ammo", "6",
+		"--brief", "make the http client retry", "--safety", "--delay", "0")
+	require.NoError(t, err)
+
+	require.Equal(t, 1, rec.calls, "the command never started the TUI")
+	require.False(t, rec.opts.AltScreen, "--alt-screen=false must reach the program")
+	require.True(t, rec.opts.NoAnim)
+	require.NotNil(t, rec.opts.OnStop, "the demo reports a confirmed stop through OnStop")
+	require.Equal(t, 6, rec.demo.Ammo)
+	require.Equal(t, "make the http client retry", rec.demo.Brief)
+	require.True(t, rec.demo.Safety)
+}
+
+func TestTUIDemoDrawsOnTheAltScreenByDefault(t *testing.T) {
+	tuiDemoFakeTerminal(t, true)
+	rec := tuiDemoFakeTUI(t, false)
+
+	_, err := rootRun(t, "tui-demo")
+	require.NoError(t, err)
+	require.True(t, rec.opts.AltScreen)
+	require.Equal(t, tui.DemoAmmo, rec.demo.Ammo)
+}
+
+func TestTUIDemoReportsAConfirmedStop(t *testing.T) {
+	tuiDemoFakeTerminal(t, true)
+	tuiDemoFakeTUI(t, true)
+
+	out, err := rootRun(t, "tui-demo")
+	require.NoError(t, err)
+	require.Contains(t, out, "sc: stop confirmed")
+}
+
+func TestTUIDemoWithoutATerminalSaysWhatToRunInstead(t *testing.T) {
+	tuiDemoFakeTerminal(t, false)
+	rec := tuiDemoFakeTUI(t, false)
+
+	_, err := rootRun(t, "tui-demo")
+	require.Error(t, err)
+	require.Zero(t, rec.calls, "a program that cannot read the keyboard must not be started")
+	require.Contains(t, err.Error(), "needs a terminal")
+	require.Contains(t, err.Error(), "--"+FlagDemoEvents)
+	require.Contains(t, err.Error(), "--"+FlagRunHeadless)
+}
+
+func TestTUIDemoEventsNeedsNoTerminal(t *testing.T) {
+	tuiDemoFakeTerminal(t, false)
+	rec := tuiDemoFakeTUI(t, false)
+
+	out, err := rootRun(t, "tui-demo", "--events")
+	require.NoError(t, err, "--events is how the script is read from a pipe")
+	require.Zero(t, rec.calls)
+	require.Contains(t, out, `"kind":"run_started"`)
 }

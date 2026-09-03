@@ -1,5 +1,5 @@
-▄█▓═▶  slop-cannon · run sc-feedback-0001 · brief · ammo 0/4 · safety on
- 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+▄█▓═▶  [1mslop-cannon[0m · run sc-feedback-0001 · brief · ammo 0/4 · safety on
+ 1 Graph  2 Agents [1m 3 Feedback [0m 4 PRs  5 Log 
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 open items
   BEAD       U Q T │ sc-e5f6  Add a --cache flag
@@ -9,13 +9,13 @@
   sc-g7h8    ✓ ✓ ✓ │   ⚙ report add the flag and document it
   sc-i9j0    ✓ ✓ ✓ │   ✗ ux   changes naming
   sc-k1l2    · ✗ · │     • minor   ux-r1-1   Spell the flag --no-cache [accepted]
-  sc-m3n4    ✓ ✓ ◐ │       ↩ pushback every other flag in the CLI is positive; --cache=false already works
-                   │     · nit     ux-r1-2   Capitalise the help text [accepted]
-                   │       ⊘ wontfix  cobra lower-cases every other help string
+  sc-m3n4    ✓ ✓ ◐ │     · nit     ux-r1-2   Capitalise the help text [accepted]
                    │   ✓ qa   approve behaviour is right
                    │   ✓ test approve covered
                    │
                    │ [1mround 2[0m · review · 5e6f708 · ux
+                   │   ↩ pushback ux-r1-1   every other flag in the CLI is positive; --cache=false already wo…
+                   │   ⊘ wontfix  ux-r1-2   cobra lower-cases every other help string
                    │   ✓ ux   approve fair, the rationale holds
                    │
                    │

@@ -185,7 +185,8 @@ Engineer: **pushback** — The function is obvious from its name.
 - Check the change against every line of the Rules section. A violation is category `rules` and severity `blocker`, always, and you must look for one every round.
 - Stay inside your lens and inside this diff. Another tester owns the other lenses, and problems the diff does not touch belong in a new bead, not in this verdict.
 - Every item needs `id`, `severity`, `title` and enough `detail` for the engineer to act without asking you a question; add `file` and `line` when you can point at one, and `suggestion` when you know the fix.
-- Carry every item listed above into your `items` list with its **original id**, unchanged, and set its `status`: `resolved` when the fix is real and complete, `accepted` when you accept the engineer's pushback or wontfix, `held` when the pushback does not hold (say why in `detail`), `open` when it is simply still wrong.
+- Carry every item listed above into your `items` list with its **original id**, `severity` and `category`, unchanged, and set its `status`: `resolved` when the fix is real and complete, `accepted` when you accept the engineer's pushback or wontfix, `held` when the pushback does not hold (say why in `detail`), `open` when it is simply still wrong.
+- An item in the category `rules` — a violation of a rules file, always severity `blocker` — cannot be `accepted` and cannot be downgraded: it is `resolved` once the diff fixes it and `open` until then.
 - Judge the fix, not the promise: a response saying `fixed` that the diff does not show is still `open`.
-- New problems this round get new ids (`qa-r2-1`, `qa-r2-2`, …) and status `open`.
+- New problems this round get new ids (`qa-r2-1`, `qa-r2-2`, …) and status `open`; only an item you raised before may be settled.
 - Set `outcome` to `changes` while any item is `open` or `held`, and to `approve` only when none is. Approving costs the engineer nothing; holding out for perfection costs it a whole round.

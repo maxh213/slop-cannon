@@ -11,6 +11,7 @@ import (
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/domain"
@@ -252,7 +253,7 @@ func TestPRsRowsEdgeCases(t *testing.T) {
 		st := prsState(true, []events.Event{
 			events.RunStarted{Meta: prsMeta(0), Info: prsRunInfo(true)},
 			events.PROpened{Meta: prsMeta(1), Bead: "sc-eee", URL: "https://example.invalid/acme/app/pull/9", Number: 9, External: true},
-			events.RoundStarted{Meta: prsMeta(2), Bead: "sc-eee", Round: 1, RoundKind: events.RoundReview},
+			events.RoundStarted{Meta: prsMeta(2), Bead: "sc-eee", Round: 1, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA, domain.LensTest}},
 			events.VerdictReceived{Meta: prsMeta(3), Bead: "sc-eee", Round: 1, Verdict: domain.Verdict{Lens: domain.LensQA, Round: 1, Outcome: domain.VerdictApprove}},
 			events.VerdictReceived{Meta: prsMeta(4), Bead: "sc-eee", Round: 1, Verdict: domain.Verdict{Lens: domain.LensTest, Round: 1, Outcome: domain.VerdictChanges}},
 		})
@@ -274,6 +275,238 @@ func TestPRsRowsEdgeCases(t *testing.T) {
 	})
 }
 
+// prsExternalEvents scripts an external pull request under review by lenses,
+// with the first n verdicts in. It is how the "reviewed" status is checked
+// against a round that has not finished.
+func prsExternalEvents(lenses []domain.Lens, verdicts []domain.Verdict) []events.Event {
+	evs := []events.Event{
+		events.RunStarted{Meta: prsMeta(0), Info: prsRunInfo(true)},
+		events.BeadCreated{Meta: prsMeta(1), Bead: domain.Bead{ID: "sc-ext", Title: "Review PR #88", Type: domain.BeadTypeTask, Priority: domain.PriorityDefault, State: domain.BeadStateInReview, Round: 1}},
+		events.PROpened{Meta: prsMeta(2), Bead: "sc-ext", URL: "https://example.invalid/acme/app/pull/88", Number: 88, External: true},
+		events.RoundStarted{Meta: prsMeta(3), Bead: "sc-ext", Round: 1, RoundKind: events.RoundReview, Lenses: lenses},
+	}
+	for i, v := range verdicts {
+		evs = append(evs, events.VerdictReceived{Meta: prsMeta(4 + i), Bead: "sc-ext", Round: 1, Verdict: v})
+	}
+	return evs
+}
+
+// TestPRsExternalReviewIsOnlyReportedOnceItIsPosted pins the rule the whole
+// external-PR column rests on: the testers post one consolidated review when
+// the round finishes (D-11, gitx.BuildReview), so a round that is still
+// collecting verdicts must not be shown as reviewed — the word could still
+// flip from "approve" to "changes" when the next tester reports.
+func TestPRsExternalReviewIsOnlyReportedOnceItIsPosted(t *testing.T) {
+	lenses := []domain.Lens{domain.LensUX, domain.LensQA, domain.LensTest}
+	approve := func(l domain.Lens) domain.Verdict {
+		return domain.Verdict{Lens: l, Round: 1, Outcome: domain.VerdictApprove}
+	}
+
+	t.Run("one verdict of three is still being reviewed", func(t *testing.T) {
+		rows := PRRows(prsState(true, prsExternalEvents(lenses, []domain.Verdict{approve(domain.LensUX)})))
+		require.Len(t, rows, 1)
+		require.Equal(t, DeliveryReviewing, rows[0].Status)
+		require.Empty(t, rows[0].Review, "no review has been posted yet")
+		require.Equal(t, 1, rows[0].ReviewsIn)
+		require.Equal(t, 3, rows[0].ReviewsExpected)
+		require.Equal(t, "1/3", rows[0].Note(), "the column counts verdicts, it does not guess the outcome")
+	})
+
+	t.Run("the last verdict posts the review", func(t *testing.T) {
+		rows := PRRows(prsState(true, prsExternalEvents(lenses, []domain.Verdict{
+			approve(domain.LensUX), approve(domain.LensQA), approve(domain.LensTest),
+		})))
+		require.Equal(t, DeliveryReviewed, rows[0].Status)
+		require.Equal(t, domain.VerdictApprove, rows[0].Review)
+		require.Equal(t, "approve", rows[0].Note())
+	})
+
+	t.Run("one changes verdict makes the whole review a change request", func(t *testing.T) {
+		rows := PRRows(prsState(true, prsExternalEvents(lenses, []domain.Verdict{
+			approve(domain.LensUX),
+			{Lens: domain.LensQA, Round: 1, Outcome: domain.VerdictChanges},
+			approve(domain.LensTest),
+		})))
+		require.Equal(t, DeliveryReviewed, rows[0].Status)
+		require.Equal(t, domain.VerdictChanges, rows[0].Review)
+	})
+
+	t.Run("a round that never announced its lenses cannot be known to be done", func(t *testing.T) {
+		rows := PRRows(prsState(true, prsExternalEvents(nil, []domain.Verdict{approve(domain.LensQA)})))
+		require.Equal(t, DeliveryReviewing, rows[0].Status)
+		require.Empty(t, rows[0].Review)
+		require.Equal(t, "1/?", rows[0].Note())
+	})
+
+	t.Run("a closed review bead is reviewed whatever the round said", func(t *testing.T) {
+		evs := append(prsExternalEvents(nil, []domain.Verdict{approve(domain.LensQA)}),
+			events.BeadStateChanged{Meta: prsMeta(9), Bead: "sc-ext", From: domain.BeadStateInReview, To: domain.BeadStateClosed})
+		rows := PRRows(prsState(true, evs))
+		require.Equal(t, DeliveryReviewed, rows[0].Status)
+		require.Equal(t, domain.VerdictApprove, rows[0].Review)
+	})
+
+	t.Run("the view says reviewing, not reviewed", func(t *testing.T) {
+		st := prsState(true, prsExternalEvents(lenses, []domain.Verdict{approve(domain.LensUX)}))
+		out := prsView(100, 20, PRsOptions{}).View(st)
+		require.Contains(t, out, DeliveryReviewing.Glyph()+" reviewing")
+		require.NotContains(t, out, "reviewed")
+		require.NotContains(t, out, "approve")
+	})
+}
+
+// prsAbandonedEvents scripts one abandoned and one parked delivery, the two
+// deliveries nobody is pushing any more.
+func prsAbandonedEvents() []events.Event {
+	return []events.Event{
+		events.RunStarted{Meta: prsMeta(0), Info: prsRunInfo(true)},
+		events.BeadCreated{Meta: prsMeta(1), Bead: domain.Bead{ID: "sc-dead", Title: "abandoned", Type: domain.BeadTypeTask, Priority: domain.PriorityDefault, State: domain.BeadStateFailed}},
+		events.PROpened{Meta: prsMeta(2), Bead: "sc-dead", URL: "https://example.invalid/acme/app/pull/6", Number: 6},
+		events.BeadCreated{Meta: prsMeta(3), Bead: domain.Bead{ID: "sc-park", Title: "parked", Type: domain.BeadTypeTask, Priority: domain.PriorityDefault, State: domain.BeadStateNeedsHuman}},
+		events.PROpened{Meta: prsMeta(4), Bead: "sc-park", URL: "https://example.invalid/acme/app/pull/7", Number: 7},
+	}
+}
+
+// TestPRsAbandonedWorkIsNotInFlight checks that work nobody is pushing any
+// more is neither counted as in flight nor shown with checks still running.
+func TestPRsAbandonedWorkIsNotInFlight(t *testing.T) {
+	st := prsState(true, prsAbandonedEvents())
+	rows := PRRows(st)
+	require.Len(t, rows, 2)
+	require.Equal(t, DeliveryFailed, rows[0].Status)
+	require.Equal(t, ChecksUnknown, rows[0].Checks, "nothing is running on an abandoned delivery")
+	require.Equal(t, "-", rows[0].Note())
+	require.Equal(t, DeliveryNeedsHuman, rows[1].Status)
+	require.Equal(t, ChecksUnknown, rows[1].Checks)
+
+	out := prsView(100, 20, PRsOptions{}).View(st)
+	require.NotContains(t, out, "in flight")
+	require.Contains(t, out, "2 delivered, 1 needs a human, 1 abandoned")
+	require.NotContains(t, out, "pending")
+
+	t.Run("a failing check is still reported on a parked delivery", func(t *testing.T) {
+		evs := append(prsAbandonedEvents(),
+			events.RoundStarted{Meta: prsMeta(5), Bead: "sc-park", Round: 1, RoundKind: events.RoundCheckFailed, Lenses: []domain.Lens{domain.LensQA}})
+		rows := PRRows(prsState(true, evs))
+		require.Equal(t, ChecksFailing, rows[1].Checks, "the last thing known about the checks still stands")
+	})
+}
+
+// TestPRsCanonicalTerminal checks the 80x24 terminal every other golden frame
+// is rendered at: the pull request URL must be readable somewhere on screen,
+// and the counts must survive.
+func TestPRsCanonicalTerminal(t *testing.T) {
+	const w, h = 80, 24
+	st := prsState(true, prsFixtureEvents())
+	out := prsView(w, h, PRsOptions{}).View(st)
+
+	t.Run("the selected PR URL is on screen in full", func(t *testing.T) {
+		require.Contains(t, out, "https://example.invalid/acme/app/pull/42")
+	})
+
+	t.Run("no line is wider than the terminal", func(t *testing.T) {
+		for _, l := range strings.Split(out, "\n") {
+			require.LessOrEqual(t, lipgloss.Width(l), w, "line wider than the terminal: %q", l)
+		}
+	})
+
+	t.Run("a cut REF column is dropped rather than shown cut", func(t *testing.T) {
+		require.NotContains(t, out, "REF")
+		require.NotContains(t, out, "https://example.invalid/acme/app/pull/43", "only the selected row's URL is shown")
+	})
+
+	t.Run("the counts survive", func(t *testing.T) {
+		require.Contains(t, out, "1 external")
+		require.Contains(t, strings.Split(out, "\n")[0], "4 delivered, 2 merged, 2 in flight, 1 external")
+	})
+
+	t.Run("a wide pane keeps the REF column and the URL in it", func(t *testing.T) {
+		wide := prsView(prsWideWidth, h, PRsOptions{}).View(st)
+		require.Contains(t, wide, "REF")
+		require.Contains(t, wide, "https://example.invalid/acme/app/pull/43")
+	})
+
+	t.Run("a URL too long for the REF column moves to the detail line", func(t *testing.T) {
+		long := "https://example.invalid/acme/a-repository-with-a-very-long-name/pull/123456"
+		lst := prsState(true, []events.Event{
+			events.RunStarted{Meta: prsMeta(0), Info: prsRunInfo(true)},
+			events.PROpened{Meta: prsMeta(1), Bead: "sc-long", URL: long, Number: 123456},
+		})
+		out := prsView(prsWideWidth, h, PRsOptions{}).View(lst)
+		require.Greater(t, len(long), prsRefWidth(prsWideWidth))
+		require.Contains(t, strings.Split(out, "\n")[h-chromeHeight-1], long, "the detail line carries what the REF column had to cut")
+	})
+}
+
+// TestPRsModelSize checks the geometry the view reports back.
+func TestPRsModelSize(t *testing.T) {
+	w, h := prsView(100, 20, PRsOptions{}).Size()
+	require.Equal(t, 100, w)
+	require.Equal(t, 20-chromeHeight, h)
+
+	t.Run("never smaller than one cell", func(t *testing.T) {
+		w, h := NewPRsModel(PRsOptions{}).Resize(0, -3).Size()
+		require.Equal(t, 1, w)
+		require.Equal(t, 1, h)
+	})
+}
+
+// TestPRsOpenThroughTheModel drives `o` through the real program's update
+// loop — Model.Update, handleKey, updateView — rather than the view alone, so
+// a regression that stopped propagating the command fails here.
+func TestPRsOpenThroughTheModel(t *testing.T) {
+	st := prsState(true, prsFixtureEvents())
+	newModel := func(t *testing.T, open URLOpener) Model {
+		t.Helper()
+		m := New(t.Context(), Options{Run: st.Run, NoColor: true, Open: open, Now: func() time.Time { return prsAt(20) }})
+		m.state = st
+		m.tab = TabPRs
+		m.width, m.height = 120, 24
+		return m
+	}
+
+	t.Run("the key reaches the opener and the footer says so", func(t *testing.T) {
+		got := make(chan string, 1)
+		m := newModel(t, func(_ context.Context, u string) error {
+			got <- u
+			return nil
+		})
+		next, cmd := m.Update(prsKey("o"))
+		require.NotNil(t, cmd, "`o` must produce the open command through the model")
+		msg, ok := cmd().(URLOpenedMsg)
+		require.True(t, ok)
+		require.NoError(t, msg.Err)
+		require.Equal(t, "https://example.invalid/acme/app/pull/42", <-got)
+
+		after, _ := prsModelOf(t, next).Update(msg)
+		require.Contains(t, prsFooter(t, after), "opened https://example.invalid/acme/app/pull/42")
+	})
+
+	t.Run("a failed open is reported, not swallowed", func(t *testing.T) {
+		boom := errors.New("exec: xdg-open: executable file not found in $PATH")
+		m := newModel(t, func(context.Context, string) error { return boom })
+		next, cmd := m.Update(prsKey("o"))
+		require.NotNil(t, cmd)
+		after, _ := prsModelOf(t, next).Update(cmd())
+		am := prsModelOf(t, after)
+		require.Contains(t, prsFooter(t, am), "could not open https://example.invalid/acme/app/pull/42")
+		require.Len(t, am.State().Notices, 1)
+		require.Equal(t, events.KindError, am.State().Notices[0].Kind)
+		require.Equal(t, prsAt(20), am.State().Notices[0].At)
+		require.Contains(t, am.State().Notices[0].Err, "xdg-open")
+
+		t.Run("and cleared by the next key press", func(t *testing.T) {
+			cleared, _ := am.Update(prsKey("j"))
+			require.NotContains(t, prsFooter(t, cleared), "could not open")
+		})
+	})
+
+	t.Run("the model defaults to the real opener", func(t *testing.T) {
+		m := New(t.Context(), Options{Run: st.Run, NoColor: true})
+		require.NotNil(t, m.prs.open)
+	})
+}
+
 // TestPRsViewLayout checks the frame's shape rather than its exact text.
 func TestPRsViewLayout(t *testing.T) {
 	st := prsState(true, prsFixtureEvents())
@@ -282,7 +515,7 @@ func TestPRsViewLayout(t *testing.T) {
 		lines := strings.Split(prsFrame(t, prsView(100, 20, PRsOptions{}), st, 100, 20), "\n")
 		require.Len(t, lines, 20)
 		for _, l := range lines {
-			require.LessOrEqual(t, len([]rune(l)), 100, "line wider than the terminal: %q", l)
+			require.LessOrEqual(t, lipgloss.Width(l), 100, "line wider than the terminal: %q", l)
 		}
 	})
 
@@ -330,7 +563,7 @@ func TestPRsViewLayout(t *testing.T) {
 		})
 		out := prsView(100, 20, PRsOptions{}).View(lst)
 		for _, l := range strings.Split(out, "\n") {
-			require.LessOrEqual(t, len([]rune(l)), 100)
+			require.LessOrEqual(t, lipgloss.Width(l), 100)
 		}
 		require.Contains(t, out, "…")
 	})
@@ -484,6 +717,22 @@ func TestOpenURL(t *testing.T) {
 		require.NotEmpty(t, command)
 		require.Contains(t, args, "https://example.invalid/x")
 	})
+}
+
+// prsModelOf asserts a [tea.Model] back to the concrete model the update
+// loop returns.
+func prsModelOf(t *testing.T, m tea.Model) Model {
+	t.Helper()
+	mm, ok := m.(Model)
+	require.True(t, ok, "the update loop must return a tui.Model")
+	return mm
+}
+
+// prsFooter renders the model's footer wide enough that nothing in it is
+// clipped, which is what the assertions about it are interested in.
+func prsFooter(t *testing.T, m tea.Model) string {
+	t.Helper()
+	return prsModelOf(t, m).footer(300)
 }
 
 // prsKeysOf lists the first key of each binding, for the help assertions.

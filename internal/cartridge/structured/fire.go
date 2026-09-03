@@ -34,6 +34,19 @@ type RetryContext struct {
 // RetryPromptFunc builds the prompt for the next attempt.
 type RetryPromptFunc func(RetryContext) string
 
+// ResultCheck validates a reply that already satisfies the contract's JSON
+// Schema against the rules the schema cannot express (a plan without
+// dependency cycles, a verdict that overrules nothing, a response set that
+// answers every item). It is given the validated block and the full reply
+// text, so a caller can hand it an existing parse-and-validate helper.
+//
+// A non-nil error makes the attempt a contract failure: Fire quotes the
+// feedback back to the model and retries like any other unusable reply. An
+// error that is already a *ParseError is passed through unchanged, so
+// errors.Is still reaches the caller's own sentinel; anything else is
+// wrapped with ReasonSchema.
+type ResultCheck func(parsed Parsed, output string) error
+
 // Option configures Fire.
 type Option func(*options)
 
@@ -41,6 +54,7 @@ type options struct {
 	observer   func(cartridge.SessionEvent)
 	maxRetries int
 	retry      RetryPromptFunc
+	check      ResultCheck
 	noSuffix   bool
 }
 
@@ -60,6 +74,13 @@ func WithMaxRetries(n int) Option {
 // WithRetryPrompt replaces RetryPrompt as the builder of retry prompts.
 func WithRetryPrompt(fn RetryPromptFunc) Option {
 	return func(o *options) { o.retry = fn }
+}
+
+// WithCheck adds a [ResultCheck] that runs on every reply the schema
+// accepted; its failures are retried like any other contract failure. A nil
+// fn leaves the reply unchecked.
+func WithCheck(fn ResultCheck) Option {
+	return func(o *options) { o.check = fn }
 }
 
 // WithoutPromptSuffix stops Fire from appending Contract.PromptSuffix to the
@@ -96,7 +117,9 @@ type Outcome struct {
 }
 
 // Fire runs spec through c, asking for contract's block, and parses the
-// reply. When the reply has no valid block it fires again with a retry
+// reply; [WithCheck] adds the rules the schema cannot express, and a reply
+// its check rejects counts as unusable too. When the reply has no valid
+// block (or the check rejects it) it fires again with a retry
 // prompt (RetryPrompt by default) that quotes the failure, up to
 // DefaultMaxRetries extra times. The returned error is the last *ParseError
 // when every attempt's reply was unusable, or the *cartridge.Error of the
@@ -131,6 +154,9 @@ func Fire(ctx context.Context, c cartridge.Cartridge, spec cartridge.RunSpec, co
 			return out, err
 		}
 		parsed, perr := contract.Parse(res.Output)
+		if perr == nil && o.check != nil {
+			perr = checkError(contract, o.check(parsed, res.Output))
+		}
 		if perr == nil {
 			out.Attempts = append(out.Attempts, Attempt{Prompt: spec.Prompt, Result: res})
 			out.Parsed, out.Result = parsed, res
@@ -143,6 +169,28 @@ func Fire(ctx context.Context, c cartridge.Cartridge, spec cartridge.RunSpec, co
 		}
 	}
 	return out, lastErr
+}
+
+// checkError turns a ResultCheck failure into the *ParseError the retry loop
+// feeds back to the model. An error that is already a *ParseError is kept as
+// it is, so errors.Is reaches the check's own sentinels as well as the
+// Reason's.
+func checkError(c *Contract, err error) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := AsParseError(err); ok {
+		return err
+	}
+	// Problems carries the message as well as Detail: Feedback shows the
+	// model the problems of a schema failure, never the detail line.
+	return &ParseError{
+		Reason:   ReasonSchema,
+		Contract: c.Name(),
+		Detail:   err.Error(),
+		Problems: []string{err.Error()},
+		Cause:    err,
+	}
 }
 
 func runOnce(ctx context.Context, c cartridge.Cartridge, spec cartridge.RunSpec, observe func(cartridge.SessionEvent)) (cartridge.Result, error) {

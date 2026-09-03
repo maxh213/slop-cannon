@@ -50,6 +50,13 @@ type AgentRun struct {
 	// when the caller already holds the compiled contract (the role
 	// builders do).
 	Contract *structured.Contract
+	// Check is the role's own rule check, run on every reply the schema
+	// accepted and inside the retry loop, so a schema-valid but unusable
+	// answer is retried with the check's feedback like any other contract
+	// failure. Build it with [PlanCheck], [TesterVerdictCheck],
+	// [EngineerResultCheck], [ArbitrationCheck] or [EscalationCheck]; nil
+	// means the schema is the whole contract.
+	Check structured.ResultCheck
 	// Agent identifies the firing on the event stream and on errors. ID is
 	// required; Role, Lens and Bead are stamped on the transcript and on
 	// [AgentError] when set.
@@ -80,7 +87,8 @@ type AgentRun struct {
 
 // Validate reports the first problem that makes the firing impossible: no
 // cartridge, an unusable spec, no agent id, an unknown role, lens or message
-// type, or no way to resolve an output contract. Every error wraps
+// type, a tool policy the role and task were not given (see [CheckPolicy]),
+// or no way to resolve an output contract. Every error wraps
 // [ErrInvalidAgentRun].
 func (r AgentRun) Validate() error {
 	if r.Cartridge == nil {
@@ -98,10 +106,49 @@ func (r AgentRun) Validate() error {
 	if r.Agent.Lens != "" && !r.Agent.Lens.Valid() {
 		return fmt.Errorf("%w: agent lens %q is not a lens", ErrInvalidAgentRun, r.Agent.Lens.String())
 	}
+	if err := r.CheckPolicy(); err != nil {
+		return err
+	}
 	if _, err := r.OutputContract(); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidAgentRun, err)
 	}
 	return nil
+}
+
+// CheckPolicy re-derives the tool policy the firing is entitled to from the
+// role and the task ([Policy]) and refuses a spec carrying any other one.
+// That is what makes [ApplyPolicy] the only way a policy gets chosen: a spec
+// built by hand, or rebuilt from persisted state, cannot smuggle write tools
+// into a tester's firing. A run with neither a role nor a task has nothing
+// to derive the policy from and passes (the spec's own policy is still
+// validated by cartridge.RunSpec.Validate). Errors wrap
+// [ErrInvalidAgentRun].
+func (r AgentRun) CheckPolicy() error {
+	if r.Agent.Role == "" && r.Task == "" {
+		return nil
+	}
+	want, err := Policy(r.Agent.Role, r.Task)
+	if err != nil {
+		return fmt.Errorf("%w: %w", ErrInvalidAgentRun, err)
+	}
+	if r.Spec.ToolPolicy != want {
+		return fmt.Errorf("%w: tool policy %q was not chosen for this firing: %s runs %q (build the spec with ApplyPolicy)",
+			ErrInvalidAgentRun, string(r.Spec.ToolPolicy), r.firingName(), string(want))
+	}
+	return nil
+}
+
+// firingName names the role and task a policy was derived from, for the
+// error [CheckPolicy] returns.
+func (r AgentRun) firingName() string {
+	switch {
+	case r.Agent.Role == "":
+		return fmt.Sprintf("task %q", r.Task.String())
+	case r.Task == "":
+		return fmt.Sprintf("role %q", r.Agent.Role.String())
+	default:
+		return fmt.Sprintf("role %q on task %q", r.Agent.Role.String(), r.Task.String())
+	}
 }
 
 // OutputContract returns the contract the reply must satisfy: Contract when
@@ -264,8 +311,8 @@ type AgentError struct {
 	Contract string `json:"contract,omitempty"`
 	// Failure classifies the failure for the event stream.
 	Failure events.Failure `json:"failure"`
-	// Kind is the cartridge failure kind; cartridge.KindUnknown for a
-	// contract failure (Failure is then events.FailureBadOutput).
+	// Kind is the cartridge failure kind; empty for a contract failure
+	// (Failure is then events.FailureBadOutput).
 	Kind cartridge.Kind `json:"kind,omitempty"`
 	// Attempts is how many sessions were fired.
 	Attempts int `json:"attempts"`
@@ -348,16 +395,19 @@ func FailureOf(err error) events.Failure {
 //
 // It is the single firing path every role shares:
 //
-//  1. the run is validated and the spec's tool policy is re-checked with
-//     [EnforcementFor]; a policy the cartridge cannot hold refuses the
-//     firing before any subprocess starts (P5-06);
+//  1. the run is validated, the spec's tool policy is checked against the
+//     one the role and task were given ([AgentRun.CheckPolicy]) and re-checked
+//     with [EnforcementFor]; a policy nobody chose, or one the cartridge
+//     cannot hold, refuses the firing before any subprocess starts (P5-06);
 //  2. the session runs through [structured.Fire], which appends the
 //     contract to the prompt when the prompt builder has not already
 //     (WithPromptSuffix is idempotent);
 //  3. every session event is turned into output lines and published;
-//  4. a reply with no valid result block is retried once (AgentRun.SchemaRetries),
+//  4. the reply is checked against the schema and, when AgentRun.Check is
+//     set, against the role's own rules ([PlanCheck] and friends);
+//  5. a reply that fails either check is retried once (AgentRun.SchemaRetries),
 //     with structured.ParseError.Feedback quoted back to the model;
-//  5. the validated block is decoded into T.
+//  6. the validated block is decoded into T.
 //
 // T is the payload type of the contract: domain.Plan, domain.ImplReport,
 // domain.Verdict, [ResponseSet], domain.Arbitration or domain.Escalation.
@@ -378,21 +428,29 @@ func RunAgent[T any](ctx context.Context, r AgentRun) (T, Transcript, error) {
 	}
 	var v T
 	if err := tr.Parsed.Decode(&v); err != nil {
-		// The block validated, so a decode failure is a mismatch between
-		// the schema and the Go type: report it as a contract failure, the
-		// same shape every other unusable reply has.
-		pe := &structured.ParseError{
-			Reason:   structured.ReasonSchema,
-			Contract: tr.Contract,
-			Detail:   fmt.Sprintf("the result could not be decoded into %T", v),
-			Cause:    err,
-		}
-		if n := len(tr.Attempts); n > 0 {
-			tr.Attempts[n-1].Err, tr.Attempts[n-1].Failure = pe, events.FailureBadOutput
-		}
-		return zero, tr, r.agentError(tr, pe)
+		return zero, tr, r.decodeFailure(&tr, fmt.Sprintf("the result could not be decoded into %T", v), err)
 	}
 	return v, tr, nil
+}
+
+// decodeFailure reports a reply that satisfied the contract but would not
+// decode into the Go type behind it. The block validated, so this is a
+// mismatch between the schema and the type rather than a bad answer, but the
+// caller sees the same shape every other unusable reply has: the last
+// attempt is stamped events.FailureBadOutput and the error is an *AgentError
+// wrapping a *structured.ParseError. It mutates tr, so pass the transcript
+// the caller returns.
+func (r AgentRun) decodeFailure(tr *Transcript, detail string, cause error) *AgentError {
+	pe := &structured.ParseError{
+		Reason:   structured.ReasonSchema,
+		Contract: tr.Contract,
+		Detail:   detail,
+		Cause:    cause,
+	}
+	if n := len(tr.Attempts); n > 0 {
+		tr.Attempts[n-1].Err, tr.Attempts[n-1].Failure = pe, events.FailureBadOutput
+	}
+	return r.agentError(*tr, pe)
 }
 
 // fireAgent runs the session and fills in the transcript; the callers decode
@@ -443,6 +501,7 @@ func fireAgent(ctx context.Context, r AgentRun) (Transcript, error) {
 		structured.WithObserver(observe),
 		structured.WithMaxRetries(r.retries()),
 		structured.WithRetryPrompt(announce),
+		structured.WithCheck(r.Check),
 	)
 	sink.flush(r.now())
 	tr.Duration = r.now().Sub(start)
@@ -476,6 +535,10 @@ func fireAgent(ctx context.Context, r AgentRun) (Transcript, error) {
 // []domain.Response, domain.Arbitration or domain.Escalation), which is
 // exactly what beads.Message.Payload holds. AgentRun.Contract is ignored
 // here: the message type decides both the contract and the payload type.
+//
+// It fails exactly the way [RunAgent] does: once a session has run the error
+// is an *AgentError, and a payload that will not decode is
+// events.FailureBadOutput rather than a cartridge failure.
 func RunMessage(ctx context.Context, r AgentRun) (any, Transcript, error) {
 	if r.Message == "" {
 		return nil, Transcript{}, fmt.Errorf("%w: RunMessage needs a message type", ErrInvalidAgentRun)
@@ -489,7 +552,7 @@ func RunMessage(ctx context.Context, r AgentRun) (any, Transcript, error) {
 	}
 	v, err := decodePayload(r.Message, tr.Parsed.JSON)
 	if err != nil {
-		return nil, tr, err
+		return nil, tr, r.decodeFailure(&tr, fmt.Sprintf("the result could not be decoded into the %s payload", r.Message), err)
 	}
 	return v, tr, nil
 }
@@ -510,6 +573,70 @@ func (r AgentRun) agentError(tr Transcript, err error) *AgentError {
 		}
 	}
 	return ae
+}
+
+// The checks below wire each role's own parse-and-validate helper into
+// AgentRun.Check, so the rules a JSON Schema cannot express (cycles in a
+// plan, an item only the product owner may overrule, a response to an item
+// nobody raised) are enforced inside RunAgent's retry loop instead of after
+// it. Each returns the helper's *structured.ParseError unchanged, so
+// errors.Is still reaches ErrPlanRejected and the rest. The request must
+// already be valid — the role's RunSpec builder validates it — since a
+// request error would otherwise be reported as an unusable reply.
+
+// PlanCheck is the product owner's planning check: it runs [ParsePlanOutput],
+// so a schema-valid plan with a dependency cycle, a dangling or duplicate
+// dependency, duplicate titles, too many beads, or a bead that repeats an
+// open one is retried with the broken rules quoted back (P5-02).
+func PlanCheck(req PlanRequest) structured.ResultCheck {
+	return func(_ structured.Parsed, output string) error {
+		_, _, err := ParsePlanOutput(req, output)
+		return err
+	}
+}
+
+// TesterVerdictCheck is a tester's check: it runs [ParseTesterVerdict], so a
+// verdict that overrules an item (only the product owner does that, D-08),
+// approves with items still open, drops an item it was asked about or
+// rewrites a carried item's severity is retried (P5-04).
+func TesterVerdictCheck(req TesterRequest) structured.ResultCheck {
+	return func(_ structured.Parsed, output string) error {
+		_, _, err := ParseTesterVerdict(req, output)
+		return err
+	}
+}
+
+// EngineerResultCheck is an engineer's check: it runs
+// [EngineerRequest.ParseResult], so an address-feedback reply that invents an
+// item id, answers an item twice, leaves one unanswered or pushes back on a
+// rules violation is retried (P5-03, D-08).
+func EngineerResultCheck(req EngineerRequest) structured.ResultCheck {
+	return func(_ structured.Parsed, output string) error {
+		_, err := req.ParseResult(output)
+		return err
+	}
+}
+
+// ArbitrationCheck is the product owner's arbitration check: it runs
+// [ArbitrationRequest.Parse], so a ruling on the wrong item, a compromise
+// with no instruction, or a rules violation ruled in the engineer's favour is
+// retried (P5-05, D-08).
+func ArbitrationCheck(req ArbitrationRequest) structured.ResultCheck {
+	return func(_ structured.Parsed, output string) error {
+		_, _, err := req.Parse(output)
+		return err
+	}
+}
+
+// EscalationCheck is the product owner's escalation check: it runs
+// [EscalationRequest.Parse], so an outcome missing the field that goes with
+// it, or work that still violates a rules file being approved with notes, is
+// retried (P5-05).
+func EscalationCheck(req EscalationRequest) structured.ResultCheck {
+	return func(_ structured.Parsed, output string) error {
+		_, _, err := req.Parse(output)
+		return err
+	}
 }
 
 // outputSink turns session events into output lines: the model's text on

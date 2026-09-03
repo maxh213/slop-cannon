@@ -1,15 +1,15 @@
-LIVE · AMMO 2/6 ────────────────────────────────────────────────────────────────
+[1mLIVE · AMMO 2/6 · ENTER TRANSCRIPT[0m ─────────────────────────────────────────────
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ ⚙ engineer · av-2 · claude/fable · implement r1                       2m0s ⠋ │
+│ ■ [1mengineer[0m · av-2 · claude/fable · implement r1                       2m0s ⠋ │
 │ warning: no test command configured                                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ╭──────────────────────────────────────────────────────────────────────────────╮
-│ ◎ tester/qa · av-2 · claude/fable · review r1                        1m30s ⠋ │
+│ ▲ [1mtester/qa[0m · av-2 · claude/fable · review r1                        1m30s ⠋ │
 │ running go test ./...                                                        │
 ╰──────────────────────────────────────────────────────────────────────────────╯
-HISTORY · 2 ────────────────────────────────────────────────────────────────────
-  ✘ tester/ux · av-2 · timeout (agent timeout after 15m)                   15m0s
-  ✔ po · - · plan (exit 0)                                                   42s
+[1mHISTORY · 2[0m ────────────────────────────────────────────────────────────────────
+  ✗ [1mtester/ux[0m · av-2 · timeout (agent timeout after 15m)                   15m0s
+  ✓ [1mpo[0m · - · plan (exit 0)                                                   42s
 
 
 

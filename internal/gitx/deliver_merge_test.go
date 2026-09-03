@@ -111,8 +111,42 @@ func (f *dmFixture) dmMerges(t *testing.T) string {
 // overrides) and returns a client for the fixture repository.
 func dmBeads(t *testing.T, root string, overrides map[string]string) (*beads.Client, *testutil.Shim) {
 	t.Helper()
-	shim := testutil.FakeBD(t, testutil.StageBDSamples(t, overrides))
+	return dmBeadsWith(t, root, overrides, nil)
+}
+
+// dmBeadsWith is dmBeads with extra sample files written into the staged
+// directory (name to content), for replies the captured set cannot express
+// because they carry a SHA the test only learns at run time.
+func dmBeadsWith(t *testing.T, root string, overrides, extra map[string]string) (*beads.Client, *testutil.Shim) {
+	t.Helper()
+	dir := testutil.StageBDSamples(t, overrides)
+	for name, content := range extra {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
+	}
+	shim := testutil.FakeBD(t, dir)
 	return beads.New(root, beads.Options{Actor: "sc:test", Timeout: 20 * time.Second}), shim
+}
+
+// dmShowJSON renders a `bd show --json` reply for one bead carrying the
+// sc_merge_sha metadata an earlier delivery attempt recorded.
+func dmShowJSON(id domain.BeadID, mergeSHA string) string {
+	return fmt.Sprintf(`{"schema_version":1,"data":[{"id":%q,"title":"Fix the mean bug","status":"delivering","priority":1,`+
+		`"issue_type":"task","metadata":{"sc_run":"r1","sc_merge_sha":%q}}]}`, id, mergeSHA)
+}
+
+// dmCalled reports how many of the recorded bd calls name subcommand.
+func dmCalled(t *testing.T, shim *testutil.Shim, subcommand string) int {
+	t.Helper()
+	n := 0
+	for _, args := range shim.ArgLists(t) {
+		for _, a := range args {
+			if a == subcommand {
+				n++
+				break
+			}
+		}
+	}
+	return n
 }
 
 // dmStage returns the stage of the DeliveryError err carries, failing the
@@ -144,6 +178,16 @@ func TestDetectCheckCommand(t *testing.T) {
 		{"makefile with spaced test target", map[string]string{"GNUmakefile": "test :\n\tpytest\n"}, "make test", true},
 		{"makefile without test target falls through", map[string]string{"Makefile": "build:\n\tgo build\n", "go.mod": "module x\n"}, "go test ./...", true},
 		{"makefile whose test target is only a prerequisite", map[string]string{"Makefile": "all: test\n", "Cargo.toml": ""}, "cargo test", true},
+		{"makefile test variable is not a target", map[string]string{"Makefile": "test := $(GO) test ./...\nbuild:\n\t$(test)\n", "go.mod": "module x\n"}, "go test ./...", true},
+		{"makefile test variable without spaces is not a target", map[string]string{"Makefile": "test:=1\n", "Cargo.toml": ""}, "cargo test", true},
+		{"makefile posix ::= assignment is not a target", map[string]string{"Makefile": "test ::= 1\n"}, "", false},
+		{"makefile :::= assignment is not a target", map[string]string{"Makefile": "test :::= 1\n"}, "", false},
+		{"makefile += assignment is not a target", map[string]string{"Makefile": "test += 1\n"}, "", false},
+		{"makefile ?= assignment is not a target", map[string]string{"Makefile": "test ?= 1\n"}, "", false},
+		{"makefile double-colon test target counts", map[string]string{"Makefile": "test::\n\tgo test ./...\n"}, "make test", true},
+		{"makefile test target with prerequisites counts", map[string]string{"Makefile": "test: build\n\tgo test ./...\n"}, "make test", true},
+		{"makefile phony declaration alone is not a target", map[string]string{"Makefile": ".PHONY: test\n"}, "", false},
+		{"makefile tests target is not a test target", map[string]string{"Makefile": "tests:\n\tgo test ./...\n"}, "", false},
 		{"package.json with a test script", map[string]string{"package.json": `{"scripts":{"test":"vitest run"}}`}, "npm test", true},
 		{"package.json without a test script falls through", map[string]string{"package.json": `{"scripts":{"build":"tsc"}}`, "go.mod": "module x\n"}, "go test ./...", true},
 		{"package.json without scripts at all", map[string]string{"package.json": "{}"}, "", false},
@@ -379,6 +423,15 @@ func TestManager_DeliverMerge(t *testing.T) {
 		var ee *proc.ExitError
 		require.ErrorAs(t, err, &ee)
 		assert.Equal(t, 3, ee.Result.ExitCode)
+
+		// The whole CheckResult travels with the error, so a caller that
+		// only has the error can still report what ran (P6-06).
+		require.NotNil(t, de.Check, "the failing check reaches the caller")
+		assert.Equal(t, "echo boom-out; echo boom-err >&2; exit 3", de.Check.Command)
+		assert.False(t, de.Check.Detected, "it was configured, not autodetected")
+		assert.Equal(t, 3, de.Check.ExitCode)
+		assert.Positive(t, de.Check.Duration)
+		assert.Equal(t, de.Output, de.Check.Output)
 
 		assert.Equal(t, before, f.dmMain(t), "main is untouched")
 		assert.Empty(t, bd.ArgLists(t), "the bead is not closed")
@@ -645,17 +698,111 @@ func TestManager_DeliverMerge(t *testing.T) {
 		}(), "the user's edit survives")
 	})
 
-	t.Run("branch without commits closes without touching main", func(t *testing.T) {
+	// D-20: a bead is closed only when its code has landed. An empty sc/
+	// branch is trivially an ancestor of the default branch, so ancestry
+	// alone would close the bead and stamp sc_merge_sha with a commit the
+	// bead never produced, unblocking its dependents (the P4-13 defect).
+	t.Run("branch without commits is refused instead of closing the bead", func(t *testing.T) {
 		f := dmSetup(t)
 		before := f.dmMain(t)
 		client, bd := dmBeads(t, f.repo.Root, nil)
+
 		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client})
+		assert.Nil(t, res)
+		require.ErrorIs(t, err, ErrNothingToDeliver)
+		assert.Equal(t, StageMerge, dmStage(t, err))
+		assert.Equal(t, before, f.dmMain(t), "main is untouched")
+		assert.Zero(t, dmCalled(t, bd, "close"), "the bead stays open")
+		assert.Zero(t, dmCalled(t, bd, "update"), "and unstamped")
+	})
+
+	t.Run("branch without commits is refused against its recorded base", func(t *testing.T) {
+		f := dmSetup(t)
+		base := f.dmMain(t)
+		// The default branch moves on, so the empty branch's rebase lands
+		// it on a tip it did not produce.
+		f.dmMainCommit(t, "from-main.txt", "m\n", "Something landed on main")
+		moved := f.dmMain(t)
+		client, bd := dmBeads(t, f.repo.Root, nil)
+
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client, BaseSHA: base})
+		require.ErrorIs(t, err, ErrNothingToDeliver)
+		assert.Equal(t, StageMerge, dmStage(t, err))
+		assert.Equal(t, moved, f.dmMain(t))
+		assert.Empty(t, bd.ArgLists(t), "the recorded base settles it without asking bd")
+	})
+
+	t.Run("branch without commits is refused with no bead client and no base", func(t *testing.T) {
+		f := dmSetup(t)
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true"})
+		require.ErrorIs(t, err, ErrNothingToDeliver)
+		assert.Equal(t, StageMerge, dmStage(t, err))
+	})
+
+	// The zero-commit path is what makes a delivery idempotent: the merge
+	// and the push landed, only bd close failed. The recorded base tells
+	// that apart from a branch that never received a commit.
+	t.Run("a retry after the merge landed closes the bead without redelivering", func(t *testing.T) {
+		f := dmSetup(t)
+		base := f.dmMain(t)
+		sha := f.dmBranchCommit(t, "stats/fix.txt", "fixed\n", "Fix the mean bug")
+		client, bd := dmBeads(t, f.repo.Root, map[string]string{"close.1": "error-close-blocked"})
+
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client, BaseSHA: base})
+		require.ErrorIs(t, err, beads.ErrBlockedOpen)
+		require.Equal(t, sha, f.dmMain(t), "the merge landed before the close was refused")
+
+		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client, BaseSHA: base})
 		require.NoError(t, err)
 		assert.Equal(t, 0, res.Commits)
-		assert.Equal(t, before, res.Head)
-		assert.Equal(t, before, f.dmMain(t))
+		assert.True(t, res.AlreadyLanded)
 		assert.True(t, res.Closed)
-		assert.Len(t, bd.ArgLists(t), 2)
+		assert.Equal(t, sha, res.Head)
+		assert.Equal(t, sha, f.dmMain(t), "main did not move again")
+		assert.Equal(t, 2, dmCalled(t, bd, "close"), "the close is the only stage retried")
+		assert.Zero(t, dmCalled(t, bd, "show"), "the recorded base needs no bd call")
+	})
+
+	t.Run("a retry finishes on the sc_merge_sha the first attempt recorded", func(t *testing.T) {
+		f := dmSetup(t)
+		sha := f.dmBranchCommit(t, "note.txt", "n\n", "Add note")
+		client, bd := dmBeadsWith(t, f.repo.Root,
+			map[string]string{"close.1": "error-close-blocked"},
+			map[string]string{"show.json": dmShowJSON(wtBead.ID, sha)})
+
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client})
+		require.ErrorIs(t, err, beads.ErrBlockedOpen)
+
+		// No BaseSHA this time: the sc_merge_sha the first attempt stamped
+		// on the bead is the proof that the code landed.
+		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client})
+		require.NoError(t, err)
+		assert.True(t, res.AlreadyLanded)
+		assert.True(t, res.Closed)
+		assert.Equal(t, sha, f.dmMain(t))
+		assert.Equal(t, 1, dmCalled(t, bd, "show"))
+	})
+
+	t.Run("a retry pushes a merge that landed only locally", func(t *testing.T) {
+		f := dmSetup(t, testutil.WithBareRemote())
+		base := f.dmMain(t)
+		sha := f.dmBranchCommit(t, "note.txt", "n\n", "Add note")
+		f.r.Git(t, "remote", "set-url", "--push", "origin", filepath.Join(t.TempDir(), "missing.git"))
+		client, bd := dmBeads(t, f.repo.Root, nil)
+
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client, BaseSHA: base})
+		require.Error(t, err)
+		require.Equal(t, StagePush, dmStage(t, err))
+		require.NotEqual(t, sha, f.dmRemoteMain(t))
+		require.Empty(t, bd.ArgLists(t), "the bead is not touched while the push is missing")
+
+		f.r.Git(t, "remote", "set-url", "--push", "origin", f.r.RemoteDir)
+		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client, BaseSHA: base})
+		require.NoError(t, err)
+		assert.True(t, res.AlreadyLanded)
+		assert.True(t, res.Pushed, "the stage that failed is retried")
+		assert.True(t, res.Closed)
+		assert.Equal(t, sha, f.dmRemoteMain(t))
 	})
 
 	t.Run("no check command runs when nothing is configured or detected", func(t *testing.T) {
@@ -760,6 +907,24 @@ func TestManager_DeliverMerge(t *testing.T) {
 		assert.Equal(t, StageCheck, de.Stage)
 		assert.ErrorIs(t, err, proc.ErrTimeout)
 		assert.Contains(t, de.Output, "partial-output", "the tail of a killed check is still reported")
+		require.NotNil(t, de.Check)
+		assert.Equal(t, "echo partial-output; sleep 30", de.Check.Command)
+		assert.Equal(t, -1, de.Check.ExitCode, "a killed check has no exit status")
+	})
+
+	t.Run("a failing autodetected check says it was autodetected", func(t *testing.T) {
+		f := dmSetup(t)
+		acWrite(t, f.wt.Path, "Makefile", "test:\n\t@echo detected-boom; exit 4\n")
+		f.dmBranchCommit(t, "Makefile", "test:\n\t@echo detected-boom; exit 4\n", "Trim Makefile")
+
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{})
+		var de *DeliveryError
+		require.ErrorAs(t, err, &de)
+		assert.Equal(t, StageCheck, de.Stage)
+		require.NotNil(t, de.Check)
+		assert.Equal(t, "make test", de.Check.Command)
+		assert.True(t, de.Check.Detected, "the caller can say where the command came from")
+		assert.Contains(t, de.Check.Output, "detected-boom")
 	})
 
 	t.Run("a blank check command falls back to detection", func(t *testing.T) {

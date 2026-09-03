@@ -88,7 +88,8 @@ func renderRepo(rc RepoContext, treeLimit, readmeChars int) string {
 		if shown < total {
 			count = strconv.Itoa(shown) + " of " + strconv.Itoa(total) + " entries"
 		}
-		fmt.Fprintf(&b, "\nTree (%s, %s):\n\n```\n%s\n```\n", depth, count, strings.Join(tree, "\n"))
+		fmt.Fprintf(&b, "\nTree (%s, %s):\n\n", depth, count)
+		b.WriteString(Fenced("", strings.Join(tree, "\n")))
 	}
 
 	if head := limitReadme(rc.ReadmeHead, readmeChars); head != "" {
@@ -100,7 +101,8 @@ func renderRepo(rc RepoContext, treeLimit, readmeChars int) string {
 		if rc.ReadmeTruncated || len(head) < len(rc.ReadmeHead) {
 			suffix = " (truncated)"
 		}
-		fmt.Fprintf(&b, "\n%s%s:\n\n```\n%s\n```\n", title, suffix, head)
+		fmt.Fprintf(&b, "\n%s%s:\n\n", title, suffix)
+		b.WriteString(Fenced("", head))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -117,8 +119,10 @@ func limitTree(rc RepoContext, limit int) []string {
 	return rc.Tree[:limit]
 }
 
-// limitReadme cuts the README head to limit characters at a line boundary; a
-// negative limit means all of it and zero omits it.
+// limitReadme cuts the README head to limit bytes at a line boundary, and at
+// a rune boundary when the kept window holds no line break at all, so a
+// budget-driven cut can never leave half a rune in the prompt; a negative
+// limit means all of it and zero omits it.
 func limitReadme(head string, limit int) string {
 	switch {
 	case head == "" || limit == 0:
@@ -126,7 +130,7 @@ func limitReadme(head string, limit int) string {
 	case limit < 0 || limit >= len(head):
 		return head
 	}
-	return strings.TrimRight(cutAtLine(head[:limit]), "\n")
+	return strings.TrimRight(cutAtRune(cutAtLine(head[:limit])), "\n")
 }
 
 // renderOpenBeads renders the beads that already exist, so the product owner
@@ -224,7 +228,7 @@ func renderHistory(rounds []Round, keep int) string {
 			b.WriteString("\n" + renderReport(*r.Report))
 		}
 		if d := strings.TrimSpace(r.Diff); d != "" {
-			fmt.Fprintf(&b, "\nDiff reviewed:\n\n```diff\n%s\n```\n", d)
+			b.WriteString("\nDiff reviewed:\n\n" + Fenced("diff", d))
 		}
 		for _, v := range r.Verdicts {
 			b.WriteString("\n" + renderVerdict(v))
@@ -241,9 +245,11 @@ func renderHistory(rounds []Round, keep int) string {
 				suffix(" — ", oneLine(a.Instruction)), suffix(" (", closeParen(oneLine(a.Rationale))))
 		}
 		if e := r.Escalation; e != nil {
-			fmt.Fprintf(&b, "\nProduct owner escalation ruling: %s%s%s%s\n", e.Outcome,
-				suffix(" — ", oneLine(e.Notes)), suffix(" New acceptance: ", oneLine(e.NewAcceptance)),
-				suffix(" For the human: ", oneLine(e.Summary)))
+			fmt.Fprintf(&b, "\nProduct owner escalation ruling: %s%s\n", e.Outcome, clauses(
+				oneLine(e.Notes),
+				suffix("new acceptance: ", oneLine(e.NewAcceptance)),
+				suffix("for the human: ", oneLine(e.Summary)),
+			))
 		}
 		for _, n := range r.Notes {
 			if s := strings.TrimSpace(n); s != "" {
@@ -335,6 +341,59 @@ func suffix(prefix, value string) string {
 		return ""
 	}
 	return prefix + value
+}
+
+// clauses joins the non-empty trailing clauses of a one-line ruling: the
+// first after an em dash, any further one after a semicolon, so two clauses
+// never run together into a single unreadable sentence.
+func clauses(parts ...string) string {
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	if len(kept) == 0 {
+		return ""
+	}
+	return " — " + strings.Join(kept, "; ")
+}
+
+// Fenced renders body as a Markdown fenced block tagged info (an empty info
+// string leaves the block untagged), followed by a newline. The fence is
+// chosen with fenceFor, so content that itself contains code fences — a
+// README, a diff of a Markdown file — cannot break out of the block and
+// corrupt the sections after it. Prompt layers built outside this package
+// should use it rather than writing three backticks by hand.
+func Fenced(info, body string) string {
+	fence := fenceFor(body)
+	return fence + info + "\n" + body + "\n" + fence + "\n"
+}
+
+// fenceFor returns the backtick fence that can wrap body verbatim: three
+// backticks, or one more than the longest run of backticks inside body.
+// CommonMark closes a fenced block only at a fence of at least the opening
+// length and of the same character, so a longer fence quotes anything —
+// including tilde fences, which cannot close a backtick block at all.
+// structured.Extract applies the same rule reading blocks back out of an
+// agent's reply; this is the same rule on the way in.
+func fenceFor(body string) string {
+	longest, run := 0, 0
+	for i := range len(body) {
+		if body[i] != '`' {
+			run = 0
+			continue
+		}
+		run++
+		if run > longest {
+			longest = run
+		}
+	}
+	n := 3
+	if longest >= n {
+		n = longest + 1
+	}
+	return strings.Repeat("`", n)
 }
 
 // closeParen closes the parenthesis suffix opens, so an empty rationale

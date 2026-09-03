@@ -1,7 +1,7 @@
-▄█▓═▶  slop-cannon · run sc-feedback-0001 · brief · ammo 0/4 · safety on
- 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+▄█▓═▶  [1mslop-cannon[0m · run sc-feedback-0001 · brief · ammo 0/4 · safety on
+ 1 Graph  2 Agents [1m 3 Feedback [0m 4 PRs  5 Log 
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
-7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 open items · lines 1-21/35
+7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 open items · lines 1-21/39
   BEAD       U Q T │ sc-i9j0  Stream the response body
   sc-a1b2    ✓ ✓ ✓ │ ◔ in_review · 3 rounds · ux ✓  qa ✓  test ✓ · satisfied
   sc-c3d4    ✓ ✓ ✓ │
@@ -19,8 +19,8 @@
                    │       suggestion: guard the call and cover it with a table case
                    │
                    │ [1mround 2[0m · review · a3b4c5d · test
+                   │   ⊘ wontfix  test-r1-1 the empty body is unreachable through the public API
+                   │       re: round 1 · test · blocker · No test for the empty-body case
                    │   ✗ test changes rules say every branch is tested
                    │     [1m! blocker[0m test-r1-1 No test for the empty-body case (rules) [held]
-                   │       internal/http/retry.go:42
-                   │       seen while exercising No test for the empty-body case
 tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

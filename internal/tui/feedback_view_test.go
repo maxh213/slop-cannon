@@ -1,8 +1,11 @@
 package tui
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -477,9 +480,23 @@ func TestFeedbackThreadsScenarios(t *testing.T) {
 		require.Zero(t, th.Open, "the overruled item no longer counts")
 		item, ok := th.Item("qa-r1-1")
 		require.True(t, ok)
-		require.Equal(t, domain.ItemOverruled, item.Status, "the latest occurrence wins")
-		require.NotNil(t, item.Ruling)
-		require.Equal(t, domain.RulingUpholdEngineer, item.Ruling.Ruling)
+		require.Equal(t, domain.ItemOverruled, item.Status, "the latest occurrence says where it stands")
+		require.Equal(t, 3, item.Round)
+		require.Nil(t, item.Response, "nothing was said about the occurrence that closed the item")
+		require.Nil(t, item.Ruling)
+
+		raised, ok := th.Answered(2, "qa-r1-1")
+		require.True(t, ok)
+		require.Equal(t, 1, raised.Round, "round 2's response answers the item round 1 raised")
+		require.Equal(t, domain.ActionPushback, raised.Response.Action)
+		require.Equal(t, 2, raised.ResponseRound)
+
+		held, ok := th.Ruled(2, "qa-r1-1")
+		require.True(t, ok)
+		require.Equal(t, 2, held.Round, "the ruling settles the occurrence the tester held")
+		require.Equal(t, domain.ItemHeld, held.Status)
+		require.Equal(t, domain.RulingUpholdEngineer, held.Ruling.Ruling)
+		require.Equal(t, 2, held.RulingRound)
 	})
 
 	t.Run("e tester upheld then fixed", func(t *testing.T) {
@@ -489,9 +506,31 @@ func TestFeedbackThreadsScenarios(t *testing.T) {
 		item, ok := th.Item("test-r1-1")
 		require.True(t, ok)
 		require.Equal(t, domain.CategoryRules, item.Category)
-		require.Equal(t, domain.RulingUpholdTester, item.Ruling.Ruling)
-		require.Equal(t, domain.ActionFixed, item.Response.Action, "the latest response wins")
 		require.Equal(t, domain.ItemResolved, item.Status)
+
+		// The pushback that caused the arbitration was given in round 2 and
+		// stays on the occurrence it answered: round 3's fix does not
+		// overwrite it.
+		raised, ok := th.Answered(2, "test-r1-1")
+		require.True(t, ok)
+		require.Equal(t, 1, raised.Round)
+		require.Equal(t, domain.ActionWontfix, raised.Response.Action)
+		require.Equal(t, "the empty body is unreachable through the public API", raised.Response.Rationale)
+		require.Equal(t, 2, raised.ResponseRound)
+
+		held, ok := th.Ruled(2, "test-r1-1")
+		require.True(t, ok)
+		require.Equal(t, 2, held.Round)
+		require.Equal(t, domain.ItemHeld, held.Status)
+		require.Equal(t, domain.RulingUpholdTester, held.Ruling.Ruling)
+		require.Equal(t, 2, held.RulingRound)
+		require.Equal(t, domain.ActionFixed, held.Response.Action, "round 3 answered the held occurrence")
+		require.Equal(t, 3, held.ResponseRound)
+
+		_, ok = th.Answered(1, "test-r1-1")
+		require.False(t, ok, "nothing was raised before round 1")
+		_, ok = th.Ruled(2, "no-such-item")
+		require.False(t, ok)
 	})
 
 	t.Run("f round cap escalates", func(t *testing.T) {
@@ -802,4 +841,255 @@ func TestFeedbackNoColor(t *testing.T) {
 
 	themed := NewFeedbackModel(FeedbackOptions{Theme: ThemeFor(ProfileNoColor)}).Resize(110, 22).View(st)
 	require.Equal(t, plain, themed, "an explicit no-colour theme renders the same frame")
+}
+
+// fbRoundHead matches a round section heading, wherever the bead list
+// column leaves it on the line.
+var fbRoundHead = regexp.MustCompile(`round ([0-9]+) · `)
+
+// fbRoundOf reports which round section of a rendered thread the first line
+// containing needle sits in, and 0 when the needle is not on screen. It is
+// how the tests below pin an answer to the round it was given in.
+func fbRoundOf(out, needle string) int {
+	round := 0
+	for _, line := range strings.Split(out, "\n") {
+		plain := fbPlain(line)
+		if m := fbRoundHead.FindStringSubmatch(plain); m != nil {
+			n, err := strconv.Atoi(m[1])
+			if err == nil {
+				round = n
+			}
+		}
+		if strings.Contains(plain, needle) {
+			return round
+		}
+	}
+	return 0
+}
+
+// fbPlain strips the SGR escapes a themed frame carries, so a test can look
+// for text that a style split across attributes.
+func fbPlain(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == 0x1b {
+			for i < len(s) && s[i] != 'm' {
+				i++
+			}
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
+}
+
+// TestFeedbackAnswersKeepTheirRound is the regression test for the round
+// attribution of engineer responses and product-owner rulings: every answer
+// is drawn in the round it was given, and an item answered again later
+// keeps what was said about it the first time (P6-04 scenarios (c), (d) and
+// (e)).
+func TestFeedbackAnswersKeepTheirRound(t *testing.T) {
+	st := fbFixtureState()
+
+	t.Run("e the pushback that caused the arbitration is not overwritten", func(t *testing.T) {
+		v := fbAtCursor(t, fbView(110, 40, FeedbackOptions{}), st, "sc-i9j0")
+		out := v.View(st)
+		require.Contains(t, out, "the empty body is unreachable through the public API",
+			"the round-2 wontfix renders")
+		require.Equal(t, 2, fbRoundOf(out, "⊘ wontfix"), "it was given in round 2")
+		require.Equal(t, 2, fbRoundOf(out, "⚖ uphold_tester"), "the ruling followed in round 2")
+		require.Equal(t, 3, fbRoundOf(out, "→ fixed"), "the fix came in round 3")
+		require.Equal(t, 1, fbRoundOf(out, "No test for the empty-body case"),
+			"the item itself is still raised in round 1")
+	})
+
+	t.Run("c the pushback is drawn in the round it was given", func(t *testing.T) {
+		v := fbAtCursor(t, fbView(110, 40, FeedbackOptions{}), st, "sc-e5f6")
+		out := v.View(st)
+		require.Equal(t, 2, fbRoundOf(out, "↩ pushback"))
+		require.Equal(t, 2, fbRoundOf(out, "⊘ wontfix"))
+		require.Equal(t, 1, fbRoundOf(out, "Spell the flag --no-cache"))
+	})
+
+	t.Run("d the ruling is drawn in the round it was made", func(t *testing.T) {
+		v := fbAtCursor(t, fbView(110, 40, FeedbackOptions{}), st, "sc-g7h8")
+		out := v.View(st)
+		require.Equal(t, 2, fbRoundOf(out, "↩ pushback"))
+		require.Equal(t, 2, fbRoundOf(out, "⚖ uphold_engineer"))
+		require.Equal(t, 3, fbRoundOf(out, "[overruled]"))
+	})
+
+	t.Run("the answer names the item it answers", func(t *testing.T) {
+		v := fbAtCursor(t, fbView(110, 40, FeedbackOptions{Details: true}), st, "sc-i9j0")
+		out := v.View(st)
+		require.Contains(t, out, "⊘ wontfix  test-r1-1")
+		require.Contains(t, out, "re: round 1 · test · blocker · No test for the empty-body case",
+			"details spell out the occurrence answered")
+		require.Contains(t, out, "re: round 2 · test · blocker · No test for the empty-body case")
+	})
+
+	t.Run("an answer to an item no verdict raised still renders", func(t *testing.T) {
+		orphan := fbState([]events.Event{
+			events.RunStarted{Meta: fbMeta(0), Info: fbRunInfo()},
+			events.RoundStarted{Meta: fbMeta(1), Bead: "sc-orph", Round: 1, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}},
+			events.ResponseReceived{Meta: fbMeta(2), Bead: "sc-orph", Round: 1, Agent: "eng-9", Responses: []domain.Response{
+				{ItemID: "ghost-1", Action: domain.ActionFixed, Rationale: "answered an item nobody raised"},
+			}},
+			events.ArbitrationReceived{Meta: fbMeta(3), Bead: "sc-orph", Round: 1, Agent: "po-9", Rulings: []domain.Arbitration{
+				{ItemID: "ghost-1", Ruling: domain.RulingCompromise, Instruction: "split the difference"},
+			}},
+		})
+		out := fbView(110, 40, FeedbackOptions{Details: true}).View(orphan)
+		require.Contains(t, out, "→ fixed    ghost-1")
+		require.Contains(t, out, "⚖ compromise")
+		require.NotContains(t, out, "re: round", "there is no occurrence to point back at")
+	})
+}
+
+// TestFeedbackEscalationOutcomes covers the two D-08 outcomes the seven
+// scenarios do not reach: approve_with_notes, which has only notes, and
+// narrow_scope, which replaces the acceptance criteria.
+func TestFeedbackEscalationOutcomes(t *testing.T) {
+	esc := func(e domain.Escalation) *State {
+		return fbState([]events.Event{
+			events.RunStarted{Meta: fbMeta(0), Info: fbRunInfo()},
+			events.RoundStarted{Meta: fbMeta(1), Bead: "sc-esc0", Round: 1, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}},
+			events.VerdictReceived{Meta: fbMeta(2), Bead: "sc-esc0", Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1, "one major",
+				fbItem("qa-r1-1", domain.SeverityMajor, "The retry budget is unbounded", domain.ItemOpen))},
+			events.ArbitrationReceived{Meta: fbMeta(3), Bead: "sc-esc0", Round: 1, Agent: "po-1", Escalation: &e},
+		})
+	}
+
+	t.Run("approve_with_notes falls back to the notes", func(t *testing.T) {
+		st := esc(domain.Escalation{
+			Outcome: domain.EscalationApproveWithNotes,
+			Notes:   "fine at this traffic",
+		})
+		out := fbView(110, 30, FeedbackOptions{}).View(st)
+		require.Contains(t, out, "▲ escalation approve_with_notes")
+		require.Contains(t, out, "fine at this traffic", "the notes are the only text there is")
+		th, ok := fbView(110, 30, FeedbackOptions{}).Selected(st)
+		require.True(t, ok)
+		require.Equal(t, domain.EscalationApproveWithNotes, th.Escalation.Outcome)
+	})
+
+	t.Run("narrow_scope falls back to the new acceptance", func(t *testing.T) {
+		st := esc(domain.Escalation{
+			Outcome:       domain.EscalationNarrowScope,
+			NewAcceptance: "retry only idempotent verbs",
+		})
+		out := fbView(110, 30, FeedbackOptions{}).View(st)
+		require.Contains(t, out, "▲ escalation narrow_scope")
+		require.Contains(t, out, "retry only idempotent verbs")
+		require.NotContains(t, out, "acceptance:", "there is nothing else to say")
+	})
+
+	t.Run("details spell the new acceptance out under a summary", func(t *testing.T) {
+		st := esc(domain.Escalation{
+			Outcome:       domain.EscalationNarrowScope,
+			Summary:       "three rounds on a budget nobody agreed",
+			NewAcceptance: "retry only idempotent verbs",
+		})
+		plain := fbView(110, 30, FeedbackOptions{}).View(st)
+		require.Contains(t, plain, "three rounds on a budget nobody agreed")
+		require.NotContains(t, plain, "acceptance:", "the long form is behind the details toggle")
+
+		out := fbView(110, 30, FeedbackOptions{Details: true}).View(st)
+		require.Contains(t, out, "acceptance: retry only idempotent verbs")
+	})
+
+	t.Run("the summary line counts an escalated bead however it ended", func(t *testing.T) {
+		for _, outcome := range domain.EscalationOutcomes() {
+			st := esc(domain.Escalation{Outcome: outcome, Summary: "ruled"})
+			require.Contains(t, fbView(110, 30, FeedbackOptions{}).View(st), "1 escalated", "%s", outcome)
+		}
+	})
+}
+
+// TestFeedbackStatusStyle checks every item status is coloured, including a
+// status this build does not know.
+func TestFeedbackStatusStyle(t *testing.T) {
+	th := ThemeFor(ProfileTrueColor)
+	for _, s := range domain.ItemStatuses() {
+		require.NotEmpty(t, feedbackStatusStyle(th, s).Render(s.String()), "%s", s)
+	}
+	require.Equal(t,
+		feedbackStatusStyle(th, domain.ItemOpen).Render("x"),
+		feedbackStatusStyle(th, domain.ItemStatus("from-a-newer-build")).Render("x"),
+		"an unknown status reads as unsettled")
+}
+
+// TestFeedbackViewScrollsTheBeadList covers a run with more reviewed beads
+// than the list column has rows: the cursor stays visible and the beads
+// above it scroll off.
+func TestFeedbackViewScrollsTheBeadList(t *testing.T) {
+	evs := []events.Event{events.RunStarted{Meta: fbMeta(0), Info: fbRunInfo()}}
+	c := &fbClock{}
+	ids := make([]domain.BeadID, 0, 12)
+	for i := range 12 {
+		id := domain.BeadID(fmt.Sprintf("sc-l%03d", i))
+		ids = append(ids, id)
+		evs = append(evs,
+			events.BeadCreated{Meta: c.next(), Bead: fbBead(id, fmt.Sprintf("Reviewed bead %d", i), domain.BeadStateClosed, 1)},
+			events.RoundStarted{Meta: c.next(), Bead: id, Round: 1, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}},
+			events.VerdictReceived{Meta: c.next(), Bead: id, Round: 1, Agent: "qa-1", Verdict: fbApprove(domain.LensQA, 1, "fine")},
+		)
+	}
+	st := fbState(evs)
+	require.Len(t, FeedbackThreads(st), len(ids))
+
+	v := fbView(110, 12, FeedbackOptions{})
+	top := v.View(st)
+	require.Contains(t, top, string(ids[0]))
+	require.NotContains(t, top, string(ids[len(ids)-1]), "the last bead is below the fold")
+
+	v = fbAtCursor(t, v, st, ids[len(ids)-1])
+	bottom := v.View(st)
+	require.Contains(t, bottom, string(ids[len(ids)-1]), "the cursor stays visible")
+	require.NotContains(t, bottom, string(ids[0]), "the list scrolled past the first bead")
+}
+
+// TestFeedbackViewSparseRounds covers a round nobody has said anything in:
+// no lenses, no report and no verdicts.
+func TestFeedbackViewSparseRounds(t *testing.T) {
+	st := fbState([]events.Event{
+		events.RunStarted{Meta: fbMeta(0), Info: fbRunInfo()},
+		events.RoundStarted{Meta: fbMeta(1), Bead: "sc-qui1", Round: 1, RoundKind: events.RoundReview},
+	})
+	out := fbView(110, 20, FeedbackOptions{}).View(st)
+	require.Contains(t, out, "no testers yet", "nobody was asked to review")
+	require.Contains(t, out, "waiting for verdicts", "and nothing was said in the round")
+
+	narrow := fbView(50, 20, FeedbackOptions{}).View(st)
+	require.Contains(t, narrow, "no testers yet", "the narrow selector says the same")
+}
+
+// TestFeedbackOccurrenceLookups covers the guards that keep a mismatched
+// index or an unindexed verdict from breaking a frame.
+func TestFeedbackOccurrenceLookups(t *testing.T) {
+	st := fbFixtureState()
+	th, ok := fbAtCursor(t, fbView(110, 26, FeedbackOptions{}), st, "sc-c3d4").Selected(st)
+	require.True(t, ok)
+
+	got, ok := th.occurrence(1, domain.LensQA, "qa-r1-1")
+	require.True(t, ok)
+	require.Equal(t, 1, got.Round)
+
+	_, ok = th.occurrence(9, domain.LensQA, "qa-r1-1")
+	require.False(t, ok, "no such round")
+
+	broken := FeedbackThread{Items: th.Items, at: map[string]int{
+		feedbackItemKey(1, domain.LensQA, "qa-r1-1"): len(th.Items) + 3,
+	}}
+	_, ok = broken.occurrence(1, domain.LensQA, "qa-r1-1")
+	require.False(t, ok, "an index past the items is not an item")
+
+	// A verdict filed under a round the thread does not index still renders
+	// its items from the verdict itself.
+	v := fbView(110, 26, FeedbackOptions{})
+	lines := v.verdictLines(th, 7, fbChanges(domain.LensQA, 7, "unindexed",
+		fbItem("qa-r7-1", domain.SeverityMinor, "Raised out of band", domain.ItemOpen)), 110)
+	require.Len(t, lines, 2)
+	require.Contains(t, lines[0], "unindexed")
+	require.Contains(t, lines[1], "Raised out of band")
 }

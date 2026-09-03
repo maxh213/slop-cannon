@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -75,14 +76,12 @@ var animPaneRows = []string{
 	"  sc-7g8h  open         Document the retry policy",
 }
 
-// animTabBar renders the tab bar exactly the way [Model.tabBar] does, so the
-// tab indicators the animations aim at line up with the labels.
-func animTabBar() string {
-	var b strings.Builder
-	for i, t := range Tabs() {
-		fmt.Fprintf(&b, " %d %s ", i+1, t)
-	}
-	return b.String()
+// animTabBar is [Model.tabBar] itself, stripped of styling: the geometry the
+// animations aim at is checked against the bar the program really draws, so a
+// change to the label format cannot silently misaim every fallback animation.
+func animTabBar(w int) string {
+	m := New(context.Background(), Options{NoColor: true, NoAnim: true})
+	return ansi.Strip(m.tabBar(w))
 }
 
 // animBaseFrame renders the terminal the sequences animate over: the header
@@ -91,7 +90,7 @@ func animTabBar() string {
 func animBaseFrame(a Animator, w, h int) string {
 	lines := make([]string, h)
 	lines[0] = animClipLine(a.Cannon()+"slop-cannon · run sc-anim-0001 · brief · ammo 2/4", w)
-	lines[1] = animClipLine(animTabBar(), w)
+	lines[1] = animClipLine(animTabBar(w), w)
 	lines[2] = strings.Repeat("─", w)
 	for i := 3; i < h-1; i++ {
 		row := ""
@@ -465,7 +464,9 @@ func TestAnimatorAimsAtTheNodeThenTheTabIndicator(t *testing.T) {
 
 func TestAnimTabLabelGeometryMatchesTheTabBar(t *testing.T) {
 	t.Parallel()
-	bar := animTabBar()
+	// The bar comes from Model.tabBar, so this pins the animation geometry
+	// to the program's own labels rather than to a copy of them.
+	bar := animTabBar(200)
 	for i, tab := range Tabs() {
 		label := fmt.Sprintf(" %d %s ", i+1, tab)
 		require.Equal(t, len([]rune(label)), tabLabelWidth(tab))
@@ -807,4 +808,319 @@ func BenchmarkAnimatorBusy(b *testing.B) {
 			_ = a.Overlay(frame)
 		}
 	}
+}
+
+// --- the wiring the program actually uses ---------------------------------
+//
+// Everything above drives the animator directly, with a fake node resolver.
+// These drive [Model]: the animations have to reach a bead's box in a frame
+// the program drew, or the "projectile to the target bead node" of the task
+// is a test double nobody sees.
+
+// animDemo is the scripted run the wiring tests replay.
+var animDemo = DemoOptions{Delay: -1}
+
+// animModelClock is the fixed clock the model renders against, so a frame
+// cannot depend on when the test ran.
+func animModelClock() time.Time { return DemoStart.Add(20 * time.Minute) }
+
+// animModel builds the real model over the scripted run at w×h, with colour
+// off and the animations on.
+func animModel(t *testing.T, w, h int, demo DemoOptions) Model {
+	t.Helper()
+	m := New(t.Context(), Options{Run: DemoRun(demo), NoColor: true, Now: animModelClock})
+	return animModelSend(m, tea.WindowSizeMsg{Width: w, Height: h})
+}
+
+// animModelSend applies messages the way the Bubble Tea loop does, dropping
+// the commands.
+func animModelSend(m Model, msgs ...tea.Msg) Model {
+	for _, msg := range msgs {
+		next, _ := m.Update(msg)
+		out, ok := next.(Model)
+		if !ok {
+			panic("tui: Update returned something that is not a tui.Model")
+		}
+		m = out
+	}
+	return m
+}
+
+// animFirstShot replays the scripted run into m up to the first agent spawned
+// at a bead, applies that event and returns the model and the event. The
+// earlier events' animations are cleared first, so what is left playing is
+// the one shot the test is about.
+func animFirstShot(t *testing.T, m Model) (Model, events.AgentSpawned) {
+	t.Helper()
+	for _, ev := range DemoEvents(animDemo) {
+		if s, ok := ev.(events.AgentSpawned); ok && s.Agent.Bead != "" {
+			m.anim = m.anim.Clear()
+			return animModelSend(m, EventMsg{Event: ev}), s
+		}
+		m = animModelSend(m, EventMsg{Event: ev})
+	}
+	t.Fatal("the scripted run never spawns an agent at a bead")
+	return m, events.AgentSpawned{}
+}
+
+// animPlainFrame renders the model's frame with the animation layer stopped
+// and the styling stripped: the picture the sprites are drawn over.
+func animPlainFrame(m Model) []string {
+	m.anim = m.anim.Clear()
+	return strings.Split(ansi.Strip(m.View()), "\n")
+}
+
+// animPlayOut advances an animator to its last drawn frame and returns the
+// last sprite of it.
+func animPlayOut(t *testing.T, a Animator) Sprite {
+	t.Helper()
+	var last Sprite
+	found := false
+	for i := 0; !a.Idle(); i++ {
+		require.Less(t, i, 400, "the animation never finished")
+		if s := a.Sprites(); len(s) > 0 {
+			last, found = s[len(s)-1], true
+		}
+		a = a.Advance()
+	}
+	require.True(t, found, "the animation drew nothing")
+	return last
+}
+
+func TestAnimatorInTheProgramAimsAtTheBeadsNode(t *testing.T) {
+	m, spawn := animFirstShot(t, animModel(t, 80, 24, animDemo))
+	require.Equal(t, TabGraph, m.tab, "the program opens on the graph")
+	require.NotNil(t, m.anim.targets, "the model wires the graph view's node resolver in")
+	require.Equal(t, 1, m.anim.Active(), "the spawn fired a shot")
+
+	target, ok := m.anim.targets(spawn.Agent.Bead)
+	require.True(t, ok, "the graph knows where %s is drawn", spawn.Agent.Bead)
+	require.GreaterOrEqual(t, target.Row, chromeHeight-1, "the node is in the main pane, not the chrome")
+	require.Less(t, target.Row, 24-1, "and not on the footer")
+
+	// The row the projectile lands on is the bead's own box line, in the
+	// frame the program draws.
+	plain := animPlainFrame(m)
+	require.Contains(t, plain[target.Row], string(spawn.Agent.Bead),
+		"the target cell is not on the node's line:\n%s", strings.Join(plain, "\n"))
+
+	// And the cell is between that box's own side borders, not in the gap
+	// between two boxes.
+	left, right := animBoxAround([]rune(plain[target.Row]), target.Col)
+	require.GreaterOrEqual(t, left, 0, "no box border left of the target: %q", plain[target.Row])
+	require.Greater(t, right, target.Col, "no box border right of the target: %q", plain[target.Row])
+	require.Equal(t, GraphBoxWidth-1, right-left, "the target is not inside one node box")
+	require.Contains(t, string([]rune(plain[target.Row])[left:right]), string(spawn.Agent.Bead))
+
+	// And the projectile really ends up there rather than on a tab label.
+	last := animPlayOut(t, m.anim)
+	require.Equal(t, target, Target{Row: last.Row, Col: last.Col}, "the shot landed somewhere else")
+	require.NotEqual(t, m.anim.tabIndicator(TabAgents), Target{Row: last.Row, Col: last.Col})
+}
+
+func TestAnimatorInTheProgramFallsBackToTheTabIndicator(t *testing.T) {
+	m, spawn := animFirstShot(t, animModel(t, 80, 24, animDemo))
+
+	// Another tab is up: there is no node on screen to aim at.
+	agents := animModelSend(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
+	require.Nil(t, agents.animTargets(), "only the graph view has nodes")
+
+	// The help overlay covers the pane, so nothing may be fired into it.
+	help := animModelSend(m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("?")})
+	require.Nil(t, help.animTargets())
+
+	// The bead detail panel replaces the boxes with prose.
+	detail := animModelSend(m, tea.KeyMsg{Type: tea.KeyEnter})
+	require.True(t, detail.graph.ShowingDetail())
+	_, ok := GraphTargets(detail.graph, detail.state)(spawn.Agent.Bead)
+	require.False(t, ok)
+
+	// A terminal too narrow for boxes draws the indented list instead.
+	narrow := animModelSend(m, tea.WindowSizeMsg{Width: GraphNarrowWidth - 1, Height: 24})
+	require.Equal(t, GraphIndentedList, narrow.graph.Orientation())
+	_, ok = GraphTargets(narrow.graph, narrow.state)(spawn.Agent.Bead)
+	require.False(t, ok)
+
+	// A bead that is not in this run has no node either.
+	_, ok = GraphTargets(m.graph, m.state)("sc-nope")
+	require.False(t, ok)
+	_, ok = GraphTargets(m.graph, m.state)("")
+	require.False(t, ok)
+	_, ok = GraphTargets(m.graph, nil)(spawn.Agent.Bead)
+	require.False(t, ok)
+}
+
+func TestAnimatorInTheProgramAimsAtEveryVisibleNode(t *testing.T) {
+	m, _ := animFirstShot(t, animModel(t, 120, 40, animDemo))
+	m = animModelSend(m, tea.WindowSizeMsg{Width: 120, Height: 40})
+	plain := animPlainFrame(m)
+	resolve := GraphTargets(m.graph, m.state)
+
+	lay := BuildGraphLayout(m.state)
+	require.NotEmpty(t, lay.Nodes)
+	hits := 0
+	for _, n := range lay.Nodes {
+		target, ok := resolve(n.ID)
+		if !ok {
+			continue // scrolled off the pane
+		}
+		hits++
+		require.Contains(t, plain[target.Row], string(n.ID), "%s: the cell is not on its own box", n.ID)
+	}
+	require.Equal(t, len(lay.Nodes), hits, "every node of a run that fits is aimable")
+}
+
+// TestAnimGoldenOverTheProgramFrame is the composed golden the animation
+// layer needs: sprites drawn over a frame [Model.View] really produced —
+// box-drawing characters, styled chrome and all — rather than over a base
+// frame written by hand in this file.
+func TestAnimGoldenOverTheProgramFrame(t *testing.T) {
+	m, _ := animFirstShot(t, animModel(t, 80, 24, animDemo))
+	var b strings.Builder
+	for i := 0; ; i++ {
+		require.Less(t, i, 400, "the animation never finished")
+		if i%animGoldenStep == 0 {
+			c := m.anim.CannonFrame()
+			fmt.Fprintf(&b, "frame %03d  active %d  queued %d  recoil %d  flash %d\n",
+				i, m.anim.Active(), m.anim.Queued(), c.Recoil, c.Flash)
+			frame := m.View()
+			for _, line := range strings.Split(frame, "\n") {
+				require.LessOrEqual(t, ansi.StringWidth(line), 80, "the overlay widened a line")
+			}
+			b.WriteString(ansi.Strip(frame))
+			b.WriteString("\n\n")
+		}
+		if m.anim.Idle() {
+			break
+		}
+		// The model's own tick, so the sequence is the program's.
+		m = animModelSend(m, AnimTickMsg{Gen: m.anim.gen})
+	}
+	animGolden(t, "anim-over-frame", b.String())
+}
+
+// TestAnimGoldenOverTheProgramFrameIsReproducible guards the golden above
+// against a clock or a map order leaking into it.
+func TestAnimGoldenOverTheProgramFrameIsReproducible(t *testing.T) {
+	play := func() string {
+		m, _ := animFirstShot(t, animModel(t, 80, 24, animDemo))
+		var b strings.Builder
+		for !m.anim.Idle() {
+			b.WriteString(m.View())
+			m = animModelSend(m, AnimTickMsg{Gen: m.anim.gen})
+		}
+		return b.String()
+	}
+	require.Equal(t, play(), play())
+}
+
+// --- the queue is bounded -------------------------------------------------
+
+func TestAnimatorQueueIsBounded(t *testing.T) {
+	t.Parallel()
+	a := animNewAnimator(AnimOptions{Tab: TabGraph})
+	active, queued := a.Capacity()
+	require.Equal(t, AnimMaxActive, active)
+	require.Equal(t, AnimMaxQueued, queued)
+
+	const burst = 10000
+	for i := 0; i < burst; i++ {
+		a, _ = a.Fire(AnimConfetti, animTargetBead)
+	}
+	require.Equal(t, AnimMaxActive, a.Active())
+	require.Equal(t, AnimMaxQueued, a.Queued(), "the queue is capped, not just the active set")
+	require.Equal(t, uint64(burst-AnimMaxActive-AnimMaxQueued), a.Dropped())
+
+	// And the whole burst drains in seconds, not minutes: the ticker stops
+	// soon after the events do, which is what the idle-CPU criterion needs.
+	frames := 0
+	for !a.Idle() {
+		a = a.Advance()
+		frames++
+		require.Less(t, frames, 400, "the queue never drained")
+	}
+	require.Less(t, time.Duration(frames)*AnimFrame, 3*time.Second,
+		"%d frames of ticking after the events stopped", frames)
+}
+
+func TestAnimatorQueueKeepsTheNewestAnimations(t *testing.T) {
+	t.Parallel()
+	a := animNewAnimator(AnimOptions{Tab: TabGraph, Max: 1, MaxQueued: 2})
+	active, queued := a.Capacity()
+	require.Equal(t, 1, active)
+	require.Equal(t, 2, queued)
+
+	for _, k := range []AnimKind{AnimShot, AnimBurst, AnimRicochet, AnimSmoke} {
+		a, _ = a.Fire(k, animTargetBead)
+	}
+	require.Equal(t, []AnimKind{AnimShot}, animPlayingKinds(a))
+	require.Equal(t, []AnimKind{AnimRicochet, AnimSmoke}, a.Pending(), "the oldest waiting animation gave up its place")
+	require.Equal(t, uint64(1), a.Dropped())
+
+	// Dropping is the only loss: what is left still plays.
+	for !a.Idle() {
+		a = a.Advance()
+	}
+	require.Equal(t, uint64(1), a.Dropped(), "advancing drops nothing")
+}
+
+// animPlayingKinds is the kinds of the animations on screen.
+func animPlayingKinds(a Animator) []AnimKind {
+	out := make([]AnimKind, 0, a.Active())
+	for _, p := range a.Playing() {
+		out = append(out, p.Kind)
+	}
+	return out
+}
+
+func TestAnimatorDroppedAnimationsDoNotLeakIntoCopies(t *testing.T) {
+	t.Parallel()
+	a := animNewAnimator(AnimOptions{Tab: TabGraph, Max: 1, MaxQueued: 1})
+	a, _ = a.Fire(AnimShot, animTargetBead)
+	a, _ = a.Fire(AnimShot, animTargetBead)
+	before := a
+
+	full, _ := before.Fire(AnimShot, animTargetBead)
+	require.Equal(t, uint64(1), full.Dropped())
+	require.Equal(t, uint64(0), before.Dropped(), "the copy left the original alone")
+	require.Equal(t, 1, before.Queued())
+	require.Equal(t, 1, full.Queued())
+}
+
+// --- the header the cannon shares -----------------------------------------
+
+// TestAnimCannonFieldLeavesRoomForTheHeaderFields pins the budget the cannon
+// takes out of the header: at the 80 columns the phase-7 criteria are written
+// for, the safety field — the one that says whether the run pushes to the
+// default branch — must still be readable in full, on or off.
+func TestAnimCannonFieldLeavesRoomForTheHeaderFields(t *testing.T) {
+	t.Parallel()
+	for _, safety := range []bool{true, false} {
+		demo := DemoOptions{Delay: -1, Safety: safety}
+		m := animModel(t, 80, 24, demo)
+		require.Equal(t, CannonFieldWidth, len([]rune(m.anim.Cannon())), "the cannon field is fixed width")
+
+		header := animPlainFrame(m)[0]
+		require.LessOrEqual(t, len([]rune(header)), 80)
+		require.Contains(t, header, "safety "+onOff(safety),
+			"the safety field is cut in half at 80 columns: %q", header)
+	}
+}
+
+// animBoxAround returns the columns of the node-box side borders either side
+// of col on a rendered row, or -1 when there is none.
+func animBoxAround(row []rune, col int) (left, right int) {
+	left, right = -1, -1
+	for i, r := range row {
+		if r != '┃' && r != '│' {
+			continue
+		}
+		switch {
+		case i < col:
+			left = i
+		case right < 0:
+			right = i
+		}
+	}
+	return left, right
 }

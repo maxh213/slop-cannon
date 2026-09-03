@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -168,13 +169,21 @@ func avPress(t *testing.T, v tui.AgentsModel, st *tui.State, key string) tui.Age
 // avLines splits a rendered frame into its lines.
 func avLines(frame string) []string { return strings.Split(frame, "\n") }
 
+// avEscape matches an ANSI escape sequence: the theme keeps bold under
+// NO_COLOR, so a frame carries attributes even with colour switched off.
+var avEscape = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
+
+// avPlain strips every escape, so an assertion sees the characters the user
+// reads rather than the attributes around them.
+func avPlain(s string) string { return avEscape.ReplaceAllString(s, "") }
+
 // avBody returns the transcript lines of a frame: everything under the
 // selected agent's card and the pane's rule.
 func avBody(t *testing.T, frame string) string {
 	t.Helper()
 	lines := avLines(frame)
 	for i, l := range lines {
-		if strings.HasPrefix(l, "TRANSCRIPT") {
+		if strings.HasPrefix(avPlain(l), "TRANSCRIPT") {
 			return strings.Join(lines[i+1:], "\n")
 		}
 	}
@@ -206,7 +215,7 @@ func TestAgentsViewNarrowGolden(t *testing.T) {
 	require.NotContains(t, frame, "claude/fable")
 	require.NotContains(t, frame, "implement r1")
 	require.NotContains(t, frame, "agent timeout after 15m")
-	require.Contains(t, frame, "⚙ engineer · av-2")
+	require.Contains(t, avPlain(frame), "■ engineer · av-2")
 	avGolden(t, "narrow", frame)
 }
 
@@ -300,7 +309,7 @@ func TestAgentsViewSelectedCardIsAlwaysVisible(t *testing.T) {
 		v = avPress(t, v, st, "down")
 	}
 	frame := v.View(st)
-	require.Contains(t, frame, "✔ po", "the selected history row is scrolled into view")
+	require.Contains(t, avPlain(frame), "✓ po", "the selected history row is scrolled into view")
 	require.Contains(t, frame, "▌ ", "and it carries the cursor gutter")
 }
 
@@ -459,12 +468,17 @@ func TestAgentsViewIgnoresNonKeyMessages(t *testing.T) {
 
 func TestAgentsViewSpinnerAdvances(t *testing.T) {
 	st, v := avView(t, 80, 20)
+	v, _ = v.Wake(st)
+	require.True(t, v.Ticking())
 	first := v.View(st)
 	for range 3 {
-		v = v.Tick()
+		v = avTick(t, v, st)
 	}
 	require.NotEqual(t, first, v.View(st), "the spinner frame should change")
-	require.Equal(t, first, v.Tick().Tick().Tick().Tick().Tick().Tick().Tick().View(st), "ten ticks return to frame zero")
+	for range 7 {
+		v = avTick(t, v, st)
+	}
+	require.Equal(t, first, v.View(st), "ten ticks return to frame zero")
 }
 
 func TestAgentsViewDefaultsAreUsable(t *testing.T) {
@@ -501,4 +515,287 @@ func TestAgentsViewLiveElapsedUsesTheClock(t *testing.T) {
 	require.Contains(t, v.View(st), "2m0s")
 	// A failed agent shows how long it ran, not how long ago it started.
 	require.Contains(t, v.View(st), "15m0s")
+}
+
+// avTick advances the view one spinner frame and asserts the tick was the
+// live ticker's own, the way [tui.Model] drives it.
+func avTick(t *testing.T, v tui.AgentsModel, st *tui.State) tui.AgentsModel {
+	t.Helper()
+	next, cmd, ok := v.Tick(tui.AgentsTickMsg{Gen: v.Generation()}, st)
+	require.True(t, ok, "the view dropped its own tick")
+	require.NotNil(t, cmd, "a live run reschedules the next frame")
+	return next
+}
+
+// avKilled is the script of an agent the orchestrator killed, which is the
+// one ending the other fixtures never produce.
+func avKilled() []events.Event {
+	at := avStart
+	const eng domain.AgentID = "eng-killed-1"
+	return []events.Event{
+		events.AgentSpawned{
+			Meta:  events.MetaAt(avRun, at),
+			Agent: avAgent(eng, domain.RoleEngineer, "", "av-7", at),
+			Task:  events.TaskImplement, BeadTitle: "Stopped work", Round: 1, Attempt: 1,
+		},
+		events.AgentOutput{Meta: events.MetaAt(avRun, at.Add(time.Second)), Agent: eng, Stream: events.StreamStdout, Line: "editing internal/http/client.go"},
+		events.AgentFailed{
+			Meta: events.MetaAt(avRun, at.Add(30*time.Second)), Agent: eng, Role: domain.RoleEngineer,
+			Bead: "av-7", Failure: events.FailureKilled, Err: "run stopped",
+			Duration: 30 * time.Second, ExitCode: -1, Attempt: 1,
+		},
+	}
+}
+
+func TestAgentsViewTickerRunsOnlyWhileAgentsAreLive(t *testing.T) {
+	st, v := avView(t, 80, 20)
+	require.False(t, v.Ticking(), "a view nobody woke does not tick, so a still frame is reproducible")
+
+	v, cmd := v.Wake(st)
+	require.NotNil(t, cmd, "a live agent starts the ticker")
+	require.True(t, v.Ticking())
+	msg, ok := cmd().(tui.AgentsTickMsg)
+	require.True(t, ok, "the ticker command must produce an AgentsTickMsg")
+	require.Equal(t, v.Generation(), msg.Gen)
+
+	// Waking an already-ticking view does not start a second ticker.
+	woken, again := v.Wake(st)
+	require.Nil(t, again)
+	require.Equal(t, v.Generation(), woken.Generation())
+
+	// A tick from an older generation is dropped without a redraw.
+	_, stale, handled := v.Tick(tui.AgentsTickMsg{Gen: msg.Gen - 1}, st)
+	require.False(t, handled)
+	require.Nil(t, stale)
+
+	// When the last agent ends the ticker stops, and the next spawn wakes it
+	// again with a fresh generation.
+	ended := avEndEveryAgent(t, st)
+	stopped, cmd, handled := v.Tick(msg, ended)
+	require.True(t, handled)
+	require.Nil(t, cmd, "nothing is live, so no frame is scheduled")
+	require.False(t, stopped.Ticking())
+
+	restarted, cmd := stopped.Wake(st)
+	require.NotNil(t, cmd)
+	require.Equal(t, msg.Gen+1, restarted.Generation())
+}
+
+// avEndEveryAgent returns a copy of the scripted run in which every agent
+// has ended.
+func avEndEveryAgent(t *testing.T, _ *tui.State) *tui.State {
+	t.Helper()
+	evs := avScript()
+	at := avStart.Add(10 * time.Minute)
+	evs = append(evs,
+		events.AgentFinished{Meta: events.MetaAt(avRun, at), Agent: "eng-av-2-r1", Role: domain.RoleEngineer, Bead: "av-2", Duration: 96 * time.Second, Produced: domain.MessageImplReport},
+		events.AgentFinished{Meta: events.MetaAt(avRun, at.Add(time.Second)), Agent: "tester-qa-av-2-r1", Role: domain.RoleTester, Bead: "av-2", Duration: 58 * time.Second, Produced: domain.MessageVerdict},
+	)
+	st, _ := avFold(t, 80, 20, evs)
+	return st
+}
+
+func TestAgentsViewTickRedrawsTheElapsedTime(t *testing.T) {
+	// The tick is what re-renders a live card, so a clock that moves shows a
+	// different elapsed time on the next frame.
+	now := avNow
+	st, _ := avFold(t, 80, 20, avScript())
+	v := tui.NewAgentsModel(tui.AgentsOptions{NoColor: true, Now: func() time.Time { return now }}).Resize(80, 20)
+	for _, ev := range avScript() {
+		v = v.Apply(ev)
+	}
+	v, _ = v.Wake(st)
+	require.Contains(t, v.View(st), "2m0s")
+	now = now.Add(time.Second)
+	v = avTick(t, v, st)
+	require.Contains(t, v.View(st), "2m1s")
+}
+
+func TestAgentsViewTranscriptCapDefaultsTo500Lines(t *testing.T) {
+	require.Equal(t, 500, tui.AgentsTranscriptLines)
+	v := tui.NewAgentsModel(tui.AgentsOptions{NoColor: true})
+	const over = tui.AgentsTranscriptLines + 100
+	for i := range over {
+		v = v.Apply(events.AgentOutput{
+			Meta: events.MetaAt(avRun, avStart), Agent: "eng-1",
+			Stream: events.StreamStdout, Line: fmt.Sprintf("line %d", i),
+		})
+	}
+	got := v.Transcript("eng-1")
+	require.Len(t, got, tui.AgentsTranscriptLines)
+	require.Equal(t, "line 100", got[0], "the oldest lines are the ones dropped")
+	require.Equal(t, fmt.Sprintf("line %d", over-1), got[len(got)-1])
+}
+
+func TestAgentsViewKilledAgentRendersTheStoppedGlyph(t *testing.T) {
+	st, v := avFold(t, 80, 20, avKilled())
+	frame := v.View(st)
+	require.Contains(t, avPlain(frame), "⊗ engineer", "a killed agent gets the theme's killed glyph")
+	require.Contains(t, avPlain(frame), "killed (run stopped)")
+	require.NotContains(t, avPlain(frame), "LIVE ·", "nothing is live any more")
+	avGolden(t, "killed", frame)
+
+	// The same glyph on the transcript pane's card, and the killed style is
+	// the theme's, not a colour of this view's own.
+	v = avPress(t, v, st, "enter")
+	require.Contains(t, avPlain(v.View(st)), "⊗ engineer")
+	require.Equal(t, "⊗", tui.AgentStateGlyph(domain.AgentStateKilled))
+}
+
+func TestAgentsViewSelectionFollowsTheAgentThroughAReorder(t *testing.T) {
+	st, v := avView(t, 80, 20)
+	// Select the second live agent (the QA tester) and open its transcript.
+	v = avPress(t, v, st, "down")
+	v = avPress(t, v, st, "enter")
+	require.Equal(t, domain.AgentID("tester-qa-av-2-r1"), v.SelectedID())
+	require.Contains(t, avBody(t, v.View(st)), "running go test ./...")
+
+	// The engineer above it finishes: it leaves the live section and joins
+	// the head of the history, so every index below it moves. The selection
+	// is pinned to the agent, not to the row it was on.
+	fin := events.AgentFinished{
+		Meta: events.MetaAt(avRun, avNow), Agent: "eng-av-2-r1", Role: domain.RoleEngineer,
+		Bead: "av-2", Duration: 96 * time.Second, Produced: domain.MessageImplReport,
+	}
+	st.Apply(fin)
+	v = v.Apply(fin)
+
+	a, ok := v.Selected(st)
+	require.True(t, ok)
+	require.Equal(t, domain.AgentID("tester-qa-av-2-r1"), a.ID, "the transcript must not switch agents on its own")
+	require.Contains(t, avBody(t, v.View(st)), "running go test ./...")
+	require.NotContains(t, avBody(t, v.View(st)), "step 12: editing internal/http/client.go")
+}
+
+func TestAgentsViewSanitisesSubprocessOutput(t *testing.T) {
+	const id domain.AgentID = "eng-raw"
+	dirty := []string{
+		"\x1b[2J\x1b[H\x1b[31mred\x1b[0m alert",
+		"progress  10%\rprogress 100%",
+		"tabs\tbetween\twords",
+		"\x07bell\x08back\x7fdel",
+		"\x1b]0;window title\x07titled",
+		"plain text",
+	}
+	v := tui.NewAgentsModel(tui.AgentsOptions{NoColor: true}).Resize(60, 12)
+	for _, line := range dirty {
+		v = v.Apply(events.AgentOutput{
+			Meta: events.MetaAt(avRun, avStart), Agent: id,
+			Stream: events.StreamStdout, Line: line,
+		})
+	}
+	require.Equal(t, []string{
+		"red alert",
+		"progress 100%",
+		"tabs    between    words",
+		"bellbackdel",
+		"titled",
+		"plain text",
+	}, v.Transcript(id))
+
+	// And nothing that survived can move the cursor or repaint the screen.
+	st, _ := avFold(t, 60, 12, []events.Event{
+		events.AgentSpawned{
+			Meta:  events.MetaAt(avRun, avStart),
+			Agent: avAgent(id, domain.RoleEngineer, "", "av-8", avStart),
+			Task:  events.TaskImplement, Attempt: 1,
+		},
+	})
+	frame := avPress(t, v, st, "enter").View(st)
+	require.NotContains(t, frame, "\x1b[2J")
+	require.NotContains(t, frame, "\x1b[31m")
+	require.NotContains(t, frame, "\r")
+	for i, l := range avLines(frame) {
+		require.LessOrEqual(t, lipgloss.Width(l), 60, "line %d is wider than the pane: %q", i, l)
+	}
+}
+
+func TestAgentsViewHeadingsShowTheTranscriptKeys(t *testing.T) {
+	st, v := avView(t, 80, 20)
+	require.Contains(t, v.View(st), "ENTER TRANSCRIPT", "the list says how to open a transcript")
+
+	open := avPress(t, v, st, "enter").View(st)
+	require.Contains(t, open, "F FOLLOW")
+	require.Contains(t, open, "ESC BACK")
+
+	// A pane too narrow for the hint keeps the heading instead.
+	stn, narrow := avView(t, 44, 12)
+	require.NotContains(t, avPress(t, narrow, stn, "enter").View(stn), "ESC BACK")
+}
+
+// avModelWithALiveAgent builds the assembled [tui.Model] on the Agents tab
+// with one live agent and one that ended, so the transcript pane and the
+// spinner ticker can be driven the way the program drives them.
+func avModelWithALiveAgent(t *testing.T) tui.Model {
+	t.Helper()
+	m := tui.New(t.Context(), tui.Options{
+		Run:     domain.Run{ID: avRun, Config: domain.ConfigSnapshot{Ammo: 6}},
+		NoColor: true,
+		Now:     func() time.Time { return avNow },
+	})
+	m = tuiResize(m, 80, 24)
+	for _, ev := range avScript() {
+		m = tuiUpdate(m, tui.EventMsg{Event: ev})
+	}
+	return tuiUpdate(m, tuiKey("2"))
+}
+
+func TestModelOpensAndClosesTheAgentsTranscript(t *testing.T) {
+	m := avModelWithALiveAgent(t)
+	require.Equal(t, tui.TabAgents, m.Tab())
+	require.Contains(t, m.View(), "LIVE · AMMO 2/6")
+
+	open := tuiUpdate(m, tuiKey("enter"))
+	require.Contains(t, open.View(), "TRANSCRIPT ·", "enter must reach the Agents view")
+	require.Contains(t, open.View(), "step 12: editing internal/http/client.go")
+
+	// The pane stays open across a tab switch, and esc closes it.
+	back := tuiUpdate(tuiUpdate(open, tuiKey("1")), tuiKey("2"))
+	require.Contains(t, back.View(), "TRANSCRIPT ·")
+	require.Contains(t, tuiUpdate(back, tuiKey("esc")).View(), "LIVE · AMMO 2/6")
+}
+
+func TestModelDrivesTheAgentsSpinner(t *testing.T) {
+	m := avModelWithALiveAgent(t)
+	before := m.View()
+	// Generation 1 is the ticker the first spawn started; the model must
+	// advance the spinner and schedule the next frame.
+	next, cmd := tuiUpdateCmd(m, tui.AgentsTickMsg{Gen: 1})
+	require.NotNil(t, cmd, "the model reschedules the ticker while an agent is live")
+	require.NotEqual(t, before, next.View(), "the spinner did not advance")
+	require.Contains(t, next.View(), "⠙", "the second spinner frame")
+
+	// A stale tick changes nothing.
+	stale, cmd := tuiUpdateCmd(next, tui.AgentsTickMsg{Gen: 99})
+	require.Nil(t, cmd)
+	require.Equal(t, next.View(), stale.View())
+}
+
+func TestModelHelpOverlayListsTheAgentsKeys(t *testing.T) {
+	m := avModelWithALiveAgent(t)
+	overlay := tuiUpdate(m, tuiKey("?")).View()
+	require.Contains(t, overlay, "Agents keys")
+	for _, want := range []string{"transcript", "follow", "back", "page up", "newest"} {
+		require.Contains(t, overlay, want, "the `?` overlay documents the transcript keys")
+	}
+
+	// Another tab's overlay carries the global keys only.
+	graph := tuiUpdate(tuiUpdate(m, tuiKey("1")), tuiKey("?")).View()
+	require.NotContains(t, graph, "Agents keys")
+}
+
+func TestModelHelpOverlayWithTheAgentsKeysStillFits(t *testing.T) {
+	// The view's keys are a second block under the global ones rather than
+	// three more columns beside them, so the box stays inside a narrow pane.
+	for _, w := range []int{40, 60, 80} {
+		t.Run(fmt.Sprintf("%dx24", w), func(t *testing.T) {
+			m := tuiResize(avModelWithALiveAgent(t), w, 24)
+			frame := tuiUpdate(m, tuiKey("?")).View()
+			lines := avLines(frame)
+			require.Len(t, lines, 24)
+			for i, l := range lines {
+				require.LessOrEqual(t, lipgloss.Width(l), w, "overlay line %d is wider than the pane", i)
+			}
+		})
+	}
 }

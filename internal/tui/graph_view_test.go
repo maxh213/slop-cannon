@@ -135,6 +135,42 @@ func gvBig() []domain.Bead {
 	return out
 }
 
+// gvSkip is a graph whose dependencies jump over levels: two beads wait on
+// the root as well as on the bead in between them, so their edges to the root
+// span two and four levels and cannot run straight through one gutter.
+func gvSkip() []domain.Bead {
+	return []domain.Bead{
+		gvBead("sc-aaaa", "Extract the HTTP client", domain.BeadStateClosed, 0),
+		gvBead("sc-bbbb", "Retry idempotent requests", domain.BeadStateInProgress, 1, "sc-aaaa"),
+		gvBead("sc-cccc", "Benchmark the client", domain.BeadStateOpen, 0, "sc-aaaa", "sc-bbbb"),
+		gvBead("sc-dddd", "Document the retry policy", domain.BeadStateOpen, 0, "sc-cccc"),
+		gvBead("sc-eeee", "Release notes for retries", domain.BeadStateOpen, 0, "sc-aaaa", "sc-dddd"),
+	}
+}
+
+// gvSkipEdges are the dependencies gvSkip declares, blocker first.
+func gvSkipEdges() [][2]domain.BeadID {
+	return [][2]domain.BeadID{
+		{"sc-aaaa", "sc-bbbb"},
+		{"sc-aaaa", "sc-cccc"},
+		{"sc-bbbb", "sc-cccc"},
+		{"sc-cccc", "sc-dddd"},
+		{"sc-aaaa", "sc-eeee"},
+		{"sc-dddd", "sc-eeee"},
+	}
+}
+
+// gvCycle is a graph the layering cannot place: two beads block each other, a
+// third waits on the pair, and a fourth waits on a blocker outside the run.
+func gvCycle() []domain.Bead {
+	return []domain.Bead{
+		gvBead("sc-loop", "Rewrite the scheduler", domain.BeadStateOpen, 0, "sc-back"),
+		gvBead("sc-back", "Rewrite the queue", domain.BeadStateInProgress, 1, "sc-loop"),
+		gvBead("sc-heir", "Benchmark both halves", domain.BeadStateOpen, 0, "sc-loop"),
+		gvBead("sc-free", "Document the queue", domain.BeadStateOpen, 0, "sc-out1"),
+	}
+}
+
 // gvView builds the view sized to the main pane of a w×h terminal.
 func gvView(w, h int, opts GraphOptions) GraphModel {
 	opts.NoColor = true
@@ -279,8 +315,36 @@ func TestGraphViewGoldenVariants(t *testing.T) {
 		for i := 0; i < 6; i++ {
 			v, _ = v.Update(gvKey("down"), st, DefaultKeyMap())
 		}
-		require.Equal(t, 6, v.DetailOffset())
+		require.Equal(t, 3, v.DetailOffset(), "the offset stops at the last page the panel can show")
 		gvGolden(t, "graph-detail-scrolled", gvFrame(t, v, st, 80, 24))
+	})
+
+	t.Run("cycle", func(t *testing.T) {
+		st := gvState(gvCycle())
+		v := gvView(100, 24, GraphOptions{})
+		require.Equal(t, GraphLeftToRight, v.Orientation())
+		gvGolden(t, "graph-cycle", gvFrame(t, v, st, 100, 24))
+	})
+
+	t.Run("cycle-narrow", func(t *testing.T) {
+		st := gvState(gvCycle())
+		v := gvView(64, 20, GraphOptions{})
+		require.Equal(t, GraphIndentedList, v.Orientation())
+		gvGolden(t, "graph-cycle-narrow", gvFrame(t, v, st, 64, 20))
+	})
+
+	t.Run("skip", func(t *testing.T) {
+		st := gvState(gvSkip())
+		v := gvView(120, 30, GraphOptions{})
+		require.Equal(t, GraphLeftToRight, v.Orientation())
+		gvGolden(t, "graph-skip", gvFrame(t, v, st, 120, 30))
+	})
+
+	t.Run("skip-vertical", func(t *testing.T) {
+		st := gvState(gvSkip())
+		v := gvView(100, 60, GraphOptions{})
+		require.Equal(t, GraphTopToBottom, v.Orientation())
+		gvGolden(t, "graph-skip-vertical", gvFrame(t, v, st, 100, 60))
 	})
 }
 
@@ -704,4 +768,295 @@ func TestGraphCanvasKeepsBoxes(t *testing.T) {
 	c.text(2, 0, "X", nil)
 	c.polyline([]graphPoint{{0, 0}, {4, 0}}, nil, false)
 	require.Equal(t, "──X──", c.row(0, 0, 5))
+}
+
+// gvDirections pairs each direction bit with its opposite and the step that
+// follows it, so a walk over the drawn edges only crosses cells that agree
+// they are joined.
+var gvDirections = []struct {
+	dir, opposite uint8
+	dx, dy        int
+}{
+	{graphNorth, graphSouth, 0, -1},
+	{graphSouth, graphNorth, 0, 1},
+	{graphEast, graphWest, 1, 0},
+	{graphWest, graphEast, -1, 0},
+}
+
+// gvReaches reports whether the edges drawn on the canvas join two cells: it
+// walks the direction masks, so a route chopped in half by a box in the way
+// does not count as joined.
+func gvReaches(c *graphCanvas, from, to graphPoint) bool {
+	if !c.inside(from.x, from.y) || c.masks[from.y*c.w+from.x] == 0 {
+		return false
+	}
+	seen := map[graphPoint]bool{from: true}
+	for queue := []graphPoint{from}; len(queue) > 0; queue = queue[1:] {
+		p := queue[0]
+		if p == to {
+			return true
+		}
+		mask := c.masks[p.y*c.w+p.x]
+		for _, d := range gvDirections {
+			q := graphPoint{p.x + d.dx, p.y + d.dy}
+			if mask&d.dir == 0 || !c.inside(q.x, q.y) || seen[q] {
+				continue
+			}
+			if c.masks[q.y*c.w+q.x]&d.opposite == 0 {
+				continue
+			}
+			seen[q] = true
+			queue = append(queue, q)
+		}
+	}
+	return false
+}
+
+// gvEnds returns the cell an edge leaves the blocker's box from and the cell
+// it arrives at beside the dependent's box.
+func gvEnds(src, dst graphBox, vertical bool) (from, to graphPoint) {
+	if vertical {
+		return graphPoint{src.midX(), src.y + src.h}, graphPoint{dst.midX(), dst.y - 1}
+	}
+	return graphPoint{src.x + src.w, src.midY()}, graphPoint{dst.x - 1, dst.midY()}
+}
+
+// gvAssertNoEdgeOnBoxes requires that no route was laid over a box, which is
+// what used to chop an edge into stubs.
+func gvAssertNoEdgeOnBoxes(t *testing.T, lay GraphLayout, canvas *graphCanvas, boxes []graphBox) {
+	t.Helper()
+	for i, b := range boxes {
+		for y := b.y; y < b.y+b.h; y++ {
+			for x := b.x; x < b.x+b.w; x++ {
+				require.Zero(t, canvas.masks[y*canvas.w+x],
+					"an edge was routed onto the box of %s at (%d,%d)", lay.Nodes[i].ID, x, y)
+			}
+		}
+	}
+}
+
+// gvAssertEdgesDrawn requires every named forward dependency to be drawn as
+// one unbroken route, and no route to have landed on a box.
+func gvAssertEdgesDrawn(t *testing.T, lay GraphLayout, vertical bool, want [][2]domain.BeadID) {
+	t.Helper()
+	v := NewGraphModel(GraphOptions{NoColor: true}).Resize(400, 200)
+	canvas, boxes := v.paint(lay, vertical, 0)
+	for _, e := range want {
+		si, ok := lay.Index(e[0])
+		require.True(t, ok)
+		di, ok := lay.Index(e[1])
+		require.True(t, ok)
+		from, to := gvEnds(boxes[si], boxes[di], vertical)
+		require.True(t, gvReaches(canvas, from, to),
+			"the edge %s → %s is not drawn as one unbroken route", e[0], e[1])
+	}
+	gvAssertNoEdgeOnBoxes(t, lay, canvas, boxes)
+}
+
+// TestGraphViewSkipLevelEdges is the regression test for edges whose blocker
+// is more than one level back: they used to be chopped where they crossed the
+// boxes in between, which both hid the real dependency and left stubs that
+// read as dependencies that do not exist.
+func TestGraphViewSkipLevelEdges(t *testing.T) {
+	lay := BuildGraphLayout(gvState(gvSkip()))
+	require.Len(t, lay.Layers, 5)
+	for name, vertical := range map[string]bool{"left→right": false, "top→bottom": true} {
+		t.Run(name, func(t *testing.T) {
+			gvAssertEdgesDrawn(t, lay, vertical, gvSkipEdges())
+		})
+	}
+}
+
+// TestGraphViewSkipLevelEdgesMinimal checks the smallest graph with a skip:
+// a root, a middle bead that waits on it, and a sink that waits on both.
+func TestGraphViewSkipLevelEdgesMinimal(t *testing.T) {
+	lay := BuildGraphLayout(gvState([]domain.Bead{
+		gvBead("sc-root", "Root", domain.BeadStateClosed, 0),
+		gvBead("sc-midd", "Middle", domain.BeadStateOpen, 0, "sc-root"),
+		gvBead("sc-sink", "Sink", domain.BeadStateOpen, 0, "sc-root", "sc-midd"),
+	}))
+	want := [][2]domain.BeadID{{"sc-root", "sc-midd"}, {"sc-root", "sc-sink"}, {"sc-midd", "sc-sink"}}
+	for name, vertical := range map[string]bool{"left→right": false, "top→bottom": true} {
+		t.Run(name, func(t *testing.T) {
+			gvAssertEdgesDrawn(t, lay, vertical, want)
+		})
+	}
+}
+
+// TestGraphEdges checks how each dependency is classified and that every
+// detour gets a bypass lane of its own.
+func TestGraphEdges(t *testing.T) {
+	edges, skips, backs := graphEdges(BuildGraphLayout(gvState(gvSkip())))
+	require.Len(t, edges, 6)
+	require.Equal(t, 2, skips, "sc-aaaa blocks two beads more than one level along")
+	require.Equal(t, 0, backs)
+	lanes := map[int]bool{}
+	for _, e := range edges {
+		if e.kind != graphEdgeSkip {
+			require.Equal(t, -1, e.lane, "an edge that needs no detour owns no lane")
+			continue
+		}
+		require.False(t, lanes[e.lane], "two detours share lane %d", e.lane)
+		lanes[e.lane] = true
+	}
+	require.Len(t, lanes, 2)
+
+	// A blocker outside the run has no box to draw from, and the cycle
+	// bucket's own edges are the only ones that do not move a level forward.
+	edges, skips, backs = graphEdges(BuildGraphLayout(gvState(gvCycle())))
+	require.Len(t, edges, 3, "the dangling blocker of sc-free is not drawn")
+	require.Equal(t, 0, skips)
+	require.Equal(t, 3, backs)
+}
+
+// TestGraphViewCycleAndDangling renders the graphs the layering cannot place:
+// the cycle is named in the summary, on every box that is stuck in it and in
+// the narrow list's level heading, and the blocker outside the run is counted
+// rather than silently dropped.
+func TestGraphViewCycleAndDangling(t *testing.T) {
+	st := gvState(gvCycle())
+	lay := BuildGraphLayout(st)
+	require.Len(t, lay.Cycles, 1)
+	require.Equal(t, []domain.BeadID{"sc-out1"}, lay.Dangling)
+
+	boxed := gvView(100, 24, GraphOptions{}).View(st)
+	require.Contains(t, boxed, "1 cycle", "the summary counts the cycle, in the singular")
+	require.NotContains(t, boxed, "1 cycles")
+	require.Contains(t, boxed, "1 outside the run")
+	require.Equal(t, 3, strings.Count(boxed, "─"+graphCycleLabel),
+		"every bead stuck in the cycle says so on its border")
+
+	// The cycle's own edges are drawn too, through lanes past the last level.
+	canvas, boxes := gvView(100, 24, GraphOptions{}).paint(lay, false, 0)
+	gvAssertNoEdgeOnBoxes(t, lay, canvas, boxes)
+	for _, e := range [][2]domain.BeadID{{"sc-loop", "sc-back"}, {"sc-back", "sc-loop"}, {"sc-loop", "sc-heir"}} {
+		si, _ := lay.Index(e[0])
+		di, _ := lay.Index(e[1])
+		require.True(t, gvReaches(canvas,
+			graphPoint{boxes[si].x + boxes[si].w, boxes[si].midY()},
+			graphPoint{boxes[di].x + boxes[di].w, boxes[di].midY()}),
+			"the cycle edge %s → %s leaves and re-enters on the far side", e[0], e[1])
+	}
+
+	// The same edges survive the top→bottom layout, where the lanes run below
+	// the last level instead of beside it.
+	tall := NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphTopToBottom}).Resize(120, 60)
+	canvas, boxes = tall.paint(lay, true, 0)
+	gvAssertNoEdgeOnBoxes(t, lay, canvas, boxes)
+	for _, e := range [][2]domain.BeadID{{"sc-loop", "sc-back"}, {"sc-back", "sc-loop"}, {"sc-loop", "sc-heir"}} {
+		si, _ := lay.Index(e[0])
+		di, _ := lay.Index(e[1])
+		require.True(t, gvReaches(canvas,
+			graphPoint{boxes[si].midX(), boxes[si].y + boxes[si].h},
+			graphPoint{boxes[di].midX(), boxes[di].y + boxes[di].h}),
+			"the cycle edge %s → %s is not drawn top→bottom", e[0], e[1])
+	}
+
+	// The detail panel names the cycle too, and says so when nothing has
+	// happened to the bead yet.
+	detail := gvView(80, 24, GraphOptions{})
+	for i := 0; i < 2; i++ {
+		detail, _ = detail.Update(gvKey("down"), st, DefaultKeyMap())
+	}
+	detail, _ = detail.Update(gvKey("enter"), st, DefaultKeyMap())
+	sel, ok := detail.Selected(st)
+	require.True(t, ok)
+	require.True(t, sel.Cycle)
+	pane := detail.View(st)
+	require.Contains(t, pane, "on a dependency cycle")
+	require.Contains(t, pane, "nothing has happened to this bead yet")
+	require.Nil(t, detail.detailHistory(nil, sel), "a view with no run state has no history to show")
+
+	list := gvView(64, 20, GraphOptions{}).View(st)
+	require.Contains(t, list, "cycle (3)", "the narrow list names the bucket the cycle went in")
+	require.Contains(t, list, "level 0 (1)")
+	require.Contains(t, list, "← sc-out1", "the blocker outside the run is still named")
+}
+
+// TestGraphModelDetailScrollIsBounded checks that the detail panel's offset
+// stops at the last page, so scrolling back up moves on the first press
+// instead of first undoing every wasted keystroke.
+func TestGraphModelDetailScrollIsBounded(t *testing.T) {
+	st := gvState(gvDetailBeads(), gvDetailHistory()...)
+	keys := DefaultKeyMap()
+	v := gvView(80, 24, GraphOptions{})
+	v, _ = v.Update(gvKey("down"), st, keys)
+	v, _ = v.Update(gvKey("enter"), st, keys)
+
+	lay := BuildGraphLayout(st)
+	want := v.detailMaxOffset(lay, st, v.Cursor())
+	require.Positive(t, want, "the fixture bead has more history than the pane can show")
+
+	for i := 0; i < 30; i++ {
+		v, _ = v.Update(gvKey("down"), st, keys)
+	}
+	require.Equal(t, want, v.DetailOffset())
+	before := v.View(st)
+
+	v, ok := v.Update(gvKey("up"), st, keys)
+	require.True(t, ok)
+	require.Equal(t, want-1, v.DetailOffset())
+	require.NotEqual(t, before, v.View(st), "one press back up moves the panel")
+}
+
+// TestGraphDetailHistoryExtras covers the history lines the review loop only
+// writes when it goes wrong or when the work lands: the PO's per-item
+// arbitration, its escalation after the round cap, and a merged external PR.
+func TestGraphDetailHistoryExtras(t *testing.T) {
+	st := gvState(
+		[]domain.Bead{gvBead("sc-3c4d", "Retry failed HTTP requests", domain.BeadStateApproved, 3)},
+		events.RoundStarted{Meta: gvMeta(2), Bead: "sc-3c4d", Round: 3, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}},
+		events.ArbitrationReceived{Meta: gvMeta(3), Bead: "sc-3c4d", Round: 3, Agent: "po-1",
+			Rulings:    []domain.Arbitration{{ItemID: "qa-r3-1", Ruling: domain.RulingUpholdTester, Rationale: "the leak is real"}},
+			Escalation: &domain.Escalation{Outcome: domain.EscalationBlock, Summary: "the two cannot agree"},
+		},
+		events.PROpened{Meta: gvMeta(4), Bead: "sc-3c4d", URL: "https://example.invalid/acme/app/pull/7", Number: 7, External: true},
+		events.Merged{Meta: gvMeta(5), Bead: "sc-3c4d", SHA: "abcdef1234567890", Pushed: true},
+	)
+	lay := BuildGraphLayout(st)
+	n, ok := lay.Node("sc-3c4d")
+	require.True(t, ok)
+
+	out := strings.Join(gvView(80, 24, GraphOptions{}).detailHistory(st, n), "\n")
+	require.Contains(t, out, "arbiter")
+	require.Contains(t, out, "uphold_tester the leak is real")
+	require.Contains(t, out, "escalated")
+	require.Contains(t, out, "block the two cannot agree")
+	require.Contains(t, out, "PR #7")
+	require.Contains(t, out, "merged abcdef1")
+	require.Contains(t, out, "(external)")
+}
+
+// TestGraphDetailFacts checks the readiness fact the panel puts under the
+// bead's title for a bead nothing is holding up.
+func TestGraphDetailFacts(t *testing.T) {
+	st := gvState([]domain.Bead{gvBead("sc-1a2b", "Only bead", domain.BeadStateOpen, 0)})
+	v, ok := gvView(80, 24, GraphOptions{}).Update(gvKey("enter"), st, DefaultKeyMap())
+	require.True(t, ok)
+	pane := v.View(st)
+	require.Contains(t, pane, "level 0")
+	require.Contains(t, pane, "ready")
+}
+
+// TestGraphEscalationNote checks that the escalation note comes from whichever
+// field the outcome put it in.
+func TestGraphEscalationNote(t *testing.T) {
+	require.Equal(t, "cannot agree", graphEscalationNote(domain.Escalation{Outcome: domain.EscalationBlock, Summary: "cannot agree", Notes: "n"}))
+	require.Equal(t, "shipped as is", graphEscalationNote(domain.Escalation{Outcome: domain.EscalationApproveWithNotes, Notes: "shipped as is", NewAcceptance: "a"}))
+	require.Equal(t, "just the 503 case", graphEscalationNote(domain.Escalation{Outcome: domain.EscalationNarrowScope, NewAcceptance: "just the 503 case"}))
+	require.Equal(t, "", graphEscalationNote(domain.Escalation{}))
+}
+
+// TestGraphPlural checks the summary line's word forms.
+func TestGraphPlural(t *testing.T) {
+	require.Equal(t, "beads", graphPlural(0, "bead", "beads"))
+	require.Equal(t, "bead", graphPlural(1, "bead", "beads"))
+	require.Equal(t, "beads", graphPlural(2, "bead", "beads"))
+
+	st := gvState([]domain.Bead{gvBead("sc-1a2b", "Only bead", domain.BeadStateOpen, 0)})
+	out := gvView(80, 24, GraphOptions{}).View(st)
+	require.Contains(t, out, "1 bead")
+	require.NotContains(t, out, "1 beads")
+	require.Contains(t, out, "1 level")
+	require.NotContains(t, out, "1 levels")
 }

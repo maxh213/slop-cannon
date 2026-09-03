@@ -1,5 +1,5 @@
-▄█▓═▶  slop-cannon · run demo-20260101-120000 · autopilot · ammo 0/10 · safety o
- 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+▄█▓═▶  demo-20260101-120000 · autopilot · ammo 0/10 · safety off · finished
+ 1 Graph  2 Agents [1m 3 Feedback [0m 4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads reviewed · 1 approved · 1 escalated · 2 open items
   BEAD       U Q T │ demo-2  Retry failed HTTP requests
@@ -10,13 +10,13 @@
                    │   ✓ ux   approve error messages read well
                    │   ✗ qa   changes backoff is not jittered and the cap is of…
                    │     ▲ major   qa-1      off-by-one in the attempt cap
-                   │       → fixed    the loop counter now starts at one
                    │     · nit     qa-2      add jitter to the backoff
-                   │       ↩ pushback jitter belongs to the caller's policy, no…
-                   │       ⚖ uphold_engineer open a follow-up bead
                    │
                    │ [1mround 2[0m · review · 2b7d5e6 · qa
+                   │   → fixed    qa-1      the loop counter now starts at one
+                   │   ↩ pushback qa-2      jitter belongs to the caller's poli…
                    │   ✓ qa   approve cap is right now
+                   │   ⚖ uphold_engineer  qa-2      open a follow-up bead
                    │
                    │
                    │

@@ -26,12 +26,13 @@ something leaked into the output (a wall clock, a map iteration, a colour
 profile, a path from your machine).
 
 `make check-golden` writes to the working tree, so run it on a clean tree —
-it is the explicit "the goldens are current" gate. `make check` (what CI
-runs) catches the same thing implicitly: a stale golden fails its test.
+it is the explicit "the goldens are current" gate, and CI runs it as its own
+step after `make check`. `make check` catches the same thing implicitly: a
+stale golden fails its test.
 
 ## TUI frames (`testdata/tui/`)
 
-Two kinds of file live here, both plain UTF-8 text with no ANSI colour:
+Two kinds of file live here, both plain UTF-8 text with no colour:
 
 - **Per-view frames** — `graph-*`, `agents-*`, `feedback-*`, `prs-*`,
   `anim-*`, `headless*`. Each is one component's pane, owned by the task
@@ -39,6 +40,14 @@ Two kinds of file live here, both plain UTF-8 text with no ANSI colour:
 - **Composed frames** — `frame-*`, from `internal/tui/golden_test.go`. Each
   is a whole terminal: header, tab bar, rule, pane and footer, plus the help
   and stop-confirmation overlays, exactly as the user sees them.
+
+Every file in the directory is accounted for. `TestGoldenFrameFilesAreReadable`
+reads all of them — not just the composed frames — and requires each to be
+non-empty UTF-8 with no carriage return, and to be produced by something: a
+composed frame comes from a `gfScenario`, and a per-view frame must be listed
+in `gfViewGoldens` in the same file. Renaming or dropping a scenario in any
+view therefore fails until the list is updated too, so a stale file cannot sit
+in `testdata/tui` unnoticed.
 
 Every frame is deterministic by construction, and a test enforces each part
 of that:
@@ -50,12 +59,33 @@ of that:
   in its options, and the test passes a fixed one.
 - **Fixed size** — the model is sent an explicit `tea.WindowSizeMsg`;
   the composed frames use 80×24 unless the scenario is about another size
-  (120×40 wide, 60×14 narrow, 24×5 tiny). A frame is always exactly the
-  terminal: `h` lines, none wider than `w` columns.
-- **No colour** — the models are built with `NoColor: true`, so a frame is
-  identical on a truecolor terminal, under `NO_COLOR`, and in a CI log.
-- **No animation** — `NoAnim: true`, and the animation goldens step frames
-  by hand with `Animator.Advance()` rather than by a ticker.
+  (120×40 wide, 60×14 narrow, 24×5 tiny, 40×2 shortest). A frame is always
+  exactly the terminal: `h` lines, none wider than `w` columns, including on
+  a terminal too short for the chrome, where `Model.View` clips.
+- **No colour, and no global renderer** — the models are built with
+  `NoColor: true` *and* an explicit `Theme`, and every style in the package
+  is built from that theme (`Theme.Base`, `Theme.Style` and the semantic
+  helpers). A `lipgloss.NewStyle()` anywhere in a view would use the global
+  Lip Gloss renderer, whose colour profile is detected from the process's
+  stdout — Ascii under a piped `go test`, ANSI under `CLICOLOR_FORCE`,
+  truecolor on a real tty — and the frame would then depend on the machine.
+  Two tests hold the line: `TestMain` pins the global renderer to *truecolor*
+  so any such style shows up rather than hiding, and
+  `TestGoldenFramesIgnoreTheGlobalRenderer` re-renders every frame under
+  every profile and requires the bytes to match. Bold, underline and reset
+  are the only escapes a frame may carry: with `NO_COLOR` they are what keeps
+  the cursor, the selected box and the active tab visible (P7-07).
+  Underline is allowed but unused — Lip Gloss underlines every space with its
+  own escape run, which bloats a frame and confuses width measurement, so the
+  active tab is bold instead.
+- **Animation off, except once** — the frames use `NoAnim: true`, and the
+  `anim-*` goldens step frames by hand with `Animator.Advance()` rather than
+  by a ticker. One composed frame, `frame-anim`, runs with the layer on and
+  is advanced by an explicit `AnimTickMsg`, so the overlay `Model.View`
+  composites over the finished chrome is covered by a whole frame as well:
+  the layer reads no clock and seeds its particles from a constant, so this
+  is still exact. `SC_NO_ANIM` is unset in `TestMain` so a shell that exports
+  it cannot switch that frame off.
 
 ### Adding or changing a composed frame
 
@@ -67,7 +97,8 @@ of that:
 
 Renaming or dropping a scenario leaves an orphaned file behind;
 `TestGoldenFrameFilesAreReadable` fails until you delete it, because every
-`frame-*.golden` must be produced by a scenario.
+`.golden` in `testdata/tui` must be produced by a scenario or listed in
+`gfViewGoldens`.
 
 ### When a frame will not settle
 
@@ -76,4 +107,8 @@ renders of the same input: something non-deterministic reached the view.
 Usual suspects, in order — a `time.Now` call, iteration over a map, a
 duration computed against the wall clock, and a `lipgloss.NewStyle()` that
 picked up the global renderer's colour profile instead of the theme's
-(`Theme.Style`).
+(`Theme.Style`). The last of those has its own test:
+`TestGoldenFramesIgnoreTheGlobalRenderer` fails with the name of the frame
+that moved. If a golden only fails for one person, ask them for `TERM`,
+`COLORTERM`, `NO_COLOR`, `CLICOLOR_FORCE` and `SC_NO_ANIM`, and whether they
+ran a compiled test binary on a tty rather than `go test` through a pipe.

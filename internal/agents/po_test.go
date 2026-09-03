@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -578,4 +580,210 @@ func TestPOPlansTheFixtureRepoThroughTheMock(t *testing.T) {
 	assert.Equal(t, cartridge.ToolReadOnly, call.Spec.ToolPolicy)
 	assert.Equal(t, repo.Dir, call.Spec.Workdir)
 	assert.True(t, strings.HasSuffix(strings.TrimSpace(res.Output), "```"), "the output ends with the sc-result block")
+}
+
+// poGoldenDir holds the two planning-prompt goldens, relative to this
+// package.
+const poGoldenDir = "testdata/plan"
+
+// poGolden compares got with testdata/plan/<name>.golden.md. Set
+// UPDATE_GOLDEN=1 (make update-golden) to rewrite the file instead.
+func poGolden(t *testing.T, name, got string) {
+	t.Helper()
+	path := filepath.Join(poGoldenDir, name+".golden.md")
+	if os.Getenv("UPDATE_GOLDEN") != "" {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(got), 0o644)) //nolint:gosec // test fixture
+		return
+	}
+	want, err := os.ReadFile(path)
+	require.NoError(t, err, "missing golden %s; run `make update-golden`", path)
+	require.Equal(t, string(want), got,
+		"planning prompt differs from %s; run `make update-golden` if the change is intended", path)
+}
+
+// poGoldenRequest is the planning firing both goldens are built from: fixed
+// values only, so the files never depend on a temporary directory.
+func poGoldenRequest(mode domain.RunMode) agents.PlanRequest {
+	return agents.PlanRequest{
+		Run:     "r-2026-09-03-01",
+		AgentID: "po-1",
+		Mode:    mode,
+		Repo: prompt.RepoContext{
+			Root:                 "/work/fixture",
+			DefaultBranch:        "main",
+			Stack:                []string{"Go", "Make"},
+			CheckCommand:         "make test",
+			CheckCommandDetected: true,
+			Tree:                 []string{"Makefile", "README.md", "go.mod", "stats/", "stats/stats.go", "stats/stats_test.go"},
+			TreeTotal:            6,
+			TreeDepth:            prompt.DefaultTreeDepth,
+			ReadmeName:           "README.md",
+			ReadmeHead:           "# fixture\n\nA tiny Go command-line tool that prints statistics for a list of numbers.",
+		},
+		Rules: []prompt.Doc{{
+			Name:    "rules.md",
+			Path:    "/work/fixture/rules.md",
+			Content: "- Never disable or delete a test to make the suite pass.\n- Every behaviour change lands with a test.",
+		}},
+		Vibes: []prompt.Doc{{
+			Name:    "vibes.md",
+			Path:    "/work/fixture/vibes.md",
+			Content: "- Prefer short functions with obvious names.",
+		}},
+		OpenBeads: []domain.Bead{{
+			ID:       "sc-7a1",
+			Title:    "Mean must not panic on an empty slice",
+			Type:     domain.BeadTypeBug,
+			Priority: domain.PriorityDefault,
+			Size:     domain.SizeS,
+			State:    domain.BeadStateOpen,
+		}},
+	}
+}
+
+// poPlanBody returns everything before the output contract. The contract is
+// pinned separately (poRequireContract) so that an edit to plan.schema.json,
+// which the schemas own, does not rewrite both planning goldens.
+func poPlanBody(t *testing.T, p prompt.Prompt) string {
+	t.Helper()
+	marker := "## Output contract (" + domain.MessagePlan.String() + ")"
+	i := strings.Index(p.Text, marker)
+	require.GreaterOrEqual(t, i, 0, "prompt has no output contract section")
+	return strings.TrimRight(p.Text[:i], "\n") + "\n"
+}
+
+// poRequireContract asserts the plan contract is appended verbatim.
+func poRequireContract(t *testing.T, p prompt.Prompt) {
+	t.Helper()
+	assert.True(t, agents.MustContractFor(domain.MessagePlan).HasPromptSuffix(p.Text),
+		"the plan output contract is missing")
+}
+
+// TestPOPlanPromptGolden pins the whole planning prompt in both modes: the
+// body of these prompts is generated rather than templated, so the bead cap
+// wording, the priority scale, the plannable types and the dependency and
+// rejection rules are only really covered by a golden.
+func TestPOPlanPromptGolden(t *testing.T) {
+	t.Parallel()
+
+	t.Run("autopilot", func(t *testing.T) {
+		t.Parallel()
+		p, err := agents.PlanPrompt(poGoldenRequest(domain.RunModeAutopilot))
+		require.NoError(t, err)
+		assert.True(t, p.Fits(), "the fixture prompt should fit the default budget")
+		assert.Empty(t, p.Truncations)
+		poGolden(t, "po-plan-autopilot", poPlanBody(t, p))
+		poRequireContract(t, p)
+	})
+
+	t.Run("brief", func(t *testing.T) {
+		t.Parallel()
+		req := poGoldenRequest(domain.RunModeBrief)
+		req.Brief = "Make the stats command trustworthy: no panics on empty input."
+		req.MaxBeads = 3
+		req.Notes = []string{"The ready queue is empty; plan the whole brief in one go."}
+		p, err := agents.PlanPrompt(req)
+		require.NoError(t, err)
+		assert.True(t, p.Fits(), "the fixture prompt should fit the default budget")
+		assert.Empty(t, p.Truncations)
+		poGolden(t, "po-plan-brief", poPlanBody(t, p))
+		poRequireContract(t, p)
+	})
+}
+
+// TestPOPlanRunSpecCarriesTheBeadsShim covers D-21 for a planning firing:
+// the product owner runs in the repository itself, so the orchestrator has
+// to hand it a read-only `bd`, and the spec must carry that PATH through to
+// the cartridge for the promise the prompt makes to be true.
+func TestPOPlanRunSpecCarriesTheBeadsShim(t *testing.T) {
+	t.Parallel()
+	state := t.TempDir()
+	realBD := filepath.Join(state, "real", "bd")
+	require.NoError(t, os.MkdirAll(filepath.Dir(realBD), 0o755))
+	require.NoError(t, os.WriteFile(realBD, []byte("#!/bin/sh\nexit 0\n"), 0o755)) //nolint:gosec // fake binary
+	shim, err := beads.WriteShim(filepath.Join(state, "bin"), beads.ShimOptions{Real: realBD})
+	require.NoError(t, err)
+
+	req := poRequest(t.TempDir())
+	req.Env = map[string]string{"PATH": "/usr/bin", "SC_RUN": "r-1"}
+	req.InheritEnv = []string{"HOME"}
+	req.UseShim(shim)
+	require.Equal(t, shim.Dir+string(os.PathListSeparator)+"/usr/bin", req.Env["PATH"],
+		"UseShim prepends the shim to the PATH already in the map")
+
+	spec, p, err := agents.PlanRunSpec(req)
+	require.NoError(t, err)
+	assert.Equal(t, req.Env["PATH"], spec.Env["PATH"], "the shim reaches the cartridge")
+	assert.Equal(t, "r-1", spec.Env["SC_RUN"])
+	assert.Equal(t, []string{"HOME"}, spec.InheritEnv)
+	assert.Contains(t, p.Text, beads.PromptNote,
+		"the prompt promises a read-only bd, so the spec must ship one")
+
+	// The spec holds a copy: mutating the request afterwards cannot change
+	// the environment a firing already built.
+	req.Env["PATH"] = "/tmp"
+	assert.NotEqual(t, "/tmp", spec.Env["PATH"])
+
+	// UseShim also works on a request with no environment at all.
+	fresh := poRequest(t.TempDir())
+	fresh.UseShim(shim)
+	assert.Equal(t, shim.PathEnv(), fresh.Env["PATH"])
+}
+
+// TestPOPlanRunSpecWithoutAShimInheritsPath documents what the doc comment
+// on PlanRunSpec warns about: with no shim in Env the child inherits the
+// parent's PATH, so installing one is the caller's job.
+func TestPOPlanRunSpecWithoutAShimInheritsPath(t *testing.T) {
+	t.Parallel()
+	spec, _, err := agents.PlanRunSpec(poRequest(t.TempDir()))
+	require.NoError(t, err)
+	assert.Empty(t, spec.Env)
+	assert.Nil(t, spec.InheritEnv, "nil means cartridge.DefaultInheritEnv()")
+}
+
+// TestPOParsePlanOutputRuleFailureProblems pins the retry feedback P5-08
+// sends back: one bullet per broken rule, with the wrapper sentinels
+// dropped and nothing glued together.
+func TestPOParsePlanOutputRuleFailureProblems(t *testing.T) {
+	t.Parallel()
+	req := poRequest(t.TempDir())
+	// Two rules at once, one from each layer: domain.Plan.Validate finds the
+	// cycle, ValidatePlan finds the repeated title.
+	broken := domain.Plan{Brief: "Two problems.", Beads: []domain.PlanBead{
+		{Key: "a", Title: "Same title", Acceptance: "a works", Priority: domain.PriorityDefault, Deps: []string{"b"}},
+		{Key: "b", Title: "Same title", Acceptance: "b works", Priority: domain.PriorityDefault, Deps: []string{"a"}},
+	}}
+	_, _, err := agents.ParsePlanOutput(req, poOutput(t, broken))
+	require.Error(t, err)
+	pe, ok := structured.AsParseError(err)
+	require.True(t, ok)
+	assert.Equal(t, []string{
+		"dependency cycle: a -> b -> a",
+		`bead "b" repeats the title of bead "a"`,
+	}, pe.Problems)
+	for _, p := range pe.Problems {
+		assert.NotContains(t, p, "\n", "each problem is one line")
+		assert.NotContains(t, p, "agents: plan rejected", "the bare sentinel is not feedback")
+	}
+	assert.Contains(t, pe.Feedback(), "\n- dependency cycle: a -> b -> a")
+	assert.NotContains(t, pe.Feedback(), "- agents: plan rejected")
+}
+
+// TestPOParsePlanOutputProblemsPerRule checks the flattening on the other
+// rules too: the bead cap and a duplicate of an open bead each contribute
+// exactly one line.
+func TestPOParsePlanOutputProblemsPerRule(t *testing.T) {
+	t.Parallel()
+	req := poRequest(t.TempDir())
+	req.MaxBeads = 1
+	req.OpenBeads = []domain.Bead{{ID: "bd-9", Title: "Count retries", State: domain.BeadStateOpen}}
+	_, _, err := agents.ParsePlanOutput(req, poOutput(t, poPlan()))
+	require.Error(t, err)
+	pe, ok := structured.AsParseError(err)
+	require.True(t, ok)
+	assert.Equal(t, []string{
+		"plan proposes 3 beads, the limit is 1",
+		`bead "retry-metrics" duplicates open bead bd-9 ("Count retries")`,
+	}, pe.Problems)
 }

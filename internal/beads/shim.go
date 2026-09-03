@@ -18,12 +18,21 @@ import (
 // Agents never write to beads: the orchestrator is the only writer. Each
 // agent worktree gets a directory holding a `bd` shim, prepended to the
 // agent's PATH, that execs the real binary with the global --readonly flag
-// so bd itself refuses every write ("operation 'update' is not allowed in
-// read-only mode") while `bd ready`, `bd show`, `bd list` and friends keep
-// working. The subcommands bd 1.2.2 does not gate behind --readonly
-// (ShimDenied, verified live) are refused by the shim with the same message
-// shape, so the client's error classification (ErrReadOnly) applies to
-// both. Because bd's --readonly is a plain pflag bool that a later
+// so bd itself refuses every issue-level write ("operation 'update' is not
+// allowed in read-only mode").
+//
+// bd's --readonly is not enough on its own, so the shim is an allow-list
+// (ShimAllowed): only the read commands an agent needs reach the binary at
+// all, and everything else is refused with the same message shape, so the
+// client's error classification (ErrReadOnly) applies to both. bd 1.2.2
+// runs a long tail of state-changing commands under --readonly —
+// `config set`/`set-many`/`apply` (the D-07 status registry), `import`,
+// `metrics`, `dolt`, `branch`, `vc`, `backup` (which can push the whole
+// database off-machine), `federation`, `audit`, `init`, `restore`,
+// `hooks`, `setup`, `rename` — and a deny-list only ever closes the
+// entries someone thought to check, which is how the P3-09 review found
+// `bd config set-many status.custom=…` still writing through the shim.
+// Because bd's --readonly is a plain pflag bool that a later
 // `--readonly=false` turns back off, the shim also refuses any --readonly
 // argument of its own (ReadOnlyFlag).
 //
@@ -43,34 +52,60 @@ func ReadOnlyMessage(op string) string {
 	return fmt.Sprintf("operation '%s' is not allowed in read-only mode", op)
 }
 
-// ShimDenied lists the bd subcommands that bd 1.2.2 still executes under
-// --readonly although they change state (all verified live against bd
-// 1.2.2: `config set` and `config unset` write the database, `import`
-// inserts issues, `metrics` changes global settings, `dolt` commits and
-// pushes, `init`, `restore`, `hooks` and `setup` touch the repository,
-// `rename` rewrites ids, and the two Dolt-level families found in the
-// P3-09 review on 2026-09-03 — `branch <name>` creates a Dolt branch and
-// `vc commit`/`vc merge` commit and merge one, all exiting 0 under
-// --readonly). The shim refuses them with ReadOnlyMessage before bd runs.
-// One-word entries cover every subcommand of that command; two-word
-// entries only that pair, so `config get` and `config list` stay
-// available. `branch` and `vc` are denied whole: their read-only forms
-// (`bd branch` listing, `bd vc status`) are of no use to an agent and
-// telling them apart from `bd branch <name>` would need bd's own flag
-// parser.
-var ShimDenied = []string{
-	"branch",
-	"config set",
-	"config unset",
-	"dolt",
-	"hooks",
-	"import",
-	"init",
-	"metrics",
-	"rename",
-	"restore",
-	"setup",
-	"vc",
+// ShimAllowed is the allow-list of bd commands the shim lets through to the
+// real binary; every other command is refused with ReadOnlyMessage before
+// bd runs. An agent only ever reads beads (D-21), so this list holds read
+// commands and nothing else.
+//
+// It is an allow-list on purpose. bd 1.2.2 executes many state-changing
+// commands under --readonly (the package comment lists the families found
+// so far), and each bd release adds more, so a deny-list closes one hole at
+// a time while leaving the class open — the P3-09 review reproduced
+// `bd config set-many status.custom=pwned:wip` writing through a
+// deny-list shim and overwriting the D-07 custom-status registry, plus
+// `config apply`, `backup init`/`backup sync` (a database exfiltration
+// path), `federation add-peer` and `audit record`. With an allow-list a
+// new bd verb is refused until someone deliberately adds it here.
+//
+// One-word entries allow the command with any subcommand except those in
+// ShimAllowedExceptions; two-word entries allow only that pair, so
+// `config get` works and `config set` does not. A call with no command at
+// all (`bd`, `bd --version`, `bd -- config set x`) is allowed: cobra prints
+// help or the version and touches nothing.
+var ShimAllowed = []string{
+	"blocked",
+	"children",
+	"comments",
+	"config get",
+	"config list",
+	"config show",
+	"count",
+	"dep cycles",
+	"dep list",
+	"dep tree",
+	"export",
+	"graph",
+	"help",
+	"history",
+	"list",
+	"query",
+	"ready",
+	"search",
+	"show",
+	"stale",
+	"statuses",
+	"types",
+	"version",
+}
+
+// ShimAllowedExceptions are the write subcommands of a command ShimAllowed
+// admits as a whole, refused despite that allowance. `bd comments <id>`
+// lists an issue's comments — the second word is an issue id, not a
+// subcommand, so no two-word allow entry can express the read — while
+// `bd comments add` writes one. bd's own --readonly refuses that write too;
+// listing it here means the shim never even asks.
+var ShimAllowedExceptions = []string{
+	"comments add",
 }
 
 // ReadOnlyFlag is bd's global read-only flag, which the shim always passes
@@ -87,6 +122,14 @@ const ReadOnlyFlag = "--readonly"
 // first ("Error: …") line is what StderrMessage reads.
 const ShimOverrideHint = "hint: the bd on your PATH is slop-cannon's read-only shim; " +
 	"it always runs bd with --readonly and refuses a --readonly argument of your own."
+
+// ShimDeniedHint is the second stderr line the shim prints when it refuses
+// a command that is not in ShimAllowed, telling the agent what it may run
+// instead. Like ShimOverrideHint it starts with "hint:", so StderrMessage
+// still reports the "Error: …" line above it.
+const ShimDeniedHint = "hint: the bd on your PATH is slop-cannon's read-only shim; " +
+	"it allows reads only (bd ready, bd show <id>, bd list, bd blocked, bd dep list <id>, " +
+	"bd comments <id>, bd config get <key>). The cannon records your results for you."
 
 // shimValueFlags are bd's global flags that take a separate value, so the
 // shim skips the value when looking for the subcommand — and, like cobra's
@@ -111,6 +154,20 @@ const ShimVerifyTimeout = DefaultTimeout
 // worktree and not inside it, so nothing of ours shows up in the agent's
 // `git status` or can be committed to the target repository.
 const ShimDirName = "bin"
+
+// WorktreesDirName is the directory of a run that holds one linked worktree
+// per bead, <run-dir>/wt/<bead-id> (D-23). It mirrors gitx.WorktreesDirName;
+// beads does not import gitx because gitx imports beads.
+const WorktreesDirName = "wt"
+
+// ErrShimLayout is returned by ShimDirFor and InstallForWorktree for a path
+// that is not a run's worktree, so no shim directory is ever created
+// outside the run directory.
+var ErrShimLayout = errors.New("beads: not a run worktree")
+
+// shimProbeBead is the bead id Verify names in its write probes. It does not
+// exist, so even a bd that ignored --readonly entirely would change nothing.
+const shimProbeBead = "sc-shim-probe"
 
 // Shim is a generated read-only bd shim on disk.
 type Shim struct {
@@ -195,6 +252,40 @@ func WriteShim(dir string, opts ShimOptions) (Shim, error) {
 	return s, nil
 }
 
+// shimAllowLists splits ShimAllowed and ShimAllowedExceptions into the
+// one-word commands, the two-word pairs that are allowed, the two-word
+// pairs that are refused despite a one-word allowance, and the command
+// families whose refusals name both words (`config`, `dep`, `comments`), so
+// `bd config set-many …` is refused as "config set-many". Every element is
+// shell-quoted, ready for a `case` pattern.
+func shimAllowLists() (one, two, except, families []string) {
+	seen := map[string]bool{}
+	family := func(cmd string) {
+		if !seen[cmd] {
+			seen[cmd] = true
+			families = append(families, shellQuote(cmd))
+		}
+	}
+	for _, a := range ShimAllowed {
+		cmd, sub, isPair := strings.Cut(a, " ")
+		if !isPair {
+			one = append(one, shellQuote(a))
+			continue
+		}
+		two = append(two, shellQuote(cmd+" "+sub))
+		family(cmd)
+	}
+	for _, e := range ShimAllowedExceptions {
+		cmd, sub, isPair := strings.Cut(e, " ")
+		if !isPair {
+			continue
+		}
+		except = append(except, shellQuote(cmd+" "+sub))
+		family(cmd)
+	}
+	return one, two, except, families
+}
+
 // ShimScript returns the shell script of a shim that execs real. The
 // script scans every argument the way cobra's own flag stripping does
 // (skipping global flags and the values of shimValueFlags, stopping at a
@@ -204,7 +295,9 @@ func WriteShim(dir string, opts ShimOptions) (Shim, error) {
 //     ReadOnlyMessage(argument) plus ShimOverrideHint, because
 //     `--readonly=false` would otherwise win over the flag the shim
 //     passes;
-//   - refuses every ShimDenied command with ReadOnlyMessage(command);
+//   - refuses every command that ShimAllowed does not admit, and every
+//     pair ShimAllowedExceptions takes back, with ReadOnlyMessage(command)
+//     plus ShimDeniedHint;
 //   - otherwise execs real with --readonly prepended to the arguments.
 //
 // Both refusals print on stderr and exit 1 without running bd at all.
@@ -212,10 +305,10 @@ func ShimScript(real string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")
 	b.WriteString(ShimHeader + "\n")
-	b.WriteString("# Agents read beads through this shim; every write is refused. The real\n")
-	b.WriteString("# binary runs with --readonly; the commands bd does not block in that\n")
-	b.WriteString("# mode, and any --readonly argument that would switch it off, are\n")
-	b.WriteString("# refused here with the same message.\n")
+	b.WriteString("# Agents read beads through this shim; every write is refused. Only the\n")
+	b.WriteString("# read commands of beads.ShimAllowed reach the real binary, which runs\n")
+	b.WriteString("# with --readonly; every other command, and any --readonly argument that\n")
+	b.WriteString("# would switch that off, is refused here with bd's own message.\n")
 	b.WriteString("_sc_cmd=''\n_sc_sub=''\n_sc_skip=0\n_sc_end=0\n_sc_bad=''\n_sc_n=0\n")
 	b.WriteString("for _sc_arg in \"$@\"; do\n")
 	// Everything after a bare "--" is positional for cobra/pflag, so it can
@@ -241,35 +334,62 @@ func ShimScript(real string) string {
 	b.WriteString("  echo \"Error: operation '$_sc_bad' is not allowed in read-only mode\" >&2\n")
 	b.WriteString("  echo " + shellQuote(ShimOverrideHint) + " >&2\n")
 	b.WriteString("  exit 1\nfi\n")
-	b.WriteString("_sc_op=''\n")
-	var one, two []string
-	for _, d := range ShimDenied {
-		if strings.Contains(d, " ") {
-			two = append(two, shellQuote(d))
-		} else {
-			one = append(one, shellQuote(d))
-		}
-	}
+	// A call with no command reaches cobra's root: help or --version.
+	b.WriteString("_sc_ok=0\n")
+	b.WriteString("if [ -z \"$_sc_cmd\" ]; then _sc_ok=1; fi\n")
+	one, two, except, families := shimAllowLists()
 	if len(one) > 0 {
-		b.WriteString("case \"$_sc_cmd\" in\n  " + strings.Join(one, "|") + ") _sc_op=$_sc_cmd ;;\nesac\n")
+		b.WriteString("case \"$_sc_cmd\" in\n  " + strings.Join(one, "|") + ") _sc_ok=1 ;;\nesac\n")
 	}
 	if len(two) > 0 {
-		b.WriteString("case \"$_sc_cmd $_sc_sub\" in\n  " + strings.Join(two, "|") + ") _sc_op=\"$_sc_cmd $_sc_sub\" ;;\nesac\n")
+		b.WriteString("case \"$_sc_cmd $_sc_sub\" in\n  " + strings.Join(two, "|") + ") _sc_ok=1 ;;\nesac\n")
 	}
-	b.WriteString("if [ -n \"$_sc_op\" ]; then\n")
+	if len(except) > 0 {
+		b.WriteString("case \"$_sc_cmd $_sc_sub\" in\n  " + strings.Join(except, "|") + ") _sc_ok=0 ;;\nesac\n")
+	}
+	b.WriteString("if [ \"$_sc_ok\" = 0 ]; then\n")
+	b.WriteString("  _sc_op=$_sc_cmd\n")
+	if len(families) > 0 {
+		b.WriteString("  case \"$_sc_cmd\" in\n")
+		b.WriteString("    " + strings.Join(families, "|") + ")\n")
+		b.WriteString("      if [ -n \"$_sc_sub\" ]; then _sc_op=\"$_sc_cmd $_sc_sub\"; fi ;;\n")
+		b.WriteString("  esac\n")
+	}
 	b.WriteString("  echo \"Error: operation '$_sc_op' is not allowed in read-only mode\" >&2\n")
+	b.WriteString("  echo " + shellQuote(ShimDeniedHint) + " >&2\n")
 	b.WriteString("  exit 1\nfi\n")
 	b.WriteString("exec " + shellQuote(real) + " --readonly \"$@\"\n")
 	return b.String()
 }
 
 // ShimDirFor returns the shim directory belonging to the agent worktree at
-// wt: ShimDirName beside the worktree tree, keyed by the worktree's own
-// name, so <run-dir>/wt/<bead-id> gets <run-dir>/bin/<bead-id> (D-23).
+// wt: ShimDirName beside the run's worktree tree, keyed by the worktree's
+// own name, so <run-dir>/wt/<bead-id> gets <run-dir>/bin/<bead-id> (D-23).
 // wt is cleaned but not required to exist.
-func ShimDirFor(wt string) string {
-	wt = filepath.Clean(wt)
-	return filepath.Join(filepath.Dir(filepath.Dir(wt)), ShimDirName, filepath.Base(wt))
+//
+// wt must have exactly that shape — an absolute path whose parent directory
+// is named WorktreesDirName — or the answer would name a directory outside
+// the run (climbing two levels from /home/me/proj lands on /home/bin/proj).
+// Anything else fails with ErrShimLayout; a caller with its own layout
+// passes ShimOptions.Dir instead.
+func ShimDirFor(wt string) (string, error) {
+	if wt == "" {
+		return "", fmt.Errorf("%w: empty worktree path", ErrShimLayout)
+	}
+	clean := filepath.Clean(wt)
+	if !filepath.IsAbs(clean) {
+		return "", fmt.Errorf("%w: worktree path %q is not absolute", ErrShimLayout, wt)
+	}
+	parent := filepath.Dir(clean)
+	base := filepath.Base(clean)
+	if parent == clean || base == "." || base == string(filepath.Separator) {
+		return "", fmt.Errorf("%w: worktree path %q has no name", ErrShimLayout, wt)
+	}
+	if filepath.Base(parent) != WorktreesDirName {
+		return "", fmt.Errorf("%w: %q is not <run-dir>/%s/<bead-id>, so the shim directory would land outside the run",
+			ErrShimLayout, wt, WorktreesDirName)
+	}
+	return filepath.Join(filepath.Dir(parent), ShimDirName, base), nil
 }
 
 // InstallForWorktree is the one call an orchestrator makes per agent: it
@@ -279,8 +399,10 @@ func ShimDirFor(wt string) string {
 // front of the agent's PATH with Shim.Apply(spec.Env) — the cartridge
 // RunSpec environment — so every `bd` the agent runs is the read-only one.
 //
-// wt must be an absolute path (the worktree paths gitx.Manager hands out
-// are). Nothing is written inside wt, so the agent's worktree stays clean.
+// wt must be an absolute path in the D-23 layout (the worktree paths
+// gitx.Manager hands out are), unless opts.Dir says where the shim goes;
+// see ShimDirFor. Nothing is written inside wt, so the agent's worktree
+// stays clean.
 func InstallForWorktree(ctx context.Context, wt string, opts ShimOptions) (Shim, error) {
 	if wt == "" {
 		return Shim{}, errors.New("beads: InstallForWorktree: empty worktree path")
@@ -290,7 +412,11 @@ func InstallForWorktree(ctx context.Context, wt string, opts ShimOptions) (Shim,
 	}
 	dir := opts.Dir
 	if dir == "" {
-		dir = ShimDirFor(wt)
+		var err error
+		dir, err = ShimDirFor(wt)
+		if err != nil {
+			return Shim{}, err
+		}
 	}
 	s, err := WriteShim(dir, ShimOptions{Real: opts.Real})
 	if err != nil {
@@ -376,22 +502,40 @@ func (s Shim) Apply(env map[string]string) {
 	env["PATH"] = s.PathEnv()
 }
 
-// shimProbes are the refusals Verify checks after bd's own: one per
-// mechanism the shim adds on top of --readonly. Every probe uses an
-// argument form that would be harmless if the shim ever let it through
-// (`bd config set` without a key errors, `bd branch` only lists, `bd vc
-// status` only reports, and the override probe names a bead id that does
-// not exist), so verification can never change a database.
+// shimReadProbes are the reads Verify runs through the shim: the commands
+// P3-09 requires to keep working for an agent. They must not be refused —
+// a shim that denied everything (an over-broad ShimAllowed edit, a chained
+// wrapper) would otherwise pass the self-check and only fail once an agent
+// was running.
+var shimReadProbes = [][]string{
+	{"ready", "--json", "-n", "0"},
+	{"show", shimProbeBead, "--json"},
+}
+
+// shimProbes are the refusals Verify checks: the write an agent is most
+// likely to attempt, one command per family bd 1.2.2 executes anyway under
+// --readonly (so the allow-list, not bd, must stop them), and an attempt to
+// switch --readonly off. Every probe uses an argument form that would be
+// harmless if the shim ever let it through (the write probes name a bead id
+// that does not exist and the rest are bare commands that need arguments),
+// so verification can never change a database.
 var shimProbes = []struct {
 	// op is the operation name the shim must report.
 	op string
 	// args is what to run through the shim.
 	args []string
 }{
+	{op: "update", args: []string{"update", shimProbeBead, "-s", "open"}},
 	{op: "config set", args: []string{"config", "set"}},
+	{op: "config set-many", args: []string{"config", "set-many"}},
+	{op: "backup", args: []string{"backup"}},
+	{op: "federation", args: []string{"federation"}},
+	{op: "audit", args: []string{"audit"}},
+	{op: "import", args: []string{"import"}},
 	{op: "branch", args: []string{"branch"}},
 	{op: "vc", args: []string{"vc", "status"}},
-	{op: ReadOnlyFlag + "=false", args: []string{ReadOnlyFlag + "=false", "update", "sc-shim-probe", "-s", "open"}},
+	{op: "comments add", args: []string{"comments", "add"}},
+	{op: ReadOnlyFlag + "=false", args: []string{ReadOnlyFlag + "=false", "update", shimProbeBead, "-s", "open"}},
 }
 
 // Verify executes the shim the way an agent would, from dir (the worktree,
@@ -399,14 +543,18 @@ var shimProbes = []struct {
 // so callers can log it and abort the agent before it starts:
 //
 //   - `bd version --json` must succeed through the shim;
-//   - `bd update <probe> -s open` must be refused by bd itself with
-//     ReadOnlyMessage;
-//   - every shimProbes entry — the commands bd 1.2.2 runs anyway under
-//     --readonly (`config set`, `branch`, `vc`) and an attempt to switch
-//     --readonly off — must be refused by the shim, naming that operation.
+//   - every shimReadProbes entry (`bd ready`, `bd show`) must reach bd —
+//     the shim may not refuse a read;
+//   - every shimProbes entry — a write, one command per family bd runs
+//     anyway under --readonly, and an attempt to switch --readonly off —
+//     must be refused by the shim, naming that operation;
+//   - the real binary must still enforce --readonly itself, checked by
+//     running it directly (the shim refuses the write before bd sees it),
+//     so the second line of defence D-21 relies on is proven too.
 //
-// Only the first two probes start bd; the rest are refused by the script
-// itself, so the check stays cheap enough to run before every agent.
+// Only the version, read and bd-side probes start bd; the rest are refused
+// by the script itself, so the check stays cheap enough to run before every
+// agent.
 func (s Shim) Verify(ctx context.Context, dir string) error {
 	res, err := proc.Run(ctx, s.spec(dir, "version", "--json"))
 	if err != nil {
@@ -418,13 +566,36 @@ func (s Shim) Verify(ctx context.Context, dir string) error {
 	if err := Decode(res.Stdout, &probe); err != nil || probe.Version == "" {
 		return fmt.Errorf("beads: shim %s: bd version printed no version: %q", s.Path, strings.TrimSpace(res.Stdout))
 	}
-	if _, err := s.verifyRefused(ctx, dir, "", "update", "sc-shim-probe", "-s", "open"); err != nil {
-		return err
+	for _, args := range shimReadProbes {
+		if err := s.verifyAllowed(ctx, dir, args...); err != nil {
+			return err
+		}
 	}
 	for _, p := range shimProbes {
 		if _, err := s.verifyRefused(ctx, dir, p.op, p.args...); err != nil {
 			return err
 		}
+	}
+	return s.verifyBDReadOnly(ctx, dir)
+}
+
+// verifyAllowed runs one read probe through the shim and requires that the
+// shim did not refuse it. bd's own failures are accepted — dir may hold no
+// beads database yet, and the probe's bead id does not exist — because this
+// checks the shim, not the project; anything the shim itself refuses comes
+// back as a read-only message.
+func (s Shim) verifyAllowed(ctx context.Context, dir string, args ...string) error {
+	shown := Binary + " " + strings.Join(args, " ")
+	_, err := proc.Run(ctx, s.spec(dir, args...))
+	if err == nil {
+		return nil
+	}
+	var exit *proc.ExitError
+	if !errors.As(err, &exit) || exit.Cause != nil {
+		return fmt.Errorf("beads: shim %s: running `%s`: %w", s.Path, shown, err)
+	}
+	if msg := StderrMessage(exit.Result.Stderr); errors.Is(KindOf("", msg), ErrReadOnly) {
+		return fmt.Errorf("beads: shim %s: refuses the read `%s`: %s (agents must be able to read beads)", s.Path, shown, msg)
 	}
 	return nil
 }
@@ -435,8 +606,33 @@ func (s Shim) Verify(ctx context.Context, dir string) error {
 // with an empty op any ErrReadOnly message (bd's own) is accepted. It
 // returns the message so callers can log it.
 func (s Shim) verifyRefused(ctx context.Context, dir, op string, args ...string) (string, error) {
-	shown := Binary + " " + strings.Join(args, " ")
-	_, err := proc.Run(ctx, s.spec(dir, args...))
+	return s.refused(ctx, s.spec(dir, args...), Binary+" "+strings.Join(args, " "), op)
+}
+
+// verifyBDReadOnly checks the guarantee underneath the shim: the real
+// binary refuses a write of its own accord when it is given --readonly.
+// The shim's allow-list stops such a call before bd ever runs, so this
+// probe invokes the real binary directly, with the same environment an
+// agent would have. The bead it names does not exist.
+func (s Shim) verifyBDReadOnly(ctx context.Context, dir string) error {
+	args := []string{"update", shimProbeBead, "-s", "open"}
+	sp := Spec(CallOptions{Dir: dir, Timeout: ShimVerifyTimeout, ReadOnly: true}, args...)
+	sp.Command = s.Real
+	sp.Env["PATH"] = s.PathEnv()
+	shown := Binary + " " + ReadOnlyFlag + " " + strings.Join(args, " ")
+	if _, err := s.refused(ctx, sp, shown, ""); err != nil {
+		return fmt.Errorf("%w (%s does not enforce %s itself)", err, s.Real, ReadOnlyFlag)
+	}
+	return nil
+}
+
+// refused runs sp and requires it to fail with a read-only refusal, shown
+// as the command line shown. When op is not empty the message must be
+// exactly ReadOnlyMessage(op), which only the shim's own refusals produce;
+// with an empty op any ErrReadOnly message (bd's own) is accepted. It
+// returns the message so callers can log it.
+func (s Shim) refused(ctx context.Context, sp proc.Spec, shown, op string) (string, error) {
+	_, err := proc.Run(ctx, sp)
 	if err == nil {
 		return "", fmt.Errorf("beads: shim %s: `%s` was not refused", s.Path, shown)
 	}

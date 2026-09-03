@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"slop-cannon/internal/domain"
@@ -264,6 +265,13 @@ func DemoEvents(opts DemoOptions) []events.Event {
 // first. It returns when the script is exhausted or ctx is done; it does not
 // close the bus, so the TUI keeps rendering the finished run.
 func PlayScript(ctx context.Context, bus *events.Bus, script []ScriptedEvent) error {
+	return playScript(ctx, bus, script, nil)
+}
+
+// playScript is [PlayScript] with a hook called with each event just before
+// it is published. [Demo] uses it to move the simulated clock on, so a frame
+// drawn for an event reads the time that event happened at.
+func playScript(ctx context.Context, bus *events.Bus, script []ScriptedEvent, before func(events.Event)) error {
 	if bus == nil {
 		return nil
 	}
@@ -289,23 +297,26 @@ func PlayScript(ctx context.Context, bus *events.Bus, script []ScriptedEvent) er
 			return ctx.Err()
 		default:
 		}
+		if before != nil {
+			before(s.Event)
+		}
 		bus.Publish(s.Event)
 	}
 	return nil
 }
 
 // Demo runs the TUI against the scripted stream: it creates a bus, plays the
-// script into it in the background, and renders it. opts.Bus and opts.Run
-// are filled in from demo; everything else in opts (output, input, colour)
-// is the caller's. It returns when the user quits or ctx is cancelled.
+// script into it in the background, and renders it. opts.Bus, opts.Run and
+// opts.Now are filled in from demo; everything else in opts (output, input,
+// colour) is the caller's. It returns when the user quits or ctx is
+// cancelled.
 func Demo(ctx context.Context, demo DemoOptions, opts Options) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	bus := events.NewBus()
 	defer bus.Close()
-	opts.Bus = bus
-	opts.Run = DemoRun(demo)
+	clock := demoClockFor(demo, &opts, bus)
 
 	// The program is built (and so subscribed) before the script starts, or
 	// a fast script would be published into a bus nobody is listening to.
@@ -313,13 +324,61 @@ func Demo(ctx context.Context, demo DemoOptions, opts Options) error {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = PlayScript(ctx, bus, DemoScript(demo))
+		_ = playScript(ctx, bus, DemoScript(demo), clock.at)
 	}()
 
 	err := runProgram(ctx, prog)
 	cancel()
 	<-done
 	return err
+}
+
+// demoClockFor fills in the parts of opts the scripted run owns — the bus,
+// the run and the simulated clock — and returns the clock, whose at method
+// is the hook [playScript] moves it on with.
+//
+// Without the clock the views would measure a live agent's elapsed time from
+// the script's fixed start date (2026-01-01) to the wall clock, and a demo
+// card would read `5885h30m57s`. The clock keeps the whole frame inside the
+// scripted timeline; a caller that already has one keeps it.
+func demoClockFor(demo DemoOptions, opts *Options, bus *events.Bus) *demoClock {
+	opts.Bus = bus
+	opts.Run = DemoRun(demo)
+	clock := newDemoClock(demo.withDefaults().Start)
+	if opts.Now == nil {
+		opts.Now = clock.Now
+	}
+	return clock
+}
+
+// demoClock is the simulated clock of a scripted run: it reports the
+// timestamp of the last event published, so elapsed times are measured in
+// the run's own timeline rather than against the wall clock. It is read by
+// the render loop while the script writes it, so it locks, and it never goes
+// backwards, whatever pacing the script is played at.
+type demoClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+// newDemoClock returns a clock reading start.
+func newDemoClock(start time.Time) *demoClock { return &demoClock{t: start} }
+
+// Now returns the simulated time. It matches [Options.Now].
+func (c *demoClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.t
+}
+
+// at moves the clock to ev's timestamp, unless that is in the past.
+func (c *demoClock) at(ev events.Event) {
+	t := ev.At()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if t.After(c.t) {
+		c.t = t
+	}
 }
 
 // demoBuilder stamps each scripted event with the next simulated timestamp

@@ -1,0 +1,24 @@
+▄█▓═▶  [1mslop-cannon[0m · run sc-graph-001 · brief · ammo 0/4 · safety on
+[1m 1 Graph [0m 2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+4 beads · 2 levels · 0 ready · 4 blocked · 0 closed · 1 cycle · 1 outside the run · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌─ cycle ────────────┐
+┃○ sc-free           ┃    │○ sc-loop           │─┬┬┐
+┃ Document the queue ┃    │ Rewrite the schedu…│ │││
+┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘ │││
+                                                 │││
+                          ┌─ cycle ────────────┐ │││
+                          │◐ sc-back       r1  │─┴┘│
+                          │ Rewrite the queue  │   │
+                          └────────────────────┘   │
+                                                   │
+                          ┌─ cycle ────────────┐   │
+                          │○ sc-heir           │───┘
+                          │ Benchmark both hal…│
+                          └────────────────────┘
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

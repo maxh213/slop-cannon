@@ -69,6 +69,10 @@ const (
 // graphBoxInner is the writable width inside a box.
 const graphBoxInner = GraphBoxWidth - 2
 
+// graphCycleLabel is written into the top border of a bead the layering could
+// not place, which is how the boxed layouts show a dependency cycle.
+const graphCycleLabel = " cycle "
+
 // GraphNode is one bead as the graph view sees it: the bead itself, where the
 // layering put it, and the facts the view draws around it — whether it is
 // claimable, blocked or stuck on a cycle, and which agent is on it.
@@ -462,7 +466,10 @@ func (v GraphModel) Update(msg tea.Msg, st *State, keys KeyMap) (GraphModel, boo
 		case key.Matches(km, keys.Up):
 			v.detailOff = max(v.detailOff-1, 0)
 		case key.Matches(km, keys.Down):
-			v.detailOff++
+			// Stop at the last page: an offset past it would show nothing
+			// new, and every press past it would have to be undone before a
+			// scroll back up moved the panel again.
+			v.detailOff = min(v.detailOff+1, v.detailMaxOffset(lay, st, v.cursor))
 		default:
 			return v, false
 		}
@@ -542,14 +549,14 @@ func (v GraphModel) View(st *State) string {
 func (v GraphModel) summary(lay GraphLayout, hint string) string {
 	ready, blocked, closed := lay.Counts()
 	fields := []string{
-		fmt.Sprintf("%d beads", lay.Len()),
-		fmt.Sprintf("%d levels", len(lay.Layers)),
+		fmt.Sprintf("%d %s", lay.Len(), graphPlural(lay.Len(), "bead", "beads")),
+		fmt.Sprintf("%d %s", len(lay.Layers), graphPlural(len(lay.Layers), "level", "levels")),
 		v.theme.Success().Render(fmt.Sprintf("%d ready", ready)),
 		v.theme.Warning().Render(fmt.Sprintf("%d blocked", blocked)),
 		fmt.Sprintf("%d closed", closed),
 	}
-	if len(lay.Cycles) > 0 {
-		fields = append(fields, v.theme.Danger().Render(fmt.Sprintf("%d cycles", len(lay.Cycles))))
+	if n := len(lay.Cycles); n > 0 {
+		fields = append(fields, v.theme.Danger().Render(fmt.Sprintf("%d %s", n, graphPlural(n, "cycle", "cycles"))))
 	}
 	if len(lay.Dangling) > 0 {
 		fields = append(fields, v.theme.Muted().Render(fmt.Sprintf("%d outside the run", len(lay.Dangling))))
@@ -624,26 +631,106 @@ func (b graphBox) midY() int { return b.y + 1 }
 // midX is the column an edge attaches to on the box's top or bottom border.
 func (b graphBox) midX() int { return b.x + b.w/2 }
 
+// graphEdgeKind is how a dependency has to get from its blocker's box to its
+// dependent's box without ever crossing a third box.
+type graphEdgeKind int
+
+const (
+	// graphEdgeDirect joins two boxes in neighbouring levels: straight
+	// through the channel in the gap between them.
+	graphEdgeDirect graphEdgeKind = iota
+	// graphEdgeSkip joins a blocker to a dependent more than one level
+	// along. The levels in between sit right on the straight line, so the
+	// route detours through a bypass lane past the end of the layers.
+	graphEdgeSkip
+	// graphEdgeBack joins two boxes that the layering put on the same level,
+	// which only happens inside the dependency-cycle bucket. The route
+	// leaves and re-enters on the far side, through a bypass lane of its
+	// own.
+	graphEdgeBack
+)
+
+// graphEdge is one dependency ready to draw: the blocker's node index, the
+// dependent's, how the route has to run, and which bypass lane of that kind
+// the route owns (-1 when it needs none).
+type graphEdge struct {
+	src, dst int
+	kind     graphEdgeKind
+	lane     int
+}
+
+// graphEdges lists the dependencies the boxed layouts draw, in a fixed order,
+// and hands each one that cannot run straight through a gap a bypass lane of
+// its own so two detours are never mistaken for one. Blockers outside the run
+// are skipped: there is no box to draw from.
+func graphEdges(lay GraphLayout) (edges []graphEdge, skips, backs int) {
+	for idx, n := range lay.Nodes {
+		for _, dep := range n.Blockers {
+			src, ok := lay.Index(dep)
+			if !ok {
+				continue // dangling: the blocker is outside the run
+			}
+			e := graphEdge{src: src, dst: idx, lane: -1}
+			switch sl, dl := lay.Nodes[src].Layer, n.Layer; {
+			case dl == sl+1:
+				e.kind = graphEdgeDirect
+			case dl > sl+1:
+				e.kind, e.lane = graphEdgeSkip, skips
+				skips++
+			default:
+				// Only the cycle bucket can hold an edge that does not move
+				// forward a level, and it holds every bead downstream of the
+				// cycle too, so both ends are in that last level together.
+				e.kind, e.lane = graphEdgeBack, backs
+				backs++
+			}
+			edges = append(edges, e)
+		}
+	}
+	return edges, skips, backs
+}
+
 // paint draws every box and edge of the layout onto a fresh canvas and
 // returns it with the position of each node's box, indexed like
 // [GraphLayout.Nodes].
 func (v GraphModel) paint(lay GraphLayout, vertical bool, cursor int) (*graphCanvas, []graphBox) {
 	boxes := make([]graphBox, len(lay.Nodes))
-	var cw, ch int
+	edges, skips, backs := graphEdges(lay)
+
+	span := 0
+	for _, row := range lay.Layers {
+		span = max(span, len(row))
+	}
+	var boxW, boxH int
 	if vertical {
-		widest := 0
-		for _, row := range lay.Layers {
-			widest = max(widest, len(row))
-		}
-		cw = max(widest*(GraphBoxWidth+GraphColGap)-GraphColGap, 1)
-		ch = max(len(lay.Layers)*(GraphBoxHeight+GraphLayerGap)-GraphLayerGap, 1)
+		boxW = max(span*(GraphBoxWidth+GraphColGap)-GraphColGap, 1)
+		boxH = max(len(lay.Layers)*(GraphBoxHeight+GraphLayerGap)-GraphLayerGap, 1)
 	} else {
-		tallest := 0
-		for _, row := range lay.Layers {
-			tallest = max(tallest, len(row))
+		boxW = max(len(lay.Layers)*(GraphBoxWidth+GraphGutter)-GraphGutter, 1)
+		boxH = max(span*(GraphBoxHeight+GraphRowGap)-GraphRowGap, 1)
+	}
+	// The bypass lanes run past the end of the layers, where no box can ever
+	// be, so a detour is drawn whole instead of being chopped by the boxes it
+	// would otherwise cross. Skip edges run along the far side of the levels,
+	// back edges along the far end of them; the canvas only grows when there
+	// is such an edge to draw.
+	cw, ch := boxW, boxH
+	skipLane, backLane := boxH+GraphRowGap, boxW+1
+	if vertical {
+		skipLane, backLane = boxW+GraphColGap, boxH+1
+		if skips > 0 {
+			cw = skipLane + skips
 		}
-		cw = max(len(lay.Layers)*(GraphBoxWidth+GraphGutter)-GraphGutter, 1)
-		ch = max(tallest*(GraphBoxHeight+GraphRowGap)-GraphRowGap, 1)
+		if backs > 0 {
+			ch = backLane + backs
+		}
+	} else {
+		if skips > 0 {
+			ch = skipLane + skips
+		}
+		if backs > 0 {
+			cw = backLane + backs
+		}
 	}
 	canvas := newGraphCanvas(cw, ch)
 	for depth, row := range lay.Layers {
@@ -665,35 +752,53 @@ func (v GraphModel) paint(lay GraphLayout, vertical bool, cursor int) (*graphCan
 	muted := v.theme.Muted()
 	accent := v.theme.Accent()
 	for _, pass := range []bool{false, true} {
-		for idx, n := range lay.Nodes {
-			for _, dep := range n.Blockers {
-				src, ok := lay.Index(dep)
-				if !ok {
-					continue // dangling: the blocker is outside the run
-				}
-				if lay.Nodes[src].Layer >= n.Layer {
-					continue // a cycle edge has no honest route
-				}
-				strong := idx == cursor || src == cursor
-				if strong != pass {
-					continue
-				}
-				style, force := &muted, false
-				if strong {
-					style, force = &accent, true
-				}
-				canvas.polyline(graphRoute(boxes[src], boxes[idx], vertical), style, force)
+		for _, e := range edges {
+			strong := e.dst == cursor || e.src == cursor
+			if strong != pass {
+				continue
 			}
+			style, force := &muted, false
+			if strong {
+				style, force = &accent, true
+			}
+			lane := skipLane + e.lane
+			if e.kind == graphEdgeBack {
+				lane = backLane + e.lane
+			}
+			canvas.polyline(graphRoute(boxes[e.src], boxes[e.dst], vertical, e.kind, lane), style, force)
 		}
 	}
 	return canvas, boxes
 }
 
 // graphRoute returns the polyline joining two boxes: out of the blocker,
-// along the channel in the gap before the dependent, and into it.
-func graphRoute(src, dst graphBox, vertical bool) []graphPoint {
+// along the channel in the gap before the dependent, and into it. A
+// [graphEdgeSkip] or [graphEdgeBack] route detours through the bypass lane at
+// lane, which runs past the end of the layers, so that no segment of any
+// route ever lands on a box.
+func graphRoute(src, dst graphBox, vertical bool, kind graphEdgeKind, lane int) []graphPoint {
 	if vertical {
 		channel := dst.y - GraphLayerGap + 1
+		switch kind {
+		case graphEdgeSkip:
+			// Leave along the row right under the source level, which the
+			// direct routes only ever touch one cell of.
+			exit := src.y + src.h
+			return []graphPoint{
+				{src.midX(), exit},
+				{lane, exit},
+				{lane, channel},
+				{dst.midX(), channel},
+				{dst.midX(), dst.y - 1},
+			}
+		case graphEdgeBack:
+			return []graphPoint{
+				{src.midX(), src.y + src.h},
+				{src.midX(), lane},
+				{dst.midX(), lane},
+				{dst.midX(), dst.y + dst.h},
+			}
+		}
 		return []graphPoint{
 			{src.midX(), src.y + src.h},
 			{src.midX(), channel},
@@ -702,6 +807,27 @@ func graphRoute(src, dst graphBox, vertical bool) []graphPoint {
 		}
 	}
 	channel := dst.x - GraphGutter/2
+	switch kind {
+	case graphEdgeSkip:
+		// Leave along the column right beside the source box, which the
+		// direct routes only ever touch one cell of.
+		exit := src.x + src.w + 1
+		return []graphPoint{
+			{src.x + src.w, src.midY()},
+			{exit, src.midY()},
+			{exit, lane},
+			{channel, lane},
+			{channel, dst.midY()},
+			{dst.x - 1, dst.midY()},
+		}
+	case graphEdgeBack:
+		return []graphPoint{
+			{src.x + src.w, src.midY()},
+			{lane, src.midY()},
+			{lane, dst.midY()},
+			{dst.x + dst.w, dst.midY()},
+		}
+	}
 	return []graphPoint{
 		{src.x + src.w, src.midY()},
 		{channel, src.midY()},
@@ -726,7 +852,14 @@ func (v GraphModel) drawBox(c *graphCanvas, b graphBox, n GraphNode, selected bo
 		tl, tr, bl, br, hz, vt = "┏", "┓", "┗", "┛", "━", "┃"
 		border = v.theme.Accent()
 	}
-	c.text(b.x, b.y, tl+strings.Repeat(hz, b.w-2)+tr, &border)
+	// A bead the layering could not place carries the reason on its top
+	// border, so a cyclic graph is not mistaken for a healthy one when the
+	// colours are off.
+	top := strings.Repeat(hz, b.w-2)
+	if n.Cycle && b.w-2 > len(graphCycleLabel)+1 {
+		top = hz + graphCycleLabel + strings.Repeat(hz, b.w-2-len(graphCycleLabel)-1)
+	}
+	c.text(b.x, b.y, tl+top+tr, &border)
 	c.text(b.x, b.y+b.h-1, bl+strings.Repeat(hz, b.w-2)+br, &border)
 	for y := b.y + 1; y < b.y+b.h-1; y++ {
 		c.text(b.x, y, vt, &border)
@@ -795,9 +928,38 @@ func (v GraphModel) listRow(n GraphNode) string {
 	return line
 }
 
-// detailLines renders the bead detail panel: what the bead asks for, and
-// what has happened to it so far.
+// detailBody is how many lines of the detail panel are on screen at once: the
+// pane less the row the closing hint is pinned to.
+func (v GraphModel) detailBody() int { return max(v.height-1, 1) }
+
+// detailMaxOffset is the largest scroll offset that still shows text: past it
+// the panel would only add blank lines, so [GraphModel.Update] stops there and
+// a scroll back up moves on the first press.
+func (v GraphModel) detailMaxOffset(lay GraphLayout, st *State, cursor int) int {
+	return max(len(v.detailContent(lay, st, cursor, v.width))-v.detailBody(), 0)
+}
+
+// detailLines renders the bead detail panel, scrolled to the view's offset and
+// with the closing hint pinned to the bottom of the pane.
 func (v GraphModel) detailLines(lay GraphLayout, st *State, cursor, w, h int) []string {
+	lines := v.detailContent(lay, st, cursor, w)
+	body := max(h-1, 1)
+	off := min(v.detailOff, max(len(lines)-body, 0))
+	end := min(off+body, len(lines))
+	out := append([]string{}, lines[off:end]...)
+	for len(out) < body {
+		out = append(out, "")
+	}
+	hint := v.theme.Muted().Render("esc close")
+	if len(lines) > body {
+		hint += v.theme.Muted().Render(fmt.Sprintf("   lines %d-%d of %d", off+1, end, len(lines)))
+	}
+	return append(out, hint)
+}
+
+// detailContent renders the bead detail panel's text before it is scrolled:
+// what the bead asks for, and what has happened to it so far.
+func (v GraphModel) detailContent(lay GraphLayout, st *State, cursor, w int) []string {
 	n := lay.Nodes[cursor]
 	inner := max(w-2, 1)
 	var lines []string
@@ -810,7 +972,9 @@ func (v GraphModel) detailLines(lay GraphLayout, st *State, cursor, w, h int) []
 
 	add(v.theme.Title().Render(string(n.ID)) + "  " + n.Title)
 	facts := []string{
-		v.theme.StateStyle(n.State).Render(v.theme.StateLabel(n.State)),
+		// StateLabel already renders through StateStyle; styling it again
+		// would nest a second SGR pair around text that is already escaped.
+		v.theme.StateLabel(n.State),
 		fmt.Sprintf("level %d", n.Layer),
 		fmt.Sprintf("priority %d", int(n.Priority)),
 	}
@@ -860,20 +1024,7 @@ func (v GraphModel) detailLines(lay GraphLayout, st *State, cursor, w, h int) []
 	for _, l := range hist {
 		add("  " + l)
 	}
-
-	// Scroll, then pin the closing hint to the bottom of the pane.
-	body := max(h-1, 1)
-	off := min(v.detailOff, max(len(lines)-body, 0))
-	end := min(off+body, len(lines))
-	out := append([]string{}, lines[off:end]...)
-	for len(out) < body {
-		out = append(out, "")
-	}
-	hint := v.theme.Muted().Render("esc close")
-	if len(lines) > body {
-		hint += v.theme.Muted().Render(fmt.Sprintf("   lines %d-%d of %d", off+1, end, len(lines)))
-	}
-	return append(out, hint)
+	return lines
 }
 
 // detailDeps renders a dependency list with each bead's state, marking the
@@ -1035,8 +1186,9 @@ func (c *graphCanvas) text(x, y int, s string, style *lipgloss.Style) {
 }
 
 // line adds the given directions to an edge cell. A cell already holding a
-// box rune is left alone: an edge crossing a box is drawn around it rather
-// than through it.
+// box rune is left alone, so an edge can never overwrite a border: [graphRoute]
+// keeps every segment clear of the boxes, and this is the backstop that keeps
+// a box readable if it ever fails to.
 func (c *graphCanvas) line(x, y int, mask uint8, style *lipgloss.Style, force bool) {
 	if !c.inside(x, y) {
 		return
@@ -1158,6 +1310,15 @@ func (c *graphCanvas) row(y, offX, w int) string {
 	}
 	flush()
 	return strings.TrimRight(b.String(), " ")
+}
+
+// graphPlural picks the singular or the plural spelling of a word for a
+// count, so the summary line reads "1 bead · 1 level" rather than "1 beads".
+func graphPlural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // graphPad clips s to w columns and pads it with spaces to exactly w.

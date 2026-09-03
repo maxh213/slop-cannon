@@ -96,6 +96,15 @@ type PlanRequest struct {
 	MaxTurns int
 	// Timeout kills the session when it elapses; zero means no limit.
 	Timeout time.Duration
+	// Env holds variables set on the cartridge process on top of the
+	// inherited allowlist, and is where the read-only bd shim goes: build
+	// it with UseShim so `bd` on the agent's PATH refuses every write
+	// (D-21). PlanRunSpec copies the map; it is never retained.
+	Env map[string]string
+	// InheritEnv is the allowlist of parent variables the cartridge passes
+	// through; nil means cartridge.DefaultInheritEnv(). PATH is always
+	// inherited, which is exactly why Env must carry the shim's PATH.
+	InheritEnv []string
 	// Budget bounds the assembled prompt; the zero value means the
 	// prompt package's defaults.
 	Budget prompt.Budget
@@ -117,6 +126,21 @@ func (r PlanRequest) Dir() string {
 		return r.Workdir
 	}
 	return r.Repo.Root
+}
+
+// UseShim puts the read-only bd shim in front of the environment this
+// firing hands the cartridge, creating Env when it is nil. It is how a
+// caller honours D-21 ("agents never write to beads") for a planning
+// firing: the planning product owner runs read_only but in the repository
+// itself, and the assembled prompt promises the agent that the `bd` on its
+// PATH refuses every write. Write the shim with beads.WriteShim into a
+// directory under the run's state directory (never inside the repository,
+// D-23) and pass it here before PlanRunSpec.
+func (r *PlanRequest) UseShim(s beads.Shim) {
+	if r.Env == nil {
+		r.Env = make(map[string]string, 1)
+	}
+	s.Apply(r.Env)
 }
 
 // Validate reports the first problem with the request. Errors wrap
@@ -194,18 +218,28 @@ func PlanPrompt(req PlanRequest) (prompt.Prompt, error) {
 // Before firing, the caller passes the spec's tool policy to
 // EnforcementFor(cartridge, spec.ToolPolicy) and refuses to fire when
 // Enforcement.Check reports the policy cannot be enforced (P5-06).
+//
+// The caller must also install the read-only bd shim itself: the spec's
+// environment is PlanRequest.Env plus the inherited allowlist, and a
+// cartridge process always inherits PATH, so without a shim in Env the
+// agent gets the real `bd` in the real repository while the prompt tells it
+// that `bd` refuses every write (D-21). Write the shim with beads.WriteShim
+// and pass it to PlanRequest.UseShim before calling this; PlanRunSpec only
+// carries Env and InheritEnv through to the spec.
 func PlanRunSpec(req PlanRequest) (cartridge.RunSpec, prompt.Prompt, error) {
 	p, err := PlanPrompt(req)
 	if err != nil {
 		return cartridge.RunSpec{}, prompt.Prompt{}, err
 	}
 	spec := cartridge.RunSpec{
-		Prompt:   p.Text,
-		Workdir:  req.Dir(),
-		Model:    req.Model,
-		MaxTurns: req.MaxTurns,
-		Timeout:  req.Timeout,
-		Labels:   cartridge.LabelsFor(req.Run, domain.Agent{ID: req.AgentID, Role: domain.RolePO}, events.TaskPlan, 0),
+		Prompt:     p.Text,
+		Workdir:    req.Dir(),
+		Model:      req.Model,
+		MaxTurns:   req.MaxTurns,
+		Timeout:    req.Timeout,
+		Env:        cloneEngineerEnv(req.Env),
+		InheritEnv: append([]string(nil), req.InheritEnv...),
+		Labels:     cartridge.LabelsFor(req.Run, domain.Agent{ID: req.AgentID, Role: domain.RolePO}, events.TaskPlan, 0),
 	}
 	if err := ApplyPolicy(&spec, domain.RolePO, events.TaskPlan); err != nil {
 		return cartridge.RunSpec{}, p, err
@@ -347,19 +381,48 @@ func ParsePlanOutput(req PlanRequest, output string) (domain.Plan, structured.Pa
 
 // planProblems renders a rejection as one line per broken rule, the shape
 // structured.ParseError.Problems (and so ParseError.Feedback) expects.
+//
+// ValidatePlan nests its errors two deep — ErrPlanRejected in front of a
+// join, one of whose members is domain.ErrInvalidPlan in front of another
+// join — so the tree is walked to its leaves and the bare sentinels, which
+// say nothing a model can act on, are dropped.
 func planProblems(err error) []string {
+	out := appendPlanProblems(nil, err)
+	if len(out) == 0 {
+		return []string{err.Error()}
+	}
+	return out
+}
+
+// appendPlanProblems appends the leaf messages of err to out, descending
+// through every multi-error and skipping the wrapper sentinels.
+func appendPlanProblems(out []string, err error) []string {
+	if err == nil {
+		return out
+	}
 	var joined interface{ Unwrap() []error }
 	if errors.As(err, &joined) {
-		errs := joined.Unwrap()
-		out := make([]string, 0, len(errs))
-		for _, e := range errs {
-			out = append(out, e.Error())
+		for _, e := range joined.Unwrap() {
+			out = appendPlanProblems(out, e)
 		}
-		if len(out) > 0 {
-			return out
+		return out
+	}
+	if isPlanSentinel(err) {
+		return out
+	}
+	return append(out, err.Error())
+}
+
+// isPlanSentinel reports whether err is one of the bare sentinels
+// ValidatePlan wraps its real problems in. It matches only the sentinel
+// itself, never an error that wraps one and adds detail of its own.
+func isPlanSentinel(err error) bool {
+	for _, s := range []error{ErrPlanRejected, domain.ErrInvalidPlan} {
+		if errors.Is(err, s) && err.Error() == s.Error() {
+			return true
 		}
 	}
-	return []string{err.Error()}
+	return false
 }
 
 // ValidatePlan checks a schema-valid plan against the rules the schema

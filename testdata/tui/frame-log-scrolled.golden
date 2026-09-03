@@ -1,5 +1,5 @@
-▄█▓═▶  slop-cannon · run demo-20260101-120000 · autopilot · ammo 0/10 · safety o
- 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+▄█▓═▶  demo-20260101-120000 · autopilot · ammo 0/10 · safety off · finished
+ 1 Graph  2 Agents  3 Feedback  4 PRs [1m 5 Log [0m
 ────────────────────────────────────────────────────────────────────────────────
   12:01:06 verdict_received     demo-2 round 1: qa says changes (2 items)
   12:01:09 bead_state_changed   bead demo-2 in_review → changes_requested (qa re

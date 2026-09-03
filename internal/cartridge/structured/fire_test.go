@@ -262,3 +262,59 @@ func TestRetryPromptTruncatesLongOutput(t *testing.T) {
 	assert.Contains(t, empty, "usable result")
 	assert.False(t, errors.Is(nil, ErrMissing))
 }
+
+func TestFireRetriesAResultCheckFailure(t *testing.T) {
+	c := structuredRegistry(t).MustGet("verdict")
+	// Both replies satisfy the schema; the first breaks a rule the schema
+	// cannot express, which the check reports as its own *ParseError.
+	rejected := errors.New("structured_test: the verdict overrules an item")
+	fake := &structuredFakeCartridge{replies: []structuredReply{
+		{output: structuredGood}, {output: structuredGood},
+	}}
+	var checked int
+	out, err := Fire(context.Background(), fake, structuredSpec(t), c,
+		WithCheck(func(p Parsed, output string) error {
+			checked++
+			assert.Equal(t, "verdict", p.Contract)
+			assert.Equal(t, structuredGood, output)
+			if checked == 1 {
+				return &ParseError{
+					Reason: ReasonSchema, Contract: c.Name(),
+					Detail: "the verdict breaks a rule", Problems: []string{"item 1 is marked overruled"},
+					Cause: rejected,
+				}
+			}
+			return nil
+		}))
+	require.NoError(t, err)
+	assert.Equal(t, 2, checked, "the check runs on every reply the schema accepted")
+	require.Len(t, out.Attempts, 2)
+	assert.ErrorIs(t, out.Attempts[0].Err, ErrSchema)
+	assert.ErrorIs(t, out.Attempts[0].Err, rejected, "the check's own error is preserved")
+	assert.NoError(t, out.Attempts[1].Err)
+	assert.NotEmpty(t, out.Parsed.JSON)
+
+	prompts := fake.prompts()
+	require.Len(t, prompts, 2)
+	assert.Contains(t, prompts[1], "item 1 is marked overruled", "the retry quotes the broken rule")
+
+	t.Run("a plain error becomes a contract failure", func(t *testing.T) {
+		fake := &structuredFakeCartridge{replies: []structuredReply{{output: structuredGood}, {output: structuredGood}}}
+		_, err := Fire(context.Background(), fake, structuredSpec(t), c,
+			WithCheck(func(Parsed, string) error { return errors.New("no items listed") }))
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrSchema)
+		pe, ok := AsParseError(err)
+		require.True(t, ok)
+		assert.Equal(t, "verdict", pe.Contract)
+		assert.Contains(t, pe.Feedback(), "no items listed", "the model is told what the check wanted")
+		assert.Len(t, fake.prompts(), 2, "retried exactly once")
+	})
+
+	t.Run("a nil check leaves the reply unchecked", func(t *testing.T) {
+		fake := &structuredFakeCartridge{replies: []structuredReply{{output: structuredGood}}}
+		out, err := Fire(context.Background(), fake, structuredSpec(t), c, WithCheck(nil))
+		require.NoError(t, err)
+		assert.Len(t, out.Attempts, 1)
+	})
+}

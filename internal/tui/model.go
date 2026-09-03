@@ -490,8 +490,9 @@ func (s *State) appendLog(ev events.Event) {
 }
 
 // FormatEvent renders one event as a single line, without a timestamp. The
-// log view and the demo generator's --events listing share it; the headless
-// renderer (P7-08) has its own, richer format.
+// log view and the agents view's transcript notes (P7-03) share it. The
+// headless renderer (P7-08) has its own, richer format, and `sc tui-demo
+// --events` writes the events themselves as JSONL rather than this.
 func FormatEvent(ev events.Event) string {
 	switch e := ev.(type) {
 	case events.RunStarted:
@@ -584,6 +585,7 @@ type StopRequestedMsg struct{}
 type Model struct {
 	opts   Options
 	keys   KeyMap
+	theme  *Theme
 	help   help.Model
 	styles styles
 	state  *State
@@ -601,6 +603,8 @@ type Model struct {
 	tab           Tab
 	cursor        int
 	width, height int
+	flash         string
+	flashErr      bool
 	follow        bool
 	showHelp      bool
 	confirmStop   bool
@@ -629,15 +633,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.state.Apply(msg.Event)
 		m.state.Dropped = msg.Dropped
 		m.agents = m.agents.Apply(msg.Event)
+		// A spawn starts the Agents view's spinner ticker, which is also
+		// what keeps the elapsed time on a live card moving (P7-03).
+		var agentsCmd tea.Cmd
+		m.agents, agentsCmd = m.agents.Wake(m.state)
 		var animCmd tea.Cmd
-		m.anim, animCmd = m.anim.Apply(msg.Event)
-		if m.cursor >= m.rows() {
-			m.cursor = max(m.rows()-1, 0)
+		// Aim before firing: the animation layer asks the graph view where
+		// the event's bead is drawn right now (P7-06).
+		m.anim, animCmd = m.anim.SetTargets(m.animTargets()).Apply(msg.Event)
+		m.cursor = min(m.cursor, max(m.rows()-1, 0))
+		return m, tea.Batch(waitForEvent(m.sub), agentsCmd, animCmd)
+	case AgentsTickMsg:
+		a, cmd, ok := m.agents.Tick(msg, m.state)
+		if !ok {
+			return m, nil
 		}
-		return m, tea.Batch(waitForEvent(m.sub), animCmd)
+		m.agents = a
+		return m, cmd
 	case StreamClosedMsg:
 		m.streamClosed = true
 		return m, nil
+	case URLOpenedMsg:
+		return m.opened(msg), nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -649,6 +666,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // by any of `?`, `esc` and `q`.
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := m.keys
+	m.flash, m.flashErr = "", false
 	if key.Matches(msg, k.ForceQuit) {
 		m.quitting = true
 		return m, tea.Quit
@@ -777,13 +795,30 @@ func (m Model) View() string {
 	}
 	w, h := m.size()
 	body := m.body(w, h-chromeHeight)
-	return m.anim.Overlay(strings.Join([]string{
+	frame := m.anim.Overlay(strings.Join([]string{
 		m.header(w),
 		m.tabBar(w),
 		m.styles.Rule.Render(strings.Repeat("─", max(w, 1))),
 		body,
 		m.footer(w),
 	}, "\n"))
+	return clipLines(frame, m.height)
+}
+
+// clipLines drops everything below the first h lines. [Model.size] gives the
+// layout a floor of chromeHeight+1 rows so the chrome is always drawn; on a
+// terminal shorter than that the frame would otherwise be taller than the
+// screen, which scrolls the display (P7-09). A non-positive h means the size
+// is not known yet, so nothing is clipped.
+func clipLines(frame string, h int) string {
+	if h <= 0 {
+		return frame
+	}
+	lines := strings.Split(frame, "\n")
+	if len(lines) <= h {
+		return frame
+	}
+	return strings.Join(lines[:h], "\n")
 }
 
 // chromeHeight is how many lines the header, tab bar, rule and footer take,
@@ -803,41 +838,94 @@ func (m Model) size() (int, int) {
 	return w, max(h, chromeHeight+1)
 }
 
-// header renders the cannon, run id, mode, ammo and safety. P7-06 animates
-// the cannon sprite; the layout keeps its width fixed so it can.
+// header renders the cannon, run id, mode, ammo used/total, safety and the
+// run status. P7-06 animates the cannon sprite; the layout keeps its width
+// fixed so it can.
+//
+// The widest form of the line does not fit an 80-column terminal — the size
+// the golden frames and the Phase 7 exit criteria pin — so the header is
+// composed at the widest of [Model.headerVariants] that fits: what goes
+// first is what the reader can do without (the "slop-cannon" title, which
+// the sprite beside it already says; then the "run" label, then the finish
+// reason), and every field P7-01 requires survives to 80 columns.
 func (m Model) header(w int) string {
+	cannon := m.anim.Cannon()
+	sep := m.styles.Sep.Render(" · ")
+	avail := max(w-lipgloss.Width(cannon), 0)
+	variants := m.headerVariants()
+	line := ""
+	for i, fields := range variants {
+		line = strings.Join(fields, sep)
+		if lipgloss.Width(line) <= avail || i == len(variants)-1 {
+			break
+		}
+	}
+	return clip(cannon+line, w)
+}
+
+// headerVariants lists the header's field sets from widest to narrowest.
+// [Model.header] draws the first one that fits the terminal, and clips the
+// last one when even that does not.
+func (m Model) headerVariants() [][]string {
 	used, total := m.state.Ammo()
-	fields := []string{
-		m.styles.Title.Render("slop-cannon"),
-		"run " + m.styles.Value.Render(orDash(m.state.Run.ID.String())),
-		m.styles.Value.Render(m.state.Mode().String()),
-		fmt.Sprintf("ammo %s", m.styles.Value.Render(fmt.Sprintf("%d/%d", used, total))),
-		"safety " + m.styles.Value.Render(onOff(m.state.Run.Config.Safety)),
+	title := m.styles.Title.Render("slop-cannon")
+	id := m.styles.Value.Render(orDash(m.state.Run.ID.String()))
+	mode := m.styles.Value.Render(m.state.Mode().String())
+	ammo := "ammo " + m.styles.Value.Render(fmt.Sprintf("%d/%d", used, total))
+	safety := "safety " + m.styles.Value.Render(onOff(m.state.Run.Config.Safety))
+	long, short := m.status()
+	full, brief := "", ""
+	if long != "" {
+		full, brief = m.styles.Status.Render(long), m.styles.Status.Render(short)
 	}
-	if st := m.status(); st != "" {
-		fields = append(fields, m.styles.Status.Render(st))
+	return [][]string{
+		headerFields(title, "run "+id, mode, ammo, safety, full),
+		headerFields("run "+id, mode, ammo, safety, full),
+		headerFields(id, mode, ammo, safety, full),
+		headerFields(id, mode, ammo, safety, brief),
+		headerFields(id, ammo, safety, brief),
+		headerFields(id, safety, brief),
+		headerFields(id, safety),
+		headerFields(id),
 	}
-	line := m.anim.Cannon() + strings.Join(fields, m.styles.Sep.Render(" · "))
-	return clip(line, w)
+}
+
+// headerFields drops the empty fields of a header variant, so a run with no
+// status word does not render a dangling separator.
+func headerFields(fields ...string) []string {
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // CannonSprite is the static cannon drawn in the header. P7-06 replaces it
 // with animated frames.
 const CannonSprite = "▄█▓═▶"
 
-// status is the short run-status word shown in the header.
-func (m Model) status() string {
+// status is the run-status word shown in the header: long is the full form
+// and short the one a narrow terminal falls back to. Both are empty while
+// the run is simply running.
+//
+// A finished run is reported first because it is the last word on the run. A
+// stream that ended comes next, ahead of paused and stopping: once the
+// events stop arriving, "stopping" would be a state the TUI can no longer
+// vouch for, and the reader needs to know the screen has gone stale.
+func (m Model) status() (long, short string) {
 	switch {
 	case m.state.Finish != nil:
-		return "finished: " + m.state.Finish.Reason.String()
-	case m.state.Stopping:
-		return "stopping"
-	case m.state.Paused:
-		return "paused"
+		return "finished: " + m.state.Finish.Reason.String(), "finished"
 	case m.streamClosed:
-		return "disconnected"
+		return "disconnected", "disconnected"
+	case m.state.Stopping:
+		return "stopping", "stopping"
+	case m.state.Paused:
+		return "paused", "paused"
 	default:
-		return ""
+		return "", ""
 	}
 }
 
@@ -855,13 +943,50 @@ func (m Model) tabBar(w int) string {
 	return clip(lipgloss.JoinHorizontal(lipgloss.Top, parts...), w)
 }
 
-// footer renders the short keymap plus the dropped-event notice.
+// footer renders the short keymap plus the dropped-event notice and the
+// result of the last action that had one to report.
 func (m Model) footer(w int) string {
 	line := m.help.ShortHelpView(m.keys.ShortHelp())
 	if m.state.Dropped > 0 {
 		line += m.styles.Sep.Render("  ") + m.styles.Warn.Render(fmt.Sprintf("missed %d events", m.state.Dropped))
 	}
+	if m.flash != "" {
+		style := m.styles.Muted
+		if m.flashErr {
+			style = m.styles.Warn
+		}
+		line += m.styles.Sep.Render("  ") + style.Render(m.flash)
+	}
 	return clip(line, w)
+}
+
+// opened records the result of the PRs view's `o` key (P7-05): the footer
+// says what happened until the next key press, and a failure is also kept in
+// the run's notices, so a headless browser or a missing xdg-open is visible
+// rather than a key that silently does nothing.
+func (m Model) opened(msg URLOpenedMsg) Model {
+	if msg.Err == nil {
+		m.flash, m.flashErr = "opened "+msg.URL, false
+		return m
+	}
+	m.flash, m.flashErr = "could not open "+msg.URL, true
+	m.state.Notices = append(m.state.Notices, Notice{
+		At:      m.now(),
+		Kind:    events.KindError,
+		Source:  "tui",
+		Message: "could not open " + msg.URL,
+		Err:     msg.Err.Error(),
+	})
+	return m
+}
+
+// now is the model's clock: [Options.Now] when the caller pinned one (the
+// golden-frame tests do), otherwise the wall clock.
+func (m Model) now() time.Time {
+	if m.opts.Now != nil {
+		return m.opts.Now()
+	}
+	return time.Now()
 }
 
 // body renders the main pane: an overlay when one is up, otherwise the
@@ -880,11 +1005,27 @@ func (m Model) body(w, h int) string {
 	return fit(content, w, h)
 }
 
-// helpOverlay renders the `?` overlay: the full keymap in a box.
+// helpOverlay renders the `?` overlay: the full keymap in a box, plus the
+// keys of the active view under their own title.
 func (m Model) helpOverlay(w, h int) string {
 	full := m.help.FullHelpView(m.keys.FullHelp())
+	if cols := m.viewKeys(); len(cols) > 0 {
+		full += "\n\n" + m.styles.Title.Render(m.tab.String()+" keys") + "\n" + m.help.FullHelpView(cols)
+	}
 	box := m.styles.Box.Render(m.styles.Title.Render("Keys") + "\n\n" + full)
 	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, box)
+}
+
+// viewKeys returns the extra key columns of the active view, so the overlay
+// documents the bindings only that view has — the Agents view's transcript
+// keys (P7-03) — instead of the global map alone. They are rendered as their
+// own block rather than appended to the global columns, which would make the
+// box wider than a narrow terminal.
+func (m Model) viewKeys() [][]key.Binding {
+	if m.tab == TabAgents {
+		return m.agents.Keys().FullHelp()
+	}
+	return nil
 }
 
 // confirmOverlay renders the stop confirmation raised by `q` on a live run.
@@ -909,9 +1050,9 @@ func (m Model) view(w, h int) string {
 	case TabPRs:
 		return m.prs.View(m.state)
 	}
-	rows := m.rowsFor(m.tab)
+	rows := m.logRows()
 	if len(rows) == 0 {
-		return m.styles.Muted.Render(emptyText[m.tab])
+		return m.styles.Muted.Render(emptyText[TabLog])
 	}
 	cursor := m.cursorRow()
 	start := 0
@@ -940,79 +1081,27 @@ var emptyText = [...]string{
 	"no events yet",
 }
 
-// rows returns how many rows the current view has, for cursor clamping.
-func (m Model) rows() int { return len(m.rowsFor(m.tab)) }
-
-// rowsFor renders one line per item of the given view.
-func (m Model) rowsFor(t Tab) []string {
-	switch t {
-	case TabGraph:
-		out := make([]string, 0, len(m.state.Beads))
-		for _, b := range m.state.Beads {
-			deps := ""
-			if len(b.Deps) > 0 {
-				deps = m.styles.Muted.Render(fmt.Sprintf("  ← %s", beadList(b.Deps)))
-			}
-			round := ""
-			if b.Round > 0 {
-				round = fmt.Sprintf(" r%d", b.Round)
-			}
-			out = append(out, fmt.Sprintf("%-10s %-18s%s %s%s", b.ID, b.State, round, b.Title, deps))
-		}
-		return out
-	case TabAgents:
-		out := make([]string, 0, len(m.state.Agents))
-		for _, a := range m.state.Agents {
-			who := a.Role.String()
-			if a.Lens != "" {
-				who += "/" + a.Lens.String()
-			}
-			out = append(out, fmt.Sprintf("%-22s %-14s %-10s %-9s %s", a.ID, who, orDash(string(a.Bead)), a.State, a.LastLine))
-		}
-		return out
-	case TabFeedback:
-		out := make([]string, 0, len(m.state.Rounds))
-		for _, r := range m.state.Rounds {
-			verdicts := make([]string, 0, len(r.Verdicts))
-			for _, v := range r.Verdicts {
-				verdicts = append(verdicts, fmt.Sprintf("%s:%s", orDash(string(v.Lens)), v.Outcome))
-			}
-			extra := ""
-			if r.Escalation != nil {
-				extra = "  escalated:" + string(r.Escalation.Outcome)
-			} else if len(r.Rulings) > 0 {
-				extra = fmt.Sprintf("  arbitrated:%d", len(r.Rulings))
-			}
-			out = append(out, fmt.Sprintf("%-10s round %d %-12s %s%s", r.Bead, r.Number, r.Kind, strings.Join(verdicts, " "), extra))
-		}
-		return out
-	case TabPRs:
-		out := make([]string, 0, len(m.state.Deliveries))
-		for _, d := range m.state.Deliveries {
-			what := "open"
-			if d.Merged {
-				what = "merged " + shortSHA(d.SHA)
-			}
-			ref := d.URL
-			if d.Number > 0 {
-				ref = fmt.Sprintf("#%d %s", d.Number, d.URL)
-			}
-			tag := ""
-			if d.External {
-				tag = " (external)"
-			}
-			out = append(out, fmt.Sprintf("%-10s %-16s %s%s", d.Bead, what, ref, tag))
-		}
-		return out
-	case TabLog:
-		out := make([]string, 0, len(m.state.Log))
-		for _, l := range m.state.Log {
-			out = append(out, fmt.Sprintf("%s %-20s %s", l.At.Format("15:04:05"), l.Kind, l.Text))
-		}
-		return out
-	default:
-		return nil
+// rows returns how many rows the model's own cursor may move over, which is
+// only ever the log view's: every other tab is drawn by the view component
+// that owns it and keeps its own cursor (see [Model.cursorRow]), so it
+// reports none here. It counts the log rather than formatting it, so an
+// event does not build a row list nothing renders.
+func (m Model) rows() int {
+	if m.tab != TabLog {
+		return 0
 	}
+	return len(m.state.Log)
+}
+
+// logRows renders one line per log entry. The log is the only view Model
+// still draws itself — the graph, agents, feedback and PRs tabs are
+// dispatched to their own components by [Model.view] (P7-02…P7-05).
+func (m Model) logRows() []string {
+	out := make([]string, 0, len(m.state.Log))
+	for _, l := range m.state.Log {
+		out = append(out, fmt.Sprintf("%s %-20s %s", l.At.Format("15:04:05"), l.Kind, l.Text))
+	}
+	return out
 }
 
 // State returns the folded event state. Later views read it; nothing outside
@@ -1073,12 +1162,14 @@ func fit(content string, w, h int) string {
 	return strings.Join(lines, "\n")
 }
 
-// clip truncates a rendered line to w columns, ANSI sequences included.
+// clip truncates a rendered line to w columns, ANSI sequences included. The
+// style it uses is bound to a pinned renderer and sets no colour, so the
+// truncation cannot pick up the global renderer's profile (P7-09).
 func clip(s string, w int) string {
 	if w <= 0 {
 		return ""
 	}
-	return lipgloss.NewStyle().MaxWidth(w).Render(s)
+	return ThemeFor(ProfileNoColor).Base().MaxWidth(w).Render(s)
 }
 
 // onOff renders a safety flag the way the README speaks about it.

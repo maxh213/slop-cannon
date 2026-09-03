@@ -35,6 +35,8 @@ jobs:
           key: golangci-lint-${{ runner.os }}-${{ hashFiles('Makefile', 'go.mod') }}
       - name: make check
         run: make check
+      - name: make check-golden
+        run: make check-golden
       - name: make build
         run: make build && ./bin/sc version
 

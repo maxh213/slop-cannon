@@ -89,12 +89,20 @@ func shimRealBD(t *testing.T, dir string, args ...string) string {
 }
 
 // TestIntegrationShimAgainstRealBD proves the D-21 agent contract with the
-// real binary from inside a linked worktree: writes are refused with bd's
-// read-only message, the commands bd does not block are refused by the
-// shim, and reads keep working and decode.
+// real binary from inside a linked worktree: every write is refused with
+// bd's read-only message — by the shim's allow-list, before bd runs, and by
+// bd itself when the real binary is called with --readonly (Shim.Verify) —
+// the state-changing commands bd leaves open change nothing, and reads keep
+// working and decode.
 func TestIntegrationShimAgainstRealBD(t *testing.T) {
-	c, repo := integrationClient(t)
 	ctx := context.Background()
+	// bd below MinVersion has a different CLI (1.0.5 rejects the D-13
+	// `bd init --init-if-missing`), so the fixture below would fail to set
+	// up for an environment reason. Skip instead, with the install hint.
+	if _, err := Detect(ctx); err != nil {
+		t.Skipf("bd is unusable for this test: %v; %s", err, InstallHint)
+	}
+	c, repo := integrationClient(t)
 
 	bead, err := c.Create(ctx, BeadInput{Title: "Shim probe", Type: domain.BeadTypeTask, Priority: domain.PriorityDefault})
 	require.NoError(t, err)
@@ -119,7 +127,7 @@ func TestIntegrationShimAgainstRealBD(t *testing.T) {
 		assert.Equal(t, ReadOnlyMessage("update"), StderrMessage(errOut))
 		assert.ErrorIs(t, KindOf("", StderrMessage(errOut)), ErrReadOnly)
 	})
-	t.Run("bd claim, comment, close, create and dep add are refused", func(t *testing.T) {
+	t.Run("bd claim, comment, close, create, dep add and label add are refused", func(t *testing.T) {
 		cases := []struct {
 			args []string
 			op   string
@@ -129,7 +137,7 @@ func TestIntegrationShimAgainstRealBD(t *testing.T) {
 			{[]string{"close", string(bead.ID), "--reason", "done", "--json"}, "close"},
 			{[]string{"create", "sneaky", "-t", "task", "--json"}, "create"},
 			{[]string{"dep", "add", string(bead.ID), string(bead.ID), "--json"}, "dep add"},
-			{[]string{"label", "add", string(bead.ID), "x"}, "label add"},
+			{[]string{"label", "add", string(bead.ID), "x"}, "label"},
 		}
 		for _, tc := range cases {
 			_, errOut, code := shimAgentRun(t, s, wt, tc.args...)
@@ -156,36 +164,62 @@ func TestIntegrationShimAgainstRealBD(t *testing.T) {
 		}
 	})
 	t.Run("commands bd leaves open are refused by the shim", func(t *testing.T) {
-		_, errOut, code := shimAgentRun(t, s, wt, "config", "set", "custom.sc_probe", "1")
-		assert.Equal(t, 1, code)
-		assert.Equal(t, ReadOnlyMessage("config set"), StderrMessage(errOut))
-		value, err := c.ConfigGet(ctx, "custom.sc_probe")
+		// Everything here runs to completion under bd 1.2.2's --readonly
+		// (P3-09 reviews, reproduced live), so the shim's allow-list has to
+		// stop them: `config set`/`set-many` rewrite configuration — the
+		// second one overwrote the D-07 status registry through the round-2
+		// deny-list — `import` inserts issues, `backup` can push the whole
+		// database off-machine, `federation` persists a peer, `audit`
+		// appends to .beads/interactions.jsonl, and the Dolt-level `branch`
+		// and `vc` commit and merge.
+		// A run registers the D-07 custom statuses before any agent
+		// fires; `config set-many` below tries to overwrite that registry,
+		// so it has to be there to be protected.
+		_, err := c.EnsureStatuses(ctx)
 		require.NoError(t, err)
-		assert.Empty(t, value, "nothing was written")
-
-		_, errOut, code = shimAgentRun(t, s, wt, "import", "-i", filepath.Join(t.TempDir(), "none.jsonl"))
-		assert.Equal(t, 1, code)
-		assert.Equal(t, ReadOnlyMessage("import"), StderrMessage(errOut))
-
-		// bd 1.2.2 runs these Dolt-level writes under --readonly: `bd
-		// branch sc-agent-evil` creates a branch and `bd vc commit`/`bd vc
-		// merge` exit 0 (P3-09 review, reproduced live).
+		statuses, err := c.ConfigGet(ctx, StatusCustomKey)
+		require.NoError(t, err)
+		require.NotEmpty(t, statuses, "the run's custom statuses are configured")
 		before := shimRealBD(t, repo.Dir, "branch")
+
+		backupDir := t.TempDir()
 		for _, tc := range []struct {
 			args []string
 			op   string
 		}{
+			{[]string{"config", "set", "custom.sc_probe", "1"}, "config set"},
+			{[]string{"config", "set-many", StatusCustomKey + "=pwned:wip"}, "config set-many"},
+			{[]string{"config", "apply"}, "config apply"},
+			{[]string{"import", "-i", filepath.Join(t.TempDir(), "none.jsonl")}, "import"},
+			{[]string{"backup", "init", "file://" + backupDir}, "backup"},
+			{[]string{"backup", "sync"}, "backup"},
+			{[]string{"federation", "add-peer", "evil", "http://evil.example"}, "federation"},
+			{[]string{"audit", "record", "--kind", "label"}, "audit"},
+			{[]string{"comments", "add", string(bead.ID), "sneaky"}, "comments add"},
 			{[]string{"branch", "sc-agent-evil"}, "branch"},
 			{[]string{"vc", "commit", "-m", "sneaky"}, "vc"},
 			{[]string{"vc", "merge", "main"}, "vc"},
 		} {
-			_, errOut, code := shimAgentRun(t, s, wt, tc.args...)
+			out, errOut, code := shimAgentRun(t, s, wt, tc.args...)
 			assert.Equal(t, 1, code, strings.Join(tc.args, " "))
+			assert.Empty(t, strings.TrimSpace(out), strings.Join(tc.args, " "))
 			assert.Equal(t, ReadOnlyMessage(tc.op), StderrMessage(errOut), strings.Join(tc.args, " "))
+			assert.Contains(t, errOut, ShimDeniedHint, strings.Join(tc.args, " "))
 		}
-		after := shimRealBD(t, repo.Dir, "branch")
-		assert.Equal(t, before, after, "no Dolt branch was created")
-		assert.NotContains(t, after, "sc-agent-evil")
+
+		value, err := c.ConfigGet(ctx, "custom.sc_probe")
+		require.NoError(t, err)
+		assert.Empty(t, value, "nothing was written")
+		after, err := c.ConfigGet(ctx, StatusCustomKey)
+		require.NoError(t, err)
+		assert.Equal(t, statuses, after, "the D-07 status registry is intact")
+		entries, err := os.ReadDir(backupDir)
+		require.NoError(t, err)
+		assert.Empty(t, entries, "no backup destination was filled")
+
+		branches := shimRealBD(t, repo.Dir, "branch")
+		assert.Equal(t, before, branches, "no Dolt branch was created")
+		assert.NotContains(t, branches, "sc-agent-evil")
 	})
 	t.Run("bd ready and bd show work", func(t *testing.T) {
 		out, errOut, code := shimAgentRun(t, s, wt, "ready", "--json", "-n", "0")
@@ -208,7 +242,9 @@ func TestIntegrationShimAgainstRealBD(t *testing.T) {
 	t.Run("InstallForWorktree is the orchestrator's entry point", func(t *testing.T) {
 		inst, err := InstallForWorktree(ctx, wt, ShimOptions{})
 		require.NoError(t, err)
-		assert.Equal(t, ShimDirFor(wt), inst.Dir)
+		want, err := ShimDirFor(wt)
+		require.NoError(t, err)
+		assert.Equal(t, want, inst.Dir)
 		assert.Equal(t, real, inst.Real)
 		assert.False(t, strings.HasPrefix(inst.Dir, wt+string(filepath.Separator)),
 			"the shim lives beside the worktree, not inside it (D-23)")
