@@ -54,8 +54,15 @@ var pgGoldens = map[string]map[string]string{
 // golden exists, and each file is readable UTF-8 text without carriage
 // returns. Renaming or dropping a fixture therefore fails here until the list
 // is updated too.
+//
+// Under UPDATE_GOLDEN the content checks are skipped: the tests that write
+// these files run in parallel with this one, so a file caught mid-rewrite
+// reads as empty. The inventory is still checked — a writer truncates and
+// rewrites a golden in place, it never removes or renames one — and the
+// content is checked on the ordinary (non-updating) run that follows.
 func TestPromptGoldenFilesAreAccountedFor(t *testing.T) {
 	t.Parallel()
+	updating := os.Getenv("UPDATE_GOLDEN") != ""
 	for dir, want := range pgGoldens {
 		t.Run(filepath.ToSlash(dir), func(t *testing.T) {
 			t.Parallel()
@@ -72,6 +79,9 @@ func TestPromptGoldenFilesAreAccountedFor(t *testing.T) {
 				assert.Containsf(t, want, name,
 					"%s is not produced by any test; delete it or list it in pgGoldens", filepath.Join(dir, name))
 
+				if updating {
+					continue // another test is rewriting this file right now
+				}
 				body, err := os.ReadFile(filepath.Join(dir, name)) //nolint:gosec // a checked-in test fixture
 				require.NoError(t, err)
 				assert.NotEmpty(t, body, "%s is empty", name)
