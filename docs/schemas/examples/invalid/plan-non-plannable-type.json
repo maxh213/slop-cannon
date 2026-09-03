@@ -1,0 +1,10 @@
+{
+  "beads": [
+    {
+      "key": "run-epic",
+      "title": "Everything the cannon does this run",
+      "acceptance": "All child beads are closed.",
+      "type": "epic"
+    }
+  ]
+}

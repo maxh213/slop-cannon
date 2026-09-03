@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sc://schemas/verdict.schema.json",
+  "title": "verdict",
+  "description": "One tester's review of one round. Ask for changes only when you list the items; approve when nothing is left that matters.",
+  "type": "object",
+  "required": ["outcome"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "Omit this. The orchestrator stamps it when it stores the message.",
+      "const": "verdict"
+    },
+    "lens": {
+      "type": "string",
+      "description": "The perspective you reviewed from.",
+      "enum": ["ux", "qa", "test"]
+    },
+    "round": {
+      "type": "integer",
+      "description": "The review round this verdict belongs to, counting from 1.",
+      "minimum": 1
+    },
+    "outcome": {
+      "type": "string",
+      "description": "approve accepts the work as it stands; changes sends it back with items.",
+      "enum": ["approve", "changes"]
+    },
+    "summary": {
+      "type": "string",
+      "description": "Your overall note to the engineer."
+    },
+    "items": {
+      "type": "array",
+      "description": "The individual findings. Required when the outcome is changes; may be empty on an approval.",
+      "items": { "$ref": "#/$defs/feedback_item" }
+    }
+  },
+  "if": {
+    "properties": { "outcome": { "const": "changes" } },
+    "required": ["outcome"]
+  },
+  "then": {
+    "required": ["items"],
+    "properties": {
+      "items": {
+        "minItems": 1,
+        "description": "Asking for changes requires at least one item."
+      }
+    }
+  },
+  "$defs": {
+    "feedback_item": {
+      "type": "object",
+      "description": "One concrete finding. A violation of a rules file uses category \"rules\" and is always a blocker.",
+      "required": ["id", "severity", "title"],
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique within the bead across rounds, for example \"qa-r1-3\"; the engineer answers it by this id.",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[^\\s]+$"
+        },
+        "severity": {
+          "type": "string",
+          "description": "blocker must be fixed, major is a real problem, minor is worth fixing, nit is taste.",
+          "enum": ["blocker", "major", "minor", "nit"]
+        },
+        "category": {
+          "type": "string",
+          "description": "Free-form grouping. Use \"rules\" for a violation of a rules file; such items must be blockers.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "title": {
+          "type": "string",
+          "description": "One-line summary of the finding.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "detail": {
+          "type": "string",
+          "description": "What is wrong and why it matters."
+        },
+        "file": {
+          "type": "string",
+          "description": "Path the item refers to, relative to the repository root.",
+          "minLength": 1
+        },
+        "line": {
+          "type": "integer",
+          "description": "1-based line in file; omit when it does not apply.",
+          "minimum": 1
+        },
+        "suggestion": {
+          "type": "string",
+          "description": "The fix you propose, code included when that is clearer."
+        },
+        "status": {
+          "type": "string",
+          "description": "Where the item stands. Omit on a first review (it is open); on a re-review set it for every item you carry over.",
+          "enum": ["open", "resolved", "accepted", "held", "overruled"],
+          "default": "open"
+        }
+      },
+      "if": {
+        "properties": { "category": { "const": "rules" } },
+        "required": ["category"]
+      },
+      "then": {
+        "properties": {
+          "severity": {
+            "const": "blocker",
+            "description": "A rules violation is always a blocker."
+          }
+        }
+      }
+    }
+  }
+}

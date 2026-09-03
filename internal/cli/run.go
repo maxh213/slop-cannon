@@ -105,7 +105,7 @@ func addRunFlags(cmd *cobra.Command) {
 	f.Int(FlagRunAmmo, 0, "override ammo for this run (`N` agents at once, minimum 3)")
 	f.String(FlagRunSafety, "", "override safety for this run (`on|off`): on opens PRs, off merges to the default branch")
 	f.String(FlagRunCartridge, "", "fire cartridge `NAME` instead of the active one")
-	f.Bool(FlagRunNoAnim, false, "disable the cannon animations in the TUI")
+	f.Bool(FlagRunNoAnim, false, "disable the cannon animations in the TUI (also honours SC_NO_ANIM)")
 	f.Bool(FlagRunReviewPRs, true, "also review open pull requests sc did not create (needs gh and a remote)")
 }
 

@@ -1,0 +1,26 @@
+▄█▓═▶  slop-cannon · run sc-feedback-0001 · brief · ammo 0/4 · safety on
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 open items · lines 1-21/35
+  BEAD       U Q T │ sc-i9j0  Stream the response body
+  sc-a1b2    ✓ ✓ ✓ │ ◔ in_review · 3 rounds · ux ✓  qa ✓  test ✓ · satisfied
+  sc-c3d4    ✓ ✓ ✓ │
+  sc-e5f6    ✓ ✓ ✓ │ [1mround 1[0m · review · 92a3b4c · ux,qa,test
+  sc-g7h8    ✓ ✓ ✓ │   ⚙ report stream instead of buffering
+[1m▌ [0msc-i9j0    ✓ ✓ ✓ │       files: internal/http/retry.go, internal/http/retry_test.go
+  sc-k1l2    · ✗ · │       verify: go test ./internal/http/...
+  sc-m3n4    ✓ ✓ ◐ │       risk: the backoff constants are a guess
+                   │   ✓ ux   approve no interface change
+                   │   ✓ qa   approve streams as advertised
+                   │   ✗ test changes missing coverage
+                   │     [1m! blocker[0m test-r1-1 No test for the empty-body case (rules)
+                   │       internal/http/retry.go:42
+                   │       seen while exercising No test for the empty-body case
+                   │       suggestion: guard the call and cover it with a table case
+                   │
+                   │ [1mround 2[0m · review · a3b4c5d · test
+                   │   ✗ test changes rules say every branch is tested
+                   │     [1m! blocker[0m test-r1-1 No test for the empty-body case (rules) [held]
+                   │       internal/http/retry.go:42
+                   │       seen while exercising No test for the empty-body case
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

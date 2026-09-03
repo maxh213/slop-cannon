@@ -1,0 +1,5 @@
+{
+  "outcome": "narrow_scope",
+  "new_acceptance": "Mean(nil) and Mean([]float64{}) return (0, false) and no caller panics. Reworking Median and the reporting command is out of scope and moves to a new bead.",
+  "notes": "The bead grew during review; narrowing it to the original panic gets the fix landed."
+}

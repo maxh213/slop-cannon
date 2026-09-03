@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sc://schemas/plan.schema.json",
+  "title": "plan",
+  "description": "The product owner's proposal: a short brief plus the beads to create. An empty beads list means \"nothing to add right now\".",
+  "type": "object",
+  "required": ["beads"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "Omit this. The orchestrator stamps it when it stores the message.",
+      "const": "plan"
+    },
+    "brief": {
+      "type": "string",
+      "description": "One paragraph on what this plan achieves and why.",
+      "maxLength": 4000
+    },
+    "beads": {
+      "type": "array",
+      "description": "The proposed beads, most important first.",
+      "items": { "$ref": "#/$defs/plan_bead" }
+    }
+  },
+  "$defs": {
+    "key": {
+      "type": "string",
+      "description": "Plan-local identifier: no whitespace, unique within the plan.",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[^\\s]+$"
+    },
+    "plan_bead": {
+      "type": "object",
+      "required": ["key", "title", "acceptance"],
+      "additionalProperties": false,
+      "properties": {
+        "key": { "$ref": "#/$defs/key" },
+        "title": {
+          "type": "string",
+          "description": "One-line summary of the work.",
+          "minLength": 1,
+          "maxLength": 200
+        },
+        "description": {
+          "type": "string",
+          "description": "What to do, in enough detail for an engineer who has not read this plan."
+        },
+        "acceptance": {
+          "type": "string",
+          "description": "Acceptance criteria the testers hold the engineer to. Never empty.",
+          "minLength": 1
+        },
+        "type": {
+          "type": "string",
+          "description": "Issue type; omit for task.",
+          "enum": ["task", "bug", "feature", "chore"]
+        },
+        "priority": {
+          "type": "integer",
+          "description": "0 is the most urgent, 4 the least; omit for the default 2.",
+          "minimum": 0,
+          "maximum": 4,
+          "default": 2
+        },
+        "size": {
+          "type": "string",
+          "description": "Effort estimate: s under an hour, m one to three hours, l three to eight hours.",
+          "enum": ["s", "m", "l"]
+        },
+        "deps": {
+          "type": "array",
+          "description": "Keys of the beads in this plan that must land first. Never a cycle, never this bead's own key.",
+          "items": { "$ref": "#/$defs/key" },
+          "uniqueItems": true
+        }
+      }
+    }
+  }
+}

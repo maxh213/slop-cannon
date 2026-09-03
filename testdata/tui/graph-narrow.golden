@@ -1,0 +1,20 @@
+▄█▓═▶  slop-cannon · run sc-graph-001 · brief · ammo 0/4 · safet
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────
+4 beads · 3 levels · 0 ready · 1 blocked · 1 closed · list
+  level 0 (1)
+[1m▌ [0m[1m● sc-root    [0m r1   Extract the HTTP client
+  level 1 (2)
+  ↺ sc-left     r2   Retry idempotent requests  ← sc-root
+  ✓ sc-rght     r1   Cache DNS lookups  ← sc-root
+  level 2 (1)
+  ○ sc-sink          Benchmark the client  ← sc-left,sc-rght
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • 

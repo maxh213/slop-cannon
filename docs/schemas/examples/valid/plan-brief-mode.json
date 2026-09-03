@@ -1,0 +1,33 @@
+{
+  "brief": "Make the statistics helpers correct and covered before anything else is built on them: the mean is wrong on empty input and the median is not implemented, and neither has tests.",
+  "beads": [
+    {
+      "key": "fix-mean",
+      "title": "Fix Mean on an empty slice",
+      "description": "Mean divides by len(xs) without checking for zero, so it panics on an empty slice. Return 0 and a false ok flag instead, and keep the existing signature for callers.",
+      "acceptance": "Mean(nil) and Mean([]float64{}) return (0, false); every existing caller still compiles; go test ./... passes.",
+      "type": "bug",
+      "priority": 1,
+      "size": "s"
+    },
+    {
+      "key": "implement-median",
+      "title": "Implement Median",
+      "description": "Median is a stub returning 0 with a TODO. Sort a copy of the input and average the two middle values on an even length.",
+      "acceptance": "Median returns the middle value for odd lengths and the mean of the two middle values for even ones; the input slice is not reordered; the TODO is gone.",
+      "type": "feature",
+      "priority": 2,
+      "size": "m",
+      "deps": ["fix-mean"]
+    },
+    {
+      "key": "stats-tests",
+      "title": "Cover the statistics helpers with table tests",
+      "acceptance": "A table-driven test covers empty, single-element, odd and even inputs for both Mean and Median, and fails if either regresses.",
+      "type": "task",
+      "priority": 3,
+      "size": "s",
+      "deps": ["fix-mean", "implement-median"]
+    }
+  ]
+}

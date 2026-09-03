@@ -1,0 +1,2 @@
+structured: schema (impl_report): 1 violation(s)
+  - at '/commit': 'HEAD~1' does not match pattern '^[0-9a-fA-F]{7,40}$'

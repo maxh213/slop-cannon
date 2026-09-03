@@ -1,0 +1,2 @@
+structured: schema (response): 1 violation(s)
+  - at '/responses/0': missing property 'rationale'

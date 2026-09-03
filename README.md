@@ -62,7 +62,11 @@ Go 1.27+ is required. All day-to-day work goes through the Makefile:
 | `make clean` | Removes `bin/`, `dist/`, and coverage output |
 | `make tools` | Installs the pinned developer tools into `bin/` |
 | `make update-golden` | Regenerates `testdata/**/*.golden` and `docs/cli.md` from the current output (`UPDATE_GOLDEN=1 go test ./...`) |
+| `make update-golden-tui` | Regenerates just the TUI frames in `testdata/tui/` (`UPDATE_GOLDEN=1 go test ./internal/tui/...`) |
+| `make check-golden` | Fails if any golden file or `docs/cli.md` is stale; regenerates in place, so run it on a clean tree |
 | `make docs-cli` | Regenerates `docs/cli.md` from the `sc` command tree |
 | `make help` | Lists the targets |
 
 CI (`.github/workflows/ci.yml`) runs `make check` on Ubuntu and macOS for every push and pull request, and runs `make integration` in a separate job that is skipped when `bd` is not installed.
+
+Golden files (including the TUI frames in `testdata/tui/`) are explained in [docs/goldens.md](docs/goldens.md): how they stay deterministic, how to regenerate them, and how to read a diff.

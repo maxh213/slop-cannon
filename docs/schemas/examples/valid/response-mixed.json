@@ -1,0 +1,19 @@
+{
+  "responses": [
+    {
+      "item_id": "test-r1-1",
+      "action": "fixed",
+      "rationale": "Added the empty and single-element rows to the Mean table test; it fails without the fix."
+    },
+    {
+      "item_id": "test-r1-2",
+      "action": "pushback",
+      "rationale": "TestMedian is skipped because Median is a separate bead (implement-median) that has not landed. Unskipping it here would make the suite red for work this bead does not own."
+    },
+    {
+      "item_id": "ux-r1-1",
+      "action": "wontfix",
+      "rationale": "Renaming the exported Mean function is out of scope for a bug fix and would break the two other packages that call it."
+    }
+  ]
+}

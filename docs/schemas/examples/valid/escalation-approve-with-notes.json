@@ -1,0 +1,4 @@
+{
+  "outcome": "approve_with_notes",
+  "notes": "Ships with the ux lens's naming objection unresolved: the second return value is called ok while the doc comment calls it \"defined\". Cosmetic, tracked as a follow-up, not worth a sixth round."
+}

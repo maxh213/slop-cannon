@@ -1,0 +1,30 @@
+12:00:00 ◆ run sc-20260101-120000 started: mode brief, ammo 10, safety on, cartridge claude/fable, repo /repos/example, brief "add retries and document them"
+12:00:03 ▶ fired po(claude/fable) [plan, agent po-1]
+12:00:06 │ po-1 stdout: reading the repository
+12:00:09 ✔ po-1 (po) finished in 12s: plan, exit 0
+12:00:12 ✎ plan from po-1: 2 beads under epic sc-1 [docs=sc-3 retry=sc-2]
+12:00:15 + bead sc-2 created "Add retry" (feature, p2, open)
+12:00:18 + bead sc-3 created "Document the retry policy" (chore, p3, open)
+12:00:21 ⇄ graph updated under epic sc-1: 2 beads, 1 edge
+12:00:24 → bead sc-2 open → in_progress (round 1, claimed by eng-sc-2-r1)
+12:00:27 ▶ fired engineer(claude/fable) at sc-2 "Add retry" [implement, round 1, agent eng-sc-2-r1]
+12:00:30 ↩ sc-2 round 1: eng-sc-2-r1 reported "retry with exponential backoff" (2 files, commit 1f0c4d9)
+12:00:33 ✔ eng-sc-2-r1 (engineer, sc-2) finished in 1m36s: impl_report, exit 0
+12:00:36 ↻ sc-2 round 1 (review): lenses qa,ux at 1f0c4d9
+12:00:39 ✗ sc-2 round 1: tester-qa-sc-2-r1 (qa) says changes (2 items: 1 major, 1 nit) — the cap is off by one
+12:00:42 → bead sc-2 in_review → changes_requested (round 1, qa requested changes)
+12:00:45 ▶ fired engineer(claude/fable) at sc-2 "Add retry" [address_feedback, round 2, attempt 2, agent eng-sc-2-r2]
+12:00:48 ↩ sc-2 round 2: eng-sc-2-r2 answered 2 items (1 fixed, 1 pushback)
+12:00:51 § sc-2 round 2: PO po-1 ruled on 1 item (1 uphold_engineer)
+12:00:54 · bead sc-2 updated: round, state (now in_review, round 2)
+12:00:57 ✓ sc-2 round 2: tester-qa-sc-2-r1 (qa) says approve — the cap is right now
+12:01:00 ⤴ sc-2 PR #42 opened: https://example.invalid/example/pull/42 (sc/sc-2-add-retry → main)
+12:01:03 ⤵ sc-2 merged 2b7d5e6 into main (PR #42, pushed)
+12:01:06 ! warning [gates] gh not found, pull-request gates are polled manually
+12:01:09 ✖ eng-sc-3-r1 (engineer, sc-3) failed: timeout (after 15m0s, exit -1, attempt 1, retrying): agent timeout after 15m
+12:01:12 ✖ error [supervisor] engineer timed out twice (bead sc-3, agent eng-sc-3-r1)
+12:01:15 § sc-3 round 1: PO po-1 escalation block — the docs bead needs a human
+12:01:18 ‖ run paused (cost_cap)
+12:01:21 ▸ run resumed (cost_cap raised)
+12:01:24 ■ run stopping (key)
+12:01:27 ◇ run finished: stopped after 4m0s (exit 0) — 1 bead delivered, 1 needs a human

@@ -15,10 +15,10 @@ LDFLAGS := -s -w \
 	-X $(MODULE)/internal/cli.Commit=$(COMMIT) \
 	-X $(MODULE)/internal/cli.Date=$(DATE)
 
-.PHONY: help build test lint fmt check install integration clean tools update-golden docs-cli cartridge-conformance
+.PHONY: help build test lint fmt check install integration clean tools update-golden update-golden-tui check-golden docs-cli cartridge-conformance
 
 help: ## Show this help
-	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "  %-14s %s\n", $$1, $$2}'
+	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
 
 build: ## Build bin/sc with version metadata
 	@mkdir -p $(BIN_DIR)
@@ -43,6 +43,18 @@ integration: ## Run tests tagged `integration` (need real bd/git/gh)
 
 update-golden: ## Regenerate testdata/**/*.golden files (and docs/cli.md) from current output
 	UPDATE_GOLDEN=1 go test -count=1 ./...
+
+update-golden-tui: ## Regenerate only the TUI frames in testdata/tui/*.golden (P7-09)
+	UPDATE_GOLDEN=1 go test -count=1 ./internal/tui/...
+
+check-golden: ## Fail if any golden file or docs/cli.md is stale (regenerates in place; run it on a clean tree)
+	@UPDATE_GOLDEN=1 go test -count=1 ./... >/dev/null
+	@stale="$$(git status --porcelain -- '*.golden' '*.expected' docs/cli.md)"; \
+	if [ -n "$$stale" ]; then \
+		echo "golden files are out of date; run 'make update-golden' and commit the result:"; \
+		echo "$$stale"; \
+		exit 1; \
+	fi
 
 docs-cli: ## Regenerate docs/cli.md from the sc command tree
 	go run ./cmd/gendocs -o docs/cli.md

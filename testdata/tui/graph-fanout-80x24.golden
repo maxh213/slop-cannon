@@ -1,0 +1,24 @@
+▄█▓═▶  slop-cannon · run sc-graph-001 · brief · ammo 0/4 · safety on
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+9 beads · 2 levels · 3 ready · 0 blocked · 2 closed · left→right · ▼
+┏━━━━━━━━━━━━━━━━━━━━┓    [1m┌────────────────────┐[0m
+┃[1m● sc-base       r3  [0m┃──┬─[1m│[0m[1m● sc-f01            [0m[1m│[0m
+┃ Split the god obje…┃  │ [1m│[0m Move the parser out[1m│[0m
+┗━━━━━━━━━━━━━━━━━━━━┛  │ [1m└────────────────────┘[0m
+                        │
+                        │ ┌────────────────────┐
+                        ├─│◔ sc-f02        r1  │
+                        │ │ Move the printer o…│
+                        │ └────────────────────┘
+                        │
+                        │ ┌────────────────────┐
+                        ├─│◐ sc-f03        r2  │
+                        │ │ Move the linter out│
+                        │ └────────────────────┘
+                        │
+                        │ ┌────────────────────┐
+                        ├─│○ sc-f04            │
+                        │ │ Move the loader out│
+                        │ └────────────────────┘
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

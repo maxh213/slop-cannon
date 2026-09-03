@@ -77,7 +77,7 @@ sc safety off
   -h, --help             help for sc
       --json             print machine-readable JSON instead of text
   -m, --message BRIEF    start work with this BRIEF; without it the run is full autopilot
-      --no-anim          disable the cannon animations in the TUI
+      --no-anim          disable the cannon animations in the TUI (also honours SC_NO_ANIM)
       --no-color         disable colour output (also honours NO_COLOR)
       --repo PATH        target repository PATH (default ".")
       --resume           continue the most recent run of this repository instead of starting a new one
@@ -605,7 +605,7 @@ sc ./repo-path --resume
       --headless         no TUI: render events as log lines (for CI and scripts)
   -h, --help             help for run
   -m, --message BRIEF    start work with this BRIEF; without it the run is full autopilot
-      --no-anim          disable the cannon animations in the TUI
+      --no-anim          disable the cannon animations in the TUI (also honours SC_NO_ANIM)
       --resume           continue the most recent run of this repository instead of starting a new one
       --review-prs       also review open pull requests sc did not create (needs gh and a remote) (default true)
       --safety on|off    override safety for this run (on|off): on opens PRs, off merges to the default branch

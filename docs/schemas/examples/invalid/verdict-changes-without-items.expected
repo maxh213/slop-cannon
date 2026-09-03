@@ -1,0 +1,2 @@
+structured: schema (verdict): 1 violation(s)
+  - at '': missing property 'items'

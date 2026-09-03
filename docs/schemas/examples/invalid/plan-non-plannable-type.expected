@@ -1,0 +1,2 @@
+structured: schema (plan): 1 violation(s)
+  - at '/beads/0/type': value must be one of 'task', 'bug', 'feature', 'chore'

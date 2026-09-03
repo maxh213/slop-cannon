@@ -1,0 +1,5 @@
+{
+  "item_id": "test-r1-1",
+  "ruling": "uphold_tester",
+  "rationale": "The rules file is a hard constraint, not a preference: a behaviour change lands with its test. This one is two lines in a table that already exists."
+}

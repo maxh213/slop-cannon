@@ -1,0 +1,4 @@
+{
+  "summary": "Fixed the empty-slice panic in Mean.",
+  "commit": "HEAD~1"
+}

@@ -1,0 +1,4 @@
+{
+  "outcome": "block",
+  "summary": "Five rounds on fix-mean and the ux and qa lenses still disagree about whether Mean should return (0, false) or an error. Both positions are defensible and the choice is an API decision for the maintainer. The code currently on the branch is the (0, false) version and it passes the suite; the alternative is sketched in the round 4 verdict."
+}

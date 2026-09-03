@@ -26,8 +26,9 @@ type dmFixture struct {
 	wtRepo *Repo
 }
 
-// dmSetup builds the fixture (optionally with a bare remote) and creates
-// the bead's worktree.
+// dmSetup builds the fixture (optionally with a bare remote), creates the
+// bead's worktree, and registers the delivery invariants every subtest must
+// leave intact (see dmAssertDefaultBranchSafe).
 func dmSetup(t *testing.T, fixtureOpts ...testutil.FixtureOption) *dmFixture {
 	t.Helper()
 	f := wtSetup(t, fixtureOpts)
@@ -35,7 +36,38 @@ func dmSetup(t *testing.T, fixtureOpts ...testutil.FixtureOption) *dmFixture {
 	require.NoError(t, err)
 	wtRepo, err := f.m.Open(context.Background(), wtBead.ID)
 	require.NoError(t, err)
-	return &dmFixture{wtFixture: f, wt: wt, wtRepo: wtRepo}
+	d := &dmFixture{wtFixture: f, wt: wt, wtRepo: wtRepo}
+	start := d.dmMain(t)
+	t.Cleanup(func() { d.dmAssertDefaultBranchSafe(t, start) })
+	return d
+}
+
+// dmAssertDefaultBranchSafe checks the two things a safety-off delivery may
+// never do, whatever the subtest did: put a merge commit on the default
+// branch (D-10; checked with "git log --merges" locally and on the remote)
+// and move the default branch backwards. It runs after every subtest, so
+// the guarantee is not something an individual test has to remember.
+func (f *dmFixture) dmAssertDefaultBranchSafe(t *testing.T, start string) {
+	t.Helper()
+	if f.dmRefExists(t, "refs/heads/main") {
+		assert.Empty(t, f.r.Git(t, "log", "--merges", "--oneline", "refs/heads/main"),
+			"the default branch never receives a merge commit (D-10)")
+		assert.Equal(t, "0", f.r.Git(t, "rev-list", "--count", "refs/heads/main.."+start),
+			"the default branch only ever moves forward")
+	}
+	if f.r.RemoteDir != "" && f.dmRefExists(t, "refs/heads/main", "--git-dir", f.r.RemoteDir) {
+		assert.Empty(t, f.r.Git(t, "--git-dir", f.r.RemoteDir, "log", "--merges", "--oneline", "refs/heads/main"),
+			"the pushed default branch never receives a merge commit (D-10)")
+	}
+}
+
+// dmRefExists reports whether ref resolves, without failing the test when
+// it does not. Extra git arguments (such as --git-dir) come before the
+// subcommand.
+func (f *dmFixture) dmRefExists(t *testing.T, ref string, gitArgs ...string) bool {
+	t.Helper()
+	args := append(append([]string{}, gitArgs...), "for-each-ref", "--format=%(refname)", ref)
+	return f.r.Git(t, args...) != ""
 }
 
 // dmBranchCommit writes rel in the worktree and commits everything there.
@@ -68,11 +100,11 @@ func (f *dmFixture) dmRemoteMain(t *testing.T) string {
 	return f.r.Git(t, "--git-dir", f.r.RemoteDir, "rev-parse", "refs/heads/main")
 }
 
-// dmMerges lists merge commits reachable from main; a delivery must never
-// create one.
+// dmMerges lists the merge commits reachable from main; a delivery must
+// never put one there.
 func (f *dmFixture) dmMerges(t *testing.T) string {
 	t.Helper()
-	return f.r.Git(t, "rev-list", "--merges", "refs/heads/main")
+	return f.r.Git(t, "log", "--merges", "--oneline", "refs/heads/main")
 }
 
 // dmBeads installs a fake bd replaying the captured samples (with
@@ -112,14 +144,18 @@ func TestDetectCheckCommand(t *testing.T) {
 		{"makefile with spaced test target", map[string]string{"GNUmakefile": "test :\n\tpytest\n"}, "make test", true},
 		{"makefile without test target falls through", map[string]string{"Makefile": "build:\n\tgo build\n", "go.mod": "module x\n"}, "go test ./...", true},
 		{"makefile whose test target is only a prerequisite", map[string]string{"Makefile": "all: test\n", "Cargo.toml": ""}, "cargo test", true},
-		{"package.json", map[string]string{"package.json": "{}"}, "npm test", true},
+		{"package.json with a test script", map[string]string{"package.json": `{"scripts":{"test":"vitest run"}}`}, "npm test", true},
+		{"package.json without a test script falls through", map[string]string{"package.json": `{"scripts":{"build":"tsc"}}`, "go.mod": "module x\n"}, "go test ./...", true},
+		{"package.json without scripts at all", map[string]string{"package.json": "{}"}, "", false},
+		{"package.json with a blank test script", map[string]string{"package.json": `{"scripts":{"test":"  "}}`}, "", false},
+		{"malformed package.json", map[string]string{"package.json": "{oops"}, "", false},
 		{"go.mod", map[string]string{"go.mod": "module x\n"}, "go test ./...", true},
 		{"pyproject", map[string]string{"pyproject.toml": ""}, "pytest", true},
 		{"pytest.ini", map[string]string{"pytest.ini": ""}, "pytest", true},
 		{"requirements", map[string]string{"requirements.txt": ""}, "pytest", true},
 		{"cargo", map[string]string{"Cargo.toml": ""}, "cargo test", true},
-		{"make beats npm beats go", map[string]string{"Makefile": "test:\n\ttrue\n", "package.json": "{}", "go.mod": "module x\n"}, "make test", true},
-		{"npm beats go", map[string]string{"package.json": "{}", "go.mod": "module x\n"}, "npm test", true},
+		{"make beats npm beats go", map[string]string{"Makefile": "test:\n\ttrue\n", "package.json": `{"scripts":{"test":"jest"}}`, "go.mod": "module x\n"}, "make test", true},
+		{"npm beats go", map[string]string{"package.json": `{"scripts":{"test":"jest"}}`, "go.mod": "module x\n"}, "npm test", true},
 		{"go beats pytest and cargo", map[string]string{"go.mod": "module x\n", "setup.py": "", "Cargo.toml": ""}, "go test ./...", true},
 		{"directories do not count", map[string]string{"go.mod/": ""}, "", false},
 	}
@@ -138,6 +174,14 @@ func TestDetectCheckCommand(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+
+	t.Run("the candidates are the P4-06 list, in order", func(t *testing.T) {
+		var got []string
+		for _, c := range checkCandidates {
+			got = append(got, c.command)
+		}
+		assert.Equal(t, []string{"make test", "npm test", "go test ./...", "pytest", "cargo test"}, got)
+	})
 
 	t.Run("fixture repo uses make test", func(t *testing.T) {
 		got, ok := DetectCheckCommand(testutil.FixtureSourceDir(t))
@@ -370,6 +414,7 @@ func TestManager_DeliverMerge(t *testing.T) {
 		assert.Equal(t, []string{"README.md"}, de.Files)
 		assert.ErrorIs(t, err, ErrRebaseConflict)
 		assert.Contains(t, err.Error(), "conflicts in README.md")
+		assert.NotEmpty(t, de.Output, "git's own words reach the engineer")
 
 		// The conflict state is left for the engineer's conflict round.
 		assert.True(t, f.wtRepo.RebaseInProgress())
@@ -591,6 +636,7 @@ func TestManager_DeliverMerge(t *testing.T) {
 		var de *DeliveryError
 		require.ErrorAs(t, err, &de)
 		assert.Equal(t, StageMerge, de.Stage)
+		assert.NotEmpty(t, de.Output, "git's refusal reaches the caller")
 		assert.Equal(t, before, f.dmMain(t))
 		assert.Equal(t, "user is editing this\n", func() string {
 			data, err := os.ReadFile(filepath.Join(f.r.Dir, "README.md"))
@@ -671,6 +717,7 @@ func TestManager_DeliverMerge(t *testing.T) {
 		require.ErrorAs(t, err, &de)
 		assert.Equal(t, StageRebase, de.Stage)
 		assert.False(t, de.Conflict)
+		assert.NotEmpty(t, de.Output)
 		assert.Equal(t, before, f.dmMain(t))
 	})
 
@@ -700,6 +747,203 @@ func TestManager_DeliverMerge(t *testing.T) {
 		assert.LessOrEqual(t, len(res.Check.Output), MaxCheckOutput+len("[... output truncated ...]\n"))
 		assert.True(t, strings.HasPrefix(res.Check.Output, "[... output truncated ...]\n"))
 	})
+
+	t.Run("a timed out check still reports what it printed", func(t *testing.T) {
+		f := dmSetup(t)
+		f.dmBranchCommit(t, "note.txt", "n\n", "Add note")
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{
+			CheckCommand: "echo partial-output; sleep 30",
+			CheckTimeout: 300 * time.Millisecond,
+		})
+		var de *DeliveryError
+		require.ErrorAs(t, err, &de)
+		assert.Equal(t, StageCheck, de.Stage)
+		assert.ErrorIs(t, err, proc.ErrTimeout)
+		assert.Contains(t, de.Output, "partial-output", "the tail of a killed check is still reported")
+	})
+
+	t.Run("a blank check command falls back to detection", func(t *testing.T) {
+		f := dmSetup(t)
+		acWrite(t, f.wt.Path, "Makefile", "test:\n\t@echo blank-fallback\n")
+		f.dmBranchCommit(t, "Makefile", "test:\n\t@echo blank-fallback\n", "Trim Makefile")
+		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "  \t\n "})
+		require.NoError(t, err)
+		require.NotNil(t, res.Check)
+		assert.Equal(t, "make test", res.Check.Command)
+		assert.True(t, res.Check.Detected)
+		assert.Contains(t, res.Check.Output, "blank-fallback")
+	})
+
+	// The five stages in order: the check must see the rebased tree while
+	// the default branch, local and remote, is still untouched.
+	t.Run("the check runs after the rebase and before the merge and push", func(t *testing.T) {
+		f := dmSetup(t, testutil.WithBareRemote())
+		f.dmBranchCommit(t, "note.txt", "n\n", "Add note")
+		moved := f.dmMainCommit(t, "from-main.txt", "m\n", "Something landed on main")
+		f.r.Git(t, "push", "-q", "origin", "main")
+		out := filepath.Join(t.TempDir(), "order.txt")
+		command := fmt.Sprintf(`{ git rev-parse HEAD; git -C %q rev-parse refs/heads/main; git --git-dir=%q rev-parse refs/heads/main; } > %q`,
+			f.r.Dir, f.r.RemoteDir, out)
+		client, bd := dmBeads(t, f.repo.Root, nil)
+
+		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: command, Beads: client})
+		require.NoError(t, err)
+
+		data, rerr := os.ReadFile(out)
+		require.NoError(t, rerr)
+		seen := strings.Fields(string(data))
+		require.Len(t, seen, 3)
+		assert.Equal(t, res.Head, seen[0], "the check ran on the rebased tip")
+		assert.Equal(t, moved, seen[1], "the local default branch had not moved yet")
+		assert.Equal(t, moved, seen[2], "nothing had been pushed yet")
+		assert.Equal(t, res.Head, f.dmMain(t))
+		assert.Equal(t, res.Head, f.dmRemoteMain(t))
+		assert.Len(t, bd.ArgLists(t), 2, "the bead is closed last")
+	})
+
+	t.Run("the bead is closed only after the push landed", func(t *testing.T) {
+		f := dmSetup(t, testutil.WithBareRemote())
+		sha := f.dmBranchCommit(t, "note.txt", "n\n", "Add note")
+		client, bd := dmBeads(t, f.repo.Root, map[string]string{"close": "error-close-blocked"})
+
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client})
+		var de *DeliveryError
+		require.ErrorAs(t, err, &de)
+		assert.Equal(t, StageClose, de.Stage)
+		assert.Equal(t, sha, de.MergeSHA)
+		assert.Equal(t, sha, f.dmMain(t), "the merge came first")
+		assert.Equal(t, sha, f.dmRemoteMain(t), "and the push before the close")
+		assert.Len(t, bd.ArgLists(t), 2)
+	})
+
+	t.Run("a default branch that moves during the check stops the delivery", func(t *testing.T) {
+		f := dmSetup(t)
+		f.dmBranchCommit(t, "note.txt", "n\n", "Add note")
+		command := fmt.Sprintf(`git -C %q commit -q --allow-empty -m "A human commit"`, f.r.Dir)
+		client, bd := dmBeads(t, f.repo.Root, nil)
+
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: command, Beads: client})
+		var de *DeliveryError
+		require.ErrorAs(t, err, &de)
+		assert.Equal(t, StageMerge, de.Stage)
+		assert.ErrorIs(t, err, ErrNotFastForward)
+		assert.Equal(t, "A human commit", f.r.Log(t)[0], "the human's commit is still the tip")
+		assert.Empty(t, bd.ArgLists(t), "the bead is not closed")
+	})
+
+	// A merge commit inside the bead's branch must not ride onto the
+	// default branch on the fast-forward, not even when the repository
+	// asks git to preserve merges while rebasing.
+	t.Run("a merge commit in the branch never reaches the default branch", func(t *testing.T) {
+		f := dmSetup(t)
+		f.r.Git(t, "config", "rebase.rebaseMerges", "true")
+		f.dmBranchCommit(t, "note.txt", "n\n", "Add note")
+		_, err := f.wtRepo.Git(ctx, "checkout", "-q", "-b", "engineer-side")
+		require.NoError(t, err)
+		f.dmBranchCommit(t, "side.txt", "s\n", "Side work")
+		_, err = f.wtRepo.Git(ctx, "checkout", "-q", BranchName(wtBead))
+		require.NoError(t, err)
+		_, err = f.wtRepo.Git(ctx, "merge", "--no-ff", "-q", "-m", "Merge side work", "engineer-side")
+		require.NoError(t, err)
+		require.NotEmpty(t, f.r.Git(t, "log", "--merges", "--oneline", BranchName(wtBead)),
+			"the branch really does carry a merge commit")
+		moved := f.dmMainCommit(t, "from-main.txt", "m\n", "Something landed on main")
+
+		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true"})
+		require.NoError(t, err)
+		assert.Empty(t, f.dmMerges(t), "git log --merges on the default branch stays empty")
+		assert.Equal(t, res.Head, f.dmMain(t))
+		assert.Equal(t, []string{"Side work", "Add note", "Something landed on main", "Initial import of fixture project"}, f.r.Log(t),
+			"the branch is flattened onto the default branch")
+		assert.Equal(t, moved, f.r.Git(t, "rev-parse", "main~2"))
+		assert.FileExists(t, filepath.Join(f.r.Dir, "side.txt"))
+	})
+
+	t.Run("a rebase in progress for another branch is refused", func(t *testing.T) {
+		f := dmSetup(t)
+		before := f.dmMain(t)
+		f.dmBranchCommit(t, "README.md", "branch version\n", "Rewrite README on the branch")
+		f.dmMainCommit(t, "README.md", "main version\n", "Rewrite README on main")
+		// The engineer left a rebase of a branch of their own mid-flight.
+		_, err := f.wtRepo.Git(ctx, "checkout", "-q", "-b", "engineer-experiment")
+		require.NoError(t, err)
+		_, err = f.wtRepo.Git(ctx, "rebase", "main")
+		require.Error(t, err)
+		require.True(t, f.wtRepo.RebaseInProgress())
+		assert.Equal(t, "engineer-experiment", f.wtRepo.RebasingBranch())
+
+		_, err = f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true"})
+		assert.ErrorIs(t, err, ErrWrongBranch)
+		assert.Equal(t, StageRebase, dmStage(t, err))
+		assert.NotEqual(t, before, f.dmMain(t))
+		assert.Equal(t, f.r.Head(t), f.dmMain(t), "main is left where the test put it")
+	})
+
+	t.Run("a resolved rebase against a stale default branch is redone", func(t *testing.T) {
+		f := dmSetup(t)
+		f.dmBranchCommit(t, "README.md", "branch version\n", "Rewrite README on the branch")
+		f.dmMainCommit(t, "README.md", "main version\n", "Rewrite README on main")
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true"})
+		require.ErrorIs(t, err, ErrRebaseConflict)
+
+		// The engineer resolves the conflict, and while they do, more work
+		// lands on the default branch.
+		acWrite(t, f.wt.Path, "README.md", "resolved version\n")
+		_, err = f.wtRepo.Git(ctx, "add", "README.md")
+		require.NoError(t, err)
+		later := f.dmMainCommit(t, "later.txt", "l\n", "Landed while the engineer resolved")
+
+		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "test -f later.txt"})
+		require.NoError(t, err)
+		assert.False(t, f.wtRepo.RebaseInProgress())
+		assert.Equal(t, later, res.Before, "the delivery rebased onto the newest default branch")
+		assert.Equal(t, res.Head, f.dmMain(t))
+		assert.Equal(t, later, f.r.Git(t, "rev-parse", "main~1"))
+		assert.Empty(t, f.dmMerges(t))
+		assert.Equal(t, "resolved version\n", f.r.Git(t, "show", "main:README.md")+"\n")
+	})
+}
+
+func TestRepo_RunCheckCannotStart(t *testing.T) {
+	f := dmSetup(t)
+	gone := filepath.Join(t.TempDir(), "removed")
+	broken := *f.wtRepo
+	broken.Root = gone // never existed, so sh cannot be started there
+
+	check, err := broken.runCheck(context.Background(), "true", time.Second)
+	var de *DeliveryError
+	require.ErrorAs(t, err, &de, "a check that cannot start is still a typed delivery failure")
+	assert.Equal(t, StageCheck, de.Stage)
+	assert.ErrorIs(t, err, ErrCheckFailed)
+	require.NotNil(t, check)
+	assert.Equal(t, -1, check.ExitCode, "no exit status when the shell never ran")
+}
+
+func TestManager_AssertLinear(t *testing.T) {
+	ctx := context.Background()
+	f := dmSetup(t)
+	base := f.dmMain(t)
+
+	require.NoError(t, f.m.assertLinear(ctx, base, base), "an empty range is linear")
+
+	// Build a merge commit on a branch of the fixture and check the range
+	// that a fast-forward would add: this is the guard that refuses to put
+	// it on the default branch, whatever the rebase left behind.
+	f.r.Git(t, "checkout", "-q", "-b", "topic")
+	f.dmMainCommit(t, "topic.txt", "t\n", "Topic work")
+	f.r.Git(t, "checkout", "-q", "main")
+	f.dmMainCommit(t, "other.txt", "o\n", "Other work")
+	f.r.Git(t, "checkout", "-q", "-b", "with-merge")
+	f.r.Git(t, "merge", "--no-ff", "-q", "-m", "Merge topic", "topic")
+	head := f.r.Git(t, "rev-parse", "refs/heads/with-merge")
+	f.r.Git(t, "checkout", "-q", "main")
+
+	err := f.m.assertLinear(ctx, base, head)
+	var de *DeliveryError
+	require.ErrorAs(t, err, &de)
+	assert.Equal(t, StageRebase, de.Stage)
+	assert.ErrorIs(t, err, ErrNonLinearBranch)
+	assert.NotEmpty(t, de.Output)
 }
 
 func TestRepo_RebaseHelpers(t *testing.T) {
@@ -707,6 +951,7 @@ func TestRepo_RebaseHelpers(t *testing.T) {
 	f := dmSetup(t)
 	assert.False(t, f.wtRepo.RebaseInProgress())
 	assert.False(t, f.repo.RebaseInProgress())
+	assert.Empty(t, f.wtRepo.RebasingBranch(), "no rebase, no branch")
 	files, err := f.wtRepo.ConflictedPaths(ctx)
 	require.NoError(t, err)
 	assert.Nil(t, files)
@@ -716,6 +961,7 @@ func TestRepo_RebaseHelpers(t *testing.T) {
 	_, err = f.wtRepo.Git(ctx, "rebase", "main")
 	require.Error(t, err)
 	assert.True(t, f.wtRepo.RebaseInProgress(), "the linked worktree's own git dir holds the rebase state")
+	assert.Equal(t, BranchName(wtBead), f.wtRepo.RebasingBranch(), "the branch being rebased is readable")
 	assert.False(t, f.repo.RebaseInProgress(), "the main working tree is not rebasing")
 	files, err = f.wtRepo.ConflictedPaths(ctx)
 	require.NoError(t, err)
@@ -724,4 +970,5 @@ func TestRepo_RebaseHelpers(t *testing.T) {
 	_, err = f.wtRepo.Git(ctx, "rebase", "--abort")
 	require.NoError(t, err)
 	assert.False(t, f.wtRepo.RebaseInProgress())
+	assert.Empty(t, f.wtRepo.RebasingBranch())
 }

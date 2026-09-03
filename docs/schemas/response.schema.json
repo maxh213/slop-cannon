@@ -1,0 +1,61 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sc://schemas/response.schema.json",
+  "title": "response",
+  "description": "The engineer's answer to the feedback items raised by the testers: one entry per item, in the order the items were given.",
+  "type": "object",
+  "required": ["responses"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "Omit this. The orchestrator stamps it when it stores the message.",
+      "const": "response"
+    },
+    "responses": {
+      "type": "array",
+      "description": "One response per feedback item you were given. Answer every item, even the ones you disagree with.",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/response_item" }
+    }
+  },
+  "$defs": {
+    "response_item": {
+      "type": "object",
+      "description": "What you did about one feedback item.",
+      "required": ["item_id", "action"],
+      "additionalProperties": false,
+      "properties": {
+        "item_id": {
+          "type": "string",
+          "description": "The id of the feedback item you are answering, copied exactly.",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[^\\s]+$"
+        },
+        "action": {
+          "type": "string",
+          "description": "fixed means you changed the code; pushback means you disagree and want the tester to reconsider; wontfix means the item is out of scope for this bead.",
+          "enum": ["fixed", "pushback", "wontfix"]
+        },
+        "rationale": {
+          "type": "string",
+          "description": "Why. Required for pushback and wontfix; for fixed, say briefly what you changed.",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["action"],
+            "properties": { "action": { "enum": ["pushback", "wontfix"] } }
+          },
+          "then": {
+            "required": ["rationale"],
+            "$comment": "Disagreeing with a tester requires a stated reason (D-08)."
+          }
+        }
+      ]
+    }
+  }
+}

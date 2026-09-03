@@ -1,0 +1,9 @@
+{
+  "beads": [
+    {
+      "key": "fix-mean",
+      "title": "Fix Mean on an empty slice",
+      "acceptance": ""
+    }
+  ]
+}

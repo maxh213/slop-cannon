@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sc://schemas/escalation.schema.json",
+  "title": "escalation",
+  "description": "The product owner's ruling on a bead that used up its review rounds without approval. Pick exactly one outcome and fill the field that goes with it.",
+  "type": "object",
+  "required": ["outcome"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "Omit this. The orchestrator stamps it when it stores the message.",
+      "const": "escalation"
+    },
+    "outcome": {
+      "type": "string",
+      "description": "approve_with_notes: ship it as it stands and record what is left. narrow_scope: replace the acceptance criteria with something achievable and review again. block: hand the bead to a human.",
+      "enum": ["approve_with_notes", "narrow_scope", "block"]
+    },
+    "notes": {
+      "type": "string",
+      "description": "What remains unaddressed. Required for approve_with_notes.",
+      "minLength": 1
+    },
+    "new_acceptance": {
+      "type": "string",
+      "description": "The acceptance criteria that replace the bead's. Required for narrow_scope.",
+      "minLength": 1
+    },
+    "summary": {
+      "type": "string",
+      "description": "What the human needs to know to take over: what was tried, where it stalled, what you recommend. Required for block.",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["outcome"],
+        "properties": { "outcome": { "const": "approve_with_notes" } }
+      },
+      "then": { "required": ["notes"] }
+    },
+    {
+      "if": {
+        "required": ["outcome"],
+        "properties": { "outcome": { "const": "narrow_scope" } }
+      },
+      "then": { "required": ["new_acceptance"] }
+    },
+    {
+      "if": {
+        "required": ["outcome"],
+        "properties": { "outcome": { "const": "block" } }
+      },
+      "then": { "required": ["summary"] }
+    }
+  ]
+}

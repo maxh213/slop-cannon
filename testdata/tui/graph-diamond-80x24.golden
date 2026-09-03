@@ -1,0 +1,24 @@
+▄█▓═▶  slop-cannon · run sc-graph-001 · brief · ammo 0/4 · safety on
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+4 beads · 3 levels · 0 ready · 1 blocked · 1 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐    ┌────────────────────┐
+┃[1m● sc-root       r1  [0m┃──┬─│↺ sc-left       r2  │──┬─│○ sc-sink           │
+┃ Extract the HTTP c…┃  │ │ Retry idempotent r…│  │ │ Benchmark the clie…│
+┗━━━━━━━━━━━━━━━━━━━━┛  │ └────────────────────┘  │ └────────────────────┘
+                        │                         │
+                        │ ┌────────────────────┐  │
+                        └─│✓ sc-rght       r1  │──┘
+                          │ Cache DNS lookups  │
+                          └────────────────────┘
+
+
+
+
+
+
+
+
+
+
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

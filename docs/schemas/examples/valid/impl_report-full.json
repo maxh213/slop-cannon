@@ -1,0 +1,13 @@
+{
+  "summary": "Mean now returns (0, false) for an empty slice instead of dividing by zero, and the two callers were updated to check the flag. I kept the float64 return so nothing else had to change.",
+  "files_changed": ["stats/stats.go", "stats/stats_test.go", "cmd/report/main.go"],
+  "how_to_verify": "go test ./stats/... covers the empty, single and many cases; go run ./cmd/report </dev/null now prints \"no samples\" instead of panicking.",
+  "risks": [
+    "Callers outside this repository that ignore the second return value will silently read 0 instead of panicking."
+  ],
+  "questions": [
+    "Should Median follow the same (value, ok) shape, or return an error?"
+  ],
+  "commit": "4f2b1c9",
+  "type": "impl_report"
+}

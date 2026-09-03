@@ -11,15 +11,22 @@ structured message an agent must end its reply with: `plan`, `impl_report`,
   schema validator (`github.com/santhosh-tekuri/jsonschema/v6`), the retry
   loop, and this README.
 - **P5-07** owns the *schemas*: one `<name>.schema.json` per message type in
-  this directory, the Go package that embeds them (`//go:embed *.json` in a
-  `schemas.go` here) and hands the embedded `fs.FS` to
-  `structured.LoadFS`, the Go structs, the validation tests, and the
-  published copies under `docs/schemas/`.
+  this directory, the Go code that embeds them and hands the embedded
+  `fs.FS` to `structured.LoadFS` (`internal/agents/schema.go`, which embeds
+  `schemas/*.schema.json` and exposes it as `agents.SchemaFS()`), the Go
+  structs, the validation tests, and the published copies under
+  `docs/schemas/`.
 - **P5-08** owns the role-aware `RunAgent` helper that composes
   `structured.Fire` with the per-role contract.
 
-Until P5-07 lands there are no schema files here; the structured package's
-own tests use fixtures under `internal/cartridge/structured/testdata/schemas`.
+All six files are here (P5-07). The structured package's own tests still use
+their own fixtures under `internal/cartridge/structured/testdata/schemas`, so
+that package does not depend on this one.
+
+`agents.ContractFor(domain.MessageVerdict)` is the way in; `agents.ParsePlan`
+and friends parse an agent's reply straight into the domain types.
+`docs/schemas/` holds a generated copy of every file plus valid and invalid
+examples, refreshed by `make update-golden`.
 
 ## Conventions for schema files
 
@@ -43,4 +50,9 @@ own tests use fixtures under `internal/cartridge/structured/testdata/schemas`.
   the model; inline shared definitions under `$defs` when the model needs to
   see them.
 - Enum values must match `internal/domain` (`domain.VerdictOutcomes()`,
-  `domain.Severities()`, ...); P5-07's tests should assert that.
+  `domain.Severities()`, ...); `TestSchemaEnumsMatchTheDomain` asserts that,
+  and `TestSchemaPropertiesMatchTheGoStructs` asserts the field names.
+- Every file also declares an optional top-level `type` property pinned to
+  its own name with `const`, so the object the comment writer stores in a
+  bead (which carries `type`) validates against the same schema as the
+  agent's bare result.

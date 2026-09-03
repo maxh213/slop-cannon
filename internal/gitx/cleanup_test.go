@@ -176,6 +176,8 @@ func TestManager_Cleanup(t *testing.T) {
 		closedUnmerged := cuBead("fx-c2", "closed but never merged", domain.BeadStateClosed)
 		closedDirty := cuBead("fx-c3", "closed with leftovers", domain.BeadStateClosed)
 		closedNoWT := cuBead("fx-c4", "closed, worktree already gone", domain.BeadStateClosed)
+		closedWiped := cuBead("fx-c5", "closed, worktree directory wiped", domain.BeadStateClosed)
+		closedRetitled := cuBead("fx-c6", "the title it was created with", domain.BeadStateClosed)
 		failed := cuBead("fx-f1", "failed", domain.BeadStateFailed)
 		human := cuBead("fx-h1", "needs a human", domain.BeadStateNeedsHuman)
 		inFlight := cuBead("fx-p1", "still in progress", domain.BeadStateInProgress)
@@ -192,6 +194,15 @@ func TestManager_Cleanup(t *testing.T) {
 		cuWork(t, f, closedNoWT)
 		cuLand(t, f, closedNoWT)
 		require.NoError(t, f.m.Remove(ctx, closedNoWT.ID, false))
+		cuWork(t, f, closedWiped)
+		cuLand(t, f, closedWiped)
+		require.NoError(t, os.RemoveAll(f.m.PathFor(closedWiped.ID)))
+		cuWork(t, f, closedRetitled)
+		cuLand(t, f, closedRetitled)
+		closedRetitledBranch := BranchName(closedRetitled)
+		// The PO renamed the bead after its worktree was created.
+		closedRetitled.Title = "renamed after the fact"
+		require.NotEqual(t, closedRetitledBranch, BranchName(closedRetitled))
 		for _, b := range []domain.Bead{failed, human, inFlight, blocked, unknown, vanished} {
 			cuWork(t, f, b)
 		}
@@ -199,7 +210,8 @@ func TestManager_Cleanup(t *testing.T) {
 		require.NoError(t, os.MkdirAll(filepath.Join(f.m.Dir(), "fx-husk"), 0o755))
 		mainBefore := f.r.Head(t)
 
-		res, err := f.m.Cleanup(ctx, []domain.Bead{closedMerged, closedUnmerged, closedDirty, closedNoWT, failed, human, inFlight, blocked, vanished}, CleanupOptions{Logger: quiet})
+		var printed strings.Builder
+		res, err := f.m.Cleanup(ctx, []domain.Bead{closedMerged, closedUnmerged, closedDirty, closedNoWT, closedWiped, closedRetitled, failed, human, inFlight, blocked, vanished}, CleanupOptions{Logger: quiet, Out: &printed})
 		require.NoError(t, err)
 		require.NoError(t, res.Err())
 		assert.Equal(t, "main", res.Default)
@@ -227,6 +239,22 @@ func TestManager_Cleanup(t *testing.T) {
 		assert.Equal(t, CleanupNone, e.Action)
 		assert.True(t, e.BranchDeleted, "a merged branch is deleted even without a worktree")
 
+		e = cuEntry(t, res, closedWiped.ID)
+		assert.Equal(t, CleanupPruned, e.Action)
+		assert.True(t, e.BranchDeleted, "a done bead's merged branch goes even when its directory was wiped")
+		assert.Contains(t, e.Reason, "deleted (merged into main)")
+		ok, err = f.repo.BranchExists(ctx, BranchName(closedWiped))
+		require.NoError(t, err)
+		assert.False(t, ok)
+
+		e = cuEntry(t, res, closedRetitled.ID)
+		assert.Equal(t, CleanupRemoved, e.Action)
+		assert.Equal(t, closedRetitledBranch, e.Branch)
+		assert.True(t, e.BranchDeleted, "the branch the worktree held is deleted, not the one the new title names")
+		ok, err = f.repo.BranchExists(ctx, closedRetitledBranch)
+		require.NoError(t, err)
+		assert.False(t, ok)
+
 		for _, b := range []domain.Bead{failed, human, inFlight, blocked} {
 			e = cuEntry(t, res, b.ID)
 			assert.Equal(t, CleanupKept, e.Action, b.ID)
@@ -242,19 +270,25 @@ func TestManager_Cleanup(t *testing.T) {
 		assert.Contains(t, e.Reason, "not part of this run")
 		e = cuEntry(t, res, vanished.ID)
 		assert.Equal(t, CleanupPruned, e.Action)
+		assert.False(t, e.BranchDeleted, "a failed bead keeps its branch even when its directory is gone")
+		ok, err = f.repo.BranchExists(ctx, BranchName(vanished))
+		require.NoError(t, err)
+		assert.True(t, ok)
 
 		assert.Equal(t, []string{
 			f.m.PathFor(blocked.ID), f.m.PathFor(failed.ID), f.m.PathFor(human.ID), f.m.PathFor(inFlight.ID), f.m.PathFor(unknown.ID),
 		}, res.KeptPaths(), "sorted by bead id")
-		assert.Len(t, res.Removed(), 3)
+		assert.Len(t, res.Removed(), 4)
 		assert.Empty(t, res.Failed())
 
 		summary := res.Summary()
-		assert.True(t, strings.HasPrefix(summary, "removed 3 worktrees, kept 5:"), summary)
+		assert.True(t, strings.HasPrefix(summary, "removed 4 worktrees, pruned 2 stale registrations, kept 5:"), summary)
+		assert.Contains(t, summary, "\n  fx-b1 (blocked): "+f.m.PathFor(blocked.ID))
 		assert.Contains(t, summary, "\n  fx-f1 (failed): "+f.m.PathFor(failed.ID))
 		assert.Contains(t, summary, "\n  fx-h1 (needs_human): "+f.m.PathFor(human.ID))
 		assert.Contains(t, summary, "\n  fx-u1 (unknown): "+f.m.PathFor(unknown.ID))
 		assert.NotContains(t, summary, "failure")
+		assert.Equal(t, summary+"\n", printed.String(), "the kept paths are printed for the run's final report")
 
 		// Housekeeping: the vanished registration and the husk are gone,
 		// the kept worktrees are still registered, main is untouched.
@@ -401,6 +435,7 @@ func TestResumer_Resume(t *testing.T) {
 		landed := cuBead("fx-d1", "delivered before the crash", domain.BeadStateDelivering)
 		undelivered := cuBead("fx-d2", "delivery never ran", domain.BeadStateDelivering)
 		branchGone := cuBead("fx-d3", "branch deleted by hand", domain.BeadStateDelivering)
+		retitled := cuBead("fx-d4", "the title it was created with", domain.BeadStateDelivering)
 		wiped := cuBead("fx-p1", "worktree wiped mid-flight", domain.BeadStateInProgress)
 		fresh := cuBead("fx-p2", "claimed, nothing created yet", domain.BeadStateInProgress)
 		conflicted := cuBead("fx-r1", "mid-rebase", domain.BeadStateInReview)
@@ -415,6 +450,12 @@ func TestResumer_Resume(t *testing.T) {
 		cuWork(t, f, branchGone)
 		require.NoError(t, f.m.Remove(ctx, branchGone.ID, false))
 		require.NoError(t, f.m.DeleteBranch(ctx, branchGone))
+		retitledSHA := cuWork(t, f, retitled)
+		retitledBranch := BranchName(retitled)
+		// The PO rewrote the bead's title after the worktree was created, so
+		// BranchName(bead) no longer names the branch the work is on.
+		retitled.Title = "a much better title"
+		require.NotEqual(t, retitledBranch, BranchName(retitled))
 		wipedSHA := cuWork(t, f, wiped)
 		require.NoError(t, os.RemoveAll(f.m.PathFor(wiped.ID)))
 		cuWork(t, f, conflicted)
@@ -429,7 +470,7 @@ func TestResumer_Resume(t *testing.T) {
 		m2 := f.wtReopen(t)
 		tracker := &cuTracker{}
 		r := cuResumer(t, m2, tracker)
-		beadList := []domain.Bead{landed, undelivered, branchGone, wiped, fresh, conflicted, dirty, done, failed}
+		beadList := []domain.Bead{landed, undelivered, branchGone, retitled, wiped, fresh, conflicted, dirty, done, failed}
 		res, err := r.Resume(ctx, beadList)
 		require.NoError(t, err)
 		require.NoError(t, res.Err(), res.Summary())
@@ -476,6 +517,17 @@ func TestResumer_Resume(t *testing.T) {
 		assert.True(t, e.Applied)
 		assert.Equal(t, WorktreeMissing, e.WorktreeStatus)
 		assert.Equal(t, domain.BeadStateNeedsHuman, tracker.statuses[branchGone.ID])
+
+		// Retitled since the worktree was created: the branch the worktree
+		// holds is reconciled, not the one the new title would name.
+		e = cuResumeEntry(t, res, retitled.ID)
+		assert.Equal(t, WorktreeAttached, e.WorktreeStatus)
+		assert.Equal(t, retitledBranch, e.Branch)
+		assert.True(t, e.BranchExists, "a retitled bead's work is not reported as a vanished branch")
+		assert.Equal(t, retitledSHA, e.Head)
+		assert.Equal(t, domain.BeadStateDelivering, e.State)
+		assert.False(t, e.Changed(), "a retitled bead is never handed to a human for a branch that is right there")
+		assert.Contains(t, e.Reason, "deliver again")
 
 		// Wiped worktree of an in-flight bead: recreated from its branch.
 		e = cuResumeEntry(t, res, wiped.ID)
@@ -710,6 +762,40 @@ func TestResumer_Resume_WithRemote(t *testing.T) {
 		assert.False(t, e.Changed())
 		assert.Contains(t, e.Reason, "PR #5 merged")
 		assert.Empty(t, tracker.calls, "bd closes the bead through the gate, never directly")
+	})
+
+	t.Run("an open pull request outlives the local branch", func(t *testing.T) {
+		f := setup(t, domain.BeadStateDelivering)
+		// The branch was pushed and its pull request opened; then the local
+		// worktree and branch were cleaned away (a partial cleanup, or a
+		// human tidying up) before the crash. The work is on the remote.
+		f.r.Git(t, "push", "-q", "origin", BranchName(f.bead))
+		require.NoError(t, f.m.Remove(ctx, f.bead.ID, true))
+		require.NoError(t, f.m.DeleteBranch(ctx, f.bead))
+		dpSet(t, f.gh, "prs.json", `[{"number":7,"url":"https://github.com/acme/widgets/pull/7","state":"OPEN","title":"x"}]`)
+		tracker := &cuTracker{}
+		res, err := cuResumer(t, f.wtReopen(t), tracker).Resume(ctx, []domain.Bead{f.bead})
+		require.NoError(t, err)
+		require.NoError(t, res.Err())
+		e := cuResumeEntry(t, res, f.bead.ID)
+		assert.False(t, e.BranchExists)
+		assert.Empty(t, e.Head)
+		require.NotNil(t, e.PR)
+		assert.Equal(t, "OPEN", e.PRState)
+		assert.Equal(t, domain.BeadStateDelivering, e.State)
+		assert.False(t, e.Changed(), "an open pull request is not a case for a human")
+		assert.Contains(t, e.Reason, "PR #7 is open")
+		assert.Empty(t, tracker.calls)
+		assert.Len(t, f.gh.Invocations(t), 1, "gh is asked even without a local branch")
+
+		// With no pull request left, the same bead does need a human.
+		dpSet(t, f.gh, "prs.json", `[]`)
+		res, err = cuResumer(t, f.wtReopen(t), &cuTracker{}).Resume(ctx, []domain.Bead{f.bead})
+		require.NoError(t, err)
+		e = cuResumeEntry(t, res, f.bead.ID)
+		assert.Nil(t, e.PR)
+		assert.Equal(t, domain.BeadStateNeedsHuman, e.State)
+		assert.Contains(t, e.Reason, "is gone and nothing landed on main")
 	})
 
 	t.Run("recorded pull request that is gone hands the bead to a human", func(t *testing.T) {

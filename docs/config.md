@@ -54,7 +54,7 @@ pass silently. Durations are Go duration strings (`"10m"`, `"1h30m"`,
 | `safety` | bool | `true` | both | `true`: finished work is pushed as a branch and opened as a PR for a human to merge. `false`: rebased and fast-forward merged straight into the default branch (D-10). |
 | `vibes` | string array | `[]` | both | Style preference files appended to every agent prompt as soft guidance. Paths are relative to the config file's directory (a file at the repo root is stored as `../vibes.md`) or absolute. Each file must exist, be UTF-8 text, and be at most 64 KiB. |
 | `rules` | string array | `[]` | both | Hard constraint files appended to every agent prompt as MUST / MUST NOT. Same path and size rules as `vibes`. |
-| `check_command` | string | `""` | both | Command run in the worktree before a safety-off merge. Empty means autodetect in this order: `make test` (a Makefile with a `test` target), `npm test`, `go test ./...`, `pytest`, `cargo test`, by the files present. |
+| `check_command` | string | `""` | both | Command run in the worktree before a safety-off merge. Empty or blank means autodetect in this order: `make test` (a Makefile with a `test` target), `npm test` (a `package.json` with a `test` script), `go test ./...`, `pytest`, `cargo test`, by the files present. Nothing detected means no check runs. |
 | `idle_replan_interval` | duration > 0 | `"10m"` | both | Autopilot only: when the PO has nothing to add, the run idles this long before planning again (D-18). |
 | `limits.max_review_rounds` | integer ≥ 1 | `5` | both | Review rounds per bead before the PO escalates (D-08). |
 | `limits.max_pushback_rounds` | integer ≥ 0 | `2` | both | Pushback exchanges per feedback item before PO arbitration (D-08). |

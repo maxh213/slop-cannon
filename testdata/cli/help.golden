@@ -50,7 +50,7 @@ Flags:
   -h, --help             help for sc
       --json             print machine-readable JSON instead of text
   -m, --message BRIEF    start work with this BRIEF; without it the run is full autopilot
-      --no-anim          disable the cannon animations in the TUI
+      --no-anim          disable the cannon animations in the TUI (also honours SC_NO_ANIM)
       --no-color         disable colour output (also honours NO_COLOR)
       --repo PATH        target repository PATH (default ".")
       --resume           continue the most recent run of this repository instead of starting a new one

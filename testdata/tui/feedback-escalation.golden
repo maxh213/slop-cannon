@@ -1,0 +1,26 @@
+▄█▓═▶  slop-cannon · run sc-feedback-0001 · brief · ammo 0/4 · safety on
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 open items · lines 1-21/28
+  BEAD       U Q T │ sc-k1l2  Rewrite the connection pool
+  sc-a1b2    ✓ ✓ ✓ │ [1m⚑ needs_human[0m · 5 rounds · qa ✗ · 5 open
+  sc-c3d4    ✓ ✓ ✓ │
+  sc-e5f6    ✓ ✓ ✓ │ [1mround 1[0m · review · aaaaaaa · qa
+  sc-g7h8    ✓ ✓ ✓ │   ⚙ report attempt 1 at the pool
+  sc-i9j0    ✓ ✓ ✓ │   ✗ qa   changes still leaking
+[1m▌ [0msc-k1l2    · ✗ · │     [1m! blocker[0m qa-r1-1   Pool still leaks a connection per retry
+  sc-m3n4    ✓ ✓ ◐ │
+                   │ [1mround 2[0m · review · bbbbbbb · qa
+                   │   ⚙ report attempt 2 at the pool
+                   │   ✗ qa   changes still leaking
+                   │     [1m! blocker[0m qa-r2-1   Pool still leaks a connection per retry
+                   │
+                   │ [1mround 3[0m · review · ccccccc · qa
+                   │   ⚙ report attempt 3 at the pool
+                   │   ✗ qa   changes still leaking
+                   │     [1m! blocker[0m qa-r3-1   Pool still leaks a connection per retry
+                   │
+                   │ [1mround 4[0m · review · ddddddd · qa
+                   │   ⚙ report attempt 4 at the pool
+                   │   ✗ qa   changes still leaking
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

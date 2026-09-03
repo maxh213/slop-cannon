@@ -1,0 +1,26 @@
+▄█▓═▶  slop-cannon · run sc-feedback-0001 · brief · ammo 0/4 · safety on
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 open items
+  BEAD       U Q T │ sc-a1b2  Retry failed HTTP requests
+[1m▌ [0msc-a1b2    ✓ ✓ ✓ │ [1m● closed[0m · 1 round · ux ✓  qa ✓  test ✓ · satisfied
+  sc-c3d4    ✓ ✓ ✓ │
+  sc-e5f6    ✓ ✓ ✓ │ [1mround 1[0m · review · 1a2b3c4 · ux,qa,test
+  sc-g7h8    ✓ ✓ ✓ │   ⚙ report retry 5xx with capped exponential backoff
+  sc-i9j0    ✓ ✓ ✓ │   ✓ ux   approve the error message still reads well
+  sc-k1l2    · ✗ · │   ✓ qa   approve reproduced the flake, now green
+  sc-m3n4    ✓ ✓ ◐ │   ✓ test approve table test covers the cap
+                   │
+                   │
+                   │
+                   │
+                   │
+                   │
+                   │
+                   │
+                   │
+                   │
+                   │
+                   │
+                   │
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

@@ -1,0 +1,2 @@
+structured: schema (impl_report): 1 violation(s)
+  - at '': missing property 'summary'

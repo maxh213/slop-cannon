@@ -1,0 +1,4 @@
+{
+  "files_changed": ["stats/stats.go"],
+  "how_to_verify": "go test ./stats/..."
+}

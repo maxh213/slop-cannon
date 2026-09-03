@@ -1,0 +1,3 @@
+structured: schema (plan): 2 violation(s)
+  - at '/beads/0/deps/0': 'fix mean' does not match pattern '^[^\\s]+$'
+  - at '/beads/0/key': 'fix mean' does not match pattern '^[^\\s]+$'

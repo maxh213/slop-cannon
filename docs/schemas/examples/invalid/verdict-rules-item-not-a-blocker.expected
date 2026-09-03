@@ -1,0 +1,2 @@
+structured: schema (verdict): 1 violation(s)
+  - at '/items/0/severity': value must be 'blocker'

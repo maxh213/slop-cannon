@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sc://schemas/arbitration.schema.json",
+  "title": "arbitration",
+  "description": "The product owner's binding ruling on one feedback item the engineer and a tester could not settle between themselves. A violation of a rules file can never be ruled in the engineer's favour.",
+  "type": "object",
+  "required": ["item_id", "ruling"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "Omit this. The orchestrator stamps it when it stores the message.",
+      "const": "arbitration"
+    },
+    "item_id": {
+      "type": "string",
+      "description": "The id of the disputed feedback item, copied exactly.",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[^\\s]+$"
+    },
+    "ruling": {
+      "type": "string",
+      "description": "uphold_tester: the engineer must address the item. uphold_engineer: the item is overruled and stops blocking. compromise: the engineer follows your instruction instead.",
+      "enum": ["uphold_tester", "uphold_engineer", "compromise"]
+    },
+    "instruction": {
+      "type": "string",
+      "description": "What the engineer must do now. Required for compromise.",
+      "minLength": 1
+    },
+    "rationale": {
+      "type": "string",
+      "description": "Why you ruled this way, addressed to both agents.",
+      "minLength": 1
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": ["ruling"],
+        "properties": { "ruling": { "const": "compromise" } }
+      },
+      "then": {
+        "required": ["instruction"],
+        "$comment": "A compromise is only actionable with the instruction that replaces both positions."
+      }
+    }
+  ]
+}

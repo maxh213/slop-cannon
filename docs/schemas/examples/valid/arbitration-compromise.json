@@ -1,0 +1,6 @@
+{
+  "item_id": "test-r1-2",
+  "ruling": "compromise",
+  "instruction": "Leave TestMedian skipped, but change the skip reason to \"blocked on implement-median\" so the next reader knows why, and add that note to the impl report.",
+  "rationale": "The tester is right that a silent skip hides work, and the engineer is right that unskipping belongs to the median bead. Naming the blocker costs one line and settles both."
+}

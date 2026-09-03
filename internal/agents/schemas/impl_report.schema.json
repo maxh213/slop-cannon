@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "sc://schemas/impl_report.schema.json",
+  "title": "impl_report",
+  "description": "What an engineer hands to the testers after implementing a bead.",
+  "type": "object",
+  "required": ["summary"],
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "type": "string",
+      "description": "Omit this. The orchestrator stamps it when it stores the message.",
+      "const": "impl_report"
+    },
+    "summary": {
+      "type": "string",
+      "description": "What you did and why, in a few sentences.",
+      "minLength": 1
+    },
+    "files_changed": {
+      "type": "array",
+      "description": "Paths you changed, relative to the repository root.",
+      "items": { "type": "string", "minLength": 1 },
+      "uniqueItems": true
+    },
+    "how_to_verify": {
+      "type": "string",
+      "description": "The commands or steps a tester runs to see the change working."
+    },
+    "risks": {
+      "type": "array",
+      "description": "Anything you are unsure about, one per entry.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "questions": {
+      "type": "array",
+      "description": "Open points for the testers or the product owner, one per entry.",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "commit": {
+      "type": "string",
+      "description": "The git sha of the commit this report describes.",
+      "pattern": "^[0-9a-fA-F]{7,40}$"
+    }
+  }
+}

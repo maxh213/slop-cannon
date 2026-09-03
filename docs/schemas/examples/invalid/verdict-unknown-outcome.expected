@@ -1,0 +1,2 @@
+structured: schema (verdict): 1 violation(s)
+  - at '/outcome': value must be one of 'approve', 'changes'

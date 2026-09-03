@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sort"
 	"strconv"
@@ -53,6 +54,11 @@ type CleanupOptions struct {
 	KeepBranches bool
 	// Logger receives one line per action; nil means slog.Default().
 	Logger *slog.Logger
+	// Out receives [CleanupResult.Summary] followed by a newline once the
+	// pass is over, so the run's final report names the worktrees that were
+	// kept for a human and where they are. nil prints nothing; the result is
+	// returned either way.
+	Out io.Writer
 }
 
 // CleanupEntry is the outcome for one bead or worktree.
@@ -101,6 +107,10 @@ func (r *CleanupResult) Kept() []CleanupEntry { return r.byAction(CleanupKept) }
 // Removed returns the entries whose worktree was removed.
 func (r *CleanupResult) Removed() []CleanupEntry { return r.byAction(CleanupRemoved) }
 
+// Pruned returns the entries whose worktree directory had already vanished
+// and whose stale registration was dropped.
+func (r *CleanupResult) Pruned() []CleanupEntry { return r.byAction(CleanupPruned) }
+
 // KeptPaths returns the paths of the worktrees kept for a human, in bead
 // id order.
 func (r *CleanupResult) KeptPaths() []string {
@@ -136,8 +146,11 @@ func (r *CleanupResult) Err() error {
 // failure.
 func (r *CleanupResult) Summary() string {
 	var b strings.Builder
-	removed, kept, failed := len(r.Removed()), r.Kept(), r.Failed()
+	removed, pruned, kept, failed := len(r.Removed()), len(r.Pruned()), r.Kept(), r.Failed()
 	fmt.Fprintf(&b, "removed %d %s", removed, plural(removed, "worktree", "worktrees"))
+	if pruned > 0 {
+		fmt.Fprintf(&b, ", pruned %d stale %s", pruned, plural(pruned, "registration", "registrations"))
+	}
 	if len(kept) > 0 {
 		fmt.Fprintf(&b, ", kept %d:", len(kept))
 		for _, e := range kept {
@@ -176,10 +189,12 @@ func (r *CleanupResult) byAction(a CleanupAction) []CleanupEntry {
 // still in flight when the run was stopped, so a resumed run can reattach
 // it; a worktree of a bead the caller did not list is kept as well.
 // Registrations whose directory vanished and empty leftover directories
-// are pruned. The result names every kept path; see
-// [CleanupResult.Summary]. Only a failure to inspect the repository is
-// returned as an error; per-bead failures are in the entries and
-// [CleanupResult.Err].
+// are pruned; a closed bead among them still has its merged branch
+// deleted. The result names every kept path, and is printed to
+// [CleanupOptions.Out] when one is set; see [CleanupResult.Summary]. Only
+// a failure to inspect the repository as a whole (listing or pruning its
+// worktrees, reading the default branch) is returned as an error; per-bead
+// failures are in the entries and [CleanupResult.Err].
 func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts CleanupOptions) (*CleanupResult, error) {
 	log := opts.Logger
 	if log == nil {
@@ -194,6 +209,18 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 	worktrees, err := m.List(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// Drop stale registrations before any branch is looked at: git refuses
+	// to delete the branch of a worktree it still has on file, so a closed
+	// bead whose directory vanished would otherwise keep its merged branch
+	// forever. The listing above still remembers which ones were prunable.
+	for _, wt := range worktrees {
+		if wt.Prunable {
+			if err := m.Prune(ctx); err != nil {
+				return nil, err
+			}
+			break
+		}
 	}
 	res := &CleanupResult{}
 	if res.Default, err = m.repo.DefaultBranch(ctx); err != nil && !errors.Is(err, ErrNoDefaultBranch) {
@@ -214,6 +241,9 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 		case wt.Prunable:
 			e.Action = CleanupPruned
 			e.Reason = "the worktree directory had vanished; its registration was dropped"
+			if known && bead.State == domain.BeadStateClosed {
+				m.cleanupBranch(ctx, &e, bead, baseRefs, baseNames, opts.KeepBranches)
+			}
 		case !known:
 			e.Action = CleanupKept
 			e.Reason = "the bead is not part of this run's final state"
@@ -244,7 +274,12 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 		branch := BranchName(bead)
 		exists, err := m.repo.BranchExists(ctx, branch)
 		if err != nil {
-			return nil, err
+			// One unreadable ref must not abandon the rest of the pass.
+			res.Entries = append(res.Entries, CleanupEntry{
+				BeadID: id, Path: m.PathFor(id), Branch: branch, State: bead.State,
+				Action: CleanupNone, Reason: "the bead's branch could not be inspected", Err: err,
+			})
+			continue
 		}
 		if !exists {
 			continue
@@ -259,17 +294,22 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 		return nil, err
 	}
 	sort.Slice(res.Entries, func(i, j int) bool { return res.Entries[i].BeadID < res.Entries[j].BeadID })
+	if opts.Out != nil {
+		_, _ = fmt.Fprintln(opts.Out, res.Summary())
+	}
 	return res, nil
 }
 
 // cleanupBranch deletes the closed bead's branch when it is fully merged
 // into one of bases and keep is false, recording the outcome on e. names
-// are the short names of bases, used in the reason.
+// are the short names of bases, used in the reason. The branch is the one
+// the worktree actually held when that is known, and BranchName(bead)
+// otherwise: a bead retitled mid-run no longer names its own branch.
 func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domain.Bead, bases, names []string, keep bool) {
-	branch := BranchName(bead)
 	if e.Branch == "" {
-		e.Branch = branch
+		e.Branch = BranchName(bead)
 	}
+	branch := e.Branch
 	if keep {
 		e.Reason += "; branch kept as requested"
 		return
@@ -302,7 +342,7 @@ func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domai
 		e.Reason += fmt.Sprintf("; branch %s kept (not merged into %s)", branch, strings.Join(names, " or "))
 		return
 	}
-	if err := m.DeleteBranch(ctx, bead); err != nil {
+	if _, err := m.repo.Git(ctx, "branch", "-D", "--quiet", branch); err != nil {
 		e.Err = err
 		return
 	}
@@ -593,7 +633,8 @@ func activeOnResume(state domain.BeadState) bool {
 //     behind a gate is left to the poller as well.
 //   - A bead that recorded a pull request which is no longer open or
 //     merged moves to needs_human: the PR was closed without merging.
-//   - A delivering bead whose branch is gone moves to needs_human.
+//   - A delivering bead whose branch is gone and that has no pull request
+//     left to speak for it moves to needs_human.
 //   - Every other state is left alone; the entry reports the worktree
 //     (dirty, mid-rebase with conflicts) for the orchestrator to act on.
 //
@@ -677,6 +718,13 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 	switch {
 	case err == nil:
 		e.Worktree, e.WorktreeStatus = wt, WorktreeAttached
+		if wt.Branch != "" && wt.Branch != e.Branch {
+			// The bead's title changed since the worktree was created, so
+			// BranchName no longer names the branch the work is on. The
+			// worktree is the authority: reconcile the branch it holds
+			// rather than reporting a non-existent one as gone.
+			e.Branch = wt.Branch
+		}
 	case !errors.Is(err, ErrWorktreeMissing):
 		e.Err = err
 		return e
@@ -716,8 +764,11 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 		}
 	}
 
-	// Pull request, for beads that went through the PR path.
-	if *ghUsable && (bead.State == domain.BeadStateDelivering || bead.PRURL != "" || bead.PRNumber != 0) && exists {
+	// Pull request, for beads that went through the PR path. The local
+	// branch may well be gone (deleted after the merge, or by hand) while
+	// the pull request it was pushed to is still open or already merged, so
+	// gh is asked either way.
+	if *ghUsable && (bead.State == domain.BeadStateDelivering || bead.PRURL != "" || bead.PRNumber != 0) {
 		pr, state, err := r.gh.FindPR(ctx, e.Branch)
 		if reason, ok := ghUnavailable(err); ok {
 			*ghUsable = false

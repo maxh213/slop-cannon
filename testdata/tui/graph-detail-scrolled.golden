@@ -1,0 +1,24 @@
+▄█▓═▶  slop-cannon · run sc-graph-001 · brief · ammo 1/4 · safety on
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+depends on sc-1a2b [1m● closed[0m, sc-out1 (outside the run)
+blocks sc-5e6f ○ open
+
+[1mDescription[0m
+  The client gives up on the first 5xx. It should retry idempotent requests
+  with an exponential back-off, and stop after the retry budget is spent.
+
+[1mAcceptance[0m
+  A 503 followed by a 200 returns the body; the number of attempts is capped
+  by the budget; nothing is retried after a POST.
+
+[1mHistory[0m
+  round 1 review qa,test 2b7d5e6
+    qa           changes the budget is never reset
+      [1m![0m Budget leaks between calls
+    test         approve tests cover the back-off
+    response     fixed the budget is now per call
+  round 2 review qa 9f8e7d6
+  delivery PR #42 https://example.invalid/acme/app/pull/42
+esc close   lines 4-22 of 22
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

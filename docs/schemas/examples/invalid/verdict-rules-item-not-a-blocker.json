@@ -1,0 +1,14 @@
+{
+  "lens": "test",
+  "round": 1,
+  "outcome": "changes",
+  "items": [
+    {
+      "id": "test-r1-1",
+      "severity": "minor",
+      "category": "rules",
+      "title": "New behaviour ships without a test, which the rules file forbids",
+      "status": "open"
+    }
+  ]
+}

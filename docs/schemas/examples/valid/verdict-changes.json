@@ -1,0 +1,28 @@
+{
+  "lens": "test",
+  "round": 1,
+  "outcome": "changes",
+  "summary": "The fix is right but it is untested, and the new test file skips the case the bead is about.",
+  "items": [
+    {
+      "id": "test-r1-1",
+      "severity": "blocker",
+      "category": "rules",
+      "title": "New behaviour ships without a test, which the rules file forbids",
+      "detail": "rules.md says every behaviour change lands with a test in the same commit. Mean's empty-slice branch has none.",
+      "file": "stats/stats_test.go",
+      "suggestion": "Add {name: \"empty\", in: nil, want: 0, wantOK: false} to the existing table.",
+      "status": "open"
+    },
+    {
+      "id": "test-r1-2",
+      "severity": "major",
+      "category": "coverage",
+      "title": "TestMedian is skipped unconditionally",
+      "detail": "t.Skip(\"pending\") at the top of the test means the median work is unverified.",
+      "file": "stats/stats_test.go",
+      "line": 41,
+      "status": "open"
+    }
+  ]
+}

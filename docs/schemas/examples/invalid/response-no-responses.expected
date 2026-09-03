@@ -1,0 +1,2 @@
+structured: schema (response): 1 violation(s)
+  - at '/responses': minItems: got 0, want 1

@@ -1,0 +1,10 @@
+{
+  "beads": [
+    {
+      "key": "fix mean",
+      "title": "Fix Mean on an empty slice",
+      "acceptance": "Mean(nil) returns (0, false).",
+      "deps": ["fix mean"]
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+▄█▓═▶  slop-cannon · run sc-feedback-0001 · brief · ammo 0/4 · s
+ 1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────
+7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 op
+  BEAD       U Q T │ sc-c3d4  Cache DNS lookups
+  sc-a1b2    ✓ ✓ ✓ │ ✓ approved · 2 rounds · ux ✓  qa ✓  test ✓
+[1m▌ [0msc-c3d4    ✓ ✓ ✓ │
+  sc-e5f6    ✓ ✓ ✓ │ [1mround 1[0m · review · 2b3c4d5 · ux,qa,test
+  sc-g7h8    ✓ ✓ ✓ │   ⚙ report cache lookups for the TTL the re
+  sc-i9j0    ✓ ✓ ✓ │   ✓ ux   approve no user-visible change
+  sc-k1l2    · ✗ · │   ✗ qa   changes one blocker
+  sc-m3n4    ✓ ✓ ◐ │     [1m! blocker[0m qa-r1-1   Retry loops forever
+                   │       → fixed    capped the loop at five a…
+                   │   ✓ test approve coverage is fine
+                   │
+                   │ [1mround 2[0m · review · 3c4d5e6 · qa
+                   │   ⚙ report cap the retry loop
+                   │   ✓ qa   approve the cap holds
+                   │
+tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • 
