@@ -2,7 +2,7 @@
   "data": {
     "beads_dir": "/tmp/fixture-repo/.beads",
     "repo_root": "/tmp/fixture-repo",
-    "cwd_repo_root": "/home/max/workspace/slop-cannon",
+    "cwd_repo_root": "/tmp/other-repo",
     "is_redirected": true,
     "is_worktree": false,
     "backend": "dolt",

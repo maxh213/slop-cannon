@@ -164,7 +164,22 @@ func dpSetup(t *testing.T, remote bool) *dpFixture {
 	tracker := &dpTracker{}
 	d, err := NewPRDeliverer(f.m, tracker, WithPRLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	require.NoError(t, err)
-	return &dpFixture{wtFixture: f, gh: gh, tracker: tracker, d: d, wt: wt, head: c.SHA}
+	df := &dpFixture{wtFixture: f, gh: gh, tracker: tracker, d: d, wt: wt, head: c.SHA}
+
+	// Safety on never touches the default branch: whatever a subtest does,
+	// the local and remote main tips must be where they started.
+	mainBefore := f.r.Head(t)
+	var remoteBefore string
+	if remote {
+		remoteBefore = dpRemoteHeads(t, df)["main"]
+	}
+	t.Cleanup(func() {
+		assert.Equal(t, mainBefore, f.r.Head(t), "the local default branch must not move (safety on)")
+		if remote {
+			assert.Equal(t, remoteBefore, dpRemoteHeads(t, df)["main"], "the remote default branch must not move (safety on)")
+		}
+	})
+	return df
 }
 
 // dpRequest is the delivery request for wtBead with a report and verdicts.

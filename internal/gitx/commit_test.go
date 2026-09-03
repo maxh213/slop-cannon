@@ -152,6 +152,28 @@ func TestRepo_CommitAll(t *testing.T) {
 		assert.Equal(t, FallbackAuthorName+" <"+FallbackAuthorEmail+">", r.Git(t, "log", "-1", "--format=%cn <%ce>"))
 	})
 
+	t.Run("skips hooks and gpg signing", func(t *testing.T) {
+		r := testutil.NewFixtureRepo(t)
+		repo := repoOpen(t, r)
+		hooks := filepath.Join(r.Dir, ".git", "hooks")
+		require.NoError(t, os.MkdirAll(hooks, 0o755))
+		for _, hook := range []string{"pre-commit", "commit-msg"} {
+			require.NoError(t, os.WriteFile(filepath.Join(hooks, hook), []byte("#!/bin/sh\necho hook ran >&2\nexit 1\n"), 0o755))
+		}
+		r.Git(t, "config", "commit.gpgsign", "true")
+		r.Git(t, "config", "user.signingkey", "0000000000000000")
+		r.WriteFile(t, "x.txt", "x\n")
+		_, err := repo.Git(ctx, "commit", "-q", "-a", "-m", "blocked by hook")
+		require.Error(t, err, "precondition: a plain commit is blocked by the hook or the signing key")
+		assert.NotEmpty(t, r.Status(t))
+
+		c, err := repo.CommitAll(ctx, "leftovers")
+		require.NoError(t, err)
+		assert.True(t, c.Committed)
+		assert.Equal(t, "leftovers", r.Git(t, "log", "-1", "--format=%s"))
+		assert.Equal(t, "N", r.Git(t, "log", "-1", "--format=%G?"), "the commit is unsigned")
+	})
+
 	t.Run("unborn branch", func(t *testing.T) {
 		r := testutil.NewFixtureRepo(t)
 		dir := repoInitEmpty(t, r)

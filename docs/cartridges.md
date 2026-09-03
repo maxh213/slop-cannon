@@ -792,8 +792,11 @@ the file under `read_write`, `refuse` must create nothing under `read_only`.
 ### 7. Run the conformance suite against it
 
 The suite (`internal/cartridge/conformance`, P2-09) is the acceptance test:
-`detect`, `echo`, `structured`, `write`, `refuse`, `timeout` and `kill`, plus
-the stream-contract assertions on every session. Two ways to run it:
+`detect`, `echo`, `structured`, `write`, `refuse`, `timeout`, `kill` and
+`beads-readonly` (`conformance.CheckNames()`), plus the stream-contract
+assertions on every session. `beads-readonly` needs `bd` and `git` on
+`PATH` (or `Options.BD` naming the real binary) and reports `SKIP`, not
+`FAIL`, without them. Two ways to run it:
 
 - **Real CLI, from the Makefile:** after adding the blank import to
   `conformance_test.go` and a cheap default model to its
@@ -820,8 +823,10 @@ the stream-contract assertions on every session. Two ways to run it:
   ```
 
   `Options` also takes `Model`, `HangTimeout`, `KillAfter`, `Workdir`,
-  `Checks`, `Env` and an `Observer`. The report's `Table()` is what the
-  Makefile target prints.
+  `Checks` (a subset of `conformance.CheckNames()`; everything else is
+  reported as `SKIP: not selected`), `Env`, an `Observer` and `BD`. The
+  report's `Table()` is what the Makefile target prints; `rep.Err()` is nil
+  when nothing failed (skips do not count) and `rep.Passed()` says the same.
 
 A check that fails prints `FAIL: <reason>` in its detail column; the
 reasons are written to be actionable (`sc-conformance.txt was not created
@@ -974,9 +979,14 @@ func TestParrot_Selection(t *testing.T) {
 }
 ```
 
-`go test -race ./internal/cartridge/parrot/` passes both in about a second
-(verified while writing this guide, 2026-09-02; the package is not checked
-in, it is the exercise). `rep.Table()` reads exactly like the mock table in
+`go test -race ./internal/cartridge/parrot/` passes both in a few seconds
+(re-verified against the tree on 2026-09-03 by extracting the listings above
+into a throwaway package: `gofmt` and `go vet` clean, both tests green with
+all eight checks; the package is not checked in, it is the exercise). The
+`beads-readonly` check uses whatever `bd` is first on `PATH`; on a machine
+without one it reports `SKIP` and the test still passes, and a test that
+must not depend on the host can point `Options.BD` at a fake the way
+`conformance_test.go`'s `conformanceFakeBD` does. `rep.Table()` reads exactly like the mock table in
 "Expected output: mock" with `cartridge conformance: parrot` on top. To make
 `make cartridge-conformance CARTRIDGE=parrot` work as well you would add the
 blank import to `conformance_test.go`; the driver would then build parrot

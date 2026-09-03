@@ -2,10 +2,12 @@ package conformance
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -155,4 +157,59 @@ func TestBeadsCheck_SkipsWithoutBD(t *testing.T) {
 	pass, fail, skip := rep.Counts()
 	assert.Equal(t, []int{1, 0, 7}, []int{pass, fail, skip})
 	assert.Contains(t, rep.Table(), "SKIP")
+}
+
+func TestRetryTextBusy(t *testing.T) {
+	t.Parallel()
+	t.Run("retries ETXTBSY until it clears", func(t *testing.T) {
+		t.Parallel()
+		calls := 0
+		err := retryTextBusy(context.Background(), func() error {
+			calls++
+			if calls < 3 {
+				return &os.PathError{Op: "fork/exec", Path: "/tmp/bd", Err: syscall.ETXTBSY}
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 3, calls)
+	})
+	t.Run("retries the shell's complaint", func(t *testing.T) {
+		t.Parallel()
+		calls := 0
+		err := retryTextBusy(context.Background(), func() error {
+			calls++
+			if calls == 1 {
+				return errors.New("proc: /tmp/bd version: exit status 126: sh: 1: /tmp/real/bd: Text file busy")
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		assert.Equal(t, 2, calls)
+	})
+	t.Run("returns other errors at once", func(t *testing.T) {
+		t.Parallel()
+		calls := 0
+		want := errors.New("boom")
+		err := retryTextBusy(context.Background(), func() error { calls++; return want })
+		assert.Same(t, want, err)
+		assert.Equal(t, 1, calls)
+	})
+	t.Run("gives up after the attempt budget", func(t *testing.T) {
+		t.Parallel()
+		calls := 0
+		err := retryTextBusy(context.Background(), func() error { calls++; return syscall.ETXTBSY })
+		assert.ErrorIs(t, err, syscall.ETXTBSY)
+		assert.Equal(t, textBusyAttempts, calls)
+	})
+	t.Run("stops when the context ends", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		calls := 0
+		err := retryTextBusy(ctx, func() error { calls++; return syscall.ETXTBSY })
+		assert.ErrorIs(t, err, syscall.ETXTBSY)
+		assert.Equal(t, 1, calls)
+	})
+	assert.False(t, isTextBusy(nil))
 }
