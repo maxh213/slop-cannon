@@ -6,10 +6,10 @@
   sc-a1b2    ✓ ✓ ✓ │ ✓ approved · 2 rounds · ux ✓  qa ✓  test ✓
 [1m▌ [0msc-c3d4    ✓ ✓ ✓ │
   sc-e5f6    ✓ ✓ ✓ │ [1mround 1[0m · review · 2b3c4d5 · ux,qa,test
-  sc-g7h8    ✓ ✓ ✓ │   ⚙ report cache lookups for the TTL the re
+  sc-g7h8    ✓ ✓ ✓ │   ⚙ report cache lookups for the TTL the r…
   sc-i9j0    ✓ ✓ ✓ │   ✓ ux   approve no user-visible change
   sc-k1l2    · ✗ · │   ✗ qa   changes one blocker
-  sc-m3n4    ✓ ✓ ◐ │     [1m! blocker[0m qa-r1-1   Retry loops forever
+  sc-m3n4    ✓ ✓ ◐ │     [1m! blocker[0m qa-r1-1   [resolved] Retry l…
                    │   ✓ test approve coverage is fine
                    │
                    │ [1mround 2[0m · review · 3c4d5e6 · qa

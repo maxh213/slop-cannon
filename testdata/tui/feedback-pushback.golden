@@ -8,8 +8,8 @@
 [1m▌ [0msc-e5f6    ✓ ✓ ✓ │ [1mround 1[0m · review · 4d5e6f7 · ux,qa,test
   sc-g7h8    ✓ ✓ ✓ │   ⚙ report add the flag and document it
   sc-i9j0    ✓ ✓ ✓ │   ✗ ux   changes naming
-  sc-k1l2    · ✗ · │     • minor   ux-r1-1   Spell the flag --no-cache [accepted]
-  sc-m3n4    ✓ ✓ ◐ │     · nit     ux-r1-2   Capitalise the help text [accepted]
+  sc-k1l2    · ✗ · │     • minor   ux-r1-1   [accepted] Spell the flag --no-cache
+  sc-m3n4    ✓ ✓ ◐ │     · nit     ux-r1-2   [accepted] Capitalise the help text
                    │   ✓ qa   approve behaviour is right
                    │   ✓ test approve covered
                    │

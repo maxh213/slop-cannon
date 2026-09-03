@@ -15,12 +15,12 @@
                    │ [1mround 2[0m · review · 708192a · qa
                    │   ↩ pushback qa-r1-1   the config layer already rejects a negative timeout
                    │   ✗ qa   changes still want the guard
-                   │     ▲ major   qa-r1-1   Validate the timeout before use [held]
+                   │     ▲ major   qa-r1-1   [held] Validate the timeout before use
                    │   ⚖ uphold_engineer  qa-r1-1   config validation covers it; a second check is dead code
                    │
                    │ [1mround 3[0m · review · 8192a3b · qa
                    │   ✓ qa   approve ruling accepted
-                   │     ▲ major   qa-r1-1   Validate the timeout before use [overruled]
+                   │     ▲ major   qa-r1-1   [overruled] Validate the timeout before use
                    │
                    │
 tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

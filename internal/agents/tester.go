@@ -324,12 +324,13 @@ func testerDiffLadder(r TesterRequest) []int {
 	return steps
 }
 
-// ErrPromptOverBudget is returned by [TesterRunSpec] and [TesterFiring] when
-// the assembled prompt is still larger than its budget after everything that
-// can be dropped has been. The spec and the prompt come back with the error,
+// ErrPromptOverBudget is returned by every firing builder — [PlanRunSpec],
+// [EngineerRequest.Firing], [TesterRunSpec] and [TesterFiring] — when the
+// assembled prompt is still larger than its budget after everything that can
+// be dropped has been. The spec and the prompt come back with the error,
 // because the prompt is usable and only the caller knows whether firing it
-// is worth the tokens: check with errors.Is and fire anyway, or raise
-// TesterRequest.Budget.MaxTokens and build again.
+// is worth the tokens: check with errors.Is and fire anyway, or raise the
+// request's Budget.MaxTokens and build again.
 var ErrPromptOverBudget = errors.New("agents: prompt is over its token budget")
 
 // TesterRunSpec builds the prompt and the cartridge firing for a tester: the
@@ -369,16 +370,14 @@ func TesterRunSpec(r TesterRequest) (cartridge.RunSpec, prompt.Prompt, error) {
 		return cartridge.RunSpec{}, p, err
 	}
 	if p.OverBudget {
-		return spec, p, fmt.Errorf("%w: the %s %s prompt is ~%d tokens against a budget of %d, even with %s; "+
-			"raise the budget or fire it deliberately", ErrPromptOverBudget, r.Lens, r.Mode, p.Tokens, p.MaxTokens,
-			testerTruncationSummary(p))
+		return spec, p, promptBudgetError(fmt.Sprintf("%s %s", r.Lens, r.Mode), p)
 	}
 	return spec, p, nil
 }
 
-// testerTruncationSummary lists what the budget already forced out, for the
+// promptTruncationSummary lists what the budget already forced out, for the
 // over-budget error message.
-func testerTruncationSummary(p prompt.Prompt) string {
+func promptTruncationSummary(p prompt.Prompt) string {
 	if len(p.Truncations) == 0 {
 		return "nothing left to drop"
 	}

@@ -290,9 +290,10 @@ func FormatHeadless(ev events.Event, loc *time.Location) string {
 		return ""
 	}
 	at := ev.At()
-	if loc != nil {
-		at = at.In(loc)
+	if loc == nil {
+		loc = time.Local
 	}
+	at = at.In(loc)
 	line := strings.ReplaceAll(HeadlessLine(ev), "\n", " ")
 	return at.Format(headlessTimeFormat) + " " + HeadlessGlyph(ev) + " " + line
 }

@@ -384,7 +384,8 @@ func TestBuildIsDeterministic(t *testing.T) {
 	}
 }
 
-// TestBuildContractAppendedOnce checks the idempotent suffix helper is used.
+// TestBuildContractAppendedOnce checks the idempotent suffix helper is used:
+// a trailing section that already is the contract is not repeated.
 func TestBuildContractAppendedOnce(t *testing.T) {
 	req := pbEngineerRequest()
 	req.Instructions = append(req.Instructions, Section{
@@ -394,6 +395,38 @@ func TestBuildContractAppendedOnce(t *testing.T) {
 	p, err := Build(req)
 	require.NoError(t, err)
 	assert.Equal(t, 1, strings.Count(p.Text, "## Output contract (demo_result)"))
+	assert.True(t, pbContract.EndsWithPromptSuffix(p.Text))
+}
+
+// TestBuildContractIsAlwaysLast: an earlier layer that quotes the contract —
+// a bead description written by an agent, a rules file, an instruction
+// section — must not suppress the real copy. Whatever else the prompt says,
+// the output contract is the last thing in it, because its own first rule is
+// that the result block is the last thing in the reply.
+func TestBuildContractIsAlwaysLast(t *testing.T) {
+	earlier := map[string]func(req *Request){
+		"bead description": func(req *Request) { req.Bead.Bead.Description = pbContract.PromptSuffix() },
+		"rules file": func(req *Request) {
+			req.Rules = []Doc{{Name: "rules.md", Content: pbContract.PromptSuffix()}}
+		},
+		"instruction section": func(req *Request) {
+			req.Instructions = append([]Section{{Title: "Reminder", Body: pbContract.PromptSuffix()}}, req.Instructions...)
+		},
+	}
+	for name, inject := range earlier {
+		t.Run(name, func(t *testing.T) {
+			req := pbEngineerRequest()
+			inject(&req)
+			p, err := Build(req)
+			require.NoError(t, err)
+			assert.True(t, pbContract.EndsWithPromptSuffix(p.Text),
+				"the contract is not the last thing in the prompt")
+			assert.True(t, strings.HasSuffix(strings.TrimRight(p.Text, "\n"), "```"),
+				"the schema block must close the prompt")
+			assert.Equal(t, 2, strings.Count(p.Text, "## Output contract (demo_result)"),
+				"the quoted copy is kept and the real one is still appended")
+		})
+	}
 }
 
 // TestBuildWithoutContract leaves the suffix out entirely.

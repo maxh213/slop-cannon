@@ -68,7 +68,10 @@ func fbItem(id string, sev domain.Severity, title string, status domain.ItemStat
 		ID: id, Severity: sev, Title: title, Status: status,
 		Detail: "seen while exercising " + title,
 		File:   "internal/http/retry.go", Line: 42,
-		Suggestion: "guard the call and cover it with a table case",
+		// Long enough that the compact view has to cut it and the details
+		// view has to wrap it, so both goldens show what the pane does with
+		// text it cannot fit on one line.
+		Suggestion: "guard the call and cover it with a table case that exercises the failure against the fixture server",
 	}
 }
 
@@ -485,14 +488,12 @@ func TestFeedbackThreadsScenarios(t *testing.T) {
 		require.Nil(t, item.Response, "nothing was said about the occurrence that closed the item")
 		require.Nil(t, item.Ruling)
 
-		raised, ok := th.Answered(2, "qa-r1-1")
-		require.True(t, ok)
+		raised := fbOne(t, th.Answered(2, "qa-r1-1"))
 		require.Equal(t, 1, raised.Round, "round 2's response answers the item round 1 raised")
 		require.Equal(t, domain.ActionPushback, raised.Response.Action)
 		require.Equal(t, 2, raised.ResponseRound)
 
-		held, ok := th.Ruled(2, "qa-r1-1")
-		require.True(t, ok)
+		held := fbOne(t, th.Ruled(2, "qa-r1-1"))
 		require.Equal(t, 2, held.Round, "the ruling settles the occurrence the tester held")
 		require.Equal(t, domain.ItemHeld, held.Status)
 		require.Equal(t, domain.RulingUpholdEngineer, held.Ruling.Ruling)
@@ -511,15 +512,13 @@ func TestFeedbackThreadsScenarios(t *testing.T) {
 		// The pushback that caused the arbitration was given in round 2 and
 		// stays on the occurrence it answered: round 3's fix does not
 		// overwrite it.
-		raised, ok := th.Answered(2, "test-r1-1")
-		require.True(t, ok)
+		raised := fbOne(t, th.Answered(2, "test-r1-1"))
 		require.Equal(t, 1, raised.Round)
 		require.Equal(t, domain.ActionWontfix, raised.Response.Action)
 		require.Equal(t, "the empty body is unreachable through the public API", raised.Response.Rationale)
 		require.Equal(t, 2, raised.ResponseRound)
 
-		held, ok := th.Ruled(2, "test-r1-1")
-		require.True(t, ok)
+		held := fbOne(t, th.Ruled(2, "test-r1-1"))
 		require.Equal(t, 2, held.Round)
 		require.Equal(t, domain.ItemHeld, held.Status)
 		require.Equal(t, domain.RulingUpholdTester, held.Ruling.Ruling)
@@ -527,10 +526,11 @@ func TestFeedbackThreadsScenarios(t *testing.T) {
 		require.Equal(t, domain.ActionFixed, held.Response.Action, "round 3 answered the held occurrence")
 		require.Equal(t, 3, held.ResponseRound)
 
-		_, ok = th.Answered(1, "test-r1-1")
-		require.False(t, ok, "nothing was raised before round 1")
-		_, ok = th.Ruled(2, "no-such-item")
-		require.False(t, ok)
+		// Nothing was raised before round 1, so a response given in round 1
+		// would fall back to the statement round 1 itself made.
+		require.Equal(t, 1, fbOne(t, th.Answered(1, "test-r1-1")).Round)
+		require.Empty(t, th.Answered(1, "no-such-item"))
+		require.Empty(t, th.Ruled(2, "no-such-item"))
 	})
 
 	t.Run("f round cap escalates", func(t *testing.T) {
@@ -576,6 +576,25 @@ func fbTesters(th FeedbackThread) map[domain.Lens]TesterStatus {
 		out[t.Lens] = t
 	}
 	return out
+}
+
+// fbOne asserts an answer matched exactly one occurrence and returns it.
+func fbOne(t *testing.T, ivs []FeedbackItemView) FeedbackItemView {
+	t.Helper()
+	require.Len(t, ivs, 1)
+	return ivs[0]
+}
+
+// fbLineOf returns the index of the first rendered line containing needle,
+// or -1 when nothing on screen does. It is how the tests below pin one line
+// above or below another.
+func fbLineOf(out, needle string) int {
+	for i, line := range strings.Split(out, "\n") {
+		if strings.Contains(fbPlain(line), needle) {
+			return i
+		}
+	}
+	return -1
 }
 
 // TestFeedbackThreadsEdgeCases covers the states the scenarios do not reach:
@@ -1092,4 +1111,253 @@ func TestFeedbackOccurrenceLookups(t *testing.T) {
 	require.Len(t, lines, 2)
 	require.Contains(t, lines[0], "unindexed")
 	require.Contains(t, lines[1], "Raised out of band")
+}
+
+// TestFeedbackSameRoundResponse is the regression test for an engineer's
+// answer that arrives in the round of the verdict it answers: P6-04
+// aggregates a round's verdicts, consolidates the items, sends them to the
+// engineer and collects the responses without necessarily opening another
+// round, so a response can share its round with the item it replies to. It
+// must then be drawn under that verdict, not above it, and it must still be
+// attached to the occurrence it answers.
+func TestFeedbackSameRoundResponse(t *testing.T) {
+	item := fbItem("qa-1", domain.SeverityBlocker, "Retry loops forever", domain.ItemResolved)
+	st := fbState([]events.Event{
+		events.RunStarted{Meta: fbMeta(0), Info: fbRunInfo()},
+		events.RoundStarted{Meta: fbMeta(1), Bead: "sc-same", Round: 1, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}},
+		events.VerdictReceived{Meta: fbMeta(2), Bead: "sc-same", Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1, "one blocker", item)},
+		events.ResponseReceived{Meta: fbMeta(3), Bead: "sc-same", Round: 1, Agent: "eng-1", Responses: []domain.Response{
+			{ItemID: item.ID, Action: domain.ActionFixed, Rationale: "capped the loop"},
+		}},
+	})
+
+	th, ok := fbView(110, 26, FeedbackOptions{}).Selected(st)
+	require.True(t, ok)
+	answered := fbOne(t, th.Answered(1, "qa-1"))
+	require.Equal(t, 1, answered.Round, "the response answers the item this round raised")
+	require.NotNil(t, answered.Response, "the occurrence is not left looking unanswered")
+	require.Equal(t, domain.ActionFixed, answered.Response.Action)
+	require.Equal(t, 1, answered.ResponseRound)
+
+	out := fbView(110, 26, FeedbackOptions{}).View(st)
+	verdict := fbLineOf(out, "✗ qa   changes")
+	response := fbLineOf(out, "→ fixed")
+	require.Positive(t, verdict)
+	require.Positive(t, response)
+	require.Greater(t, response, verdict, "the engineer answers after the tester spoke, not before it")
+	require.Equal(t, 1, fbRoundOf(out, "→ fixed"), "and inside the round it was given in")
+
+	details := fbView(110, 30, FeedbackOptions{Details: true}).View(st)
+	require.Contains(t, details, "re: round 1 · qa · blocker · Retry loops forever",
+		"details name the occurrence answered, same round or not")
+}
+
+// TestFeedbackSameItemFromTwoLenses covers two lenses raising the same item
+// id in one round, which P6-04 produces when it dedupes items by file and
+// title across the three lenses: each lens holds its own open item, and the
+// single engineer response settles both of them.
+func TestFeedbackSameItemFromTwoLenses(t *testing.T) {
+	raised := fbItem("dup-1", domain.SeverityMajor, "The empty state has no copy", domain.ItemOpen)
+	fixed := raised
+	fixed.Status = domain.ItemResolved
+	evs := []events.Event{
+		events.RunStarted{Meta: fbMeta(0), Info: fbRunInfo()},
+		events.RoundStarted{Meta: fbMeta(1), Bead: "sc-dup0", Round: 1, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensUX, domain.LensQA}},
+		events.VerdictReceived{Meta: fbMeta(2), Bead: "sc-dup0", Round: 1, Agent: "ux-1", Verdict: fbChanges(domain.LensUX, 1, "one major", raised)},
+		events.VerdictReceived{Meta: fbMeta(3), Bead: "sc-dup0", Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1, "same major", raised)},
+	}
+	st := fbState(evs)
+	th, ok := fbView(110, 26, FeedbackOptions{}).Selected(st)
+	require.True(t, ok)
+	require.Equal(t, 2, th.Open, "each lens holds its own open item")
+
+	st = fbState(append(evs,
+		events.RoundStarted{Meta: fbMeta(4), Bead: "sc-dup0", Round: 2, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensUX, domain.LensQA}},
+		events.ResponseReceived{Meta: fbMeta(5), Bead: "sc-dup0", Round: 2, Agent: "eng-1", Responses: []domain.Response{
+			{ItemID: "dup-1", Action: domain.ActionFixed, Rationale: "wrote the empty state copy"},
+		}},
+		events.VerdictReceived{Meta: fbMeta(6), Bead: "sc-dup0", Round: 2, Agent: "ux-1", Verdict: domain.Verdict{
+			Lens: domain.LensUX, Round: 2, Outcome: domain.VerdictApprove, Summary: "reads well", Items: []domain.FeedbackItem{fixed},
+		}},
+		events.VerdictReceived{Meta: fbMeta(7), Bead: "sc-dup0", Round: 2, Agent: "qa-1", Verdict: domain.Verdict{
+			Lens: domain.LensQA, Round: 2, Outcome: domain.VerdictApprove, Summary: "copy is there", Items: []domain.FeedbackItem{fixed},
+		}},
+	))
+	th, ok = fbView(110, 26, FeedbackOptions{}).Selected(st)
+	require.True(t, ok)
+	require.Zero(t, th.Open, "both lenses saw their item settled")
+	require.True(t, th.Approved)
+
+	answered := th.Answered(2, "dup-1")
+	require.Len(t, answered, 2, "one response settles the occurrence of every lens that raised it")
+	lenses := make([]domain.Lens, 0, 2)
+	for _, iv := range answered {
+		require.NotNil(t, iv.Response, "%s is not left unanswered", iv.Lens)
+		require.Equal(t, 2, iv.ResponseRound)
+		require.Equal(t, 1, iv.Round)
+		lenses = append(lenses, iv.Lens)
+	}
+	require.ElementsMatch(t, []domain.Lens{domain.LensUX, domain.LensQA}, lenses)
+
+	out := fbView(110, 40, FeedbackOptions{Details: true}).View(st)
+	require.Contains(t, out, "re: round 1 · ux · major · The empty state has no copy")
+	require.Contains(t, out, "re: round 1 · qa · major · The empty state has no copy")
+}
+
+// fbLongState is a bead whose item, report and answers are all wider than
+// any pane, so the tests below can see what the view does with text it
+// cannot fit.
+func fbLongState() *State {
+	item := domain.FeedbackItem{
+		ID: "qa-1", Severity: domain.SeverityBlocker, Status: domain.ItemOpen,
+		Title:      "Retry loops forever on a 500 because the attempt counter is reset inside the loop body",
+		Detail:     "The counter is assigned before every request, so a server that keeps answering 500 keeps the client in the loop until the context deadline fires. Reproduced against the fixture server with a two minute deadline.",
+		Suggestion: "hoist the counter out of the loop and cover it with a table case that answers 500 forever",
+		File:       "internal/http/retry.go", Line: 42,
+	}
+	return fbState([]events.Event{
+		events.RunStarted{Meta: fbMeta(0), Info: fbRunInfo()},
+		events.RoundStarted{Meta: fbMeta(1), Bead: "sc-long", Round: 1, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}},
+		events.ResponseReceived{Meta: fbMeta(2), Bead: "sc-long", Round: 1, Agent: "eng-1", Report: &domain.ImplReport{
+			Summary: "retry with exponential backoff, capped at three attempts, and give up on a context deadline instead of spinning",
+		}},
+		events.VerdictReceived{Meta: fbMeta(3), Bead: "sc-long", Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1,
+			"one blocker in the retry path that a long running server reproduces every time", item)},
+		events.RoundStarted{Meta: fbMeta(4), Bead: "sc-long", Round: 2, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}},
+		events.ResponseReceived{Meta: fbMeta(5), Bead: "sc-long", Round: 2, Agent: "eng-1", Responses: []domain.Response{
+			{ItemID: "qa-1", Action: domain.ActionPushback, Rationale: "the deadline is the caller's to set and every other client in the repo behaves the same way"},
+		}},
+		events.ArbitrationReceived{Meta: fbMeta(6), Bead: "sc-long", Round: 2, Agent: "po-1", Rulings: []domain.Arbitration{
+			{ItemID: "qa-1", Ruling: domain.RulingCompromise, Instruction: "cap the attempts and leave the deadline to the caller, then say so in the package doc"},
+		}},
+	})
+}
+
+// fbDetail renders the round history of the selected bead on its own, so a
+// test can read it without the bead list column running through every line.
+func fbDetail(t *testing.T, v FeedbackModel, st *State) []string {
+	t.Helper()
+	th, ok := v.Selected(st)
+	require.True(t, ok)
+	out := make([]string, 0, 32)
+	for _, line := range v.detailLines(th, v.detailWidth()) {
+		out = append(out, strings.TrimRight(fbPlain(line), " "))
+	}
+	return out
+}
+
+// fbFlat joins rendered lines into one, so a test can look for text the
+// details view wrapped across several of them.
+func fbFlat(lines []string) string {
+	return strings.Join(strings.Fields(strings.Join(lines, " ")), " ")
+}
+
+// fbCutIsMarked reports whether text was cut with an ellipsis rather than
+// clipped silently: some line ends in "…" right after a prefix of it.
+func fbCutIsMarked(lines []string, text string) bool {
+	for _, line := range lines {
+		frag, ok := strings.CutSuffix(line, "…")
+		if !ok {
+			continue
+		}
+		for n := len(text); n > 8; n-- {
+			if strings.HasSuffix(frag, text[:n]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestFeedbackLongTextIsMarkedOrWrapped is the regression test for text
+// wider than the pane: the compact view never cuts anything silently, and
+// the details view shows the whole of it, as docs/tui-feedback.md promises.
+func TestFeedbackLongTextIsMarkedOrWrapped(t *testing.T) {
+	st := fbLongState()
+	cut := []string{
+		"Retry loops forever on a 500 because the attempt counter is reset inside the loop body",
+		"retry with exponential backoff, capped at three attempts, and give up on a context deadline instead of spinning",
+		"the deadline is the caller's to set and every other client in the repo behaves the same way",
+		"cap the attempts and leave the deadline to the caller, then say so in the package doc",
+		"one blocker in the retry path that a long running server reproduces every time",
+	}
+
+	for _, w := range []int{110, 80, 64} {
+		t.Run(fmt.Sprintf("compact at %d columns marks the cut", w), func(t *testing.T) {
+			lines := fbDetail(t, fbView(w, 40, FeedbackOptions{}), st)
+			flat := fbFlat(lines)
+			for _, text := range cut {
+				require.NotContains(t, flat, text, "the pane is too narrow to hold it whole")
+				require.True(t, fbCutIsMarked(lines, text), "%q was cut with no ellipsis in:\n%s",
+					text, strings.Join(lines, "\n"))
+			}
+		})
+
+		t.Run(fmt.Sprintf("details at %d columns show the whole text", w), func(t *testing.T) {
+			lines := fbDetail(t, fbView(w, 60, FeedbackOptions{Details: true}), st)
+			flat := fbFlat(lines)
+			for _, text := range cut {
+				require.Contains(t, flat, text, "the details toggle shows the item's full text")
+			}
+			require.Contains(t, flat, "The counter is assigned before every request", "the detail wraps too")
+			require.Contains(t, flat, "hoist the counter out of the loop", "and so does the suggestion")
+			require.NotContains(t, flat, "…", "nothing needs an ellipsis once it wraps")
+		})
+	}
+
+	t.Run("the status bracket survives a narrow pane", func(t *testing.T) {
+		held := domain.FeedbackItem{
+			ID: "qa-1", Severity: domain.SeverityBlocker, Status: domain.ItemHeld,
+			Title: "Retry loops forever on a 500 because the attempt counter is reset inside the loop body",
+		}
+		narrow := fbState([]events.Event{
+			events.RunStarted{Meta: fbMeta(0), Info: fbRunInfo()},
+			events.RoundStarted{Meta: fbMeta(1), Bead: "sc-held", Round: 1, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}},
+			events.VerdictReceived{Meta: fbMeta(2), Bead: "sc-held", Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1, "one blocker", held)},
+		})
+		require.Contains(t, fbView(64, 20, FeedbackOptions{}).View(narrow), "[held]",
+			"the mark is never the field the pane cuts")
+	})
+
+	t.Run("a word wider than the line is cut with an ellipsis", func(t *testing.T) {
+		require.Equal(t, []string{"short", "aaaaaaaaa…"}, feedbackWrap("short "+strings.Repeat("a", 40), 10, 10))
+		require.Equal(t, []string{"aaaa…", "b"}, feedbackWrap(strings.Repeat("a", 40)+" b", 5, 5))
+		require.Empty(t, feedbackWrap("   ", 10, 10))
+
+		// Text a cartridge filled with nothing but spaces leaves the head
+		// alone rather than an empty continuation line.
+		v := fbView(40, 12, FeedbackOptions{Details: true})
+		require.Equal(t, []string{"  ⚙ report"}, v.flow("  ⚙ report ", "   ", ThemeFor(ProfileNoColor).Muted(), 6, 40))
+	})
+
+	t.Run("a pane with no room for the text at all still renders the line", func(t *testing.T) {
+		for _, details := range []bool{false, true} {
+			out := fbView(24, 12, FeedbackOptions{Details: details}).View(st)
+			lines := strings.Split(out, "\n")
+			require.Len(t, lines, 12-chromeHeight)
+			for _, line := range lines {
+				require.LessOrEqual(t, lipgloss.Width(line), 24)
+			}
+		}
+	})
+}
+
+// TestFeedbackKeysAreInTheHelpOverlay checks the view's own bindings are
+// discoverable from inside the TUI and not only from the documentation: the
+// `?` overlay lists them under the tab's own heading (P7-13 will do the same
+// for every other view).
+func TestFeedbackKeysAreInTheHelpOverlay(t *testing.T) {
+	st := fbFixtureState()
+	m := New(t.Context(), Options{Run: st.Run, NoColor: true})
+	m.state = st
+	m.tab = TabFeedback
+	m.width, m.height = 110, 40
+	m.help.Width = 110
+
+	overlay := fbPlain(m.helpOverlay(110, 40))
+	require.Contains(t, overlay, "Feedback keys", "the overlay names the view whose keys it lists")
+	for _, want := range []string{"details", "scroll down", "scroll up", "first round", "last round"} {
+		require.Contains(t, overlay, want, "the ? overlay documents %q", want)
+	}
+	require.Len(t, m.viewKeys(), len(DefaultFeedbackKeyMap().FullHelp()))
 }

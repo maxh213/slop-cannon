@@ -397,9 +397,9 @@ func (s *State) Apply(ev events.Event) {
 		}
 		s.putDelivery(*d)
 	case events.Warning:
-		s.Notices = append(s.Notices, Notice{At: e.At(), Kind: e.Kind(), Source: e.Source, Message: e.Message, Err: e.Err})
+		s.appendNotice(Notice{At: e.At(), Kind: e.Kind(), Source: e.Source, Message: e.Message, Err: e.Err})
 	case events.Error:
-		s.Notices = append(s.Notices, Notice{At: e.At(), Kind: e.Kind(), Source: e.Source, Message: e.Message, Err: e.Err})
+		s.appendNotice(Notice{At: e.At(), Kind: e.Kind(), Source: e.Source, Message: e.Message, Err: e.Err})
 	}
 }
 
@@ -477,15 +477,36 @@ func (s *State) putDelivery(d Delivery) {
 	s.Deliveries = append(s.Deliveries, d)
 }
 
+// logLimit is how many log entries and notices the state keeps.
+func (s *State) logLimit() int {
+	if s.MaxLog <= 0 {
+		return DefaultLogLines
+	}
+	return s.MaxLog
+}
+
 // appendLog adds one line for ev, dropping the oldest when the cap is hit.
 func (s *State) appendLog(ev events.Event) {
-	limit := s.MaxLog
-	if limit <= 0 {
-		limit = DefaultLogLines
-	}
+	limit := s.logLimit()
 	s.Log = append(s.Log, LogEntry{At: ev.At(), Kind: ev.Kind(), Text: FormatEvent(ev)})
 	if len(s.Log) > limit {
 		s.Log = append(s.Log[:0], s.Log[len(s.Log)-limit:]...)
+	}
+}
+
+// appendNotice records one warning or error, keeping the newest MaxLog of
+// them. Nothing bounds a run — an autopilot run never ends on its own
+// (D-18) — so a chatty warning source would otherwise grow this slice for as
+// long as the process lives; it is capped exactly like [State.Log] and the
+// agent transcripts. The message and the underlying error come from a
+// subprocess, so both are sanitised on the way in ([logSanitize]) and are
+// safe for any view to draw.
+func (s *State) appendNotice(n Notice) {
+	limit := s.logLimit()
+	n.Message, n.Err = logSanitize(n.Message), logSanitize(n.Err)
+	s.Notices = append(s.Notices, n)
+	if len(s.Notices) > limit {
+		s.Notices = append(s.Notices[:0], s.Notices[len(s.Notices)-limit:]...)
 	}
 }
 
@@ -493,7 +514,18 @@ func (s *State) appendLog(ev events.Event) {
 // log view and the agents view's transcript notes (P7-03) share it. The
 // headless renderer (P7-08) has its own, richer format, and `sc tui-demo
 // --events` writes the events themselves as JSONL rather than this.
-func FormatEvent(ev events.Event) string {
+//
+// Several event fields are untrusted: an agent's output line, a warning's
+// message and an implementation report's summary are whatever a cartridge
+// subprocess wrote, and a real CLI writes ANSI on nearly every line. The
+// returned string is therefore sanitised (see [logSanitize]): it is always
+// one line, and it never carries an escape sequence or a control character,
+// so pasting it into a frame cannot repaint the terminal or steal a row.
+func FormatEvent(ev events.Event) string { return logSanitize(formatEvent(ev)) }
+
+// formatEvent is [FormatEvent] before sanitising, so the rendering has one
+// place and the escaping has another.
+func formatEvent(ev events.Event) string {
 	switch e := ev.(type) {
 	case events.RunStarted:
 		kind := "started"
@@ -560,6 +592,43 @@ func FormatEvent(ev events.Event) string {
 	default:
 		return string(ev.Kind())
 	}
+}
+
+// logSanitize makes one rendered line safe to draw. Event text is not all
+// the cannon's own: an agent's output line, a warning or error message and
+// an implementation report's summary come out of a subprocess, and a
+// cartridge is a CLI that writes ANSI colour, carriage returns and cursor
+// moves. Lip Gloss counts every one of those as zero width, so an escape
+// pasted into a row would repaint or erase the whole frame, and an embedded
+// newline would silently take a second body row that is drawn without the
+// cursor gutter.
+//
+// Each line is put through [agentsSanitize], which the Agents view already
+// uses for exactly these subprocess lines (P7-03): escape sequences go, a
+// carriage return is honoured the way a terminal honours it, tabs become
+// spaces and the remaining control characters are dropped. A line break
+// then becomes a single space, because a log row is one row. Text that
+// carries nothing but printable characters is returned unchanged, so a
+// benign line never pays for the walk.
+func logSanitize(s string) string {
+	if !strings.ContainsFunc(s, logIsControl) {
+		return s
+	}
+	parts := strings.Split(s, "\n")
+	kept := parts[:0]
+	for _, p := range parts {
+		if p = agentsSanitize(p); p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, " ")
+}
+
+// logIsControl reports whether r is one of the characters a terminal reads as
+// an instruction rather than as text: a C0 control (ESC, CR, LF and tab
+// included), DEL, or a C1 control.
+func logIsControl(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
 }
 
 // EventMsg carries one bus event into the Bubble Tea update loop.
@@ -965,16 +1034,17 @@ func (m Model) footer(w int) string {
 // the run's notices, so a headless browser or a missing xdg-open is visible
 // rather than a key that silently does nothing.
 func (m Model) opened(msg URLOpenedMsg) Model {
+	url := logSanitize(msg.URL)
 	if msg.Err == nil {
-		m.flash, m.flashErr = "opened "+msg.URL, false
+		m.flash, m.flashErr = "opened "+url, false
 		return m
 	}
-	m.flash, m.flashErr = "could not open "+msg.URL, true
-	m.state.Notices = append(m.state.Notices, Notice{
+	m.flash, m.flashErr = "could not open "+url, true
+	m.state.appendNotice(Notice{
 		At:      m.now(),
 		Kind:    events.KindError,
 		Source:  "tui",
-		Message: "could not open " + msg.URL,
+		Message: "could not open " + url,
 		Err:     msg.Err.Error(),
 	})
 	return m
@@ -1017,13 +1087,27 @@ func (m Model) helpOverlay(w, h int) string {
 }
 
 // viewKeys returns the extra key columns of the active view, so the overlay
-// documents the bindings only that view has — the Agents view's transcript
-// keys (P7-03) — instead of the global map alone. They are rendered as their
-// own block rather than appended to the global columns, which would make the
-// box wider than a narrow terminal.
+// documents the bindings only that view has instead of the global map alone:
+// the Graph view's level and detail keys (P7-02), the Agents view's
+// transcript keys (P7-03), the Feedback view's round keys (P7-04) and the
+// PRs view's `o` (P7-05). Every view that adds a binding is listed, because
+// docs/tui.md promises the overlay carries "the keys of the active view" —
+// and on the Graph tab `h`/`l` shadow the global previous/next view, which
+// nothing else would explain. The Log view adds none: it is drawn by
+// [Model.view] itself and moves under the global cursor keys.
+//
+// The columns are rendered as their own block rather than appended to the
+// global ones, which would make the box wider than a narrow terminal.
 func (m Model) viewKeys() [][]key.Binding {
-	if m.tab == TabAgents {
+	switch m.tab {
+	case TabGraph:
+		return m.graph.Keys().FullHelp()
+	case TabAgents:
 		return m.agents.Keys().FullHelp()
+	case TabFeedback:
+		return m.feedback.Keys().FullHelp()
+	case TabPRs:
+		return m.prs.Keys().FullHelp()
 	}
 	return nil
 }

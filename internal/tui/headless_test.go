@@ -292,7 +292,20 @@ func TestHeadlessFiredLineMatchesTheSpec(t *testing.T) {
 func TestHeadlessLocalTimeByDefault(t *testing.T) {
 	at := time.Date(2026, 1, 1, 12, 1, 3, 0, time.UTC)
 	ev := events.RunStopped{Meta: events.MetaAt(headlessRunID, at), Reason: "key"}
+
+	// A nil location means time.Local, whatever zone the machine is in —
+	// never the event's own zone, which is always UTC.
 	require.Equal(t, at.In(time.Local).Format("15:04:05")+" ■ run stopping (key)", tui.FormatHeadless(ev, nil))
+
+	// An explicit location is honoured, so the same instant stamps
+	// differently in different zones. These are fixed offsets rather than
+	// named zones so the assertion holds without a tzdata database and does
+	// not move with the machine's own TZ.
+	for _, offset := range []int{-8 * 3600, 0, 5*3600 + 1800, 9 * 3600} {
+		loc := time.FixedZone("headless-test", offset)
+		require.Equalf(t, at.In(loc).Format("15:04:05")+" ■ run stopping (key)",
+			tui.FormatHeadless(ev, loc), "offset %ds", offset)
+	}
 }
 
 func TestExitCodeFor(t *testing.T) {

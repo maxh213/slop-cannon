@@ -97,12 +97,16 @@ A tiny Go tool that prints statistics for a list of numbers.
 
 Description:
 
+```
 README promises a median but stats has none.
+```
 
 Acceptance criteria (every one of these must hold):
 
+```
 - stats.Median returns the middle value
 - a table test covers even and odd lengths
+```
 
 ## Round history
 
@@ -110,7 +114,9 @@ Acceptance criteria (every one of these must hold):
 
 Engineer report:
 
+```
 Added stats.Median with a table test for odd and even lengths.
+```
 
 - Files changed: stats/stats.go, stats/stats_test.go
 - Commit: 9f8e7d6

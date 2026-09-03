@@ -67,6 +67,33 @@ func TestScanRepoDepthAndCap(t *testing.T) {
 	assert.Greater(t, capped.TreeTotal, 5)
 }
 
+// TestScanRepoDefaultDepthAndCap exercises the documented defaults
+// themselves — depth 3, capped at DefaultTreeEntries entries — with a repo
+// big enough and deep enough to hit both, so a regression in withDefaults
+// fails here and not only in the value of the constants.
+func TestScanRepoDefaultDepthAndCap(t *testing.T) {
+	dir := t.TempDir()
+	// One file per directory keeps the walk honest about depth: the depth-4
+	// file must be missing while its depth-3 parent is listed.
+	pbWrite(t, dir, "deep/one/two/three.txt", "too deep")
+	for i := range DefaultTreeEntries + 60 {
+		pbWrite(t, dir, "pkg/f"+strconv.Itoa(i)+".txt", "x")
+	}
+
+	rc, err := ScanRepo(dir, ScanOptions{ReadmeBytes: -1})
+	require.NoError(t, err)
+
+	assert.Equal(t, DefaultTreeDepth, rc.TreeDepth)
+	assert.Len(t, rc.Tree, DefaultTreeEntries, "the default cap must bound the tree")
+	assert.Greater(t, rc.TreeTotal, DefaultTreeEntries, "the untruncated total is still reported")
+	assert.Contains(t, rc.Tree, "deep/one/two/", "depth 3 lists the directory")
+	assert.NotContains(t, rc.Tree, "deep/one/two/three.txt", "depth 3 stops before its contents")
+
+	// The prompt says how much it left out, from the same numbers.
+	out := renderRepo(rc, -1, 0)
+	assert.Contains(t, out, "Tree (depth 3, "+strconv.Itoa(DefaultTreeEntries)+" of "+strconv.Itoa(rc.TreeTotal)+" entries)")
+}
+
 func TestScanRepoSkipsNoiseDirectories(t *testing.T) {
 	dir := t.TempDir()
 	pbWrite(t, dir, "node_modules/left-pad/index.js", "x")

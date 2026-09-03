@@ -1,10 +1,17 @@
 package tui_test
 
 import (
+	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -65,10 +72,71 @@ var gfDemo = tui.DemoOptions{Delay: -1}
 // and the delivery it renders differ from the autopilot frames.
 var gfBrief = tui.DemoOptions{Delay: -1, Brief: "make the http client retry", Safety: true}
 
+// gfEastAsianEnv is the ambiguous-width switch. Both go-runewidth and
+// github.com/charmbracelet/x/ansi — the width measurement under every Lip
+// Gloss pad, truncate and join — read it once, in a package initialiser, and
+// keep the answer in an unexported condition that no test can reach. A
+// process that starts with it set therefore measures '·', '✓' and '▌' as two
+// cells for its whole life, which shifts the padding of every frame.
+const gfEastAsianEnv = "RUNEWIDTH_EASTASIAN"
+
+// gfWidthChildEnv marks the process [TestMain] re-executed with
+// [gfEastAsianEnv] cleared, so that process never re-executes itself again.
+const gfWidthChildEnv = "SC_TUI_GOLDEN_NARROW_CHILD"
+
+// gfEastAsianWidth reports whether this process was started in the width mode
+// where East-Asian ambiguous characters take two cells.
+func gfEastAsianWidth() bool {
+	v, err := strconv.ParseBool(os.Getenv(gfEastAsianEnv))
+	return err == nil && v
+}
+
+// gfRerunWithNarrowWidth re-executes this test binary with [gfEastAsianEnv]
+// removed and returns the child's exit code, when this process was started
+// with the ambiguous-width mode on and is not one of the two processes that
+// want it: the child [TestThemeGlyphColumnHoldsUnderEastAsianWidth] spawns to
+// exercise that mode on purpose, and a child this function already spawned.
+//
+// It has to be a new process. The width mode is latched at package
+// initialisation, so clearing the variable from inside a running test is too
+// late, and there is no exported knob to override it — see
+// [TestGoldenFramesSurviveEastAsianWidth] for the guarantee this buys.
+func gfRerunWithNarrowWidth() (code int, rerun bool) {
+	if !gfEastAsianWidth() || os.Getenv(gfWidthChildEnv) != "" || os.Getenv(themeEAChildEnv) != "" {
+		return 0, false
+	}
+	cmd := exec.Command(os.Args[0], os.Args[1:]...) //nolint:gosec // re-runs this very test binary
+	cmd.Env = append(gfEnvWithout(os.Environ(), gfEastAsianEnv), gfWidthChildEnv+"=1")
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	err := cmd.Run()
+	var exit *exec.ExitError
+	switch {
+	case err == nil:
+		return 0, true
+	case errors.As(err, &exit):
+		return exit.ExitCode(), true
+	default:
+		fmt.Fprintf(os.Stderr, "tui: re-running the test binary without %s: %v\n", gfEastAsianEnv, err)
+		return 1, true
+	}
+}
+
+// gfEnvWithout returns env without any assignment of the named variable.
+func gfEnvWithout(env []string, name string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if k, _, ok := strings.Cut(kv, "="); ok && k == name {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
+}
+
 // TestMain pins the ambient rendering environment before a single frame is
 // drawn, so the whole package renders the same way on every machine.
 //
-// Two things leak in otherwise. The global Lip Gloss renderer detects a
+// Three things leak in otherwise. The global Lip Gloss renderer detects a
 // colour profile from the process's stdout: Ascii under a piped `go test`,
 // but ANSI or truecolor under CLICOLOR_FORCE, or whenever the compiled test
 // binary is run on a tty. Nothing in this package may build a style from
@@ -78,8 +146,17 @@ var gfBrief = tui.DemoOptions{Delay: -1, Brief: "make the http client retry", Sa
 // [TestGoldenFramesCarryNoEscapes] loudly, instead of silently rendering
 // plain for whoever happens to run the suite through a pipe. The second leak
 // is SC_NO_ANIM, which would otherwise switch the animated frame off in a
-// shell that exports it (P7-09).
+// shell that exports it. The third is RUNEWIDTH_EASTASIAN, which cannot be
+// unset from here at all because the width libraries latch it at start-up:
+// the whole run is handed to a child process without it instead
+// (gfRerunWithNarrowWidth), so a developer who exports that variable gets
+// the same frames as CI rather than 91 failures — and, worse, rather than a
+// `make update-golden-tui` that rewrites every frame with two-cell padding
+// (P7-09).
 func TestMain(m *testing.M) {
+	if code, rerun := gfRerunWithNarrowWidth(); rerun {
+		os.Exit(code)
+	}
 	lipgloss.SetColorProfile(termenv.TrueColor)
 	lipgloss.SetHasDarkBackground(true)
 	if err := os.Unsetenv(tui.NoAnimEnv); err != nil {
@@ -296,6 +373,41 @@ func TestGoldenFramesIgnoreTheGlobalRenderer(t *testing.T) {
 	}
 }
 
+// gfEAChildEnv marks the child process
+// [TestGoldenFramesSurviveEastAsianWidth] starts, so that child does not
+// start one of its own.
+const gfEAChildEnv = "SC_TUI_GOLDEN_EASTASIAN_CHILD"
+
+// TestGoldenFramesSurviveEastAsianWidth runs the golden suite again in a
+// child process started with RUNEWIDTH_EASTASIAN=1 — the variable a terminal
+// configured for ambiguous-width 2 exports, and the one setting that would
+// otherwise silently re-pad every frame. The child must pass: [TestMain]
+// hands the run on to a process without the variable, so the frames a
+// developer with it exported renders, compares and regenerates are the ones
+// CI has.
+//
+// The proof has to be a second process, because the width libraries latch
+// the mode at package initialisation.
+func TestGoldenFramesSurviveEastAsianWidth(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv(gfEAChildEnv) != "" || gfEastAsianWidth() {
+		t.Skip("already running under the ambiguous-width mode")
+	}
+	cmd := exec.CommandContext(t.Context(), os.Args[0], //nolint:gosec // re-runs this very test binary
+		"-test.run", "^TestGoldenFrames", "-test.count=1", "-test.timeout=5m")
+	// Two variables are cleared from the child's environment. UPDATE_GOLDEN,
+	// because a rewrite must never come from a process whose width mode is
+	// in question; and gfWidthChildEnv, which this process inherits when it
+	// is itself the re-executed child of a hostile shell — leaving it set
+	// would tell the child it had already been through [TestMain]'s re-exec,
+	// and the test would then measure the very failure it exists to prevent.
+	env := gfEnvWithout(gfEnvWithout(os.Environ(), "UPDATE_GOLDEN"), gfWidthChildEnv)
+	cmd.Env = append(env, gfEastAsianEnv+"=1", gfEAChildEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "the golden frames fail with %s=1:\n%s", gfEastAsianEnv, out)
+}
+
 // TestGoldenFrameWithAnimationDrawsSprites proves the animated scenario is
 // worth pinning: the layer really did composite something over the chrome,
 // so the golden would notice a projectile that drew in the wrong place.
@@ -328,7 +440,8 @@ func gfPlain(s string) string { return gfAnyEscape.ReplaceAllString(s, "") }
 // scenario to any view means adding its file here in the same change.
 var gfViewGoldens = []string{
 	"agents-empty", "agents-history", "agents-killed", "agents-live",
-	"agents-narrow", "agents-transcript", "agents-transcript-scrolled", "agents-wide",
+	"agents-narrow", "agents-transcript", "agents-transcript-ended", "agents-transcript-scrolled",
+	"agents-wide",
 	"anim-burst", "anim-confetti", "anim-disabled", "anim-over-frame",
 	"anim-queue", "anim-ricochet", "anim-shot", "anim-shot-tab",
 	"anim-smoke", "feedback", "feedback-arbitration", "feedback-changes",
@@ -378,6 +491,89 @@ func TestGoldenFrameFilesAreReadable(t *testing.T) {
 	}
 	require.Len(t, matches, len(want),
 		"every scenario needs a golden; run `make update-golden` and check gfViewGoldens")
+}
+
+// gfCheckGoldenPathspec is the pathspec `make check-golden` passes to `git
+// status` when it decides whether a regenerated golden changed. Every golden
+// in the repo has to be covered by it: one that is not is regenerated by the
+// target and then silently ignored, so the gate reports a clean tree while
+// the file on disk is stale (P7-09).
+var gfCheckGoldenPathspec = regexp.MustCompile(`git status --porcelain --(.*)\)`)
+
+// TestCheckGoldenCoversEveryGoldenSuffix reads the Makefile and requires the
+// check-golden pathspec to match every golden file in the repository, whatever
+// its extension: `*.golden` alone silently skips the 22 `*.golden.md` prompt
+// goldens, because a git pathspec is matched against the whole name.
+func TestCheckGoldenCoversEveryGoldenSuffix(t *testing.T) {
+	t.Parallel()
+	mk, err := os.ReadFile("../../Makefile") //nolint:gosec // the repository's own Makefile
+	require.NoError(t, err)
+	m := gfCheckGoldenPathspec.FindStringSubmatch(string(mk))
+	require.Len(t, m, 2, "the check-golden target no longer runs `git status --porcelain --`")
+	patterns := gfPathspecPatterns(m[1])
+	require.NotEmpty(t, patterns)
+
+	goldens := gfRepoGoldens(t)
+	require.NotEmpty(t, goldens, "no golden files found under the repository root")
+	for _, name := range goldens {
+		require.Truef(t, gfPathspecMatches(patterns, name),
+			"`make check-golden` ignores %s: its pathspec (%s) does not match that name, so a stale copy passes the gate",
+			name, strings.Join(patterns, " "))
+	}
+}
+
+// gfPathspecPatterns splits the quoted words of a shell pathspec list.
+func gfPathspecPatterns(list string) []string {
+	var out []string
+	for _, f := range strings.Fields(list) {
+		if f = strings.Trim(f, `'"`); f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// gfPathspecMatches reports whether any pattern matches the file's base name,
+// which is how git matches a leading-`*` pathspec against a tracked path.
+func gfPathspecMatches(patterns []string, base string) bool {
+	for _, p := range patterns {
+		if ok, err := path.Match(strings.TrimPrefix(p, "*/"), base); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+// gfRepoGoldens returns the distinct base names of every golden file in the
+// repository, one per extension, so the assertion above names a real file.
+func gfRepoGoldens(t *testing.T) []string {
+	t.Helper()
+	seen := map[string]string{}
+	skip := map[string]bool{".git": true, "bin": true, "dist": true, "vendor": true}
+	require.NoError(t, filepath.WalkDir("../..", func(_ string, d fs.DirEntry, err error) error {
+		switch {
+		case err != nil:
+			// A file another test is writing right now is not this
+			// test's business; the walk carries on.
+			return nil
+		case d.IsDir():
+			if skip[d.Name()] {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		base := d.Name()
+		if i := strings.Index(base, ".golden"); i >= 0 {
+			seen[base[i:]] = base
+		}
+		return nil
+	}))
+	out := make([]string, 0, len(seen))
+	for _, base := range seen {
+		out = append(out, base)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // TestGoldenFramesMatchTheProgram runs the real Bubble Tea program over the

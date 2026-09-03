@@ -9,7 +9,7 @@
   sc-g7h8    ✓ ✓ ✓ │   ⚙ report move the transport into its own package
   sc-i9j0    ✓ ✓ ✓ │   ✓ ux   approve nothing user facing
   sc-k1l2    · ✗ · │   ✗ qa   changes one major
-[1m▌ [0msc-m3n4    ✓ ✓ ◐ │     ▲ major   qa-r1-1   Rebase dropped the timeout guard [resolved]
+[1m▌ [0msc-m3n4    ✓ ✓ ◐ │     ▲ major   qa-r1-1   [resolved] Rebase dropped the timeout guard
                    │   ✓ test approve tests moved with it
                    │
                    │ [1mround 2[0m · review · d6e7f80 · ux,qa,test

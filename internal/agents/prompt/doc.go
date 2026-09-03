@@ -31,10 +31,19 @@
 // it: the caller that fires the agent must call [Prompt.Write] with its run
 // directory, and a caller that does not leaves the run with no debug copy.
 //
-// Quoted context — the tree summary, the README head, a diff — is wrapped
-// with [Fenced], which picks a fence longer than any run of backticks inside
-// the content. Prompt layers assembled elsewhere ([Section] bodies) should
-// use it too: a three-backtick wrapper around a README or a Markdown diff
-// lets the content close the block early and turns the rest of the prompt
-// into structure the agent misreads.
+// Quoted context — the tree summary, the README head, a diff, and every
+// piece of prose an agent wrote (a bead description and its acceptance
+// criteria, an earlier round's impl_report summary) — is wrapped with
+// [Fenced], which picks a fence longer than any run of backticks inside the
+// content. Everything else agent-written is collapsed onto one line. Nothing
+// an agent produced may become prompt structure: a three-backtick wrapper
+// around a README or a Markdown diff lets the content close the block early,
+// and unquoted prose can open a "## " heading or a result block of its own,
+// so the rest of the prompt — the output contract among them — is read as
+// something the cannon never said. Prompt layers assembled elsewhere
+// ([Section] bodies) must use [Fenced] for the same reason.
+//
+// The output contract is always the last thing in the prompt, even when an
+// earlier layer quotes one: [Build] appends it unless the text already ends
+// with it (structured.Contract.EndsWithPromptSuffix).
 package prompt

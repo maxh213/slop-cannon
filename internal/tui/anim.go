@@ -561,7 +561,9 @@ func graphNodeCell(g GraphModel, st *State, bead domain.BeadID) (Target, bool) {
 	if !ok {
 		return Target{}, false
 	}
-	cursor := clampIndex(g.Cursor(), lay.Len())
+	// The graph view pins its selection to a bead id, so ask it where the
+	// selection is now rather than reusing the row it was on (P7-02).
+	cursor := g.index(lay)
 	_, boxes := g.paint(lay, orientation == GraphTopToBottom, cursor)
 	offX, offY := g.scroll(boxes[cursor])
 	b := boxes[idx]

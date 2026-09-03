@@ -436,3 +436,171 @@ func TestFormatEventCoversEveryKind(t *testing.T) {
 		require.NotContains(t, tui.FormatEvent(ev), "%!", "%s formats badly when empty", k)
 	}
 }
+
+// tuiNastyLine is one line of subprocess output the way a real cartridge CLI
+// writes it: SGR colour, a screen-clearing CSI the terminal would honour, an
+// OSC string, a C1 control, a tab and an embedded newline that would take a
+// second body row the log draws without a cursor gutter.
+const tuiNastyLine = "boom \x1b[31mRED\x1b[0m and \x1b[2J\ttabbed \x1b]0;title\x07\x9bx a newline\nSECOND LINE"
+
+// tuiControls returns every character of s a terminal reads as an
+// instruction rather than as text.
+func tuiControls(s string) []string {
+	var out []string
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			out = append(out, fmt.Sprintf("%q", r))
+		}
+	}
+	return out
+}
+
+// tuiRequireSafeLine fails when s could do anything to the terminal but put
+// printable characters in the row it was drawn in.
+func tuiRequireSafeLine(t *testing.T, s, what string) {
+	t.Helper()
+	require.Empty(t, tuiControls(s), "%s carries control characters: %q", what, s)
+}
+
+func TestFormatEventSanitizesUntrustedSubprocessText(t *testing.T) {
+	t.Parallel()
+	meta := events.NewMeta("r")
+	for _, tc := range []struct {
+		name  string
+		event events.Event
+	}{{
+		name:  "agent output",
+		event: events.AgentOutput{Meta: meta, Agent: "av-1", Stream: events.StreamStdout, Line: tuiNastyLine},
+	}, {
+		name:  "warning",
+		event: events.Warning{Meta: meta, Source: "cartridge", Message: tuiNastyLine, Err: tuiNastyLine},
+	}, {
+		name:  "error",
+		event: events.Error{Meta: meta, Source: "cartridge", Message: tuiNastyLine, Err: tuiNastyLine},
+	}, {
+		name: "implementation report summary",
+		event: events.ResponseReceived{Meta: meta, Bead: "b-1", Round: 1, Agent: "av-1",
+			Report: &domain.ImplReport{Summary: tuiNastyLine}},
+	}, {
+		name:  "bead title",
+		event: events.BeadCreated{Meta: meta, Bead: domain.Bead{ID: "b-1", Title: tuiNastyLine}},
+	}, {
+		name:  "run finished summary",
+		event: events.RunFinished{Meta: meta, Summary: tuiNastyLine},
+	}} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			line := tui.FormatEvent(tc.event)
+			tuiRequireSafeLine(t, line, tc.name)
+			require.NotContains(t, line, "\x1b[2J", "the clear-screen survived")
+			require.Contains(t, line, "SECOND LINE", "the text after the newline is kept, on the same row")
+		})
+	}
+}
+
+func TestFormatEventLeavesPrintableTextAlone(t *testing.T) {
+	t.Parallel()
+	line := tui.FormatEvent(events.AgentOutput{
+		Meta: events.NewMeta("r"), Agent: "av-1", Stream: events.StreamStdout,
+		Line: "step 12: editing internal/http/client.go — 100% done",
+	})
+	require.Equal(t, "av-1 stdout: step 12: editing internal/http/client.go — 100% done", line)
+}
+
+func TestModelLogTabDrawsNoEscapeFromAnAgent(t *testing.T) {
+	t.Parallel()
+	const w, h = 120, 24
+	m := tuiResize(tuiNewModel(t, nil), w, h)
+	m = tuiUpdate(m, tui.EventMsg{Event: events.AgentOutput{
+		Meta: events.NewMeta("r"), Agent: "av-1", Stream: events.StreamStdout, Line: tuiNastyLine,
+	}})
+	m = tuiUpdate(m, tui.EventMsg{Event: events.Warning{
+		Meta: events.NewMeta("r"), Source: "cartridge", Message: tuiNastyLine,
+	}})
+	m = tuiUpdate(m, tuiKey("5"))
+	require.Equal(t, tui.TabLog, m.Tab())
+
+	frame := m.View()
+	require.NotContains(t, frame, "\x1b[2J", "the log tab drew a clear-screen from an agent")
+	require.NotContains(t, frame, "\x1b[31m", "the log tab drew an agent's colour")
+	require.NotContains(t, frame, "\x1b]0;title", "the log tab drew an OSC string")
+	lines := strings.Split(frame, "\n")
+	require.Len(t, lines, h, "an embedded newline took an extra row")
+	for i, l := range lines {
+		require.LessOrEqual(t, lipgloss.Width(l), w, "line %d is too wide: %q", i, l)
+	}
+
+	rows := 0
+	for _, l := range lines {
+		if strings.Contains(l, "SECOND LINE") {
+			rows++
+			require.Contains(t, l, "boom", "the line was split over two rows")
+			require.True(t, strings.HasPrefix(l, "▌ ") || strings.HasPrefix(l, "  "),
+				"a log row lost its cursor gutter: %q", l)
+		}
+	}
+	require.Equal(t, 2, rows, "one row for the agent line and one for the warning")
+}
+
+func TestStateCapsNoticesLikeTheLog(t *testing.T) {
+	t.Parallel()
+	s := tui.NewState(domain.Run{ID: "r"})
+	for i := range 5000 {
+		s.Apply(events.Warning{Meta: events.NewMeta("r"), Message: fmt.Sprintf("w%d", i)})
+	}
+	require.Len(t, s.Log, tui.DefaultLogLines)
+	require.Len(t, s.Notices, tui.DefaultLogLines, "notices grow without bound")
+	require.Equal(t, "w4999", s.Notices[len(s.Notices)-1].Message, "the newest notice is kept")
+	require.Equal(t, "w4500", s.Notices[0].Message, "the oldest notices are dropped")
+
+	small := tui.NewState(domain.Run{ID: "r"})
+	small.MaxLog = 3
+	for i := range 10 {
+		small.Apply(events.Error{Meta: events.NewMeta("r"), Message: fmt.Sprintf("e%d", i)})
+	}
+	require.Len(t, small.Notices, 3)
+	require.Equal(t, "e7", small.Notices[0].Message)
+}
+
+func TestStateSanitizesNoticeText(t *testing.T) {
+	t.Parallel()
+	s := tui.NewState(domain.Run{ID: "r"})
+	s.Apply(events.Error{Meta: events.NewMeta("r"), Source: "cartridge", Message: tuiNastyLine, Err: tuiNastyLine})
+	require.Len(t, s.Notices, 1)
+	tuiRequireSafeLine(t, s.Notices[0].Message, "notice message")
+	tuiRequireSafeLine(t, s.Notices[0].Err, "notice error")
+	require.Contains(t, s.Notices[0].Message, "SECOND LINE")
+}
+
+func TestModelHelpOverlayShowsTheActiveViewsKeys(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		tab  tui.Tab
+		key  string
+		want []string
+	}{
+		{tui.TabGraph, "1", []string{"prev level", "next level", "bead detail", "first bead", "last bead"}},
+		{tui.TabAgents, "2", []string{"transcript", "follow", "page up", "newest"}},
+		{tui.TabFeedback, "3", []string{"details", "scroll up", "scroll down", "first round", "last round"}},
+		{tui.TabPRs, "4", []string{"open PR"}},
+		{tui.TabLog, "5", nil},
+	} {
+		t.Run(tc.tab.String(), func(t *testing.T) {
+			t.Parallel()
+			m := tuiFeed(tuiResize(tuiNewModel(t, nil), 120, 40))
+			m = tuiUpdate(tuiUpdate(m, tuiKey(tc.key)), tuiKey("?"))
+			require.Equal(t, tc.tab, m.Tab())
+			require.True(t, m.HelpVisible())
+			view := m.View()
+			require.Contains(t, view, "next view", "the global keys stay in the overlay")
+			if len(tc.want) == 0 {
+				require.NotContains(t, view, tc.tab.String()+" keys", "the log view adds no keys of its own")
+				return
+			}
+			require.Contains(t, view, tc.tab.String()+" keys", "the overlay does not name the view's keys")
+			for _, want := range tc.want {
+				require.Contains(t, view, want, "the %s overlay omits %q", tc.tab, want)
+			}
+		})
+	}
+}

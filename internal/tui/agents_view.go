@@ -643,9 +643,19 @@ const (
 	agentsTaskWidth = 58
 )
 
-// cardRight is the elapsed time and the spinner of a card's first line.
+// cardRight is the elapsed time and, while the agent still runs, the
+// spinner of a card's first line. An agent that has ended gets a blank in
+// the spinner's column instead: it keeps the elapsed clock in the same
+// column as the live cards above it, and it stops a finished, failed or
+// killed agent from contradicting its own lifecycle glyph by appearing to
+// still be turning (the transcript pane draws the card of whichever agent
+// is selected, ended ones included).
 func (v AgentsModel) cardRight(a AgentView) string {
-	return v.styles.Value.Render(v.elapsed(a)) + " " + v.styles.Spinner.Render(agentsSpinner[v.frame])
+	spin := " "
+	if a.Live() {
+		spin = v.styles.Spinner.Render(agentsSpinner[v.frame])
+	}
+	return v.styles.Value.Render(v.elapsed(a)) + " " + spin
 }
 
 // historyRow renders one finished, failed or killed agent as a single line.
@@ -749,10 +759,13 @@ func agentsWork(a AgentView) string {
 }
 
 // agentsTail is the second line of a card: the agent's last output line, or
-// what it produced once it ended.
+// what it produced once it ended. The last line comes straight off the
+// cartridge's stdout or stderr — [State] keeps it verbatim — so it is
+// sanitised here for the same reason the transcript is sanitised on ingest:
+// raw subprocess bytes would otherwise repaint or corrupt the frame.
 func agentsTail(a AgentView) string {
 	if a.LastLine != "" {
-		return a.LastLine
+		return agentsSanitize(a.LastLine)
 	}
 	if !a.Live() {
 		return agentsOutcome(a)
@@ -766,7 +779,9 @@ func agentsOutcome(a AgentView) string {
 	case domain.AgentStateFinished:
 		return fmt.Sprintf("%s (exit %d)", orDash(string(a.Produced)), a.ExitCode)
 	case domain.AgentStateFailed, domain.AgentStateKilled:
-		return strings.TrimSpace(fmt.Sprintf("%s %s", orDash(string(a.Failure)), parens(a.Err)))
+		// The error text can quote what the process printed before it died,
+		// so it is sanitised like any other subprocess bytes.
+		return strings.TrimSpace(fmt.Sprintf("%s %s", orDash(string(a.Failure)), parens(agentsSanitize(a.Err))))
 	default:
 		return string(a.State)
 	}

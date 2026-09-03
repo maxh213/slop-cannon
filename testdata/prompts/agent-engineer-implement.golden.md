@@ -97,12 +97,16 @@ A tiny Go command-line tool that prints statistics for a list of numbers.
 
 Description:
 
+```
 README promises a median but stats has none.
+```
 
 Acceptance criteria (every one of these must hold):
 
+```
 - stats.Median returns the middle value
 - table test covers even and odd lengths
+```
 
 ## How to implement this bead
 

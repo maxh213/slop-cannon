@@ -1060,3 +1060,331 @@ func TestGraphPlural(t *testing.T) {
 	require.Contains(t, out, "1 level")
 	require.NotContains(t, out, "1 levels")
 }
+
+// gvReplan replaces the run's graph with beads, the way the product owner's
+// second plan reaches the view (D-18: it re-plans whenever the ready queue
+// empties).
+func gvReplan(st *State, beads []domain.Bead) {
+	st.Apply(events.GraphChanged{Meta: gvMeta(9), Epic: "sc-epic", Beads: beads})
+}
+
+// TestGraphSelectionIsPinnedToTheBead checks that a re-plan cannot move the
+// cursor — or an open detail panel — onto a different bead. One new root bead
+// renumbers every level after it, so the position the cursor was on belongs
+// to somebody else afterwards.
+func TestGraphSelectionIsPinnedToTheBead(t *testing.T) {
+	st := gvState(gvDiamond())
+	keys := DefaultKeyMap()
+	v := gvView(120, 30, GraphOptions{})
+
+	v, _ = v.Update(gvKey("down"), st, keys)
+	v, _ = v.Update(gvKey("right"), st, keys)
+	sel, ok := v.Selected(st)
+	require.True(t, ok)
+	require.Equal(t, domain.BeadID("sc-sink"), sel.ID)
+	v, _ = v.Update(gvKey("enter"), st, keys)
+	require.True(t, v.ShowingDetail())
+	require.Equal(t, domain.BeadID("sc-sink"), v.SelectedID())
+	_, ok = v.Update(gvKey("z"), st, keys)
+	require.False(t, ok, "a key the panel has no use for is left to the global map")
+	was := v.Cursor()
+
+	// The re-plan puts a new bead on level 0, ahead of every bead that was
+	// there: every index after it moves by one.
+	replanned := append([]domain.Bead{gvBead("sc-newr", "Audit the timeouts", domain.BeadStateOpen, 0)}, gvDiamond()...)
+	gvReplan(st, replanned)
+	lay := BuildGraphLayout(st)
+	require.Equal(t, 5, lay.Len())
+	moved, ok := lay.Index("sc-sink")
+	require.True(t, ok)
+	require.NotEqual(t, was, moved, "the fixture must move the bead, or it proves nothing")
+	require.Equal(t, domain.BeadID("sc-rght"), lay.Nodes[was].ID, "the old position now belongs to another bead")
+
+	sel, ok = v.Selected(st)
+	require.True(t, ok)
+	require.Equal(t, domain.BeadID("sc-sink"), sel.ID, "the selection follows the bead, not the index")
+	require.True(t, v.ShowingDetail())
+	pane := v.View(st)
+	require.Contains(t, pane, "sc-sink")
+	require.NotContains(t, pane, "Cache DNS lookups", "the open panel still describes the bead it was opened on")
+
+	// Moving again starts from where the bead is now, not from the stale row.
+	v, _ = v.Update(gvKey("esc"), st, keys)
+	require.Equal(t, moved, v.Cursor())
+	v, _ = v.Update(gvKey("left"), st, keys)
+	sel, _ = v.Selected(st)
+	require.Equal(t, domain.BeadID("sc-left"), sel.ID, "left from the sink steps back a level from where it is now")
+
+	// A bead that leaves the run altogether gives the cursor back: the
+	// clamped row is used again, and the view keeps working.
+	gvReplan(st, gvChain())
+	sel, ok = v.Selected(st)
+	require.True(t, ok)
+	require.NotEmpty(t, sel.ID)
+	require.NotPanics(t, func() { _ = v.View(st) })
+}
+
+// TestGraphSelectionSurvivesTheBoxedLayouts checks the pinned selection is
+// what the scroll offset and the animation targets follow too, so a re-plan
+// cannot scroll the pane onto a bead nobody selected.
+func TestGraphSelectionSurvivesTheBoxedLayouts(t *testing.T) {
+	st := gvState(gvBig())
+	keys := DefaultKeyMap()
+	v := gvView(80, 24, GraphOptions{Orientation: GraphLeftToRight})
+	for range 12 {
+		v, _ = v.Update(gvKey("down"), st, keys)
+	}
+	sel, ok := v.Selected(st)
+	require.True(t, ok)
+	x, y := v.Viewport(st)
+
+	// A new root bead shifts every index; the viewport must not move.
+	gvReplan(st, append([]domain.Bead{gvBead("sc-new0", "Audit the timeouts", domain.BeadStateOpen, 0)}, gvBig()...))
+	again, ok := v.Selected(st)
+	require.True(t, ok)
+	require.Equal(t, sel.ID, again.ID)
+	nx, ny := v.Viewport(st)
+	require.Equal(t, [2]int{x, y}, [2]int{nx, ny}, "the pane still shows the selected bead")
+
+	target, ok := graphNodeCell(v, st, sel.ID)
+	require.True(t, ok, "the animator aims at the selected bead's own box")
+	require.GreaterOrEqual(t, target.Row, animGraphTop)
+}
+
+// gvHostileTitle is a bead title with a line break in it: a plan is written
+// by an LLM, so nothing stops one arriving.
+const gvHostileTitle = "boom\nsecond"
+
+// gvHostileEscape is a bead title carrying an ANSI colour sequence.
+const gvHostileEscape = "esc \x1b[31mRED\x1b[0m x"
+
+// gvHostile is a graph whose text would corrupt the frame if it were drawn
+// as it arrived: a line break splits a row in two, an escape sequence
+// repaints it, and Lip Gloss measures both as zero columns.
+func gvHostile() []domain.Bead {
+	a := gvBead("sc-boom", gvHostileTitle, domain.BeadStateOpen, 0)
+	a.Description = "first\n\x1b[31mred\x1b[0m\ttabbed\nlast"
+	a.Acceptance = "it \x1b]0;title\x07works"
+	b := gvBead("sc-escp", gvHostileEscape, domain.BeadStateInProgress, 1, "sc-boom")
+	b.Description = "carriage\rreturn"
+	return []domain.Bead{a, b}
+}
+
+// gvLines splits a rendered pane and reports the width of each line.
+func gvLines(t *testing.T, pane string) ([]string, []int) {
+	t.Helper()
+	lines := strings.Split(pane, "\n")
+	widths := make([]int, len(lines))
+	for i, l := range lines {
+		widths[i] = lipgloss.Width(l)
+	}
+	return lines, widths
+}
+
+// TestGraphViewScrubsBeadText checks that bead text — which the product
+// owner's LLM wrote — cannot split a row, repaint the frame or hide an
+// escape sequence in it, in every layout the view has.
+func TestGraphViewScrubsBeadText(t *testing.T) {
+	st := gvState(gvHostile())
+	layouts := []struct {
+		name string
+		w, h int
+		opts GraphOptions
+	}{
+		{"left-to-right", 200, 50, GraphOptions{Orientation: GraphLeftToRight}},
+		{"top-to-bottom", 100, 60, GraphOptions{Orientation: GraphTopToBottom}},
+		{"list", 60, 24, GraphOptions{}},
+	}
+	for _, tc := range layouts {
+		t.Run(tc.name, func(t *testing.T) {
+			v := gvView(tc.w, tc.h, tc.opts)
+			pane := v.View(st)
+			lines, widths := gvLines(t, pane)
+			require.Len(t, lines, tc.h-chromeHeight, "the pane is exactly as tall as it was sized")
+			for i, w := range widths {
+				require.LessOrEqualf(t, w, tc.w, "line %d is wider than the pane: %q", i, lines[i])
+			}
+			require.NotContains(t, pane, "\x1b[31m", "the bead's own escape sequence never reaches the frame")
+			require.NotContains(t, pane, "\x1b]", "nor an operating-system command")
+			require.Contains(t, pane, "boom second", "the line break became a space")
+			require.NotContains(t, pane, "\rreturn")
+		})
+	}
+
+	// The detail panel wraps the description itself, so it keeps the
+	// paragraph breaks and drops everything else.
+	v, ok := gvView(80, 24, GraphOptions{}).Update(gvKey("enter"), st, DefaultKeyMap())
+	require.True(t, ok)
+	pane := v.View(st)
+	lines, widths := gvLines(t, pane)
+	require.Len(t, lines, 24-chromeHeight)
+	for i, w := range widths {
+		require.LessOrEqualf(t, w, 80, "detail line %d is wider than the pane: %q", i, lines[i])
+	}
+	require.NotContains(t, pane, "\x1b[31m")
+	require.NotContains(t, pane, "\x1b]0;")
+	require.Contains(t, pane, "first")
+	require.Contains(t, pane, "red")
+	require.Contains(t, pane, "last")
+	require.Contains(t, pane, "it works", "an OSC string is dropped whole")
+}
+
+// TestGraphScrubbers checks the two scrubbers themselves: one row of text
+// and a block that keeps its paragraph breaks.
+func TestGraphScrubbers(t *testing.T) {
+	require.Equal(t, "plain title", graphText("plain title"))
+	require.Equal(t, "", graphText(""))
+	require.Equal(t, "boom second", graphText("boom\nsecond"))
+	require.Equal(t, "esc RED x", graphText("esc \x1b[31mRED\x1b[0m x"))
+	require.Equal(t, "a    b", graphText("a\tb"), "a tab becomes four spaces, as in a transcript")
+	require.Equal(t, "carriage return", graphText("carriage\rreturn"))
+	require.Equal(t, "no controls", graphBlock("no controls"))
+	require.Equal(t, "one\ntwo", graphBlock("one\ntwo"), "paragraph breaks survive")
+	require.Equal(t, "one\ntwo", graphBlock("one\r\ntwo"))
+	require.Equal(t, "one\nred", graphBlock("one\n\x1b[31mred\x1b[0m"))
+	require.True(t, graphControl('\x1b'))
+	require.True(t, graphControl(0x9b))
+	require.False(t, graphControl('a'))
+}
+
+// gvWideTitle is a bead title made of double-width characters.
+const gvWideTitle = "修复重试逻辑"
+
+// TestGraphViewDoubleWidthTitles checks a box keeps its shape when the plan
+// is not written in ASCII: a CJK or emoji rune takes two terminal cells, and
+// a canvas that wrote one rune per cell would push the right border out.
+func TestGraphViewDoubleWidthTitles(t *testing.T) {
+	beads := []domain.Bead{
+		gvBead("sc-wide", gvWideTitle, domain.BeadStateOpen, 0),
+		gvBead("sc-emji", "ship it 🚀 now", domain.BeadStateInProgress, 1, "sc-wide"),
+	}
+	st := gvState(beads)
+	v := gvView(200, 50, GraphOptions{Orientation: GraphLeftToRight})
+	lines, widths := gvLines(t, v.View(st))
+
+	// Lines 1…4 are the two boxes and the edge between them: every row of a
+	// box is exactly as wide as the box.
+	for i := 1; i <= GraphBoxHeight; i++ {
+		require.Equalf(t, GraphBoxWidth, gvBoxWidth(lines[i]),
+			"row %d of the box is not %d columns: %q", i, GraphBoxWidth, lines[i])
+	}
+	for i, w := range widths {
+		require.LessOrEqual(t, w, 200, "line %d: %q", i, lines[i])
+	}
+	require.Contains(t, v.View(st), "修复重试", "the title is drawn, not dropped")
+}
+
+// gvBoxWidth measures the first box on a rendered row: from its left border
+// to the matching right one.
+func gvBoxWidth(line string) int {
+	start := strings.IndexAny(line, "┌│└┏┃┗")
+	if start < 0 {
+		return 0
+	}
+	rs := []rune(line[start:])
+	for i := 1; i < len(rs); i++ {
+		if strings.ContainsRune("┐│┘┓┃┛", rs[i]) {
+			return lipgloss.Width(string(rs[:i+1]))
+		}
+	}
+	return lipgloss.Width(string(rs))
+}
+
+// TestGraphCanvasDoubleWidthCells checks the canvas itself: a double-width
+// rune covers two cells, a window that cuts one in half draws a space in its
+// place, and writing over either half never strands the other.
+func TestGraphCanvasDoubleWidthCells(t *testing.T) {
+	c := newGraphCanvas(6, 1)
+	c.text(0, 0, "漢字", nil)
+	require.Equal(t, "漢字", c.row(0, 0, 6))
+	require.Equal(t, 4, lipgloss.Width(c.row(0, 0, 6)))
+	require.Equal(t, "漢", c.row(0, 0, 3), "the second rune would not fit whole")
+	require.Equal(t, " 字", c.row(0, 1, 3), "a half rune at the left edge becomes a space")
+
+	// Writing over the left half blanks the right half with it.
+	over := newGraphCanvas(6, 1)
+	over.text(0, 0, "漢字", nil)
+	over.text(0, 0, "ab", nil)
+	require.Equal(t, "ab字", over.row(0, 0, 6))
+
+	// …and writing over the right half blanks the left one.
+	half := newGraphCanvas(6, 1)
+	half.text(0, 0, "漢字", nil)
+	half.text(1, 0, "x", nil)
+	require.Equal(t, " x字", half.row(0, 0, 6))
+
+	// A control character takes no column, so it is never written at all.
+	ctrl := newGraphCanvas(4, 1)
+	ctrl.text(0, 0, "a\x1bb", nil)
+	require.Equal(t, "ab", ctrl.row(0, 0, 4))
+
+	// An edge never lands on either half of a wide rune.
+	edge := newGraphCanvas(6, 1)
+	edge.text(0, 0, "漢", nil)
+	edge.polyline([]graphPoint{{0, 0}, {5, 0}}, nil, true)
+	require.Equal(t, "漢────", edge.row(0, 0, 6), "the edge starts after the wide rune's two cells")
+
+	// A rune the edge of the canvas cuts in half is never drawn as half.
+	off := newGraphCanvas(3, 1)
+	off.text(2, 0, "漢字", nil)
+	require.Equal(t, "", off.row(0, 0, 3), "the last column cannot hold either rune whole")
+	off.text(-2, 0, "ab", nil)
+	require.Equal(t, "", off.row(0, 0, 3))
+	off.text(0, 3, "ab", nil)
+	require.Equal(t, "", off.row(3, 0, 3))
+}
+
+// TestGraphRule checks the border rule: it is measured in cells, so a
+// box-drawing character a terminal renders two cells wide is repeated half as
+// often, and a width its glyph cannot divide is padded out with spaces.
+func TestGraphRule(t *testing.T) {
+	require.Equal(t, "─────", graphRule("─", 5))
+	require.Equal(t, "", graphRule("─", 0))
+	require.Equal(t, "", graphRule("─", -3))
+	require.Equal(t, "", graphRule("", 5), "a glyph of no width would never finish")
+	require.Equal(t, "漢漢 ", graphRule("漢", 5), "the odd cell is a space, not half a rune")
+	require.Equal(t, 5, lipgloss.Width(graphRule("漢", 5)))
+}
+
+// TestGraphKeysAreListedInTheHelpOverlay checks the `?` overlay documents the
+// bindings the graph view adds, which are otherwise invisible: `h` and `l`
+// shadow the global previous/next view while the graph is up.
+func TestGraphKeysAreListedInTheHelpOverlay(t *testing.T) {
+	st := gvState(gvDiamond())
+	m := New(t.Context(), Options{Run: st.Run, NoColor: true})
+	m.state = st
+	m.tab = TabGraph
+	overlay := m.helpOverlay(80, 20)
+	for _, want := range []string{"prev level", "next level", "bead detail", "close detail", "first bead", "last bead"} {
+		require.Contains(t, overlay, want)
+	}
+	require.Contains(t, overlay, m.tab.String()+" keys")
+}
+
+// TestThemeGraphBoxesHoldUnderAmbiguousWidth checks a bead box is
+// self-consistent in terminal cells: every row of it — the borders included —
+// is exactly as wide as the box, and never wider than the pane.
+//
+// The name starts with "Theme" on purpose:
+// [TestThemeGlyphColumnHoldsUnderEastAsianWidth] re-runs `^TestTheme` in a
+// child process started with RUNEWIDTH_EASTASIAN=1, where the state glyphs
+// and the box-drawing characters are two cells each, so this is the one test
+// that sees the graph drawn in that mode. Both the canvas and the borders
+// measure cells rather than runes, so the box holds together in either.
+func TestThemeGraphBoxesHoldUnderAmbiguousWidth(t *testing.T) {
+	st := gvState([]domain.Bead{
+		gvBead("sc-1a2b", "Add a retry budget", domain.BeadStateOpen, 2),
+		gvBead("sc-3c4d", "修复重试逻辑", domain.BeadStateInProgress, 1, "sc-1a2b"),
+	})
+	v := gvView(200, 50, GraphOptions{Orientation: GraphLeftToRight})
+	lines, widths := gvLines(t, v.View(st))
+	for i, w := range widths {
+		require.LessOrEqualf(t, w, 200, "line %d is wider than the pane: %q", i, lines[i])
+	}
+	want := gvBoxWidth(lines[1])
+	require.Positive(t, want)
+	for i := 1; i <= GraphBoxHeight; i++ {
+		require.Equalf(t, want, gvBoxWidth(lines[i]),
+			"row %d of the box is %d cells, not %d: %q", i, gvBoxWidth(lines[i]), want, lines[i])
+	}
+}

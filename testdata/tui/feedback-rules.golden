@@ -10,17 +10,17 @@
 [1m▌ [0msc-i9j0    ✓ ✓ ✓ │   ✓ ux   approve no interface change
   sc-k1l2    · ✗ · │   ✓ qa   approve streams as advertised
   sc-m3n4    ✓ ✓ ◐ │   ✗ test changes missing coverage
-                   │     [1m! blocker[0m test-r1-1 No test for the empty-body case (rules)
+                   │     [1m! blocker[0m test-r1-1 (rules) No test for the empty-body case
                    │
                    │ [1mround 2[0m · review · a3b4c5d · test
                    │   ⊘ wontfix  test-r1-1 the empty body is unreachable through the public API
                    │   ✗ test changes rules say every branch is tested
-                   │     [1m! blocker[0m test-r1-1 No test for the empty-body case (rules) [held]
+                   │     [1m! blocker[0m test-r1-1 (rules) [held] No test for the empty-body case
                    │   ⚖ uphold_tester    test-r1-1 add the test with a hand-built reader
                    │
                    │ [1mround 3[0m · review · b4c5d6e · test
                    │   ⚙ report add the empty-body test
                    │   → fixed    test-r1-1 added TestStreamEmptyBody
                    │   ✓ test approve covered now
-                   │     [1m! blocker[0m test-r1-1 No test for the empty-body case (rules) [resolved]
+                   │     [1m! blocker[0m test-r1-1 (rules) [resolved] No test for the empty-body case
 tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit

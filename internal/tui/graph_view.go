@@ -66,9 +66,6 @@ const (
 	GraphLayerGap = 3
 )
 
-// graphBoxInner is the writable width inside a box.
-const graphBoxInner = GraphBoxWidth - 2
-
 // graphCycleLabel is written into the top border of a bead the layering could
 // not place, which is how the boxed layouts show a dependency cycle.
 const graphCycleLabel = " cycle "
@@ -359,6 +356,7 @@ type GraphModel struct {
 
 	width, height int
 	cursor        int
+	selected      domain.BeadID
 	detail        bool
 	detailOff     int
 }
@@ -392,8 +390,39 @@ func (v GraphModel) Resize(w, h int) GraphModel {
 // Size returns the pane size the view was last resized to.
 func (v GraphModel) Size() (int, int) { return v.width, v.height }
 
-// Cursor returns the index of the selected bead in [GraphLayout.Nodes].
+// Cursor returns the row the last key press put the cursor on, as an index
+// into [GraphLayout.Nodes]. [GraphModel.Selected] is what follows the pinned
+// bead through a re-layering; this is the row number the chrome asks for.
 func (v GraphModel) Cursor() int { return v.cursor }
+
+// SelectedID returns the bead id the selection is pinned to, empty until the
+// cursor has been moved or a detail panel opened.
+func (v GraphModel) SelectedID() domain.BeadID { return v.selected }
+
+// index is the position of the selection in the layout: the position of the
+// pinned bead id while that bead is still in the run, and the clamped cursor
+// otherwise. The layering moves beads under the cursor — the product owner
+// re-plans whenever the ready queue empties (D-18), and a single new root
+// bead renumbers every level after it — so the pinned id, not the index, is
+// what keeps the selection (and an open detail panel) on the bead that was
+// chosen.
+func (v GraphModel) index(lay GraphLayout) int {
+	if v.selected != "" {
+		if i, ok := lay.Index(v.selected); ok {
+			return i
+		}
+	}
+	return clampIndex(v.cursor, lay.Len())
+}
+
+// moveTo puts the cursor on the i-th bead of the layout (clamped) and pins
+// the selection to that bead's id.
+func (v *GraphModel) moveTo(lay GraphLayout, i int) {
+	v.cursor = clampIndex(i, lay.Len())
+	if lay.Len() > 0 {
+		v.selected = lay.Nodes[v.cursor].ID
+	}
+}
 
 // Keys returns the view's own bindings.
 func (v GraphModel) Keys() GraphKeyMap { return v.keys }
@@ -428,7 +457,7 @@ func (v GraphModel) Selected(st *State) (GraphNode, bool) {
 	if lay.Len() == 0 {
 		return GraphNode{}, false
 	}
-	return lay.Nodes[clampIndex(v.cursor, lay.Len())], true
+	return lay.Nodes[v.index(lay)], true
 }
 
 // Viewport returns the top-left cell of the drawn graph that is visible: the
@@ -443,8 +472,9 @@ func (v GraphModel) Viewport(st *State) (x, y int) {
 	if lay.Len() == 0 {
 		return 0, 0
 	}
-	_, boxes := v.paint(lay, o == GraphTopToBottom, clampIndex(v.cursor, lay.Len()))
-	return v.scroll(boxes[clampIndex(v.cursor, lay.Len())])
+	cursor := v.index(lay)
+	_, boxes := v.paint(lay, o == GraphTopToBottom, cursor)
+	return v.scroll(boxes[cursor])
 }
 
 // Update handles one message and reports whether the view consumed it. It
@@ -458,7 +488,10 @@ func (v GraphModel) Update(msg tea.Msg, st *State, keys KeyMap) (GraphModel, boo
 	}
 	lay := BuildGraphLayout(st)
 	n := lay.Len()
-	v.cursor = clampIndex(v.cursor, n)
+	// Start from where the pinned bead is now, not from where the cursor was
+	// when it was last moved: the graph is re-planned under the view.
+	cur := v.index(lay)
+	v.cursor = cur
 	if v.detail {
 		switch {
 		case key.Matches(km, v.keys.Close), key.Matches(km, v.keys.Open):
@@ -469,7 +502,7 @@ func (v GraphModel) Update(msg tea.Msg, st *State, keys KeyMap) (GraphModel, boo
 			// Stop at the last page: an offset past it would show nothing
 			// new, and every press past it would have to be undone before a
 			// scroll back up moved the panel again.
-			v.detailOff = min(v.detailOff+1, v.detailMaxOffset(lay, st, v.cursor))
+			v.detailOff = min(v.detailOff+1, v.detailMaxOffset(lay, st, cur))
 		default:
 			return v, false
 		}
@@ -477,21 +510,24 @@ func (v GraphModel) Update(msg tea.Msg, st *State, keys KeyMap) (GraphModel, boo
 	}
 	switch {
 	case key.Matches(km, keys.Up):
-		v.cursor = clampIndex(v.cursor-1, n)
+		v.moveTo(lay, cur-1)
 	case key.Matches(km, keys.Down):
-		v.cursor = clampIndex(v.cursor+1, n)
+		v.moveTo(lay, cur+1)
 	case key.Matches(km, v.keys.Left):
-		v.cursor = graphStep(lay, v.cursor, -1)
+		v.moveTo(lay, graphStep(lay, cur, -1))
 	case key.Matches(km, v.keys.Right):
-		v.cursor = graphStep(lay, v.cursor, +1)
+		v.moveTo(lay, graphStep(lay, cur, +1))
 	case key.Matches(km, v.keys.Top):
-		v.cursor = 0
+		v.moveTo(lay, 0)
 	case key.Matches(km, v.keys.Bottom):
-		v.cursor = clampIndex(n-1, n)
+		v.moveTo(lay, n-1)
 	case key.Matches(km, v.keys.Open):
 		if n == 0 {
 			return v, false
 		}
+		// Pin the selection before the panel opens, so a re-plan cannot make
+		// an open panel describe a different bead.
+		v.moveTo(lay, cur)
 		v.detail, v.detailOff = true, 0
 	default:
 		return v, false
@@ -526,7 +562,7 @@ func (v GraphModel) View(st *State) string {
 	if lay.Len() == 0 {
 		return fit(v.summary(lay, "")+"\n"+v.theme.Muted().Render(emptyText[TabGraph]), w, h)
 	}
-	cursor := clampIndex(v.cursor, lay.Len())
+	cursor := v.index(lay)
 	if v.detail {
 		return fit(strings.Join(v.detailLines(lay, st, cursor, w, h), "\n"), w, h)
 	}
@@ -855,21 +891,27 @@ func (v GraphModel) drawBox(c *graphCanvas, b graphBox, n GraphNode, selected bo
 	// A bead the layering could not place carries the reason on its top
 	// border, so a cyclic graph is not mistaken for a healthy one when the
 	// colours are off.
-	top := strings.Repeat(hz, b.w-2)
-	if n.Cycle && b.w-2 > len(graphCycleLabel)+1 {
-		top = hz + graphCycleLabel + strings.Repeat(hz, b.w-2-len(graphCycleLabel)-1)
+	// Every part of the box is measured in terminal cells, not in runes: a
+	// terminal configured for ambiguous width draws a box-drawing character
+	// two cells wide, and a border counted in runes would then be twice as
+	// wide as the content it frames.
+	side := lipgloss.Width(vt)
+	inner := max(b.w-2*side, 0)
+	top := graphRule(hz, inner)
+	if label := lipgloss.Width(graphCycleLabel); n.Cycle && inner > label+lipgloss.Width(hz) {
+		top = hz + graphCycleLabel + graphRule(hz, inner-label-lipgloss.Width(hz))
 	}
 	c.text(b.x, b.y, tl+top+tr, &border)
-	c.text(b.x, b.y+b.h-1, bl+strings.Repeat(hz, b.w-2)+br, &border)
+	c.text(b.x, b.y+b.h-1, bl+graphRule(hz, inner)+br, &border)
 	for y := b.y + 1; y < b.y+b.h-1; y++ {
 		c.text(b.x, y, vt, &border)
-		c.text(b.x+b.w-1, y, vt, &border)
+		c.text(b.x+b.w-side, y, vt, &border)
 	}
 
 	right := graphPad(n.Badge(), 2) + " " + n.AgentGlyph()
-	left := graphTrunc(n.Glyph()+" "+string(n.ID), graphBoxInner-lipgloss.Width(right))
-	c.text(b.x+1, b.y+1, graphPad(left, graphBoxInner-lipgloss.Width(right))+right, &head)
-	c.text(b.x+1, b.y+2, graphPad(" "+graphTrunc(n.Title, graphBoxInner-1), graphBoxInner), &title)
+	left := graphTrunc(n.Glyph()+" "+graphText(string(n.ID)), inner-lipgloss.Width(right))
+	c.text(b.x+side, b.y+1, graphPad(left, inner-lipgloss.Width(right))+right, &head)
+	c.text(b.x+side, b.y+2, graphPad(" "+graphTrunc(graphText(n.Title), inner-1), inner), &title)
 }
 
 // listLines renders the narrow fallback: one line per bead, grouped and
@@ -920,10 +962,10 @@ func (v GraphModel) listLines(lay GraphLayout, cursor, w, h int) []string {
 // listRow renders one bead of the narrow fallback.
 func (v GraphModel) listRow(n GraphNode) string {
 	badge := graphPad(n.Badge(), 2)
-	head := v.theme.StateStyle(n.State).Render(graphPad(n.Glyph()+" "+string(n.ID), 13))
-	line := head + " " + v.theme.Muted().Render(badge) + " " + n.AgentGlyph() + " " + n.Title
+	head := v.theme.StateStyle(n.State).Render(graphPad(n.Glyph()+" "+graphText(string(n.ID)), 13))
+	line := head + " " + v.theme.Muted().Render(badge) + " " + n.AgentGlyph() + " " + graphText(n.Title)
 	if len(n.Blockers) > 0 {
-		line += v.theme.Muted().Render("  ← " + beadList(n.Blockers))
+		line += v.theme.Muted().Render("  ← " + graphText(beadList(n.Blockers)))
 	}
 	return line
 }
@@ -970,7 +1012,7 @@ func (v GraphModel) detailContent(lay GraphLayout, st *State, cursor, w int) []s
 		}
 	}
 
-	add(v.theme.Title().Render(string(n.ID)) + "  " + n.Title)
+	add(v.theme.Title().Render(graphText(string(n.ID))) + "  " + graphText(n.Title))
 	facts := []string{
 		// StateLabel already renders through StateStyle; styling it again
 		// would nest a second SGR pair around text that is already escaped.
@@ -979,7 +1021,7 @@ func (v GraphModel) detailContent(lay GraphLayout, st *State, cursor, w int) []s
 		fmt.Sprintf("priority %d", int(n.Priority)),
 	}
 	if n.Size != "" {
-		facts = append(facts, "size "+n.Size.String())
+		facts = append(facts, "size "+graphText(n.Size.String()))
 	}
 	if n.Round > 0 {
 		facts = append(facts, fmt.Sprintf("round %d", n.Round))
@@ -1008,12 +1050,12 @@ func (v GraphModel) detailContent(lay GraphLayout, st *State, cursor, w int) []s
 	if n.Description != "" {
 		add("")
 		add(v.theme.Title().Render("Description"))
-		wrap(n.Description, "  ")
+		wrap(graphBlock(n.Description), "  ")
 	}
 	if n.Acceptance != "" {
 		add("")
 		add(v.theme.Title().Render("Acceptance"))
-		wrap(n.Acceptance, "  ")
+		wrap(graphBlock(n.Acceptance), "  ")
 	}
 	add("")
 	add(v.theme.Title().Render("History"))
@@ -1034,10 +1076,10 @@ func (v GraphModel) detailDeps(lay GraphLayout, ids []domain.BeadID) string {
 	for _, id := range ids {
 		dep, ok := lay.Node(id)
 		if !ok {
-			parts = append(parts, string(id)+" (outside the run)")
+			parts = append(parts, graphText(string(id))+" (outside the run)")
 			continue
 		}
-		parts = append(parts, string(id)+" "+v.theme.StateStyle(dep.State).Render(StateGlyph(dep.State)+" "+string(dep.State)))
+		parts = append(parts, graphText(string(id))+" "+v.theme.StateStyle(dep.State).Render(StateGlyph(dep.State)+" "+string(dep.State)))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -1069,21 +1111,21 @@ func (v GraphModel) detailHistory(st *State, n GraphNode) []string {
 			}
 			line := fmt.Sprintf("  %s %s", v.theme.LensStyle(vd.Lens).Render(graphPad(orDash(string(vd.Lens)), 12)), style.Render(string(vd.Outcome)))
 			if vd.Summary != "" {
-				line += " " + vd.Summary
+				line += " " + graphText(vd.Summary)
 			}
 			out = append(out, line)
 			for _, item := range vd.Items {
-				out = append(out, "    "+v.theme.SeverityStyle(item.Severity).Render(SeverityGlyph(item.Severity))+" "+item.Title)
+				out = append(out, "    "+v.theme.SeverityStyle(item.Severity).Render(SeverityGlyph(item.Severity))+" "+graphText(item.Title))
 			}
 		}
 		for _, resp := range r.Responses {
-			out = append(out, fmt.Sprintf("  %s %s", v.theme.Muted().Render(graphPad("response", 12)), strings.TrimSpace(string(resp.Action)+" "+resp.Rationale)))
+			out = append(out, fmt.Sprintf("  %s %s", v.theme.Muted().Render(graphPad("response", 12)), graphText(strings.TrimSpace(string(resp.Action)+" "+resp.Rationale))))
 		}
 		for _, ruling := range r.Rulings {
-			out = append(out, fmt.Sprintf("  %s %s", v.theme.Muted().Render(graphPad("arbiter", 12)), strings.TrimSpace(string(ruling.Ruling)+" "+ruling.Rationale)))
+			out = append(out, fmt.Sprintf("  %s %s", v.theme.Muted().Render(graphPad("arbiter", 12)), graphText(strings.TrimSpace(string(ruling.Ruling)+" "+ruling.Rationale))))
 		}
 		if r.Escalation != nil {
-			out = append(out, fmt.Sprintf("  %s %s", v.theme.Danger().Render(graphPad("escalated", 12)), strings.TrimSpace(string(r.Escalation.Outcome)+" "+graphEscalationNote(*r.Escalation))))
+			out = append(out, fmt.Sprintf("  %s %s", v.theme.Danger().Render(graphPad("escalated", 12)), graphText(strings.TrimSpace(string(r.Escalation.Outcome)+" "+graphEscalationNote(*r.Escalation)))))
 		}
 	}
 	for _, d := range st.Deliveries {
@@ -1095,7 +1137,7 @@ func (v GraphModel) detailHistory(st *State, n GraphNode) []string {
 			line += fmt.Sprintf(" PR #%d", d.Number)
 		}
 		if d.URL != "" {
-			line += " " + d.URL
+			line += " " + graphText(d.URL)
 		}
 		if d.Merged {
 			line += " " + v.theme.Success().Render("merged "+shortSHA(d.SHA))
@@ -1152,8 +1194,14 @@ type graphCanvas struct {
 	w, h   int
 	runes  []rune
 	styles []*lipgloss.Style
-	masks  []uint8
-	edges  []*lipgloss.Style
+	// cont marks a cell covered by the right half of the double-width rune
+	// in the cell before it: a bead title can hold CJK or emoji, which take
+	// two terminal cells each, and a canvas that assumed one rune per cell
+	// would push the rest of the row — the box's right border included — out
+	// of place.
+	cont  []bool
+	masks []uint8
+	edges []*lipgloss.Style
 }
 
 // newGraphCanvas returns an empty canvas of w×h cells.
@@ -1164,25 +1212,74 @@ func newGraphCanvas(w, h int) *graphCanvas {
 		h:      max(h, 1),
 		runes:  make([]rune, n),
 		styles: make([]*lipgloss.Style, n),
+		cont:   make([]bool, n),
 		masks:  make([]uint8, n),
 		edges:  make([]*lipgloss.Style, n),
 	}
 }
 
+// graphRuneCells is how many terminal cells a rune occupies, measured the
+// same way Lip Gloss measures the strings the boxes are padded and truncated
+// with, so a canvas cell and a padded string agree on every terminal —
+// including one configured for ambiguous-width 2, where [PadGlyph] widens the
+// glyph column.
+func graphRuneCells(r rune) int { return lipgloss.Width(string(r)) }
+
 // inside reports whether the cell is on the canvas.
 func (c *graphCanvas) inside(x, y int) bool { return x >= 0 && y >= 0 && x < c.w && y < c.h }
 
-// text writes a string starting at (x, y), one rune per cell.
+// text writes a string starting at (x, y), advancing by the number of cells
+// each rune occupies. A rune that occupies none — a control character, an
+// escape byte, a combining mark — is dropped rather than written: it would
+// take no column but could still split or repaint the row it landed on. Bead
+// text is scrubbed by [graphText] before it gets here; this is the backstop.
 func (c *graphCanvas) text(x, y int, s string, style *lipgloss.Style) {
 	for _, r := range s {
-		if !c.inside(x, y) {
-			x++
+		cells := graphRuneCells(r)
+		if cells <= 0 {
 			continue
 		}
-		i := y*c.w + x
-		c.runes[i], c.styles[i] = r, style
-		x++
+		c.write(x, y, r, style)
+		for k := 1; k < cells; k++ {
+			c.writeCont(x+k, y, style)
+		}
+		x += cells
 	}
+}
+
+// write puts one rune in a cell.
+func (c *graphCanvas) write(x, y int, r rune, style *lipgloss.Style) {
+	if !c.inside(x, y) {
+		return
+	}
+	c.blank(x, y)
+	i := y*c.w + x
+	c.runes[i], c.styles[i] = r, style
+}
+
+// writeCont marks the cell as the right half of the double-width rune before
+// it. It carries the same style so the two halves render as one span.
+func (c *graphCanvas) writeCont(x, y int, style *lipgloss.Style) {
+	if !c.inside(x, y) {
+		return
+	}
+	c.blank(x, y)
+	i := y*c.w + x
+	c.styles[i], c.cont[i] = style, true
+}
+
+// blank empties a cell and, when it holds either half of a double-width
+// rune, the other half with it, so writing over one half never leaves the
+// other stranded.
+func (c *graphCanvas) blank(x, y int) {
+	i := y*c.w + x
+	if c.cont[i] && x > 0 {
+		c.runes[i-1], c.styles[i-1] = 0, nil
+	}
+	if x+1 < c.w && c.cont[i+1] {
+		c.styles[i+1], c.cont[i+1] = nil, false
+	}
+	c.runes[i], c.styles[i], c.cont[i] = 0, nil, false
 }
 
 // line adds the given directions to an edge cell. A cell already holding a
@@ -1194,7 +1291,7 @@ func (c *graphCanvas) line(x, y int, mask uint8, style *lipgloss.Style, force bo
 		return
 	}
 	i := y*c.w + x
-	if c.runes[i] != 0 {
+	if c.runes[i] != 0 || c.cont[i] {
 		return
 	}
 	c.masks[i] |= mask
@@ -1289,27 +1386,80 @@ func (c *graphCanvas) row(y, offX, w int) string {
 		}
 		run.Reset()
 	}
-	for x := offX; x < offX+w; x++ {
-		r, style := ' ', (*lipgloss.Style)(nil)
+	for x := offX; x < offX+w; {
+		r, style, cells := ' ', (*lipgloss.Style)(nil), 1
 		if c.inside(x, y) {
 			i := y*c.w + x
 			switch {
+			case c.cont[i]:
+				// The right half of a double-width rune whose left half is
+				// off the left edge of the window: a space stands in for it,
+				// so the columns after it still line up.
 			case c.runes[i] != 0:
 				r, style = c.runes[i], c.styles[i]
+				cells = graphRuneCells(r)
 			case c.masks[i] != 0:
 				if lr, ok := graphLineRunes[c.masks[i]]; ok {
 					r, style = lr, c.edges[i]
 				}
 			}
 		}
+		if cells > 1 && x+cells > offX+w {
+			// A double-width rune the right edge of the window cuts in half:
+			// drawing it would make the row one column too wide.
+			r, style, cells = ' ', nil, 1
+		}
 		if style != cur {
 			flush()
 			cur = style
 		}
 		run.WriteRune(r)
+		x += cells
 	}
 	flush()
 	return strings.TrimRight(b.String(), " ")
+}
+
+// graphText makes one piece of run data safe to draw on a single row. A
+// bead's title, description and acceptance criteria — and the text of a
+// verdict, a response or a ruling — are written by an LLM, so they are
+// exactly as untrusted as the transcript lines the Agents view scrubs
+// (P7-03): a newline would split the row and shift the rest of the frame, an
+// escape sequence would repaint it, and Lip Gloss counts both as zero width,
+// so nothing else would notice. It keeps the printable text only — through
+// the transcript's own scrubber, so there is one definition of printable —
+// and turns the line breaks into spaces so the row keeps its width.
+func graphText(s string) string {
+	if !strings.ContainsFunc(s, graphControl) {
+		return s
+	}
+	return agentsSanitize(strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' {
+			return ' '
+		}
+		return r
+	}, s))
+}
+
+// graphBlock scrubs a field the detail panel wraps itself, keeping the
+// paragraph breaks its author wrote: every line is [graphText], the newlines
+// between them survive.
+func graphBlock(s string) string {
+	if !strings.ContainsFunc(s, func(r rune) bool { return graphControl(r) && r != '\n' }) {
+		return s
+	}
+	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
+	for i, l := range lines {
+		lines[i] = graphText(l)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// graphControl reports whether a rune is one a frame cannot carry: a C0
+// control (the escape byte, a newline and a tab included), DEL, or one of the
+// C1 controls that a terminal reading UTF-8 still acts on.
+func graphControl(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
 }
 
 // graphPlural picks the singular or the plural spelling of a word for a
@@ -1319,6 +1469,23 @@ func graphPlural(n int, one, many string) string {
 		return one
 	}
 	return many
+}
+
+// graphRule repeats s until it is w cells wide, padding with spaces when the
+// glyph does not divide the width evenly. It is what draws a box border: on
+// an ordinary terminal a box-drawing character is one cell and this is a
+// plain repeat, but on one configured for ambiguous-width 2 it is two, and a
+// border of w runes would overhang the box by its own width again.
+func graphRule(s string, w int) string {
+	n := lipgloss.Width(s)
+	if w <= 0 || n <= 0 {
+		return ""
+	}
+	out := strings.Repeat(s, w/n)
+	if rest := w - (w/n)*n; rest > 0 {
+		out += strings.Repeat(" ", rest)
+	}
+	return out
 }
 
 // graphPad clips s to w columns and pads it with spaces to exactly w.

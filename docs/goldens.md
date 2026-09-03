@@ -19,6 +19,15 @@ set it in CI.
 | `make docs-cli` | `docs/cli.md` alone, from the `sc` command tree |
 | `make check-golden` | Nothing: it regenerates in place and fails if anything changed |
 
+"Every golden in the repo" means every extension: the frames and fixtures
+named `*.golden`, and the prompt goldens named `*.golden.md` (Markdown, so an
+editor renders them). `make check-golden` looks at both — its `git status`
+pathspec lists `'*.golden' '*.golden.*' '*.expected' docs/cli.md`, and
+`TestCheckGoldenCoversEveryGoldenSuffix` in `internal/tui/golden_test.go`
+reads the Makefile and fails if a golden extension in the repository is not
+covered by it. A pathspec that misses one is worse than no gate: the target
+regenerates the file and then reports a clean tree.
+
 Always read the diff before committing it. A regenerated golden is a change
 to what a user sees, so it belongs in the same commit as the code that
 changed it, and an unexpected hunk in a file you did not touch means
@@ -29,6 +38,43 @@ profile, a path from your machine).
 it is the explicit "the goldens are current" gate, and CI runs it as its own
 step after `make check`. `make check` catches the same thing implicitly: a
 stale golden fails its test.
+
+## Prompt goldens (`testdata/prompts/`, `testdata/agents/tester/`, `internal/agents/testdata/`)
+
+The other family of goldens is whole assembled agent prompts (P5-01). They
+are plain Markdown, one file per role, lens and mode, and they are what an
+agent is actually told, so a diff here is a change to the product and not
+only to a test:
+
+| Directory | Files | Written by |
+|---|---|---|
+| `testdata/prompts/` | `po-plan`, `engineer-implement`, `tester-qa-review` | `internal/agents/prompt` (`TestBuildGoldenPO`, `…Engineer`, `…Tester`) |
+| `testdata/prompts/` | `agent-engineer-implement`, `-address-feedback`, `-resolve-conflict` | `internal/agents` (`TestEngineerGolden*`) |
+| `testdata/agents/tester/` | `<lens>-<mode>` for the three lenses × three modes | `internal/agents` (`TestTesterPromptGoldens`) |
+| `internal/agents/testdata/plan/` | `po-plan-autopilot`, `po-plan-brief` | `internal/agents` (`TestPOPlanPromptGolden`) |
+| `internal/agents/testdata/arbitration/` | `po-arbitrate`, `po-escalate` | `internal/agents` (`TestArbitrationPromptGolden`, `TestEscalationPromptGolden`) |
+
+Most of them stop just before the output contract, which is pinned
+separately, so an edit to `internal/agents/schemas/*.json` does not rewrite
+every prompt; the three `internal/agents/prompt` role goldens end in a small
+stand-in contract defined in the test for the same reason. The real contracts
+are covered by `TestRealContractsAreAppended`.
+
+As in `testdata/tui`, every file in these directories is accounted for:
+`TestPromptGoldenFilesAreAccountedFor` (`internal/agents/prompt_goldens_test.go`)
+lists each golden against the test that writes it, and fails when a file on
+disk is not on the list, when a listed file is missing, or when one is empty,
+not UTF-8, or carries a carriage return. Renaming a prompt fixture therefore
+means editing `pgGoldens` in the same change, and a dropped one cannot sit
+unnoticed.
+
+Regenerate them with `make update-golden`, or just this family with
+`UPDATE_GOLDEN=1 go test ./internal/agents/...`.
+
+The prompt itself — the layers, their order, and the per-firing debug copies
+under `<state-dir>/runs/<run-id>/prompts/<agent-id>.md` — is documented in the
+`internal/agents/prompt` package comment; a user-facing page for it is still
+open as P10-06.
 
 ## TUI frames (`testdata/tui/`)
 
@@ -112,3 +158,20 @@ picked up the global renderer's colour profile instead of the theme's
 that moved. If a golden only fails for one person, ask them for `TERM`,
 `COLORTERM`, `NO_COLOR`, `CLICOLOR_FORCE` and `SC_NO_ANIM`, and whether they
 ran a compiled test binary on a tty rather than `go test` through a pipe.
+
+One more variable belongs on that list, and it is the only one the suite
+handles by itself: **`RUNEWIDTH_EASTASIAN`**. A terminal configured for
+ambiguous-width 2 exports it, and both go-runewidth and
+`github.com/charmbracelet/x/ansi` — the width measurement under every Lip
+Gloss pad, truncate and join — read it once, in a package initialiser, into a
+condition no test can reach afterwards. In such a process `·`, `✓` and `▌`
+measure two cells and the padding of every frame shifts, which would fail the
+whole suite for that developer and, worse, would make
+`make update-golden-tui` rewrite all of the frames with the wrong padding
+while CI went red. So `TestMain` does not try to unset it — too late by then
+— it hands the entire run to a child process started without it.
+`TestGoldenFramesSurviveEastAsianWidth` proves that works by running the
+golden tests again with `RUNEWIDTH_EASTASIAN=1` set on purpose. (The one
+place the mode is exercised rather than neutralised is
+`TestThemeGlyphColumnHoldsUnderEastAsianWidth`, which checks the glyph column
+holds in both width modes; `TestMain` leaves that child alone.)

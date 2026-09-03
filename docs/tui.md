@@ -35,18 +35,94 @@ animations off).
 | `ctrl+c` | quit immediately |
 
 Views add keys of their own. The `?` overlay lists them under the view's
-name, and the view puts the important ones in its own section headings, so a
-binding is discoverable without opening the overlay.
+name — Graph, Agents, Feedback and PRs each add some; the Log view adds
+none — and a view with room in its headings puts the important ones there
+too, so the binding is discoverable without opening the overlay.
 
 ## Views
 
 | Tab | Shows |
 |---|---|
-| Graph | the bead DAG, with `enter` for a bead's detail |
+| Graph | the bead DAG as boxes and dependency edges, with `enter` for a bead's detail |
 | Agents | a card per live agent, the history of the ones that ended, and their transcripts |
 | Feedback | review rounds per bead: verdicts, responses, arbitration ([tui-feedback.md](tui-feedback.md)) |
 | PRs | deliveries, their pull requests and check state; `o` opens a URL |
 | Log | every event, newest last |
+
+The Log tab is one line per event, oldest first, capped at the last 500. A
+line is what the event says, and part of what an event says was written by a
+subprocess — an agent's output, a warning's message, a run's summary — so it
+is scrubbed before it is drawn: escape sequences and control characters are
+dropped and a newline becomes a space, so a cartridge that writes ANSI
+cannot repaint the frame or take a second row.
+
+## Graph view
+
+The run's beads laid out as a layered DAG: level 0 — the beads nothing in the
+run blocks — first, then one level per step of the dependency chain. The
+layering is the one the scheduler uses (`bd`'s own), never a second opinion,
+so a bead the view calls ready is a bead `bd ready` would hand out.
+
+```
+5 beads · 5 levels · 0 ready · 3 blocked · 1 closed · left→right · ▶
+┌────────────────────┐    ┏━━━━━━━━━━━━━━━━━━━━┓
+│● sc-1a2b       r2  │────┃◐ sc-3c4d       r1 ■┃
+│ Add a retry budget │    ┃ Retry failed HTTP …┃
+└────────────────────┘    ┗━━━━━━━━━━━━━━━━━━━━┛
+```
+
+Each box carries the bead's state glyph and colour, its id, the review round
+it is on (`r1`), the role glyph of the agent working on it (`■` engineer, `▲`
+tester, `◆` product owner — blank when nothing has been fired at it) and its
+title, truncated to the box. The selected bead is drawn with a heavy border,
+so it is obvious with no colour at all. A bead the layering could not place —
+it sits on a dependency cycle, which means the repository was edited outside
+the run — is grouped into a last level whose boxes carry `cycle` in their top
+border.
+
+The summary line above the graph counts the beads, the levels, and how many
+are ready, blocked and closed, names the layout in use, and ends with arrows
+(`▲▼◀▶`) for the directions the graph carries on past the edge of the pane,
+so a clipped graph is never mistaken for the whole run.
+
+| Key | What it does |
+|---|---|
+| `↑`/`k`, `↓`/`j` | previous / next bead, in level order |
+| `←`/`h`, `→`/`l` | previous / next level, keeping your place within it |
+| `home` (`g`) / `end` (`G`) | first bead of the first level / last of the last |
+| `enter` | open the selected bead's detail panel |
+| `esc` | close the detail panel |
+| `↑` / `↓` (panel open) | scroll the detail panel a line |
+
+**The layout follows the pane.** Wider than tall, the levels are columns and
+the edges run left→right; taller than wide (a terminal cell being about twice
+as tall as it is wide), they are rows and the edges run downwards. Below 80
+columns neither fits, so the view falls back to an **indented list**: one line
+per bead grouped under its level, with the blockers of each bead named after
+a `←`. The edges are drawn with box-drawing characters and never cross a box:
+a dependency that skips a level, or one inside a cycle, detours through a
+lane of its own past the end of the layers.
+
+`enter` opens the **bead detail panel**: the bead's id and title, its state,
+level, priority (`bd`'s own 0–4 scale, where 0 is highest), size and round,
+whether it is ready or blocked, the agent on it, what it depends on and what
+it blocks with each of their states, its description and acceptance criteria,
+and its history — every review round with its verdicts, the engineer's
+responses, any arbitration or escalation, and the delivery. `esc` closes it;
+`↑`/`↓` scroll it and stop at the last page.
+
+The selection is pinned to the bead, not to the row it is on. The product
+owner re-plans whenever the ready queue empties (D-18), and a single new bead
+can renumber every level after it, so the cursor — and an open detail panel —
+stays on the bead you chose rather than following the position it used to
+occupy.
+
+Everything a bead says about itself is written by an LLM, so it is scrubbed
+before it is drawn, exactly like an agent's transcript: escape sequences and
+control characters are dropped, and a newline in a title becomes a space
+instead of splitting the row. Titles that use double-width characters (CJK,
+emoji) are measured in terminal cells, so a box keeps its shape whatever the
+plan is written in.
 
 ## Agents view
 
@@ -66,7 +142,14 @@ product owner — the same glyphs the Graph view uses), the tester's lens, the
 bead it is working on, its cartridge and model, what it was fired to do with
 its round and attempt, how long it has been running, a spinner, and its last
 line of output. A narrow pane drops the optional fields from the right
-rather than truncating them mid-word.
+rather than truncating them mid-word. The last line is a cartridge's own
+stdout or stderr, so it is stripped of escape sequences and control
+characters before it is drawn, exactly like a transcript line.
+
+Only a running agent spins: the card of an agent that has finished, failed
+or been killed leaves the spinner's column blank, so the card never
+contradicts its own lifecycle glyph. That card is what the transcript pane
+draws above the output of the agent you selected.
 
 The elapsed time and the spinner advance ten times a second while any agent
 is live, and stop the moment the last one exits, so an idle run costs

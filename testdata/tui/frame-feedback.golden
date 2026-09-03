@@ -6,7 +6,7 @@
 [1m▌ [0mdemo-2     ✓ ✓ · │ [1m● closed[0m · 2 rounds · ux ✓  qa ✓ · 2 open
   demo-3     · · · │
                    │ [1mround 1[0m · review · 1f0c4d9 · qa,ux
-                   │   ⚙ report retry with exponential backoff, capped at three
+                   │   ⚙ report retry with exponential backoff, capped at three…
                    │   ✓ ux   approve error messages read well
                    │   ✗ qa   changes backoff is not jittered and the cap is of…
                    │     ▲ major   qa-1      off-by-one in the attempt cap

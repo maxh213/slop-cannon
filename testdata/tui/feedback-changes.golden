@@ -9,7 +9,7 @@
   sc-g7h8    ✓ ✓ ✓ │   ⚙ report cache lookups for the TTL the resolver reports
   sc-i9j0    ✓ ✓ ✓ │   ✓ ux   approve no user-visible change
   sc-k1l2    · ✗ · │   ✗ qa   changes one blocker
-  sc-m3n4    ✓ ✓ ◐ │     [1m! blocker[0m qa-r1-1   Retry loops forever on a 500 [resolved]
+  sc-m3n4    ✓ ✓ ◐ │     [1m! blocker[0m qa-r1-1   [resolved] Retry loops forever on a 500
                    │   ✓ test approve coverage is fine
                    │
                    │ [1mround 2[0m · review · 3c4d5e6 · qa

@@ -215,6 +215,11 @@ func PlanPrompt(req PlanRequest) (prompt.Prompt, error) {
 // copy (prompt.Prompt.Write) without assembling it twice. The spec runs
 // read_only (ApplyPolicy): the planning product owner never edits anything.
 //
+// A prompt that is still over its budget once the builder has degraded
+// everything it may comes back with the valid spec and an
+// [ErrPromptOverBudget] error, so a large rules file cannot silently fire a
+// product owner over budget.
+//
 // Before firing, the caller passes the spec's tool policy to
 // EnforcementFor(cartridge, spec.ToolPolicy) and refuses to fire when
 // Enforcement.Check reports the policy cannot be enforced (P5-06).
@@ -247,7 +252,21 @@ func PlanRunSpec(req PlanRequest) (cartridge.RunSpec, prompt.Prompt, error) {
 	if err := spec.Validate(); err != nil {
 		return cartridge.RunSpec{}, p, err
 	}
+	if p.OverBudget {
+		return spec, p, promptBudgetError("planning", p)
+	}
 	return spec, p, nil
+}
+
+// promptBudgetError reports a prompt that is still over its token budget once
+// the builder has dropped everything it is allowed to drop (the rules, the
+// vibes and the output contract are never cut, so a large rules file alone can
+// do this). what names the firing for the message. The caller gets the valid
+// spec alongside it and decides whether to fire; see [ErrPromptOverBudget].
+func promptBudgetError(what string, p prompt.Prompt) error {
+	return fmt.Errorf("%w: the %s prompt is ~%d tokens against a budget of %d, even with %s; "+
+		"raise the budget or fire it deliberately", ErrPromptOverBudget, what, p.Tokens, p.MaxTokens,
+		promptTruncationSummary(p))
 }
 
 // planObjective is the one-or-two sentence statement of what this firing

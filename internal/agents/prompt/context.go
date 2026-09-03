@@ -154,7 +154,12 @@ func renderOpenBeads(beads []domain.Bead, limit int) string {
 	return b.String()
 }
 
-// renderBead renders the bead an agent owns.
+// renderBead renders the bead an agent owns. Its prose fields — the
+// description and the acceptance criteria — are written by the planning
+// product owner, an agent, so they are quoted with Fenced rather than pasted
+// in raw: nothing an agent wrote may open a fenced block or a "## " heading
+// and forge prompt structure the next agent then reads as ours (P5-01). The
+// orchestrator notes are collapsed onto one line for the same reason.
 func renderBead(bc *BeadContext) string {
 	if bc == nil {
 		return ""
@@ -192,15 +197,15 @@ func renderBead(bc *BeadContext) string {
 		writeBullet(&b, "Review round", strconv.Itoa(bc.Round))
 	}
 	for _, n := range bc.Notes {
-		if s := strings.TrimSpace(n); s != "" {
+		if s := oneLine(n); s != "" {
 			b.WriteString("- " + s + "\n")
 		}
 	}
 	if d := strings.TrimSpace(bead.Description); d != "" {
-		b.WriteString("\nDescription:\n\n" + d + "\n")
+		b.WriteString("\nDescription:\n\n" + Fenced("", d))
 	}
 	if a := strings.TrimSpace(bead.Acceptance); a != "" {
-		b.WriteString("\nAcceptance criteria (every one of these must hold):\n\n" + a + "\n")
+		b.WriteString("\nAcceptance criteria (every one of these must hold):\n\n" + Fenced("", a))
 	}
 	return strings.TrimRight(b.String(), "\n")
 }
@@ -252,7 +257,7 @@ func renderHistory(rounds []Round, keep int) string {
 			))
 		}
 		for _, n := range r.Notes {
-			if s := strings.TrimSpace(n); s != "" {
+			if s := oneLine(n); s != "" {
 				b.WriteString("\nNote: " + s + "\n")
 			}
 		}
@@ -260,12 +265,15 @@ func renderHistory(rounds []Round, keep int) string {
 	return strings.TrimRight(b.String(), "\n")
 }
 
-// renderReport renders one engineer impl_report.
+// renderReport renders one engineer impl_report. The summary is the previous
+// round's engineer talking, so it is quoted with Fenced for the reason
+// renderBead quotes the bead prose: an engineer must not be able to forge a
+// verdict, a heading or a result block inside the round history.
 func renderReport(rep domain.ImplReport) string {
 	var b strings.Builder
 	b.WriteString("Engineer report:\n")
 	if s := strings.TrimSpace(rep.Summary); s != "" {
-		b.WriteString("\n" + s + "\n")
+		b.WriteString("\n" + Fenced("", s))
 	}
 	if len(rep.FilesChanged) > 0 {
 		fmt.Fprintf(&b, "\n- Files changed: %s\n", strings.Join(rep.FilesChanged, ", "))

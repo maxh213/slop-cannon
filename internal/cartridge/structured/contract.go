@@ -78,15 +78,27 @@ func (c *Contract) schemaForPrompt() string {
 	return out.String()
 }
 
-// HasPromptSuffix reports whether prompt already contains c's suffix, so a
-// caller never appends it twice.
+// HasPromptSuffix reports whether prompt contains c's suffix anywhere, so a
+// caller can check the contract reached the agent at all.
 func (c *Contract) HasPromptSuffix(prompt string) bool {
 	return strings.Contains(prompt, c.PromptSuffix())
 }
 
-// WithPromptSuffix returns prompt with the contract's suffix appended once.
+// EndsWithPromptSuffix reports whether prompt ends with c's suffix, which is
+// where the contract has to be: its own first rule is that the result block
+// is the last thing in the reply, so it must be the last thing in the prompt.
+func (c *Contract) EndsWithPromptSuffix(prompt string) bool {
+	return strings.HasSuffix(strings.TrimRight(prompt, "\n"), strings.TrimRight(c.PromptSuffix(), "\n"))
+}
+
+// WithPromptSuffix returns prompt with the contract's suffix appended once,
+// at the end. The check is [EndsWithPromptSuffix] rather than
+// [HasPromptSuffix] on purpose: an earlier layer that merely quotes the
+// contract — a bead description, a rules file, an agent-authored summary of a
+// previous round — must not suppress the real copy and leave the prompt
+// ending in something else.
 func (c *Contract) WithPromptSuffix(prompt string) string {
-	if c.HasPromptSuffix(prompt) {
+	if c.EndsWithPromptSuffix(prompt) {
 		return prompt
 	}
 	return strings.TrimRight(prompt, "\n") + "\n\n" + c.PromptSuffix()

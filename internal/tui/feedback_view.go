@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -90,8 +91,9 @@ type FeedbackItemView struct {
 	Round int
 	// Response is the engineer's answer to this occurrence, when one arrived.
 	Response *domain.Response
-	// ResponseRound is the round Response was given in, which is always later
-	// than Round; 0 when there is no response.
+	// ResponseRound is the round Response was given in — the round after the
+	// one that raised the item, or the same round when the loop collected the
+	// answer without re-opening one; 0 when there is no response.
 	ResponseRound int
 	// Ruling is the product owner's arbitration on this occurrence, when the
 	// item was disputed all the way to one (D-08).
@@ -142,6 +144,12 @@ func feedbackItemKey(round int, lens domain.Lens, id string) string {
 	return fmt.Sprintf("%d/%s/%s", round, lens, id)
 }
 
+// feedbackLensKey identifies one lens's take on an item id, across rounds:
+// the same id raised by two lenses is two items, each settled on its own.
+func feedbackLensKey(lens domain.Lens, id string) string {
+	return fmt.Sprintf("%s/%s", lens, id)
+}
+
 // occurrence returns the item as the given round's verdict from that lens
 // stated it.
 func (t FeedbackThread) occurrence(round int, lens domain.Lens, id string) (FeedbackItemView, bool) {
@@ -152,43 +160,76 @@ func (t FeedbackThread) occurrence(round int, lens domain.Lens, id string) (Feed
 	return t.Items[i], true
 }
 
-// feedbackStatedBy returns the index of the newest occurrence of the item
-// with the given id stated before round, or at it when inclusive, and -1
-// when the item was never stated that early. It is how an answer given in
-// one round finds the occurrence it replies to.
-func feedbackStatedBy(items []FeedbackItemView, round int, id string, inclusive bool) int {
-	best := -1
+// feedbackStatedBy returns the indexes of the occurrences an answer given in
+// round replies to: for every lens that raised the item with the given id,
+// the newest statement that lens made before the round — or up to and
+// including it, when inclusive.
+//
+// The result is a list because two lenses can raise the same item id in one
+// round: P6-04 consolidates a round's items across the three lenses, so one
+// engineer response or one ruling settles every occurrence of the item, not
+// just the last lens to mention it. A response also falls back to a
+// statement made in its own round when that lens made no earlier one, since
+// P6-04 collects the engineer's answers inside the round that raised them.
+// The indexes come back in item order, oldest occurrence first, and the
+// result is empty when the item was never stated that early.
+func feedbackStatedBy(items []FeedbackItemView, round int, id string, inclusive bool) []int {
+	// tier 0 is a statement from a round before the answer, tier 1 one from
+	// the answering round itself, which a response only falls back to.
+	tier := func(it FeedbackItemView) int {
+		if !inclusive && it.Round == round {
+			return 1
+		}
+		return 0
+	}
+	best := make(map[domain.Lens]int, len(feedbackLensColumns))
 	for i, it := range items {
-		if it.ID != id || it.Round > round || (!inclusive && it.Round == round) {
+		if it.ID != id || it.Round > round {
 			continue
 		}
-		if best < 0 || it.Round >= items[best].Round {
-			best = i
+		if j, seen := best[it.Lens]; seen {
+			cur := items[j]
+			if tier(it) > tier(cur) || (tier(it) == tier(cur) && it.Round < cur.Round) {
+				continue
+			}
+		}
+		best[it.Lens] = i
+	}
+	out := make([]int, 0, len(best))
+	for _, i := range best {
+		out = append(out, i)
+	}
+	slices.Sort(out)
+	return out
+}
+
+// feedbackPick reads the occurrences at the given indexes, skipping any
+// index that is not an item.
+func feedbackPick(items []FeedbackItemView, idx []int) []FeedbackItemView {
+	out := make([]FeedbackItemView, 0, len(idx))
+	for _, i := range idx {
+		if i >= 0 && i < len(items) {
+			out = append(out, items[i])
 		}
 	}
-	return best
+	return out
 }
 
-// Answered returns the occurrence an engineer's response given in the given
-// round replies to: the newest statement of the item from an earlier round,
-// because the engineer answers the round it has just been handed.
-func (t FeedbackThread) Answered(round int, id string) (FeedbackItemView, bool) {
-	i := feedbackStatedBy(t.Items, round, id, false)
-	if i < 0 {
-		return FeedbackItemView{}, false
-	}
-	return t.Items[i], true
+// Answered returns the occurrences an engineer's response given in the given
+// round replies to: per lens that raised the item, the newest statement from
+// an earlier round — because the engineer answers the round it has just been
+// handed — or the statement that lens made in this very round when it made
+// no earlier one. It is empty when no verdict ever raised the item.
+func (t FeedbackThread) Answered(round int, id string) []FeedbackItemView {
+	return feedbackPick(t.Items, feedbackStatedBy(t.Items, round, id, false))
 }
 
-// Ruled returns the occurrence a product owner's ruling given in the given
-// round settles: the newest statement of the item up to and including that
-// round, because arbitration follows the verdict that held it (D-08).
-func (t FeedbackThread) Ruled(round int, id string) (FeedbackItemView, bool) {
-	i := feedbackStatedBy(t.Items, round, id, true)
-	if i < 0 {
-		return FeedbackItemView{}, false
-	}
-	return t.Items[i], true
+// Ruled returns the occurrences a product owner's ruling given in the given
+// round settles: per lens that raised the item, the newest statement up to
+// and including that round, because arbitration follows the verdict that
+// held it (D-08). It is empty when no verdict ever raised the item.
+func (t FeedbackThread) Ruled(round int, id string) []FeedbackItemView {
+	return feedbackPick(t.Items, feedbackStatedBy(t.Items, round, id, true))
 }
 
 // Latest returns the newest round of the thread.
@@ -246,6 +287,9 @@ func feedbackBuildThread(s *State, th FeedbackThread) FeedbackThread {
 		th.Title, th.BeadState = b.Title, b.State
 	}
 	th.at = make(map[string]int)
+	// latest is keyed by lens and item id, not by id alone: two lenses can
+	// raise the same item in the same round, and each of them holds its own
+	// open item until its own newest statement settles it.
 	latest := make(map[string]int)
 	for _, r := range th.Rounds {
 		for _, v := range r.Verdicts {
@@ -253,25 +297,27 @@ func feedbackBuildThread(s *State, th FeedbackThread) FeedbackThread {
 				th.Items = append(th.Items, FeedbackItemView{FeedbackItem: it, Lens: v.Lens, Round: r.Number})
 				i := len(th.Items) - 1
 				th.at[feedbackItemKey(r.Number, v.Lens, it.ID)] = i
-				latest[it.ID] = i
+				latest[feedbackLensKey(v.Lens, it.ID)] = i
 			}
 		}
 	}
 	// Responses and rulings name the item they answer but not the occurrence
-	// of it, so each one is matched onto the statement it replied to: the
-	// newest one raised before the round the engineer spoke in, and — for a
-	// ruling, which follows the verdict that held the item (D-08) — the
-	// newest one up to and including its own round. Keying them by item id
-	// alone would let a later round overwrite what was said in an earlier
-	// one and lose the round it was said in.
+	// of it, so each one is matched onto the statements it replied to: per
+	// lens, the newest one raised before the round the engineer spoke in
+	// (or, failing that, the one that lens raised in the same round), and —
+	// for a ruling, which follows the verdict that held the item (D-08) —
+	// the newest one up to and including its own round. Keying them by item
+	// id alone would let a later round overwrite what was said in an earlier
+	// one and lose the round it was said in; answering only one lens would
+	// leave the other lens that raised the item looking unanswered.
 	for _, r := range th.Rounds {
 		for _, resp := range r.Responses {
-			if i := feedbackStatedBy(th.Items, r.Number, resp.ItemID, false); i >= 0 {
+			for _, i := range feedbackStatedBy(th.Items, r.Number, resp.ItemID, false) {
 				th.Items[i].Response, th.Items[i].ResponseRound = &resp, r.Number
 			}
 		}
 		for _, rule := range r.Rulings {
-			if i := feedbackStatedBy(th.Items, r.Number, rule.ItemID, true); i >= 0 {
+			for _, i := range feedbackStatedBy(th.Items, r.Number, rule.ItemID, true) {
 				th.Items[i].Ruling, th.Items[i].RulingRound = &rule, r.Number
 			}
 		}
@@ -775,34 +821,40 @@ func (v FeedbackModel) roundBody(th FeedbackThread, r Round, last bool, w int) [
 	add := func(s string) { out = append(out, clip(s, w)) }
 
 	if r.Report != nil {
-		add("  " + t.Muted().Render("⚙ report") + " " + t.Text().Render(r.Report.Summary))
+		out = append(out, v.flow("  "+t.Muted().Render("⚙ report")+" ", r.Report.Summary, t.Text(), 6, w)...)
 		if v.details {
 			if len(r.Report.FilesChanged) > 0 {
-				add("      " + t.Muted().Render("files: "+strings.Join(r.Report.FilesChanged, ", ")))
+				out = append(out, v.flow("      ", "files: "+strings.Join(r.Report.FilesChanged, ", "), t.Muted(), 6, w)...)
 			}
 			if r.Report.HowToVerify != "" {
-				add("      " + t.Muted().Render("verify: "+r.Report.HowToVerify))
+				out = append(out, v.flow("      ", "verify: "+r.Report.HowToVerify, t.Muted(), 6, w)...)
 			}
 			for _, risk := range r.Report.Risks {
-				add("      " + t.Muted().Render("risk: "+risk))
+				out = append(out, v.flow("      ", "risk: "+risk, t.Muted(), 6, w)...)
 			}
 		}
 	}
 
-	for _, resp := range r.Responses {
-		out = append(out, v.responseLine(resp, w))
-		answered, ok := th.Answered(r.Number, resp.ItemID)
-		out = append(out, v.answerRef(answered, ok, w)...)
+	// A response normally answers the previous round, so it is drawn above
+	// the round's own verdicts; one that answers an item this very round
+	// raised belongs under the verdict that raised it instead, or it would
+	// read as the engineer replying before the tester spoke.
+	before, after := feedbackSplitResponses(th, r)
+	for _, resp := range before {
+		out = append(out, v.responseLines(th, r.Number, resp, w)...)
 	}
 
 	for _, verdict := range r.Verdicts {
 		out = append(out, v.verdictLines(th, r.Number, verdict, w)...)
 	}
 
+	for _, resp := range after {
+		out = append(out, v.responseLines(th, r.Number, resp, w)...)
+	}
+
 	for _, rule := range r.Rulings {
-		out = append(out, v.rulingLine(rule, w))
-		ruled, ok := th.Ruled(r.Number, rule.ItemID)
-		out = append(out, v.answerRef(ruled, ok, w)...)
+		out = append(out, v.rulingLine(rule, w)...)
+		out = append(out, v.answerRefs(th.Ruled(r.Number, rule.ItemID), w)...)
 	}
 
 	if r.Escalation != nil {
@@ -826,19 +878,38 @@ func (v FeedbackModel) roundBody(th FeedbackThread, r Round, last bool, w int) [
 	return out
 }
 
+// feedbackSplitResponses splits a round's responses into the ones that
+// answer an earlier round, drawn above the round's verdicts, and the ones
+// that answer an item this round raised, drawn under them. A response to an
+// item no verdict ever raised has nothing to sit under, so it stays above.
+func feedbackSplitResponses(th FeedbackThread, r Round) (before, after []domain.Response) {
+	for _, resp := range r.Responses {
+		answered := th.Answered(r.Number, resp.ItemID)
+		same := len(answered) > 0
+		for _, iv := range answered {
+			if iv.Round != r.Number {
+				same = false
+			}
+		}
+		if same {
+			after = append(after, resp)
+			continue
+		}
+		before = append(before, resp)
+	}
+	return before, after
+}
+
 // verdictLines renders one tester's verdict and the items it raised. The
 // round is the one the state filed the verdict under, which is what the
 // items are indexed by; a cartridge may leave Verdict.Round unset.
 func (v FeedbackModel) verdictLines(th FeedbackThread, round int, verdict domain.Verdict, w int) []string {
 	t := v.theme
 	status := TesterStatus{Lens: verdict.Lens, Outcome: verdict.Outcome}
-	line := "  " + status.style(t).Render(status.Glyph()) + " " +
+	head := "  " + status.style(t).Render(status.Glyph()) + " " +
 		t.LensStyle(verdict.Lens).Render(prsPad(orDash(verdict.Lens.String()), 4)) + " " +
-		status.style(t).Render(prsPad(verdict.Outcome.String(), 7))
-	if verdict.Summary != "" {
-		line += " " + t.Muted().Render(prsTruncate(verdict.Summary, max(w-lipgloss.Width(line)-1, 0)))
-	}
-	out := []string{clip(line, w)}
+		status.style(t).Render(prsPad(verdict.Outcome.String(), 7)) + " "
+	out := v.flow(head, verdict.Summary, t.Muted(), 4, w)
 	for _, it := range verdict.Items {
 		iv, ok := th.occurrence(round, verdict.Lens, it.ID)
 		if !ok {
@@ -854,17 +925,19 @@ func (v FeedbackModel) verdictLines(th FeedbackThread, round int, verdict domain
 func (v FeedbackModel) itemLines(iv FeedbackItemView, w int) []string {
 	t := v.theme
 	out := make([]string, 0, 4)
-	add := func(s string) { out = append(out, clip(s, w)) }
 
+	// The rules mark and the status bracket come before the title, which is
+	// the only field long enough to run off the pane: they would otherwise
+	// be the first thing a narrow pane cut.
 	head := "    " + t.SeverityStyle(iv.Severity).Render(SeverityGlyph(iv.Severity)+" "+prsPad(iv.Severity.String(), 7)) +
-		" " + t.Muted().Render(prsPad(iv.ID, 9)) + " " + t.Text().Render(iv.Title)
+		" " + t.Muted().Render(prsPad(iv.ID, 9))
 	if iv.Category == domain.CategoryRules {
 		head += " " + t.Danger().Render("(rules)")
 	}
 	if iv.Status != "" && iv.Status != domain.ItemOpen {
 		head += " " + feedbackStatusStyle(t, iv.Status).Render("["+iv.Status.String()+"]")
 	}
-	add(head)
+	out = append(out, v.flow(head+" ", iv.Title, t.Text(), 6, w)...)
 
 	if v.details {
 		if iv.File != "" {
@@ -872,24 +945,24 @@ func (v FeedbackModel) itemLines(iv FeedbackItemView, w int) []string {
 			if iv.Line > 0 {
 				where = fmt.Sprintf("%s:%d", iv.File, iv.Line)
 			}
-			add("      " + t.Muted().Render(where))
+			out = append(out, v.flow("      ", where, t.Muted(), 6, w)...)
 		}
 		if iv.Detail != "" {
-			add("      " + t.Muted().Render(iv.Detail))
+			out = append(out, v.flow("      ", iv.Detail, t.Muted(), 6, w)...)
 		}
 		if iv.Suggestion != "" {
-			add("      " + t.Muted().Render("suggestion: "+iv.Suggestion))
+			out = append(out, v.flow("      ", "suggestion: "+iv.Suggestion, t.Muted(), 6, w)...)
 		}
 	}
 
 	return out
 }
 
-// responseLine renders the engineer's answer to one item, in the round the
+// responseLines render the engineer's answer to one item, in the round the
 // engineer gave it: the arrow marks a fix, the hook marks a pushback (D-08)
 // and the circle a wontfix. The item id says which item is being answered;
-// [FeedbackModel.answerRef] spells the occurrence out in the details view.
-func (v FeedbackModel) responseLine(r domain.Response, w int) string {
+// [FeedbackModel.answerRefs] spells the occurrences out in the details view.
+func (v FeedbackModel) responseLines(th FeedbackThread, round int, r domain.Response, w int) []string {
 	t := v.theme
 	glyph, style := "→", t.Success()
 	switch r.Action {
@@ -898,20 +971,14 @@ func (v FeedbackModel) responseLine(r domain.Response, w int) string {
 	case domain.ActionWontfix:
 		glyph, style = "⊘", t.Muted()
 	}
-	line := "  " + style.Render(glyph+" "+prsPad(r.Action.String(), 8)) + " " + t.Muted().Render(prsPad(r.ItemID, 9))
-	if r.Rationale != "" {
-		rationale := r.Rationale
-		if !v.details {
-			rationale = prsTruncate(rationale, max(w-lipgloss.Width(line)-1, 0))
-		}
-		line += " " + t.Muted().Render(rationale)
-	}
-	return clip(line, w)
+	head := "  " + style.Render(glyph+" "+prsPad(r.Action.String(), 8)) + " " + t.Muted().Render(prsPad(r.ItemID, 9)) + " "
+	out := v.flow(head, r.Rationale, t.Muted(), 6, w)
+	return append(out, v.answerRefs(th.Answered(round, r.ItemID), w)...)
 }
 
 // rulingLine renders the product owner's binding decision on a disputed
 // item (D-08), in the round the ruling was made.
-func (v FeedbackModel) rulingLine(a domain.Arbitration, w int) string {
+func (v FeedbackModel) rulingLine(a domain.Arbitration, w int) []string {
 	t := v.theme
 	style := t.Accent()
 	switch a.Ruling {
@@ -920,31 +987,29 @@ func (v FeedbackModel) rulingLine(a domain.Arbitration, w int) string {
 	case domain.RulingUpholdEngineer:
 		style = t.Success()
 	}
-	line := "  " + style.Render("⚖ "+prsPad(a.Ruling.String(), 16)) + " " + t.Muted().Render(prsPad(a.ItemID, 9))
+	head := "  " + style.Render("⚖ "+prsPad(a.Ruling.String(), 16)) + " " + t.Muted().Render(prsPad(a.ItemID, 9)) + " "
 	tail := a.Instruction
 	if tail == "" {
 		tail = a.Rationale
 	}
-	if tail != "" {
-		if !v.details {
-			tail = prsTruncate(tail, max(w-lipgloss.Width(line)-1, 0))
-		}
-		line += " " + t.Muted().Render(tail)
-	}
-	return clip(line, w)
+	return v.flow(head, tail, t.Muted(), 6, w)
 }
 
-// answerRef names the occurrence a response or a ruling replies to, so the
-// details view can point back at the round and the wording of the item that
-// drew it. It renders nothing outside the details view, and nothing when
-// the answer names an item no verdict raised.
-func (v FeedbackModel) answerRef(iv FeedbackItemView, ok bool, w int) []string {
-	if !v.details || !ok {
+// answerRefs name the occurrences a response or a ruling replies to, so the
+// details view can point back at the round and the wording of every item
+// that drew it — two lenses can raise the same item id, and one answer
+// settles both. It renders nothing outside the details view, and nothing
+// when the answer names an item no verdict raised.
+func (v FeedbackModel) answerRefs(ivs []FeedbackItemView, w int) []string {
+	if !v.details {
 		return nil
 	}
-	t := v.theme
-	ref := fmt.Sprintf("re: round %d · %s · %s · %s", iv.Round, iv.Lens, iv.Severity, iv.Title)
-	return []string{clip("      "+t.Muted().Render(ref), w)}
+	out := make([]string, 0, len(ivs))
+	for _, iv := range ivs {
+		head := "      " + v.theme.Muted().Render(fmt.Sprintf("re: round %d · %s · %s · ", iv.Round, iv.Lens, iv.Severity))
+		out = append(out, v.flow(head, iv.Title, v.theme.Muted(), 6, w)...)
+	}
+	return out
 }
 
 // escalationLines render the product owner's ruling after the review round
@@ -955,7 +1020,6 @@ func (v FeedbackModel) escalationLines(e domain.Escalation, w int) []string {
 	if e.Outcome == domain.EscalationBlock {
 		style = t.Danger()
 	}
-	line := "  " + style.Render("▲ escalation "+e.Outcome.String())
 	tail := e.Summary
 	if tail == "" {
 		tail = e.Notes
@@ -963,12 +1027,69 @@ func (v FeedbackModel) escalationLines(e domain.Escalation, w int) []string {
 	if tail == "" {
 		tail = e.NewAcceptance
 	}
-	if tail != "" {
-		line += " " + t.Muted().Render(prsTruncate(tail, max(w-lipgloss.Width(line)-1, 0)))
-	}
-	out := []string{clip(line, w)}
+	out := v.flow("  "+style.Render("▲ escalation "+e.Outcome.String())+" ", tail, t.Muted(), 6, w)
 	if v.details && e.NewAcceptance != "" && tail != e.NewAcceptance {
-		out = append(out, clip("      "+t.Muted().Render("acceptance: "+e.NewAcceptance), w))
+		out = append(out, v.flow("      ", "acceptance: "+e.NewAcceptance, t.Muted(), 6, w)...)
+	}
+	return out
+}
+
+// flow renders a line whose last field is free text that can be longer than
+// the pane: head is the styled prefix, up to and including the space the
+// text starts after. The compact view cuts the text with an ellipsis, so a
+// reader can see something was left out; the details view wraps the whole
+// text onto continuation lines indented to indent columns, so the details
+// toggle really does show the item's full text (P7-04 round 3). Nothing is
+// ever hard-clipped without a mark.
+func (v FeedbackModel) flow(head, text string, style lipgloss.Style, indent, w int) []string {
+	avail := w - lipgloss.Width(head)
+	if text == "" || avail <= 0 {
+		return []string{clip(strings.TrimRight(head, " "), w)}
+	}
+	if !v.details {
+		return []string{clip(head+style.Render(prsTruncate(text, avail)), w)}
+	}
+	segs := feedbackWrap(text, avail, w-indent)
+	if len(segs) == 0 {
+		return []string{clip(strings.TrimRight(head, " "), w)}
+	}
+	out := make([]string, 0, len(segs))
+	out = append(out, clip(head+style.Render(segs[0]), w))
+	for _, seg := range segs[1:] {
+		out = append(out, clip(strings.Repeat(" ", max(indent, 0))+style.Render(seg), w))
+	}
+	return out
+}
+
+// feedbackWrap breaks s on spaces into segments that fit the given widths:
+// first for the opening segment, which shares its line with a prefix, and
+// rest for every continuation line. A single word wider than the line it
+// starts is cut with an ellipsis rather than clipped silently.
+func feedbackWrap(s string, first, rest int) []string {
+	width, rest := max(first, 1), max(rest, 1)
+	var out []string
+	cur := ""
+	flush := func() {
+		out = append(out, cur)
+		cur, width = "", rest
+	}
+	for _, word := range strings.Fields(s) {
+		switch {
+		case cur != "" && lipgloss.Width(cur)+1+lipgloss.Width(word) <= width:
+			cur += " " + word
+			continue
+		case cur != "":
+			flush()
+		}
+		if lipgloss.Width(word) > width {
+			out = append(out, prsTruncate(word, width))
+			width = rest
+			continue
+		}
+		cur = word
+	}
+	if cur != "" {
+		flush()
 	}
 	return out
 }

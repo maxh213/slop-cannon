@@ -345,7 +345,8 @@ func (r EngineerRequest) Prompt() (prompt.Prompt, error) {
 }
 
 // RunSpec builds the cartridge run spec for the firing; see Firing, which
-// returns the prompt alongside it.
+// returns the prompt alongside it. An over-budget prompt comes back as a
+// valid spec plus an [ErrPromptOverBudget] error, exactly as it does there.
 func (r EngineerRequest) RunSpec() (cartridge.RunSpec, error) {
 	f, err := r.Firing()
 	return f.Spec, err
@@ -355,6 +356,11 @@ func (r EngineerRequest) RunSpec() (cartridge.RunSpec, error) {
 // run spec (workdir = the bead's worktree, tool policy set by ApplyPolicy)
 // and the output contract. It fails on an invalid request or a run spec the
 // cartridge layer would reject.
+//
+// A prompt that is still over its budget once the builder has degraded
+// everything it may comes back complete, alongside an [ErrPromptOverBudget]
+// error: the firing is usable and only the caller knows whether the tokens
+// are worth spending.
 func (r EngineerRequest) Firing() (EngineerFiring, error) {
 	pr, err := r.PromptRequest()
 	if err != nil {
@@ -382,14 +388,18 @@ func (r EngineerRequest) Firing() (EngineerFiring, error) {
 	if err := spec.Validate(); err != nil {
 		return EngineerFiring{}, fmt.Errorf("agents: engineer %s: %w", r.AgentID, err)
 	}
-	return EngineerFiring{
+	f := EngineerFiring{
 		Mode:     r.Mode,
 		Task:     task,
 		Prompt:   p,
 		Spec:     spec,
 		Contract: pr.Contract,
 		Message:  r.Mode.MessageType(),
-	}, nil
+	}
+	if p.OverBudget {
+		return f, promptBudgetError(fmt.Sprintf("engineer %s", r.Mode), p)
+	}
+	return f, nil
 }
 
 // cloneEngineerEnv copies an environment map so the caller's map is never retained.

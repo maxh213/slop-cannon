@@ -96,12 +96,16 @@ A tiny Go command-line tool that prints statistics for a list of numbers.
 
 Description:
 
+```
 stats.Mean divides by len(xs) without checking it.
+```
 
 Acceptance criteria (every one of these must hold):
 
+```
 - Mean(nil) and Mean([]float64{}) return (0, false)
 - a table test covers both
+```
 
 ## Round history
 
@@ -109,7 +113,9 @@ Acceptance criteria (every one of these must hold):
 
 Engineer report:
 
+```
 Mean returns (0, false) for an empty slice.
+```
 
 - Files changed: stats/stats.go
 - Commit: 1f0c9ab

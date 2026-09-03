@@ -799,3 +799,95 @@ func TestModelHelpOverlayWithTheAgentsKeysStillFits(t *testing.T) {
 		})
 	}
 }
+
+// avColor matches an SGR colour escape. The no-colour theme still emits
+// bold and reset, so a frame legitimately carries escapes; a foreground or
+// background colour in one is either a theme bug or unsanitised subprocess
+// output.
+var avColor = regexp.MustCompile(`\x1b\[[0-9;]*(3[0-9]|4[0-9]|9[0-7]|10[0-7])m`)
+
+// avSpinnerGlyphs are the frames of the card spinner, spelled out here so a
+// test can assert that none of them is on screen.
+const avSpinnerGlyphs = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+// avHasSpinner reports whether s carries any spinner frame.
+func avHasSpinner(s string) bool { return strings.ContainsAny(s, avSpinnerGlyphs) }
+
+func TestAgentsViewSanitisesTheCardsLastLine(t *testing.T) {
+	const id domain.AgentID = "eng-dirty"
+	dirty := "\x1b[2J\x1b[H\x1b[31mBOOM\x1b[0m done\rrewritten"
+	evs := []events.Event{
+		events.AgentSpawned{
+			Meta:  events.MetaAt(avRun, avStart),
+			Agent: avAgent(id, domain.RoleEngineer, "", "av-9", avStart),
+			Task:  events.TaskImplement, BeadTitle: "Dirty output", Round: 1, Attempt: 1,
+		},
+		events.AgentOutput{
+			Meta: events.MetaAt(avRun, avStart.Add(time.Second)), Agent: id,
+			Stream: events.StreamStdout, Line: dirty,
+		},
+	}
+	st, v := avFold(t, 80, 20, evs)
+
+	// The state keeps the raw bytes — sanitising is the view's job, and the
+	// card reads LastLine straight off the state.
+	a, ok := st.Agent(id)
+	require.True(t, ok)
+	require.Equal(t, dirty, a.LastLine, "the state is expected to hold the line verbatim")
+
+	// The card list draws the last line, so the frame must not carry the
+	// escapes: they would clear and home the user's terminal on every
+	// redraw, inject colour into a NO_COLOR frame, and the carriage return
+	// would send the cursor back to column 0 mid-row and shift the card's
+	// right border.
+	frame := v.View(st)
+	require.Contains(t, frame, "rewritten", "the CR is honoured: what came after it wins")
+	require.NotContains(t, frame, "BOOM", "everything before the CR is overwritten")
+	require.NotContains(t, frame, "\x1b[2J")
+	require.NotContains(t, frame, "\x1b[H")
+	require.NotContains(t, frame, "\x1b[31m")
+	require.NotContains(t, frame, "\r")
+	require.NotRegexp(t, avColor, frame, "a NO_COLOR frame carries no colour escape")
+	for i, l := range avLines(frame) {
+		require.LessOrEqual(t, lipgloss.Width(l), 80, "line %d is wider than the pane: %q", i, l)
+		if strings.Contains(l, "│") {
+			// A card row: the right border has to land on the last column,
+			// which a stray CR or escape in the last line would move.
+			require.Equal(t, 80, lipgloss.Width(l), "the card's border is not at column 80: %q", l)
+			require.True(t, strings.HasSuffix(avPlain(l), "│"), "the card's row does not end at its border: %q", l)
+		}
+	}
+
+	// The transcript pane draws the same card, so it is clean there too.
+	open := avPress(t, v, st, "enter").View(st)
+	require.NotContains(t, open, "\x1b[2J")
+	require.NotContains(t, open, "\r")
+}
+
+func TestAgentsViewEndedAgentsTranscriptHasNoSpinner(t *testing.T) {
+	st, v := avView(t, 80, 20)
+	// The card list is live agents first, then the history newest first:
+	// two down keys land on the tester that timed out.
+	v = avPress(t, v, st, "down")
+	v = avPress(t, v, st, "down")
+	v = avPress(t, v, st, "enter")
+
+	a, ok := v.Selected(st)
+	require.True(t, ok)
+	require.False(t, a.Live(), "this test needs an agent that has ended")
+
+	frame := v.View(st)
+	require.Contains(t, avPlain(frame), "✗ tester/ux", "the card still carries the lifecycle glyph")
+	require.False(t, avHasSpinner(frame),
+		"an agent that has ended must not appear to still be spinning:\n%s", frame)
+	avGolden(t, "transcript-ended", frame)
+}
+
+func TestAgentsViewLiveAgentsTranscriptKeepsItsSpinner(t *testing.T) {
+	st, v := avView(t, 80, 20)
+	v = avPress(t, v, st, "enter")
+	a, ok := v.Selected(st)
+	require.True(t, ok)
+	require.True(t, a.Live())
+	require.True(t, avHasSpinner(v.View(st)), "a running agent's card still spins")
+}

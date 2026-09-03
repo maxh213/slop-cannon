@@ -5,17 +5,17 @@
                                                                                 
                                                                                 
                                                                                 
-                                                                                
-                                                                                
         ╭─────────────────────────────────────────────────────────────╮         
         │  [1mKeys[0m                                                       │         
         │                                                             │         
         │  tab       next view        ↑/k up      ?      help         │         
         │  shift+tab previous view    ↓/j down    q      stop / quit  │         
         │  1…5       jump to view                 ctrl+c quit now     │         
+        │                                                             │         
+        │  [1mGraph keys[0m                                                 │         
+        │  ←/h prev level    enter bead detail     g first bead       │         
+        │  →/l next level    esc   close detail    G last bead        │         
         ╰─────────────────────────────────────────────────────────────╯         
-                                                                                
-                                                                                
                                                                                 
                                                                                 
                                                                                 
