@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/domain"
@@ -224,6 +225,11 @@ func NewPRDeliverer(m *Manager, tracker PRTracker, opts ...PROption) (*PRDeliver
 // local and the bead is moved to needs_human too (Status PRNoRemote).
 // Neither is an error. Errors: [ErrBranchMissing], [ErrPushRejected], gh
 // failures other than the ones above as [*GHError], and tracker errors.
+//
+// A hand-off leaves the bead in needs_human, so a later retry that does
+// reach gh reports Status PRCreated and State delivering without writing
+// that status: the caller owns the bead's status and must move it back to
+// delivering itself, exactly as it does before the first delivery.
 func (d *PRDeliverer) Deliver(ctx context.Context, req PRRequest) (*PRResult, error) {
 	bead := req.Bead
 	if bead.ID == "" {
@@ -362,15 +368,22 @@ func manualPRInstructions(res *PRResult) string {
 	return fmt.Sprintf("open a pull request from %s to %s on %s (%s) yourself", res.Branch, res.Base, res.Remote, res.RemoteURL)
 }
 
-// PRTitle returns the pull request title for a bead: its title, trimmed
-// and capped, or "Bead <id>" when the title is empty.
+// PRTitle returns the pull request title for a bead: its title with
+// whitespace collapsed, capped at [maxPRTitleLen] bytes on a rune
+// boundary (so the title stays valid UTF-8), or "Bead <id>" when the bead
+// has no title.
 func PRTitle(bead domain.Bead) string {
 	title := strings.Join(strings.Fields(bead.Title), " ")
 	if title == "" {
 		return "Bead " + string(bead.ID)
 	}
 	if len(title) > maxPRTitleLen {
-		title = strings.TrimSpace(title[:maxPRTitleLen-1]) + "…"
+		const ellipsis = "…"
+		cut := maxPRTitleLen - len(ellipsis)
+		for cut > 0 && !utf8.RuneStart(title[cut]) {
+			cut--
+		}
+		title = strings.TrimSpace(title[:cut]) + ellipsis
 	}
 	return title
 }

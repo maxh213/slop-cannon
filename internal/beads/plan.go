@@ -107,6 +107,12 @@ type PlanResult struct {
 	// criteria (and, for an existing epic, parent) could not be written
 	// before an error; the returned error says why. Empty on success.
 	Unfinished []domain.BeadID
+	// Warnings are `warning:` lines bd printed on the real create call.
+	// The dry run of the very same plan is verified first (any warning
+	// there fails the build, D-24), so this stays empty in practice; when
+	// it does not, bd dropped something and the caller should say so.
+	// ApplyPlan also logs them at Warn.
+	Warnings []string
 }
 
 // planBuild is the converted plan plus what the graph cannot carry.
@@ -324,6 +330,13 @@ func (c *Client) ApplyPlan(ctx context.Context, req PlanRequest, dryRun bool) (P
 	real, err := c.CreateGraph(ctx, b.graph, false)
 	if err != nil {
 		return out, err
+	}
+	if len(real.Warnings) > 0 {
+		// The identical plan dry ran without a warning, so this means bd
+		// dropped something the dry run accepted: never silent (D-24).
+		out.Warnings = append([]string(nil), real.Warnings...)
+		c.logger.WarnContext(ctx, "bd warned about the applied graph plan",
+			"repo", c.repo, "run", string(req.Run), "warnings", strings.Join(real.Warnings, "; "))
 	}
 	out.IDs = make(map[string]domain.BeadID, len(b.keys))
 	var missing []string

@@ -796,7 +796,8 @@ The suite (`internal/cartridge/conformance`, P2-09) is the acceptance test:
 `beads-readonly` (`conformance.CheckNames()`), plus the stream-contract
 assertions on every session. `beads-readonly` needs `bd` and `git` on
 `PATH` (or `Options.BD` naming the real binary) and reports `SKIP`, not
-`FAIL`, without them. Two ways to run it:
+`FAIL`, without them or on a platform with no POSIX shell. Two ways to
+run it:
 
 - **Real CLI, from the Makefile:** after adding the blank import to
   `conformance_test.go` and a cheap default model to its

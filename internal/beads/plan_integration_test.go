@@ -4,13 +4,18 @@ package beads
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/domain"
+	"slop-cannon/internal/proc"
 )
 
 // TestIntegrationApplyPlanDiamond applies the six-bead diamond plan to a
@@ -140,4 +145,93 @@ func sortedBlockers(m map[domain.BeadID][]domain.BeadID) map[domain.BeadID][]dom
 		out[k] = ids
 	}
 	return out
+}
+
+// planRawDryRun runs `bd create --graph <file> --dry-run --json` outside
+// the typed GraphPlan struct, so a test can send fields BuildGraphPlan
+// cannot express, and returns the decoded report plus the raw result.
+func planRawDryRun(t *testing.T, repo, body string) (GraphResult, proc.Result, error) {
+	t.Helper()
+	file := filepath.Join(t.TempDir(), "plan.json")
+	require.NoError(t, os.WriteFile(file, []byte(body), 0o600))
+	res, err := Run(context.Background(), CallOptions{Repo: repo, Timeout: time.Minute}, "create", "--graph", file, "--dry-run", "--json")
+	if err != nil {
+		return GraphResult{}, res, err
+	}
+	var out GraphResult
+	if err := Decode(res.Stdout, &out); err != nil {
+		return GraphResult{}, res, err
+	}
+	out.Warnings = GraphWarnings(res.Stderr)
+	return out, res, nil
+}
+
+// TestIntegrationGraphPlanNodeFields re-verifies the P3-11 facts recorded
+// in Appendix A against the installed bd: which node fields the graph-plan
+// parser accepts, that node-level deps are dropped while top-level edges
+// are counted (D-24), that metadata values must be strings, and that
+// VerifyDryRun fails loudly on the resulting warning.
+func TestIntegrationGraphPlanNodeFields(t *testing.T) {
+	_, repo := integrationClient(t)
+
+	t.Run("accepted node fields", func(t *testing.T) {
+		for _, field := range []string{
+			`"description":"d"`, `"labels":["sc:run:r1"]`, `"metadata":{"sc_run":"r1"}`,
+			`"parent_key":"p"`, `"parent_id":"fx-nope"`, `"assignee":"sc"`,
+		} {
+			body := `{"nodes":[{"key":"p","title":"P","type":"epic","priority":1},{"key":"n","title":"N","type":"task","priority":2,` + field + `}]}`
+			out, _, err := planRawDryRun(t, repo.Dir, body)
+			require.NoError(t, err, field)
+			assert.Empty(t, out.Warnings, "%s is an accepted node field", field)
+		}
+	})
+
+	t.Run("no acceptance field exists", func(t *testing.T) {
+		for _, field := range []string{"acceptance", "acceptance_criteria", "acceptanceCriteria", "criteria", "notes", "design", "owner", "id", "status", "deps"} {
+			body := `{"nodes":[{"key":"n","title":"N","type":"task","priority":2,"` + field + `":"x"}]}`
+			out, _, err := planRawDryRun(t, repo.Dir, body)
+			require.NoError(t, err, field)
+			require.Len(t, out.Warnings, 1, "%s is dropped with a warning", field)
+			assert.Contains(t, out.Warnings[0], "unknown field(s): ["+field+"]")
+			assert.ErrorIs(t, VerifyDryRun(GraphPlan{Nodes: make([]GraphNode, out.NodeCount)}, out), ErrPlanWarning)
+		}
+	})
+
+	t.Run("node deps are dropped, top-level edges are counted", func(t *testing.T) {
+		nodes := `{"key":"a","title":"A","type":"task","priority":2},{"key":"b","title":"B","type":"task","priority":2}`
+		out, _, err := planRawDryRun(t, repo.Dir, `{"nodes":[`+nodes+`],"edges":[{"from_key":"b","to_key":"a","type":"blocks"}]}`)
+		require.NoError(t, err)
+		assert.Empty(t, out.Warnings)
+		assert.Equal(t, 1, out.EdgeCount, "top-level edges[] are the D-24 dependency channel")
+
+		dropped, _, err := planRawDryRun(t, repo.Dir, `{"nodes":[{"key":"a","title":"A","type":"task","priority":2,"deps":[{"target":"b","type":"blocks"}]},{"key":"b","title":"B","type":"task","priority":2}]}`)
+		require.NoError(t, err)
+		assert.Equal(t, 0, dropped.EdgeCount, "node-level deps create nothing (D-24)")
+		assert.NotEmpty(t, dropped.Warnings)
+	})
+
+	t.Run("metadata values must be strings", func(t *testing.T) {
+		_, _, err := planRawDryRun(t, repo.Dir, `{"nodes":[{"key":"n","title":"N","type":"task","priority":2,"metadata":{"sc_round":0}}]}`)
+		require.Error(t, err, "a numeric metadata value fails the whole call; GraphMetadata stringifies")
+
+		plan, err := BuildGraphPlan(planRequest(""))
+		require.NoError(t, err)
+		for _, n := range plan.Nodes {
+			for k, v := range n.Metadata {
+				assert.IsType(t, "", v, "node %s metadata %s", n.Key, k)
+			}
+		}
+	})
+
+	t.Run("the captured plan dry runs clean", func(t *testing.T) {
+		plan, err := BuildGraphPlan(planRequest(""))
+		require.NoError(t, err)
+		body, err := json.Marshal(plan)
+		require.NoError(t, err)
+		out, _, err := planRawDryRun(t, repo.Dir, string(body))
+		require.NoError(t, err)
+		assert.NoError(t, VerifyDryRun(plan, out))
+		assert.Equal(t, planDiamond().DependencyCount(), out.EdgeCount, "edge_count == Plan.DependencyCount() (P3-15)")
+		assert.Equal(t, len(plan.Nodes), out.NodeCount)
+	})
 }

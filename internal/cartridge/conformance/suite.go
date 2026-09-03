@@ -706,27 +706,46 @@ func runTimeout(ctx context.Context, e *env) (string, cartridge.Usage, error) {
 	return detail, o.res.Usage, nil
 }
 
-// runKill is CheckKill.
+// runKill is CheckKill. The check calls Session.Kill itself once
+// KillAfter has elapsed; a session that reports ErrKilled without that
+// call (the run's context was cancelled, or the adapter gave up on its
+// own) fails, so a cancelled run never shows a passing kill row.
 func runKill(ctx context.Context, e *env) (string, cartridge.Usage, error) {
 	spec, err := e.spec(CheckKill, cartridge.ToolReadExec, HangPrompt())
 	if err != nil {
 		return "", cartridge.Usage{}, err
 	}
-	killed := make(chan struct{})
+	// The killer goroutine exists only once Run has returned a session
+	// (onStart), so killed is waited on only when it was started; ended
+	// tells the killer the session finished on its own so it does not
+	// linger until KillAfter. didKill is written before killed is closed
+	// and read after it is received, which orders the two.
+	var (
+		started bool
+		didKill bool
+		killed  = make(chan struct{})
+		ended   = make(chan struct{})
+	)
 	onStart := func(s cartridge.Session) {
+		started = true
 		go func() {
 			defer close(killed)
 			t := time.NewTimer(e.opts.KillAfter)
 			defer t.Stop()
 			select {
 			case <-t.C:
+				didKill = true
 				s.Kill()
+			case <-ended:
 			case <-ctx.Done():
 			}
 		}()
 	}
 	o, err := e.run(ctx, CheckKill, spec, onStart)
-	<-killed
+	close(ended)
+	if started {
+		<-killed
+	}
 	if err != nil {
 		return "", o.res.Usage, err
 	}
@@ -736,6 +755,10 @@ func runKill(ctx context.Context, e *env) (string, cartridge.Usage, error) {
 		return detail, o.res.Usage, fmt.Errorf("the hung session finished successfully instead of being killed (output: %q)", o.res.Output)
 	case !errors.Is(o.err, cartridge.ErrKilled):
 		return detail, o.res.Usage, fmt.Errorf("the killed session ended with %s, want ErrKilled: %w", cartridge.KindOf(o.err), o.err)
+	case !didKill && ctx.Err() != nil:
+		return detail, o.res.Usage, fmt.Errorf("the session ended with ErrKilled before the suite called Kill: the run's context was cancelled (%v): %w", ctx.Err(), o.err)
+	case !didKill:
+		return detail, o.res.Usage, fmt.Errorf("the session ended with ErrKilled before the suite called Kill at %s: %w", e.opts.KillAfter, o.err)
 	case o.elapsed > e.opts.KillAfter+endSlack:
 		return detail, o.res.Usage, fmt.Errorf("the session took %s to end after Kill at %s", o.elapsed.Round(time.Millisecond), e.opts.KillAfter)
 	}

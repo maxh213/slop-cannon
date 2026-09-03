@@ -108,6 +108,24 @@ func TestRepo_CommitAll(t *testing.T) {
 		assert.Equal(t, "1", r.Git(t, "rev-list", "--count", before+".."+c.SHA), "exactly one commit was added")
 	})
 
+	t.Run("commits deletions and paths git would otherwise quote", func(t *testing.T) {
+		r := testutil.NewFixtureRepo(t)
+		repo := repoOpen(t, r)
+		require.NoError(t, os.Remove(filepath.Join(r.Dir, "README.md")))
+		acWrite(t, r.Dir, "notes/a note.txt", "spaces\n")
+		acWrite(t, r.Dir, "notes/café.txt", "unicode\n")
+
+		c, err := repo.CommitAll(ctx, "leftovers")
+		require.NoError(t, err)
+		assert.True(t, c.Committed)
+		assert.ElementsMatch(t, []string{"README.md", "notes/a note.txt", "notes/café.txt"}, c.Paths,
+			"paths are reported raw, never in git's quoted form")
+		assert.Empty(t, r.Status(t))
+		tracked := r.Git(t, "ls-files", "-z")
+		assert.NotContains(t, tracked, "README.md", "the deletion was committed")
+		assert.Contains(t, tracked, "notes/café.txt")
+	})
+
 	t.Run("clean tree makes no commit", func(t *testing.T) {
 		r := testutil.NewFixtureRepo(t)
 		repo := repoOpen(t, r)
@@ -245,6 +263,23 @@ func TestRepo_DiffStats(t *testing.T) {
 		again, err := repo.DiffStats(ctx, "main")
 		require.NoError(t, err)
 		assert.Equal(t, stats, again)
+	})
+
+	t.Run("counts deleted files", func(t *testing.T) {
+		r := testutil.NewFixtureRepo(t)
+		repo := repoOpen(t, r)
+		r.Git(t, "checkout", "-q", "-b", "sc/fx-a0u-del")
+		require.NoError(t, os.Remove(filepath.Join(r.Dir, "README.md")))
+		r.Commit(t, "drop the readme")
+
+		stats, err := repo.DiffStats(ctx, "main")
+		require.NoError(t, err)
+		require.Equal(t, 1, stats.Files)
+		deleted := acFileStat(t, stats, "README.md")
+		assert.Zero(t, deleted.Insertions)
+		assert.Positive(t, deleted.Deletions)
+		assert.Equal(t, deleted.Deletions, stats.Deletions)
+		assert.Equal(t, deleted.Deletions, stats.Lines())
 	})
 
 	t.Run("no divergence", func(t *testing.T) {

@@ -297,6 +297,18 @@ func TestDoltCheck(t *testing.T) {
 		require.True(t, errors.As(err, &bdErr))
 		assert.Equal(t, "config get", bdErr.Command)
 	})
+
+	t.Run("warnings found before a config get failure are still logged", func(t *testing.T) {
+		beads := doltBeadsDir(t, "")
+		c, _, logs := doltClient(t, doltStage(t, map[string]string{"context": "context-server", "config-get": "error-no-project"}, beads))
+		status, err := c.CheckDolt(ctx)
+		require.Error(t, err)
+		require.Len(t, status.Warnings, 2, strings.Join(status.Warnings, "\n"))
+		assert.Equal(t, ServerModeWarning(status.Context), status.Warnings[0])
+		assert.Empty(t, status.AutoCommit)
+		assert.Contains(t, logs.String(), "only been tested against embedded mode")
+		assert.Contains(t, logs.String(), "dolt_mode=server")
+	})
 }
 
 func TestDoltWarningText(t *testing.T) {

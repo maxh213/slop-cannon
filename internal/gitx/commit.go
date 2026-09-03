@@ -211,8 +211,13 @@ func (r *Repo) DiffStats(ctx context.Context, base string) (*DiffStats, error) {
 }
 
 // diffStatsBetween runs "git diff --numstat -M -z from to" and parses it.
+// External diff drivers and textconv filters are disabled so the counts
+// describe the same bytes as the patch [Repo.Diff] hands to reviewers; a
+// repository whose .gitattributes configures textconv would otherwise
+// report line counts (and therefore a D-09 change ratio) computed on
+// converted text.
 func (r *Repo) diffStatsBetween(ctx context.Context, from, to string) (*DiffStats, error) {
-	out, err := r.Git(ctx, "diff", "--numstat", "-M", "-z", from, to, "--")
+	out, err := r.Git(ctx, "diff", "--numstat", "-M", "-z", "--no-ext-diff", "--no-textconv", from, to, "--")
 	if err != nil {
 		return nil, err
 	}

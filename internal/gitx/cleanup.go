@@ -81,8 +81,16 @@ type CleanupEntry struct {
 // CleanupResult is what [Manager.Cleanup] did, one entry per bead or
 // worktree, sorted by bead id.
 type CleanupResult struct {
-	// Default is the default branch merged branches were checked against.
+	// Default is the default branch's short name; empty when the
+	// repository has none.
 	Default string
+	// Bases are the revisions a closed bead's branch was checked against,
+	// as short names: it counts as merged when it is an ancestor of any of
+	// them. The remote-tracking branch of the default remote comes first
+	// (a delivery pushes there, and a merged pull request shows up there
+	// once fetched), then the local Default. Empty when neither ref
+	// exists, in which case no branch is deleted.
+	Bases []string
 	// Entries lists every bead or worktree looked at.
 	Entries []CleanupEntry
 }
@@ -191,6 +199,11 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 	if res.Default, err = m.repo.DefaultBranch(ctx); err != nil && !errors.Is(err, ErrNoDefaultBranch) {
 		return nil, err
 	}
+	baseRefs, baseNames, err := m.repo.defaultBases(ctx, res.Default)
+	if err != nil {
+		return nil, err
+	}
+	res.Bases = baseNames
 
 	seen := map[domain.BeadID]bool{}
 	for _, wt := range worktrees {
@@ -216,7 +229,7 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 			}
 			e.Action = CleanupRemoved
 			e.Reason = "the bead is closed"
-			m.cleanupBranch(ctx, &e, bead, res.Default, opts.KeepBranches)
+			m.cleanupBranch(ctx, &e, bead, baseRefs, baseNames, opts.KeepBranches)
 		}
 		log.InfoContext(ctx, "cleanup: "+string(e.Action)+" worktree", "bead", string(e.BeadID), "path", e.Path, "state", string(e.State), "reason", e.Reason, "err", e.Err)
 		res.Entries = append(res.Entries, e)
@@ -237,7 +250,7 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 			continue
 		}
 		e := CleanupEntry{BeadID: id, Path: m.PathFor(id), Branch: branch, State: bead.State, Action: CleanupNone, Reason: "the bead is closed and has no worktree"}
-		m.cleanupBranch(ctx, &e, bead, res.Default, opts.KeepBranches)
+		m.cleanupBranch(ctx, &e, bead, baseRefs, baseNames, opts.KeepBranches)
 		log.InfoContext(ctx, "cleanup: closed bead without worktree", "bead", string(id), "branch", branch, "deleted", e.BranchDeleted, "err", e.Err)
 		res.Entries = append(res.Entries, e)
 	}
@@ -250,8 +263,9 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 }
 
 // cleanupBranch deletes the closed bead's branch when it is fully merged
-// into the default branch and keep is false, recording the outcome on e.
-func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domain.Bead, def string, keep bool) {
+// into one of bases and keep is false, recording the outcome on e. names
+// are the short names of bases, used in the reason.
+func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domain.Bead, bases, names []string, keep bool) {
 	branch := BranchName(bead)
 	if e.Branch == "" {
 		e.Branch = branch
@@ -260,7 +274,7 @@ func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domai
 		e.Reason += "; branch kept as requested"
 		return
 	}
-	if def == "" {
+	if len(bases) == 0 {
 		e.Reason += "; branch kept (no default branch to check it against)"
 		return
 	}
@@ -272,13 +286,20 @@ func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domai
 	if !exists {
 		return
 	}
-	merged, err := m.repo.isAncestor(ctx, "refs/heads/"+branch, def)
-	if err != nil {
-		e.Err = err
-		return
+	mergedInto := ""
+	for i, base := range bases {
+		merged, err := m.repo.isAncestor(ctx, "refs/heads/"+branch, base)
+		if err != nil {
+			e.Err = err
+			return
+		}
+		if merged {
+			mergedInto = names[i]
+			break
+		}
 	}
-	if !merged {
-		e.Reason += fmt.Sprintf("; branch %s kept (not merged into %s)", branch, def)
+	if mergedInto == "" {
+		e.Reason += fmt.Sprintf("; branch %s kept (not merged into %s)", branch, strings.Join(names, " or "))
 		return
 	}
 	if err := m.DeleteBranch(ctx, bead); err != nil {
@@ -286,7 +307,40 @@ func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domai
 		return
 	}
 	e.BranchDeleted = true
-	e.Reason += fmt.Sprintf("; branch %s deleted (merged into %s)", branch, def)
+	e.Reason += fmt.Sprintf("; branch %s deleted (merged into %s)", branch, mergedInto)
+}
+
+// defaultBases returns the revisions a branch counts as landed on when it
+// is an ancestor of any of them: the remote-tracking branch of def on the
+// default remote first (a delivery pushes there, and a pull request
+// merged on the forge shows up there once fetched), then the local def.
+// The first result holds full refs for git, the second their short names
+// for reporting; both are empty when def is empty or neither ref exists.
+func (r *Repo) defaultBases(ctx context.Context, def string) (refs, names []string, err error) {
+	if def == "" {
+		return nil, nil, nil
+	}
+	remote, err := r.DefaultRemote(ctx)
+	if err != nil && !errors.Is(err, ErrNoRemote) {
+		return nil, nil, err
+	}
+	if remote != "" {
+		tracking := "refs/remotes/" + remote + "/" + def
+		if _, err := r.RevParse(ctx, tracking); err == nil {
+			refs = append(refs, tracking)
+			names = append(names, remote+"/"+def)
+		} else if !errors.Is(err, ErrUnknownRevision) {
+			return nil, nil, err
+		}
+	}
+	switch ok, err := r.BranchExists(ctx, def); {
+	case err != nil:
+		return nil, nil, err
+	case ok:
+		refs = append(refs, "refs/heads/"+def)
+		names = append(names, def)
+	}
+	return refs, names, nil
 }
 
 // WorktreeStatus says whether a bead's worktree could be reattached on
@@ -571,24 +625,14 @@ func (r *Resumer) Resume(ctx context.Context, beadList []domain.Bead) (*ResumeRe
 	}
 	// The "landed" check looks at both the local default branch and its
 	// remote-tracking branch, whichever exist; Base names the preferred.
-	var bases []string
-	if ok, err := repo.BranchExists(ctx, def); err != nil {
+	bases, baseNames, err := repo.defaultBases(ctx, def)
+	if err != nil {
 		return nil, err
-	} else if ok {
-		bases = append(bases, "refs/heads/"+def)
-	}
-	if remote != "" {
-		tracking := "refs/remotes/" + remote + "/" + def
-		if _, err := repo.RevParse(ctx, tracking); err == nil {
-			bases = append([]string{tracking}, bases...)
-		} else if !errors.Is(err, ErrUnknownRevision) {
-			return nil, err
-		}
 	}
 	if len(bases) == 0 {
 		return nil, fmt.Errorf("%w: %s has no commits", ErrNoDefaultBranch, def)
 	}
-	res.Base = strings.TrimPrefix(strings.TrimPrefix(bases[0], "refs/heads/"), "refs/remotes/")
+	res.Base = baseNames[0]
 
 	worktrees, err := r.m.List(ctx)
 	if err != nil {

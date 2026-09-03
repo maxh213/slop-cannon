@@ -2,6 +2,7 @@ package gitx
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -80,6 +81,15 @@ func dmBeads(t *testing.T, root string, overrides map[string]string) (*beads.Cli
 	t.Helper()
 	shim := testutil.FakeBD(t, testutil.StageBDSamples(t, overrides))
 	return beads.New(root, beads.Options{Actor: "sc:test", Timeout: 20 * time.Second}), shim
+}
+
+// dmStage returns the stage of the DeliveryError err carries, failing the
+// test when it is not one.
+func dmStage(t *testing.T, err error) DeliveryStage {
+	t.Helper()
+	var de *DeliveryError
+	require.ErrorAs(t, err, &de, "every delivery failure is a *DeliveryError")
+	return de.Stage
 }
 
 // dmPwdCheck returns a check command that records its working directory
@@ -166,6 +176,14 @@ func TestDeliveryError(t *testing.T) {
 		require.ErrorAs(t, err, &de)
 		assert.Equal(t, "blocked by fx-1", de.Output)
 		assert.ErrorIs(t, err, beads.ErrBlockedOpen)
+	})
+	t.Run("stageErr keeps the innermost stage", func(t *testing.T) {
+		inner := &DeliveryError{Stage: StageRebase, Conflict: true, Err: ErrRebaseConflict}
+		err := stageErr(StageMerge, fmt.Errorf("wrapped: %w", inner), "")
+		var de *DeliveryError
+		require.ErrorAs(t, err, &de)
+		assert.Equal(t, StageRebase, de.Stage, "an already staged error is never restaged")
+		assert.True(t, de.Conflict)
 	})
 }
 
@@ -610,6 +628,7 @@ func TestManager_DeliverMerge(t *testing.T) {
 		f := wtSetup(t, nil)
 		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{})
 		assert.ErrorIs(t, err, ErrWorktreeMissing)
+		assert.Equal(t, StagePrepare, dmStage(t, err), "even setup failures name a stage")
 	})
 
 	t.Run("empty bead id", func(t *testing.T) {
@@ -617,6 +636,7 @@ func TestManager_DeliverMerge(t *testing.T) {
 		_, err := f.m.DeliverMerge(ctx, domain.Bead{Title: "no id"}, MergeOptions{})
 		require.Error(t, err)
 		assert.NotErrorIs(t, err, ErrWorktreeMissing)
+		assert.Equal(t, StagePrepare, dmStage(t, err))
 	})
 
 	t.Run("worktree on the wrong branch", func(t *testing.T) {
@@ -625,6 +645,20 @@ func TestManager_DeliverMerge(t *testing.T) {
 		require.NoError(t, err)
 		_, err = f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true"})
 		assert.ErrorIs(t, err, ErrWrongBranch)
+		assert.Equal(t, StageRebase, dmStage(t, err))
+		assert.Empty(t, f.dmMerges(t))
+	})
+
+	t.Run("detached worktree head is refused before anything moves", func(t *testing.T) {
+		f := dmSetup(t)
+		before := f.dmMain(t)
+		f.dmBranchCommit(t, "note.txt", "n\n", "Add note")
+		_, err := f.wtRepo.Git(ctx, "checkout", "-q", "--detach")
+		require.NoError(t, err)
+		_, err = f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true"})
+		assert.ErrorIs(t, err, ErrWrongBranch)
+		assert.Equal(t, StageRebase, dmStage(t, err))
+		assert.Equal(t, before, f.dmMain(t))
 	})
 
 	t.Run("dirty worktree is refused by the rebase", func(t *testing.T) {
@@ -638,6 +672,23 @@ func TestManager_DeliverMerge(t *testing.T) {
 		assert.Equal(t, StageRebase, de.Stage)
 		assert.False(t, de.Conflict)
 		assert.Equal(t, before, f.dmMain(t))
+	})
+
+	t.Run("the check command runs with the full environment", func(t *testing.T) {
+		f := dmSetup(t)
+		f.dmBranchCommit(t, "note.txt", "n\n", "Add note")
+		t.Setenv("SC_DM_MARKER", "present")
+		out := filepath.Join(t.TempDir(), "env.txt")
+		command := fmt.Sprintf(`printf '%%s|%%s' "$SC_DM_MARKER" "$HOME" > "%s"`, out)
+		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: command})
+		require.NoError(t, err)
+		require.NotNil(t, res.Check)
+		got, err := os.ReadFile(out)
+		require.NoError(t, err)
+		marker, home, ok := strings.Cut(string(got), "|")
+		require.True(t, ok)
+		assert.Equal(t, "present", marker, "the check inherits the process environment")
+		assert.Equal(t, repoTestEnv(f.r)["HOME"], home, "the repository's explicit variables win")
 	})
 
 	t.Run("check output is capped", func(t *testing.T) {

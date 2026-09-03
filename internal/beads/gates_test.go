@@ -3,6 +3,7 @@ package beads
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -36,6 +37,9 @@ import (
 //	gate-check-missing-gh  no `gh` on PATH: stderr "error checking - gh CLI not installed"
 //	gate-check-unauth      `gh` not logged in: two-line stderr error
 //	gate-check-bad-gh      `gh` printed garbage: "failed to parse gh output"
+//	gate-check-gh-network  `gh` exited non-zero on a network outage: bd's
+//	                       "gh pr view failed: <gh stderr>" wrapper again, but a
+//	                       transient one (captured 2026-09-03)
 //	gate-check-pr-missing  `gh` cannot find the PR: ESCALATE "pull request not found"
 //	gate-check-none        no open gh:pr gate: a text line, no JSON
 //	gate-check-dry-run     --dry-run: dry_run true
@@ -275,6 +279,13 @@ func TestCheckGatesReplaysCapturedOutput(t *testing.T) {
 			results: []GateResult{{GateID: "fx-8p9", Outcome: GateError, Detail: `failed to parse gh output: invalid character '"' after object key:value pair`}},
 		},
 		{
+			name: "gh could not reach github", sample: "gate-check-gh-network",
+			want:    GateCheck{Checked: 1, Errors: 1, Warnings: []string{"fx-8ht: gh pr view failed: error connecting to api.github.com"}},
+			results: []GateResult{{GateID: "fx-8ht", Outcome: GateError, Detail: "gh pr view failed: error connecting to api.github.com"}},
+			// Not GHUnavailable: gh is installed and logged in, the outage
+			// is worth retrying on the next poll (P6-10).
+		},
+		{
 			name: "no open gates", sample: "gate-check-none",
 			want: GateCheck{},
 		},
@@ -302,7 +313,8 @@ func TestCheckGatesReplaysCapturedOutput(t *testing.T) {
 			assert.Equal(t, want, got)
 
 			args := clientLastArgs(t, bd)
-			assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "gate", "check", "--type=gh:pr"}, args[:5])
+			assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "gate", "check", "--type=gh:pr", "-l", "0"}, args[:7],
+				"-l 0 lifts bd's default limit of 100 gates per check")
 			assert.Equal(t, "--json", args[len(args)-1])
 			assert.Equal(t, tc.opts.Escalate, contains(args, "--escalate"))
 			assert.Equal(t, tc.opts.DryRun, contains(args, "--dry-run"))
@@ -332,6 +344,40 @@ func TestGateCheckHelpers(t *testing.T) {
 	assert.False(t, unavailable)
 	_, unavailable = GateCheck{Checked: 1, Errors: 1, Results: []GateResult{{GateID: "g", Outcome: GateError, Detail: "failed to parse gh output"}}}.GHUnavailable()
 	assert.False(t, unavailable, "a parse failure is not a missing gh")
+
+	// bd wraps every non-zero gh exit in "gh pr view failed: …", so the
+	// wrapper alone says nothing: only the text gh itself printed does.
+	transient := []string{
+		"gh pr view failed: error connecting to api.github.com",
+		"gh pr view failed: HTTP 502 (https://api.github.com/graphql)",
+		"gh pr view failed: context deadline exceeded",
+	}
+	for _, detail := range transient {
+		check := GateCheck{Checked: 1, Errors: 1, Results: []GateResult{{GateID: "g", Outcome: GateError, Detail: detail}}}
+		_, unavailable = check.GHUnavailable()
+		assert.False(t, unavailable, "retryable: %s", detail)
+	}
+	for _, detail := range []string{
+		"gh CLI not installed",
+		`exec: "gh": executable file not found in $PATH`,
+		"gh pr view failed: To get started with GitHub CLI, please run:  gh auth login",
+		"gh pr view failed: populate the GH_TOKEN environment variable",
+		"gh pr view failed: You are not logged into any GitHub hosts",
+	} {
+		check := GateCheck{Checked: 1, Errors: 1, Results: []GateResult{{GateID: "g", Outcome: GateError, Detail: detail}}}
+		reason, unavailable := check.GHUnavailable()
+		assert.True(t, unavailable, "gh itself is unusable: %s", detail)
+		assert.Equal(t, detail, reason)
+	}
+
+	// One unusable gh and one outage is still not "gh is unavailable":
+	// the outage may clear on its own, so polling keeps going.
+	mixed := GateCheck{Checked: 2, Errors: 2, Results: []GateResult{
+		{GateID: "g-1", Outcome: GateError, Detail: "gh pr view failed: error connecting to api.github.com"},
+		{GateID: "g-2", Outcome: GateError, Detail: "gh CLI not installed"},
+	}}
+	_, unavailable = mixed.GHUnavailable()
+	assert.False(t, unavailable)
 }
 
 func TestParseGateCheck(t *testing.T) {
@@ -390,18 +436,23 @@ func TestCheckGatesFailures(t *testing.T) {
 // the verdict lines from what gh answered. It exercises the whole chain
 // (gh answer → bd output → parser) without the real binary. A file named
 // no-gh in the shim directory makes it report gh as not installed.
+//
+// `gate check -l N` truncates the way bd's real `--limit` does, and the
+// shim's default is 2 rather than bd's 100 so that a CheckGates call that
+// forgot `-l 0` checks too few gates and fails the test loudly.
 func gatesChainBD(t *testing.T) *testutil.Shim {
 	t.Helper()
 	return testutil.FakeBin(t, "bd", `
 gates="$SC_FAKEBIN_DIR/gates"
 touch "$gates"
-key=''; sub=''; blocks=''; await=''; escalate=0; skip=0
+key=''; sub=''; blocks=''; await=''; escalate=0; skip=0; limit=2
 for a in "$@"; do
   if [ "$skip" = 1 ]; then skip=0; continue; fi
   case "$a" in
     -C) skip=1 ;;
     --blocks) want=blocks ;;
     --await-id) want=await ;;
+    -l|--limit) want=limit ;;
     --escalate) escalate=1 ;;
     -n|--reason) skip=1 ;;
     -*) ;;
@@ -429,7 +480,7 @@ case "$key $sub" in
     n=0; r=0; e=0; x=0
     tmp="$gates.next"; : > "$tmp"
     while read -r id pr bead status; do
-      if [ "$status" != open ]; then echo "$id $pr $bead $status" >> "$tmp"; continue; fi
+      if [ "$status" != open ] || { [ "$limit" != 0 ] && [ "$n" -ge "$limit" ]; }; then echo "$id $pr $bead $status" >> "$tmp"; continue; fi
       n=$((n + 1))
       if [ -f "$SC_FAKEBIN_DIR/no-gh" ] || ! command -v gh >/dev/null 2>&1; then
         echo "✗ $id: error checking - gh CLI not installed" >&2; x=$((x + 1))
@@ -562,6 +613,36 @@ func TestCheckGatesThroughShims(t *testing.T) {
 	for _, inv := range bd.Invocations(t) {
 		assert.Equal(t, []string{"-C", "/tmp/fixture-repo"}, inv.Args[:2])
 	}
+}
+
+// TestCheckGatesIgnoresBDsGateLimit pins the `-l 0` of CheckGates: bd's
+// `gate check` stops after 100 gates by default, and with safety on every
+// delivered bead holds an open gh:pr gate until a human merges the PR, so
+// a long autopilot run passes that limit and the gates past it would never
+// be checked again — their beads would sit in `delivering` for ever.
+func TestCheckGatesIgnoresBDsGateLimit(t *testing.T) {
+	envIsolate(t)
+	bd := gatesChainBD(t)
+	gh := gatesChainGH(t)
+	require.NoError(t, os.WriteFile(filepath.Join(gh.Dir, "state"), []byte("MERGED"), 0o644))
+	c := New("/tmp/fixture-repo", Options{Actor: "sc:test"})
+	ctx := context.Background()
+
+	// Five gates, more than the shim's truncating default of 2.
+	var want []domain.BeadID
+	for i := 1; i <= 5; i++ {
+		g, err := c.CreatePRGate(ctx, domain.BeadID(fmt.Sprintf("fx-b%d", i)), i, "")
+		require.NoError(t, err)
+		want = append(want, g.ID)
+	}
+
+	check, err := c.CheckGates(ctx, GateCheckOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 5, check.Checked, "every gate was checked, not just the first page")
+	assert.Equal(t, 5, check.Resolved)
+	assert.Equal(t, want, check.ByOutcome(GateResolved))
+	assert.Contains(t, clientLastArgs(t, bd), "-l")
+	assert.Len(t, gh.ArgLists(t), 5)
 }
 
 // contains reports whether list holds s.

@@ -1,8 +1,10 @@
 package beads
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -291,6 +293,33 @@ func TestApplyPlanFailsOnEdgeCountMismatch(t *testing.T) {
 	assert.Equal(t, 4, res.DryRun.EdgeCount)
 	assert.Nil(t, res.IDs)
 	assert.Len(t, bd.ArgLists(t), 1)
+}
+
+// TestApplyPlanReportsRealRunWarnings covers the case the dry run cannot
+// catch: bd warns only on the real create call. The plan still completes
+// (the beads exist), but the warnings are reported and logged, never
+// swallowed (D-24).
+func TestApplyPlanReportsRealRunWarnings(t *testing.T) {
+	envIsolate(t)
+	bd := testutil.FakeBD(t, clientStage(t, map[string]string{
+		"create-graph-dry-run": "graph-dry-run",
+		"create-graph":         "graph-create-warning",
+	}))
+	var logs bytes.Buffer
+	c := New("/tmp/fixture-repo", Options{
+		Actor:  "sc:test",
+		Logger: slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})),
+	})
+	res, err := c.ApplyPlan(context.Background(), planRequest(""), false)
+	require.NoError(t, err)
+	assert.Empty(t, testutil.MissingSamples(t, bd))
+	require.Len(t, res.Warnings, 1)
+	assert.Contains(t, res.Warnings[0], "unknown field(s): [sc_future]")
+	assert.Contains(t, logs.String(), "bd warned about the applied graph plan")
+	assert.Contains(t, logs.String(), "run=r1")
+	assert.Len(t, res.Beads, 6, "the beads were still created")
+	assert.Empty(t, res.Unfinished)
+	assert.Empty(t, res.DryRun.Warnings)
 }
 
 func TestApplyPlanFailsBeforeCreateOnBadInput(t *testing.T) {

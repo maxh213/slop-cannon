@@ -228,20 +228,28 @@ func (c *Client) CheckDolt(ctx context.Context) (DoltStatus, error) {
 	}
 	auto, err := c.ConfigGet(ctx, AutoCommitKey)
 	if err != nil {
+		status.log(ctx, c)
 		return status, err
 	}
 	status.AutoCommit = auto
 	if auto != AutoCommitOn && auto != "" {
 		status.warn(AutoCommitWarning(auto))
 	}
-	for _, w := range status.Warnings {
-		c.logger.WarnContext(ctx, w, "repo", c.repo, "dolt_mode", bc.DoltMode)
-	}
+	status.log(ctx, c)
 	return status, nil
 }
 
 // warn appends a warning.
 func (s *DoltStatus) warn(text string) { s.Warnings = append(s.Warnings, text) }
+
+// log writes every collected warning to the client's logger at Warn
+// level. CheckDolt calls it on both exits so a warning is never returned
+// without being logged.
+func (s DoltStatus) log(ctx context.Context, c *Client) {
+	for _, w := range s.Warnings {
+		c.logger.WarnContext(ctx, w, "repo", c.repo, "dolt_mode", s.Context.DoltMode)
+	}
+}
 
 // ServerModeWarning is the warning CheckDolt records when bd is not in
 // embedded mode: sc continues, but has not been tested there.

@@ -203,6 +203,7 @@ func TestManager_Cleanup(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, res.Err())
 		assert.Equal(t, "main", res.Default)
+		assert.Equal(t, []string{"main"}, res.Bases, "no remote: only the local default branch")
 
 		e := cuEntry(t, res, closedMerged.ID)
 		assert.Equal(t, CleanupRemoved, e.Action)
@@ -299,6 +300,7 @@ func TestManager_Cleanup(t *testing.T) {
 		res, err := f.m.Cleanup(ctx, []domain.Bead{bead}, CleanupOptions{Logger: quiet})
 		require.NoError(t, err)
 		assert.Empty(t, res.Default)
+		assert.Empty(t, res.Bases)
 		e := cuEntry(t, res, bead.ID)
 		assert.Equal(t, CleanupRemoved, e.Action)
 		assert.False(t, e.BranchDeleted)
@@ -312,6 +314,44 @@ func TestManager_Cleanup(t *testing.T) {
 		assert.Empty(t, res.Entries)
 		assert.Equal(t, "removed 0 worktrees", res.Summary())
 		assert.NoError(t, res.Err())
+	})
+
+	t.Run("a branch merged only on the remote is deleted", func(t *testing.T) {
+		f := wtSetup(t, []testutil.FixtureOption{testutil.WithBareRemote()})
+		landed := cuBead("fx-c1", "delivered with safety on", domain.BeadStateClosed)
+		unmerged := cuBead("fx-c2", "closed with the PR still open", domain.BeadStateClosed)
+		cuWork(t, f, landed)
+		cuWork(t, f, unmerged)
+		// The pull request merged on the forge: the remote default branch
+		// has the work, the local one does not.
+		f.r.Git(t, "push", "-q", "origin", BranchName(landed)+":main")
+		f.r.Git(t, "fetch", "-q", "origin")
+		localMain := f.r.Head(t)
+
+		res, err := f.m.Cleanup(ctx, []domain.Bead{landed, unmerged}, CleanupOptions{Logger: quiet})
+		require.NoError(t, err)
+		require.NoError(t, res.Err())
+		assert.Equal(t, "main", res.Default)
+		assert.Equal(t, []string{"origin/main", "main"}, res.Bases, "the remote-tracking branch is checked first")
+
+		e := cuEntry(t, res, landed.ID)
+		assert.Equal(t, CleanupRemoved, e.Action)
+		assert.True(t, e.BranchDeleted)
+		assert.Contains(t, e.Reason, "deleted (merged into origin/main)")
+		ok, err := f.repo.BranchExists(ctx, BranchName(landed))
+		require.NoError(t, err)
+		assert.False(t, ok)
+
+		e = cuEntry(t, res, unmerged.ID)
+		assert.Equal(t, CleanupRemoved, e.Action)
+		assert.False(t, e.BranchDeleted)
+		assert.Contains(t, e.Reason, "kept (not merged into origin/main or main)")
+		ok, err = f.repo.BranchExists(ctx, BranchName(unmerged))
+		require.NoError(t, err)
+		assert.True(t, ok)
+
+		assert.Equal(t, localMain, f.r.Head(t), "cleanup never moves the default branch")
+		assert.Empty(t, f.r.Status(t))
 	})
 
 	t.Run("a failed removal is reported and the worktree kept", func(t *testing.T) {

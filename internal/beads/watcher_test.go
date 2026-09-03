@@ -209,6 +209,17 @@ func TestWatcherDiffBlockerOrderIsIrrelevant(t *testing.T) {
 	assert.True(t, DiffIssues([]Issue{a}, []Issue{b}).Empty())
 }
 
+func TestWatcherDiffSwappedBlocker(t *testing.T) {
+	// Same number of blockers, one of them replaced: updated_at, status and
+	// assignee are all identical, so only the blocker comparison catches it.
+	a := watcherIssue("b-1", domain.BeadStateOpen, 0, "x", "y")
+	b := watcherIssue("b-1", domain.BeadStateOpen, 0, "x", "z")
+	ch := DiffIssues([]Issue{a}, []Issue{b})
+	assert.Equal(t, graphIDs("b-1"), ch.Changed)
+	assert.Empty(t, ch.Added)
+	assert.Empty(t, ch.Removed)
+}
+
 func TestWatcherMergeChanges(t *testing.T) {
 	earlier := Change{
 		At:      watcherT0,

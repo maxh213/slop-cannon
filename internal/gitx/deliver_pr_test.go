@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -268,8 +269,18 @@ func TestPRTitle(t *testing.T) {
 	assert.Equal(t, "Bead fx-1", PRTitle(domain.Bead{ID: "fx-1", Title: "  \n "}))
 	assert.Equal(t, "a b c", PRTitle(domain.Bead{ID: "fx-1", Title: " a\tb\n c "}), "whitespace is collapsed")
 	long := PRTitle(domain.Bead{ID: "fx-1", Title: strings.Repeat("x", 500)})
-	assert.LessOrEqual(t, len(long), maxPRTitleLen+len("…"))
+	assert.LessOrEqual(t, len(long), maxPRTitleLen)
 	assert.True(t, strings.HasSuffix(long, "…"))
+	assert.True(t, utf8.ValidString(long))
+
+	// Truncation lands on a rune boundary whatever the byte offset of the
+	// cut falls in the middle of; GitHub rejects invalid UTF-8 titles.
+	for _, pad := range []int{0, 1, 2} {
+		title := PRTitle(domain.Bead{ID: "fx-1", Title: strings.Repeat("a", pad) + strings.Repeat("é", 400)})
+		assert.LessOrEqual(t, len(title), maxPRTitleLen, "pad %d", pad)
+		assert.True(t, utf8.ValidString(title), "pad %d: %q", pad, title)
+		assert.True(t, strings.HasSuffix(title, "…"), "pad %d", pad)
+	}
 }
 
 func TestPRBody(t *testing.T) {

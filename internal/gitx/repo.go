@@ -138,6 +138,12 @@ func WithTimeout(d time.Duration) Option {
 // checkout, or the checkout itself) and returns a [Repo] for it. It fails
 // with [ErrNotRepository] when path is not inside a working tree, including
 // for bare repositories, and with a plain error when path does not exist.
+// Other git failures (a "dubious ownership" refusal, a corrupt repository)
+// are returned as an unclassified [*GitError] carrying git's stderr.
+//
+// The repository is discovered from path alone: GIT_DIR, GIT_WORK_TREE and
+// the other repository-location variables of the parent process are never
+// forwarded to git (see [Repo.Git]).
 func Open(ctx context.Context, path string, opts ...Option) (*Repo, error) {
 	if path == "" {
 		path = "."
@@ -160,22 +166,57 @@ func Open(ctx context.Context, path string, opts ...Option) (*Repo, error) {
 	}
 	r.inherit = inheritedEnv()
 
-	out, err := r.Git(ctx, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-dir", "--git-common-dir")
+	// --show-toplevel is always absolute. --git-dir and --git-common-dir
+	// are asked for separately from the top level so that a relative
+	// answer (".git") resolves against the right directory on every git
+	// since 2.30; --path-format=absolute would do it in one call but needs
+	// git 2.31, newer than the floor sc doctor enforces.
+	top, err := r.run(ctx, abs, "rev-parse", "--show-toplevel")
 	if err != nil {
-		var ge *GitError
-		if errors.As(err, &ge) && ge.ExitCode == 128 {
-			ge.Cause = ErrNotRepository
-		}
-		return nil, err
+		return nil, classifyNotRepository(err)
+	}
+	if top == "" || strings.Contains(top, "\n") {
+		return nil, fmt.Errorf("gitx: unexpected rev-parse output %q", top)
+	}
+	r.Root = filepath.Clean(top)
+
+	out, err := r.Git(ctx, "rev-parse", "--git-dir", "--git-common-dir")
+	if err != nil {
+		return nil, classifyNotRepository(err)
 	}
 	lines := strings.Split(out, "\n")
-	if len(lines) != 3 {
+	if len(lines) != 2 || lines[0] == "" || lines[1] == "" {
 		return nil, fmt.Errorf("gitx: unexpected rev-parse output %q", out)
 	}
-	r.Root = filepath.Clean(lines[0])
-	r.GitDir = filepath.Clean(lines[1])
-	r.CommonDir = filepath.Clean(lines[2])
+	r.GitDir = r.absolute(lines[0])
+	r.CommonDir = r.absolute(lines[1])
 	return r, nil
+}
+
+// absolute resolves a path git printed relative to the working tree's top
+// level (the directory it ran in) to a clean absolute path.
+func (r *Repo) absolute(p string) string {
+	if !filepath.IsAbs(p) {
+		p = filepath.Join(r.Root, p)
+	}
+	return filepath.Clean(p)
+}
+
+// classifyNotRepository tags err with [ErrNotRepository] when git refused
+// because the directory is outside any repository or working tree. Other
+// exit-128 failures (dubious ownership, corruption) keep a nil Cause so the
+// real message reaches the user.
+func classifyNotRepository(err error) error {
+	var ge *GitError
+	if !errors.As(err, &ge) || ge.ExitCode != 128 {
+		return err
+	}
+	stderr := strings.ToLower(ge.Stderr)
+	if strings.Contains(stderr, "not a git repository") ||
+		strings.Contains(stderr, "must be run in a work tree") {
+		ge.Cause = ErrNotRepository
+	}
+	return err
 }
 
 // IsWorktree reports whether the Repo is a linked worktree rather than the
@@ -187,8 +228,9 @@ func (r *Repo) IsWorktree() bool { return r.GitDir != r.CommonDir }
 // porcelain status columns survive). A non-zero exit is reported as a
 // [*GitError]; a failure to start git (missing binary) is returned as-is and
 // matches proc.IsNotFound. The child sees only PATH, HOME, the XDG_* directories,
-// the SSH agent and GnuPG variables, every GIT_* variable set in the parent,
-// fixed values that keep output stable and non-interactive (LC_ALL=C,
+// the SSH agent and GnuPG variables, every GIT_* variable set in the parent
+// except the ones that relocate the repository (GIT_DIR, GIT_WORK_TREE and
+// friends, see [inheritedEnv]), fixed values that keep output stable and non-interactive (LC_ALL=C,
 // GIT_TERMINAL_PROMPT=0, GIT_OPTIONAL_LOCKS=0, no pager or editor), and
 // anything set with [WithEnv], which wins on conflict.
 func (r *Repo) Git(ctx context.Context, args ...string) (string, error) {
@@ -236,7 +278,10 @@ func (r *Repo) run(ctx context.Context, dir string, args ...string) (string, err
 
 // inheritedEnv names the parent variables git may see: enough to find its
 // configuration, credentials, and SSH agent, plus every GIT_* override the
-// user set. Tokens and unrelated variables are withheld.
+// user set. Tokens and unrelated variables are withheld, and so are the
+// GIT_* variables that would point git at a different repository than the
+// one Open was given (a git hook or alias exports GIT_DIR, GIT_WORK_TREE
+// and GIT_INDEX_FILE for its own repository).
 func inheritedEnv() []string {
 	names := []string{
 		"HOME", "USER", "LOGNAME",
@@ -246,11 +291,26 @@ func inheritedEnv() []string {
 	}
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
-		if strings.HasPrefix(name, "GIT_") {
+		if strings.HasPrefix(name, "GIT_") && !repoLocationEnv[name] {
 			names = append(names, name)
 		}
 	}
 	return names
+}
+
+// repoLocationEnv lists the GIT_* variables that change which repository,
+// working tree, index, or object store git operates on. They are never
+// inherited so that a Repo always addresses the path it was opened on.
+var repoLocationEnv = map[string]bool{
+	"GIT_DIR":                          true,
+	"GIT_WORK_TREE":                    true,
+	"GIT_INDEX_FILE":                   true,
+	"GIT_OBJECT_DIRECTORY":             true,
+	"GIT_ALTERNATE_OBJECT_DIRECTORIES": true,
+	"GIT_COMMON_DIR":                   true,
+	"GIT_NAMESPACE":                    true,
+	"GIT_CEILING_DIRECTORIES":          true,
+	"GIT_PREFIX":                       true,
 }
 
 // classify returns err with its GitError's Cause set to cause when err is a
@@ -317,7 +377,11 @@ func (r *Repo) DefaultRemote(ctx context.Context) (string, error) {
 // DefaultBranch detects the branch that finished work is delivered to. It
 // checks, in order: the remote HEAD (refs/remotes/<remote>/HEAD, origin
 // first, then any other remote), then a local "main", then a local
-// "master". It fails with [ErrNoDefaultBranch] when none exists.
+// "master". A remote HEAD that points at a branch which no longer exists
+// (neither as refs/remotes/<remote>/<name> nor as a local branch, as after
+// the upstream renamed its default branch and a prune fetch removed the old
+// tracking ref) is skipped as if it were unset. It fails with
+// [ErrNoDefaultBranch] when none exists.
 func (r *Repo) DefaultBranch(ctx context.Context) (string, error) {
 	remotes, err := r.Remotes(ctx)
 	if err != nil {
@@ -337,11 +401,29 @@ func (r *Repo) DefaultBranch(ctx context.Context) (string, error) {
 	}
 	for _, remote := range ordered {
 		ref, err := r.Git(ctx, "symbolic-ref", "-q", "refs/remotes/"+remote+"/HEAD")
-		if err == nil && ref != "" {
-			return strings.TrimPrefix(ref, "refs/remotes/"+remote+"/"), nil
-		}
-		if !isExit(err, 1) {
+		if err != nil {
+			if isExit(err, 1) {
+				continue
+			}
 			return "", err
+		}
+		prefix := "refs/remotes/" + remote + "/"
+		if !strings.HasPrefix(ref, prefix) || ref == prefix {
+			continue
+		}
+		name := strings.TrimPrefix(ref, prefix)
+		ok, err := r.refResolves(ctx, ref)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			ok, err = r.BranchExists(ctx, name)
+			if err != nil {
+				return "", err
+			}
+		}
+		if ok {
+			return name, nil
 		}
 	}
 	for _, name := range []string{"main", "master"} {
@@ -354,6 +436,18 @@ func (r *Repo) DefaultBranch(ctx context.Context) (string, error) {
 		}
 	}
 	return "", ErrNoDefaultBranch
+}
+
+// refResolves reports whether ref names a commit.
+func (r *Repo) refResolves(ctx context.Context, ref string) (bool, error) {
+	_, err := r.RevParse(ctx, ref)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, ErrUnknownRevision) {
+		return false, nil
+	}
+	return false, err
 }
 
 // BranchExists reports whether a local branch named name exists.
@@ -415,11 +509,13 @@ func (r *Repo) Fetch(ctx context.Context) error {
 }
 
 // HeadSHA returns the full SHA of the commit HEAD points at. It fails with
-// [ErrNoCommits] on an unborn branch.
+// [ErrNoCommits] on an unborn branch (rev-parse --verify exits 1 there);
+// any other failure (timeout, corrupt or unreadable repository) keeps its
+// own classification so callers never mistake it for an empty repository.
 func (r *Repo) HeadSHA(ctx context.Context) (string, error) {
 	sha, err := r.RevParse(ctx, "HEAD")
 	if err != nil {
-		return "", classify(err, ErrNoCommits)
+		return "", classify(err, ErrNoCommits, 1)
 	}
 	return sha, nil
 }

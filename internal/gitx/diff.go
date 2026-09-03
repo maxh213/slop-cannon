@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -60,12 +63,13 @@ type Diff struct {
 	// Files lists every changed file with its status, in git's order (the
 	// same order as Stats.Changed).
 	Files []DiffFile
-	// Bytes is the size of the unified diff, whether or not Patch holds it.
+	// Bytes is the exact size of the unified diff, whether or not Patch
+	// holds it, so an oversized diff can still be reported by size.
 	Bytes int
 	// MaxBytes is the cap that was applied to Patch.
 	MaxBytes int
-	// Patch is the unified diff with rename detection, or "" when
-	// Truncated.
+	// Patch is the unified diff with rename detection, byte for byte as
+	// git wrote it, or "" when Truncated.
 	Patch string
 	// Truncated is set when the unified diff exceeded MaxBytes; Files and
 	// Stats are still complete, so reviewers get [Diff.Stat] and open the
@@ -130,10 +134,10 @@ func WithMaxDiffBytes(n int) DiffOption {
 // base (a branch name or any revision), with rename detection. Uncommitted
 // changes are not included: reviewers see what [Manager.CommitLeftovers]
 // committed (D-14). When the unified diff is larger than the cap the
-// result carries only the file list and statistics with Truncated set. It
-// fails with [ErrUnknownRevision] when base does not resolve,
-// [ErrNoMergeBase] when the histories are unrelated, and [ErrNoCommits] on
-// an unborn branch.
+// result carries only the file list and statistics with Truncated set,
+// and the patch itself is never read into memory. It fails with
+// [ErrUnknownRevision] when base does not resolve, [ErrNoMergeBase] when
+// the histories are unrelated, and [ErrNoCommits] on an unborn branch.
 func (r *Repo) Diff(ctx context.Context, base string, opts ...DiffOption) (*Diff, error) {
 	o := diffOptions{maxBytes: DefaultMaxDiffBytes}
 	for _, opt := range opts {
@@ -161,20 +165,56 @@ func (r *Repo) Diff(ctx context.Context, base string, opts ...DiffOption) (*Diff
 		d.Files = append(d.Files, DiffFile{FileStat: f, Status: st.Status, Similarity: st.Similarity})
 	}
 
-	patch, err := r.Git(ctx, append(diffArgs("--patch"), stats.Base, stats.Head, "--")...)
+	patch, size, err := r.patch(ctx, stats.Base, stats.Head, o.maxBytes)
 	if err != nil {
 		return nil, err
 	}
-	if patch != "" {
-		patch += "\n"
-	}
-	d.Bytes = len(patch)
-	if d.Bytes > o.maxBytes {
-		d.Truncated = true
-	} else {
-		d.Patch = patch
-	}
+	d.Patch = patch
+	d.Bytes = clampToInt(size)
+	d.Truncated = size > int64(o.maxBytes)
 	return d, nil
+}
+
+// patch returns the unified diff between two commits together with its
+// exact size in bytes. git writes it to a temporary file ("git diff
+// --output") rather than to a pipe, for two reasons: the file's size is
+// measured before anything is read, so a diff over maxBytes is never held
+// in memory (only its size is reported, and the returned patch is empty),
+// and the bytes are returned exactly as git wrote them, including CRLF
+// line endings and the trailing newline that reading stdout would
+// normalise away. The temporary file lives outside the repository (D-23)
+// and is always removed.
+func (r *Repo) patch(ctx context.Context, from, to string, maxBytes int) (string, int64, error) {
+	dir, err := os.MkdirTemp("", "sc-diff-")
+	if err != nil {
+		return "", 0, fmt.Errorf("gitx: diff: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(dir) }()
+	file := filepath.Join(dir, "patch")
+	if _, err := r.Git(ctx, append(diffArgs("--patch"), "--output="+file, from, to, "--")...); err != nil {
+		return "", 0, err
+	}
+	info, err := os.Stat(file)
+	if err != nil {
+		return "", 0, fmt.Errorf("gitx: diff: %w", err)
+	}
+	if info.Size() > int64(maxBytes) {
+		return "", info.Size(), nil
+	}
+	b, err := os.ReadFile(file)
+	if err != nil {
+		return "", 0, fmt.Errorf("gitx: diff: %w", err)
+	}
+	return string(b), int64(len(b)), nil
+}
+
+// clampToInt narrows a file size to int without wrapping on a 32-bit
+// build; such a size is far past any usable cap anyway.
+func clampToInt(n int64) int {
+	if n > math.MaxInt {
+		return math.MaxInt
+	}
+	return int(n)
 }
 
 // Diff returns the bead's committed changes against the merge-base with
@@ -223,9 +263,13 @@ func (c ChangeRatio) Exceeds(threshold float64) bool {
 // ChangeRatio computes the D-09 change ratio between the previous round's
 // diff and the current one: the lines changed between their heads,
 // relative to the current diff's changed lines. Both heads must still be
-// reachable in the repository. When the branch was rebased between rounds
-// the upstream commits count as movement too, which errs on the side of
-// re-reviewing.
+// reachable in the repository: it fails with [ErrUnknownRevision] when
+// one of them is gone (the previous round was rebased away and its old
+// commit pruned), which callers should read as "everything changed" and
+// send every tester back to review rather than as a failure of the round.
+// When the branch was rebased between rounds and the old commit is still
+// reachable the upstream commits count as movement too, which errs on the
+// same side.
 func (r *Repo) ChangeRatio(ctx context.Context, previous, current *Diff) (ChangeRatio, error) {
 	if previous == nil || current == nil {
 		return ChangeRatio{}, errors.New("gitx: ChangeRatio: both diffs are required")
@@ -234,7 +278,7 @@ func (r *Repo) ChangeRatio(ctx context.Context, previous, current *Diff) (Change
 	if c.Previous != c.Current {
 		delta, err := r.diffStatsBetween(ctx, c.Previous, c.Current)
 		if err != nil {
-			return ChangeRatio{}, err
+			return ChangeRatio{}, classify(err, ErrUnknownRevision, 128)
 		}
 		c.Delta = delta.Lines()
 	}

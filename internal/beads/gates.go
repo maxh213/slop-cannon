@@ -20,8 +20,9 @@ import (
 // the human merges. `bd gate check --type=gh:pr` asks `gh pr view <n>
 // --json state,title` and closes the gate when the PR is MERGED, reports
 // ESCALATE when it is CLOSED without merging (or no longer exists), and
-// reports an error per gate when `gh` is missing or not authenticated. bd
-// 1.2.2 changes nothing on the gate for an escalation (it only shells out
+// reports an error per gate when `gh` is missing, not authenticated or
+// cannot reach GitHub. bd 1.2.2 changes nothing on the gate for an
+// escalation (it only shells out
 // to Gas Town's `gt escalate` under `--escalate`, which is a warning when
 // `gt` is absent), so the caller acts on GateEscalated itself: move the
 // bead to `needs_human` and, if it wants the gate out of the way, resolve
@@ -219,8 +220,10 @@ const (
 	// exists). bd leaves the gate open; the caller moves the bead to
 	// `needs_human`.
 	GateEscalated GateOutcome = "escalated"
-	// GateError means the check itself failed, typically because `gh` is not
-	// installed or not authenticated (see GateCheck.GHUnavailable).
+	// GateError means the check itself failed: `gh` is not installed or not
+	// authenticated (see GateCheck.GHUnavailable), GitHub could not be
+	// reached, or gh printed something bd could not parse. The gate stays
+	// open and is checked again next time.
 	GateError GateOutcome = "error"
 )
 
@@ -232,7 +235,8 @@ type GateResult struct {
 	Outcome GateOutcome
 	// Detail is bd's explanation: "PR 'title' was merged", "PR 'title' is
 	// still open", "PR 'title' was closed without merging", "pull request
-	// not found", "gh CLI not installed", "gh pr view failed: …".
+	// not found", "gh CLI not installed", "gh pr view failed: <gh's
+	// stderr>" (bd's prefix for every non-zero gh exit, whatever the cause).
 	Detail string
 }
 
@@ -279,9 +283,16 @@ func (g GateCheck) ByOutcome(outcome GateOutcome) []domain.BeadID {
 }
 
 // GHUnavailable reports whether the checks failed because the `gh` CLI is
-// missing or not authenticated (every checked gate errored with a gh
-// problem), together with bd's explanation. Callers skip gate polling with
-// a single Warning in that case (P6-10) instead of repeating it per gate.
+// missing or not authenticated (every checked gate errored, and every
+// error names gh itself: "gh CLI not installed", "gh auth login",
+// GH_TOKEN, "not logged into", "authentication"), together with bd's
+// explanation. Callers skip gate polling with a single Warning in that
+// case (P6-10) instead of repeating it per gate. A transient failure such
+// as a network outage ("gh pr view failed: error connecting to
+// api.github.com"), a PR gh could not parse, or an error on only some of
+// the gates is not gh being unavailable: those checks are worth retrying
+// on the next poll, so the method reports false and the per-gate
+// Warnings carry the detail.
 func (g GateCheck) GHUnavailable() (string, bool) {
 	if g.Checked == 0 || g.Errors == 0 {
 		return "", false
@@ -304,19 +315,22 @@ func (g GateCheck) GHUnavailable() (string, bool) {
 	return reason, true
 }
 
-// ghProblems are the substrings of bd's per-gate error text that mean
-// `gh` itself, not the pull request, is the problem.
+// ghProblems are the substrings (lower-cased) of bd's per-gate error text
+// that mean `gh` itself is missing or unauthenticated. bd prefixes every
+// non-zero gh exit with "gh pr view failed: ", so that prefix alone is
+// deliberately not in the list: it also covers network outages and other
+// transient failures that must not be mistaken for a missing gh.
 var ghProblems = []string{
 	"gh cli not installed",
 	"gh auth login",
 	"gh_token",
 	"not logged into",
 	"authentication",
-	"gh pr view failed",
 	"executable file not found",
 }
 
-// isGHProblem reports whether detail describes a missing or unusable gh.
+// isGHProblem reports whether detail describes a missing or
+// unauthenticated gh (as opposed to a failed check).
 func isGHProblem(detail string) bool {
 	lower := strings.ToLower(detail)
 	for _, p := range ghProblems {
@@ -334,16 +348,20 @@ var gateLineRe = regexp.MustCompile(`^\S+\s+(\S+): (resolved|pending|ESCALATE|er
 // gateSummaryRe matches bd's "Checked N gates: …" summary line.
 var gateSummaryRe = regexp.MustCompile(`^Checked \d+ gates?: `)
 
-// CheckGates runs `bd gate check --type=gh:pr --json` (with `--escalate`
-// and `--dry-run` per opts), which asks `gh pr view <n>` for every open
-// gh:pr gate and closes the gates whose PR merged. The result lists every
-// gate's outcome; `gh` being missing or not authenticated is not an error
-// of the call but a GateError per gate, a Warning each, and
-// GateCheck.GHUnavailable. Only a failure to run bd is an error. With no
-// open gh:pr gate bd prints a text line and no JSON; that is an empty
-// GateCheck.
+// CheckGates runs `bd gate check --type=gh:pr -l 0 --json` (with
+// `--escalate` and `--dry-run` per opts), which asks `gh pr view <n>` for
+// every open gh:pr gate and closes the gates whose PR merged. `-l 0` lifts
+// bd's default limit of 100 gates per check (D-21: bd's listing defaults
+// truncate; with safety on every delivered bead holds an open gate until a
+// human merges, so an autopilot run passes 100 easily and a truncated
+// check would leave the later beads in `delivering` for ever). The result
+// lists every gate's outcome; a gate whose check failed is not an error of
+// the call but a GateError and a Warning each, and GateCheck.GHUnavailable
+// tells a missing or unauthenticated gh apart from a transient failure.
+// Only a failure to run bd is an error. With no open gh:pr gate bd prints a
+// text line and no JSON; that is an empty GateCheck.
 func (c *Client) CheckGates(ctx context.Context, opts GateCheckOptions) (GateCheck, error) {
-	args := []string{"gate", "check", "--type=" + GateTypePR}
+	args := []string{"gate", "check", "--type=" + GateTypePR, "-l", "0"}
 	if opts.Escalate {
 		args = append(args, "--escalate")
 	}

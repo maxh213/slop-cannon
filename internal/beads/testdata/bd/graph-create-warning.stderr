@@ -1,0 +1,1 @@
+warning: graph plan node["a"] has unknown field(s): [sc_future] (silently dropped — see 'bd create --graph' schema)

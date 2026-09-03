@@ -30,7 +30,11 @@ type DeliveryStage string
 
 // Stages of a safety-off delivery, in the order they run.
 const (
-	// StageFetch syncs the local default branch with its remote.
+	// StagePrepare resolves the bead's worktree, branch, default branch
+	// and remote before anything is touched.
+	StagePrepare DeliveryStage = "prepare"
+	// StageFetch syncs the local default branch with its remote and
+	// resolves the base the branch is rebased onto.
 	StageFetch DeliveryStage = "fetch"
 	// StageRebase rebases the bead's branch onto the default branch.
 	StageRebase DeliveryStage = "rebase"
@@ -188,41 +192,45 @@ type MergeResult struct {
 // bead and close it (D-20). The caller serialises deliveries: only one
 // runs at a time per repository.
 //
-// Every failure is a [*DeliveryError] naming the stage. A rebase that stops
-// on conflicts is reported with Conflict set and [ErrRebaseConflict]; the
-// worktree is left mid-rebase with the conflict markers so the engineer's
-// conflict round can resolve them. On the next attempt a resolved rebase
-// (conflicts fixed and staged, or already continued) is finished
-// automatically; an unresolved one is reported again. It fails with
-// [ErrWorktreeMissing] (wrapped) when the bead has no worktree, and with
-// [ErrWrongBranch] when the worktree is not on the bead's branch.
+// Every failure is a [*DeliveryError] naming the stage it happened in and
+// carrying the failing command's output; the sentinels below and the
+// underlying [*GitError], proc and beads errors all stay matchable with
+// errors.Is through it. A rebase that stops on conflicts is reported with
+// Conflict set and [ErrRebaseConflict]; the worktree is left mid-rebase
+// with the conflict markers so the engineer's conflict round can resolve
+// them. On the next attempt a resolved rebase (conflicts fixed and staged,
+// or already continued) is finished automatically; an unresolved one is
+// reported again. It fails at [StagePrepare] with [ErrWorktreeMissing] when
+// the bead has no worktree, and at [StageRebase] with [ErrWrongBranch] when
+// the worktree is not on the bead's branch.
 func (m *Manager) DeliverMerge(ctx context.Context, bead domain.Bead, opts MergeOptions) (*MergeResult, error) {
 	if bead.ID == "" {
-		return nil, errors.New("gitx: DeliverMerge: bead has no id")
+		return nil, stageErr(StagePrepare, errors.New("gitx: DeliverMerge: bead has no id"), "")
 	}
 	branch := BranchName(bead)
 	wt, err := m.Reattach(ctx, bead.ID)
 	if err != nil {
-		return nil, err
+		return nil, stageErr(StagePrepare, err, "")
 	}
 	wtRepo, err := Open(ctx, wt.Path, WithEnv(m.repo.env), WithTimeout(m.repo.timeout))
 	if err != nil {
-		return nil, err
+		return nil, stageErr(StagePrepare, err, "")
 	}
 
 	target, err := m.repo.DefaultBranch(ctx)
 	if err != nil {
-		return nil, err
+		return nil, stageErr(StagePrepare, err, "")
 	}
 	res := &MergeResult{BeadID: bead.ID, Branch: branch, Target: target}
 
 	remote, err := m.repo.DefaultRemote(ctx)
 	if err != nil && !errors.Is(err, ErrNoRemote) {
-		return nil, err
+		return nil, stageErr(StagePrepare, err, "")
 	}
 	res.Remote = remote
 
-	// Stage fetch: bring the local default branch level with the remote.
+	// Stage fetch: bring the local default branch level with the remote,
+	// then resolve the base the branch is rebased onto.
 	if remote != "" {
 		if err := m.syncDefault(ctx, remote, target); err != nil {
 			return nil, err
@@ -230,39 +238,43 @@ func (m *Manager) DeliverMerge(ctx context.Context, bead domain.Bead, opts Merge
 	}
 	local, err := m.repo.BranchExists(ctx, target)
 	if err != nil {
-		return nil, err
+		return nil, stageErr(StageFetch, err, "")
 	}
 	base := target
 	if !local {
 		base = remote + "/" + target
 	}
 	if res.Before, err = m.repo.RevParse(ctx, base); err != nil {
-		return nil, err
+		return nil, stageErr(StageFetch, err, "")
 	}
 
 	// Stage rebase.
 	tipBefore, err := wtRepo.HeadSHA(ctx)
 	if err != nil {
-		return nil, err
+		return nil, stageErr(StageRebase, err, "")
 	}
 	if err := wtRepo.rebaseOnto(ctx, branch, base); err != nil {
 		return nil, err
 	}
 	head, err := wtRepo.HeadSHA(ctx)
 	if err != nil {
-		return nil, err
+		return nil, stageErr(StageRebase, err, "")
 	}
 	res.Head = head
 	res.Rebased = head != tipBefore
-	if cur, err := wtRepo.CurrentBranch(ctx); err != nil || cur != branch {
-		return nil, fmt.Errorf("%w: %s is on %q, want %q", ErrWrongBranch, wt.Path, cur, branch)
+	cur, err := wtRepo.CurrentBranch(ctx)
+	if err != nil && !errors.Is(err, ErrDetachedHead) {
+		return nil, stageErr(StageRebase, err, "")
+	}
+	if cur != branch {
+		return nil, stageErr(StageRebase, fmt.Errorf("%w: %s is on %q, want %q", ErrWrongBranch, wt.Path, cur, branch), "")
 	}
 	count, err := m.repo.Git(ctx, "rev-list", "--count", res.Before+".."+head)
 	if err != nil {
-		return nil, err
+		return nil, stageErr(StageRebase, err, "")
 	}
 	if res.Commits, err = strconv.Atoi(strings.TrimSpace(count)); err != nil {
-		return nil, fmt.Errorf("gitx: unexpected rev-list output %q", count)
+		return nil, stageErr(StageRebase, fmt.Errorf("gitx: unexpected rev-list output %q", count), "")
 	}
 
 	// Stage check.
@@ -328,28 +340,28 @@ func (m *Manager) syncDefault(ctx context.Context, remote, target string) error 
 	}
 	local, err := m.repo.BranchExists(ctx, target)
 	if err != nil {
-		return err
+		return stageErr(StageFetch, err, "")
 	}
 	tracking, err := m.repo.RevParse(ctx, remote+"/"+target)
 	if errors.Is(err, ErrUnknownRevision) {
 		return nil // never pushed; the push stage creates it
 	}
 	if err != nil {
-		return err
+		return stageErr(StageFetch, err, "")
 	}
 	if !local {
 		return nil
 	}
 	localSHA, err := m.repo.RevParse(ctx, target)
 	if err != nil {
-		return err
+		return stageErr(StageFetch, err, "")
 	}
 	if localSHA == tracking {
 		return nil
 	}
 	behind, err := m.repo.isAncestor(ctx, localSHA, tracking)
 	if err != nil {
-		return err
+		return stageErr(StageFetch, err, "")
 	}
 	if behind {
 		if err := m.fastForward(ctx, target, tracking, "refs/remotes/"+remote+"/"+target); err != nil {
@@ -363,7 +375,7 @@ func (m *Manager) syncDefault(ctx context.Context, remote, target string) error 
 	}
 	ahead, err := m.repo.isAncestor(ctx, tracking, localSHA)
 	if err != nil {
-		return err
+		return stageErr(StageFetch, err, "")
 	}
 	if ahead {
 		return nil
@@ -383,14 +395,14 @@ func (m *Manager) syncDefault(ctx context.Context, remote, target string) error 
 func (m *Manager) fastForward(ctx context.Context, target, sha, ref string) error {
 	ok, err := m.repo.isAncestor(ctx, target, sha)
 	if err != nil {
-		return err
+		return stageErr(StageMerge, err, "")
 	}
 	if !ok {
 		return &DeliveryError{Stage: StageMerge, Err: fmt.Errorf("%w: %s is not an ancestor of %s", ErrNotFastForward, target, shortSHA(sha))}
 	}
 	current, err := m.repo.CurrentBranch(ctx)
 	if err != nil && !errors.Is(err, ErrDetachedHead) {
-		return err
+		return stageErr(StageMerge, err, "")
 	}
 	if current == target {
 		_, err = m.repo.Git(ctx, "merge", "--ff-only", "--quiet", "--no-verify", ref)
@@ -402,7 +414,7 @@ func (m *Manager) fastForward(ctx context.Context, target, sha, ref string) erro
 	}
 	got, err := m.repo.RevParse(ctx, target)
 	if err != nil {
-		return err
+		return stageErr(StageMerge, err, "")
 	}
 	if got != sha {
 		return &DeliveryError{Stage: StageMerge, Err: fmt.Errorf("%w: %s is at %s after the fast-forward, want %s", ErrNotFastForward, target, shortSHA(got), shortSHA(sha))}
@@ -418,14 +430,14 @@ func (m *Manager) fastForward(ctx context.Context, target, sha, ref string) erro
 func (r *Repo) rebaseOnto(ctx context.Context, branch, base string) error {
 	committer, err := r.withIdentity(ctx)
 	if err != nil {
-		return err
+		return stageErr(StageRebase, err, "")
 	}
 	var out string
 	var rebaseErr error
 	if r.RebaseInProgress() {
 		files, err := r.ConflictedPaths(ctx)
 		if err != nil {
-			return err
+			return stageErr(StageRebase, err, "")
 		}
 		if len(files) > 0 {
 			return &DeliveryError{Stage: StageRebase, Conflict: true, Files: files, Err: ErrRebaseConflict}
@@ -433,8 +445,11 @@ func (r *Repo) rebaseOnto(ctx context.Context, branch, base string) error {
 		out, rebaseErr = committer.Git(ctx, "-c", "commit.gpgsign=false", "rebase", "--continue")
 	} else {
 		cur, err := r.CurrentBranch(ctx)
-		if err != nil || cur != branch {
-			return fmt.Errorf("%w: %s is on %q, want %q", ErrWrongBranch, r.Root, cur, branch)
+		if err != nil && !errors.Is(err, ErrDetachedHead) {
+			return stageErr(StageRebase, err, "")
+		}
+		if cur != branch {
+			return stageErr(StageRebase, fmt.Errorf("%w: %s is on %q, want %q", ErrWrongBranch, r.Root, cur, branch), "")
 		}
 		out, rebaseErr = committer.Git(ctx, "-c", "commit.gpgsign=false", "rebase", "--no-verify", "--quiet", base)
 	}
@@ -447,7 +462,7 @@ func (r *Repo) rebaseOnto(ctx context.Context, branch, base string) error {
 	}
 	files, ferr := r.ConflictedPaths(ctx)
 	if ferr != nil {
-		return ferr
+		return stageErr(StageRebase, ferr, "")
 	}
 	var ge *GitError
 	output := out
@@ -609,6 +624,10 @@ func hasMakeTestTarget(dir string) bool {
 // stageErr wraps err as a DeliveryError at stage, carrying git's stderr as
 // the output and mergeSHA when the merge already happened.
 func stageErr(stage DeliveryStage, err error, mergeSHA string) error {
+	var already *DeliveryError
+	if errors.As(err, &already) {
+		return err // already staged deeper down; keep the precise stage
+	}
 	de := &DeliveryError{Stage: stage, Err: err, MergeSHA: mergeSHA}
 	var ge *GitError
 	if errors.As(err, &ge) {

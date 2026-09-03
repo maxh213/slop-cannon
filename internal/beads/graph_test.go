@@ -145,6 +145,17 @@ func TestGraphCycle(t *testing.T) {
 	assert.Empty(t, g.Layers())
 	assert.EqualError(t, g.Validate(), "beads: dependency cycle: s -> s")
 
+	// A cycle entered from a downstream bead is still reported starting at
+	// its own earliest bead: d is visited first but is not on the cycle,
+	// and a precedes b, so the cycle rotates to a -> b -> a.
+	g = NewGraph([]Issue{
+		graphIssue("d", domain.BeadStateOpen, "b"),
+		graphIssue("a", domain.BeadStateOpen, "b"),
+		graphIssue("b", domain.BeadStateOpen, "a"),
+	})
+	assert.Equal(t, [][]domain.BeadID{graphIDs("a", "b")}, g.Cycles())
+	assert.EqualError(t, g.Validate(), "beads: dependency cycle: a -> b -> a")
+
 	assert.Equal(t, "", FormatCycle(nil))
 }
 
@@ -235,6 +246,8 @@ func TestGraphDuplicatesAndEmpty(t *testing.T) {
 	assert.Equal(t, graphIDs("b"), IssueIDs(g.Ready()))
 	_, ok = g.Issue("zz")
 	assert.False(t, ok)
+	assert.Equal(t, []string{"second", "b"}, []string{g.Issues()[0].Title, g.Issues()[1].Title}, "Issues follows IDs order")
+	assert.Len(t, g.Issues(), 2)
 
 	empty := NewGraph(nil)
 	assert.Zero(t, empty.Len())

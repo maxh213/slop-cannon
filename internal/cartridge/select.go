@@ -100,9 +100,13 @@ type Selection struct {
 // adapter (D-19): any number of built cartridges may be mixed across roles.
 //
 // Detect verdicts are cached per cartridge for the configured TTL so that
-// firing many agents does not spawn a probe each time; a warning is raised
-// once per fresh failed probe, not once per Select. Selector is safe for
-// concurrent use.
+// firing many agents does not spawn a probe each time, and concurrent
+// callers that find the cache cold share one in-flight probe rather than
+// each spawning their own; a warning is raised once per fresh failed probe,
+// not once per Select. A probe that fails only because the caller's context
+// was cancelled or timed out is neither cached nor warned about, so one
+// dead context cannot poison selection for the rest of the TTL. Selector is
+// safe for concurrent use.
 type Selector struct {
 	// cfg holds the active cartridge and the role overrides; the lookup
 	// itself is config.Config.CartridgeFor so the policy lives in one place.
@@ -114,8 +118,9 @@ type Selector struct {
 	ttl time.Duration
 	now func() time.Time
 
-	mu    sync.Mutex
-	cache map[string]detectEntry
+	mu       sync.Mutex
+	cache    map[string]detectEntry
+	inflight map[string]*detectProbe
 }
 
 // detectEntry is one cached Detect verdict.
@@ -123,6 +128,17 @@ type detectEntry struct {
 	status Status
 	err    error
 	at     time.Time
+}
+
+// detectProbe is one in-flight Detect that concurrent callers wait on
+// instead of probing again. done is closed once the fields are final.
+type detectProbe struct {
+	done chan struct{}
+	// cancelled is true when the probe failed because the leader's context
+	// ended; waiters then probe again with their own context.
+	cancelled bool
+	status    Status
+	err       error
 }
 
 // NewSelector builds a Selector for cfg over cartridges (normally the map
@@ -154,6 +170,7 @@ func NewSelector(cfg config.Config, cartridges map[string]Cartridge, opts ...Sel
 		ttl:        DefaultDetectTTL,
 		now:        time.Now,
 		cache:      map[string]detectEntry{},
+		inflight:   map[string]*detectProbe{},
 	}
 	for n, c := range cartridges {
 		s.cartridges[n] = c
@@ -213,7 +230,9 @@ func (s *Selector) Select(ctx context.Context, role domain.Role) (Cartridge, err
 }
 
 // Choose is Select with the full decision: which cartridge was requested,
-// which was chosen, its Status, and why a fallback happened.
+// which was chosen, its Status, and why a fallback happened. A probe that
+// fails because ctx itself is done returns that error with no fallback:
+// the caller has given up, and the override was never shown to be broken.
 func (s *Selector) Choose(ctx context.Context, role domain.Role) (Selection, error) {
 	sel := Selection{Role: role, Requested: s.Requested(role)}
 	status, err := s.detect(ctx, sel.Requested)
@@ -222,7 +241,7 @@ func (s *Selector) Choose(ctx context.Context, role domain.Role) (Selection, err
 		return sel, nil
 	}
 	active := s.Active()
-	if sel.Requested == active {
+	if sel.Requested == active || contextFailed(ctx, err) {
 		sel.Status = status
 		return sel, err
 	}
@@ -258,28 +277,75 @@ func (s *Selector) Invalidate(name string) {
 	delete(s.cache, name)
 }
 
-// detect serves name's verdict from the cache or probes and records it. A
-// fresh failed probe publishes one Warning. Concurrent callers may probe the
-// same cartridge twice while the cache is cold; the last verdict wins.
+// detect serves name's verdict from the cache, joins an in-flight probe for
+// the same cartridge, or probes and records the result. A fresh failed
+// probe publishes one Warning. A probe that fails only because the leader's
+// context ended is not cached and not warned about: the leader gets the
+// error, and any waiter (or the next caller) probes again with its own
+// context.
 func (s *Selector) detect(ctx context.Context, name string) (Status, error) {
-	now := s.now()
-	s.mu.Lock()
-	e, ok := s.cache[name]
-	s.mu.Unlock()
-	if ok && s.fresh(e, now) {
-		return e.status, e.err
+	for {
+		now := s.now()
+		s.mu.Lock()
+		if e, ok := s.cache[name]; ok && s.fresh(e, now) {
+			s.mu.Unlock()
+			return e.status, e.err
+		}
+		if p, ok := s.inflight[name]; ok {
+			s.mu.Unlock()
+			select {
+			case <-p.done:
+				if p.cancelled {
+					continue
+				}
+				return p.status, p.err
+			case <-ctx.Done():
+				return Status{}, cancelledError(ctx, name)
+			}
+		}
+		p := &detectProbe{done: make(chan struct{})}
+		s.inflight[name] = p
+		s.mu.Unlock()
+		return s.probe(ctx, name, p, now)
 	}
+}
+
+// probe runs Detect for name as the leader of p, records the verdict and
+// releases the waiters.
+func (s *Selector) probe(ctx context.Context, name string, p *detectProbe, now time.Time) (Status, error) {
 	status, err := s.cartridges[name].Detect(ctx)
 	if err == nil && !status.Ready() {
 		err = notReadyError(name, status)
 	}
+	cancelled := contextFailed(ctx, err)
 	s.mu.Lock()
-	s.cache[name] = detectEntry{status: status, err: err, at: now}
+	delete(s.inflight, name)
+	if !cancelled {
+		s.cache[name] = detectEntry{status: status, err: err, at: now}
+	}
+	p.status, p.err, p.cancelled = status, err, cancelled
+	close(p.done)
 	s.mu.Unlock()
-	if err != nil {
+	if err != nil && !cancelled {
 		s.warn(name, status, err)
 	}
 	return status, err
+}
+
+// contextFailed reports whether err is a failure caused by ctx (or any
+// context) ending rather than by the cartridge: a non-nil err while ctx is
+// done, or an err wrapping context.Canceled or context.DeadlineExceeded.
+func contextFailed(ctx context.Context, err error) bool {
+	if err == nil {
+		return false
+	}
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// cancelledError is what a waiter gets when its own context ends before the
+// probe it joined finishes.
+func cancelledError(ctx context.Context, name string) error {
+	return NewError(KindKilled, name, "detect cancelled", context.Cause(ctx))
 }
 
 // fresh reports whether a cached entry is still within the TTL.
@@ -295,20 +361,18 @@ func (s *Selector) fresh(e detectEntry, now time.Time) bool {
 }
 
 // notReadyError turns a Detect that returned a nil error but a Status that
-// is not Ready into the *Error the interface promised.
+// is not Ready into the *Error the interface promised. Status.Ready is
+// false exactly when the CLI is not installed or its login is missing.
 func notReadyError(name string, st Status) error {
-	switch {
-	case !st.Installed:
+	if !st.Installed {
 		return NewError(KindNotInstalled, name, st.Detail, nil)
-	case st.Auth == AuthMissing:
-		return NewError(KindAuth, name, st.Detail, nil)
-	default:
-		return NewError(KindUnknown, name, "detect reported not ready: "+st.Detail, nil)
 	}
+	return NewError(KindAuth, name, st.Detail, nil)
 }
 
 // warn publishes the detection failure. When name is an override the
-// message names the roles that will fall back to the active cartridge.
+// message names the roles that will fall back to the active cartridge; when
+// no role uses it (a direct Detect call) it says so instead.
 func (s *Selector) warn(name string, st Status, err error) {
 	if s.pub == nil {
 		return
@@ -317,10 +381,16 @@ func (s *Selector) warn(name string, st Status, err error) {
 	if st.Version != "" {
 		msg += fmt.Sprintf(" (version %s)", st.Version)
 	}
-	if active := s.Active(); name != active {
-		msg += fmt.Sprintf("; %s fall back to the active cartridge %q", s.rolesUsing(name), active)
-	} else {
+	active := s.Active()
+	switch roles := s.rolesUsing(name); {
+	case name == active:
 		msg += "; it is the active cartridge, so there is no fallback"
+	case len(roles) == 0:
+		msg += "; no role is configured to use it"
+	case len(roles) == 1:
+		msg += fmt.Sprintf("; role %s falls back to the active cartridge %q", roles[0], active)
+	default:
+		msg += fmt.Sprintf("; roles %s fall back to the active cartridge %q", strings.Join(roles, ", "), active)
 	}
 	s.pub.Publish(events.Warning{
 		Meta:    events.MetaAt(s.run, s.now()),
@@ -330,22 +400,15 @@ func (s *Selector) warn(name string, st Status, err error) {
 	})
 }
 
-// rolesUsing renders the roles whose override is name, for the warning.
-func (s *Selector) rolesUsing(name string) string {
+// rolesUsing lists, in order, the roles whose override is name.
+func (s *Selector) rolesUsing(name string) []string {
 	var out []string
 	for _, r := range sortedRoles(s.cfg.Roles) {
 		if s.cfg.Roles[r] == name {
 			out = append(out, r.String())
 		}
 	}
-	switch len(out) {
-	case 0:
-		return "roles configured for it"
-	case 1:
-		return "role " + out[0]
-	default:
-		return "roles " + strings.Join(out, ", ")
-	}
+	return out
 }
 
 func sortedRoles(m map[domain.Role]string) []domain.Role {

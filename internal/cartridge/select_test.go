@@ -2,6 +2,7 @@ package cartridge
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -26,6 +27,7 @@ type selectFake struct {
 	mu      sync.Mutex
 	status  Status
 	err     error
+	hook    func(context.Context) (Status, error)
 	detects atomic.Int32
 }
 
@@ -33,11 +35,17 @@ var _ Cartridge = (*selectFake)(nil)
 
 func (f *selectFake) Name() string { return f.name }
 
-func (f *selectFake) Detect(context.Context) (Status, error) {
+// Detect counts the probe and returns the scripted verdict, or defers to
+// the hook when one is set (for probes that must block or watch ctx).
+func (f *selectFake) Detect(ctx context.Context) (Status, error) {
 	f.detects.Add(1)
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.status, f.err
+	status, err, hook := f.status, f.err, f.hook
+	f.mu.Unlock()
+	if hook != nil {
+		return hook(ctx)
+	}
+	return status, err
 }
 
 func (f *selectFake) Run(context.Context, RunSpec) (Session, error) {
@@ -46,11 +54,30 @@ func (f *selectFake) Run(context.Context, RunSpec) (Session, error) {
 	return p, nil
 }
 
-// set replaces the Detect verdict.
+// set replaces the Detect verdict and clears any hook.
 func (f *selectFake) set(st Status, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.status, f.err = st, err
+	f.status, f.err, f.hook = st, err, nil
+}
+
+// setHook makes Detect call fn instead of returning the scripted verdict.
+func (f *selectFake) setHook(fn func(context.Context) (Status, error)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hook = fn
+}
+
+// selectCancelAware is a Detect hook that behaves like the real adapters:
+// it reports the healthy status unless ctx is already done, in which case
+// it maps the context error to KindTimeout the way cartridge/mock does.
+func selectCancelAware(name string) func(context.Context) (Status, error) {
+	return func(ctx context.Context) (Status, error) {
+		if err := ctx.Err(); err != nil {
+			return Status{}, NewError(KindTimeout, name, "detect cancelled", err)
+		}
+		return selectHealthy(name), nil
+	}
 }
 
 func selectHealthy(name string) Status {
@@ -224,6 +251,8 @@ func TestSelectPolicyTable(t *testing.T) {
 		role  domain.Role
 		alpha func(*selectFake)
 		beta  func(*selectFake)
+		// cancelled runs the selection with an already-cancelled context.
+		cancelled bool
 
 		want       string
 		fellBack   bool
@@ -231,6 +260,8 @@ func TestSelectPolicyTable(t *testing.T) {
 		reasonKind Kind
 		warnings   int
 		warnHas    []string
+		// after runs extra assertions once the selection has been checked.
+		after func(t *testing.T, s *Selector, fakes *selectFakes, rec *selectRecorder)
 	}{
 		{
 			name: "no override uses active",
@@ -294,6 +325,29 @@ func TestSelectPolicyTable(t *testing.T) {
 			wantErr:    ErrCrash,
 			warnings:   2,
 		},
+		{
+			// Both CLIs are healthy; only the caller's context is dead. The
+			// probe error is returned as-is with no fallback, nothing is
+			// cached and nothing is warned about, so the next Select with a
+			// live context gets the override.
+			name:      "cancelled context is neither cached nor a fallback",
+			role:      domain.RoleTester,
+			alpha:     func(f *selectFake) { f.setHook(selectCancelAware("alpha")) },
+			beta:      func(f *selectFake) { f.setHook(selectCancelAware("beta")) },
+			cancelled: true,
+			wantErr:   context.Canceled,
+			after: func(t *testing.T, s *Selector, fakes *selectFakes, rec *selectRecorder) {
+				assert.EqualValues(t, 2, fakes.beta.detects.Load(), "Choose and Select each probed beta")
+				assert.EqualValues(t, 0, fakes.alpha.detects.Load(), "no fallback probe for a dead caller")
+				c, err := s.Select(context.Background(), domain.RoleTester)
+				require.NoError(t, err)
+				assert.Equal(t, "beta", c.Name(), "the cancelled verdict was not cached")
+				c, err = s.Select(context.Background(), domain.RolePO)
+				require.NoError(t, err)
+				assert.Equal(t, "alpha", c.Name())
+				assert.Empty(t, rec.warnings())
+			},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -303,6 +357,12 @@ func TestSelectPolicyTable(t *testing.T) {
 			}
 			if tc.beta != nil {
 				tc.beta(fakes.beta)
+			}
+			ctx := ctx
+			if tc.cancelled {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
 			}
 
 			sel, err := s.Choose(ctx, tc.role)
@@ -319,6 +379,7 @@ func TestSelectPolicyTable(t *testing.T) {
 				var ce *Error
 				require.ErrorAs(t, err, &ce, "selection errors are *Error")
 				assert.Nil(t, sel.Cartridge)
+				assert.Empty(t, sel.Name)
 				c, err := s.Select(ctx, tc.role)
 				require.ErrorIs(t, err, tc.wantErr)
 				assert.Nil(t, c)
@@ -344,6 +405,9 @@ func TestSelectPolicyTable(t *testing.T) {
 				for _, want := range tc.warnHas {
 					assert.Contains(t, warns[0].Message+" | "+warns[0].Err, want)
 				}
+			}
+			if tc.after != nil {
+				tc.after(t, s, fakes, rec)
 			}
 		})
 	}
@@ -474,16 +538,36 @@ func TestSelectorMultipleRolesShareAnOverride(t *testing.T) {
 	assert.Contains(t, warns[0].Message, "roles engineer, tester fall back")
 }
 
+// TestSelectorConcurrentSelects is the scheduler's burst at run start: many
+// Selects hit a cold cache at once and must share one probe per cartridge.
+// Each probe blocks until every goroutine has called Select, so without
+// coalescing every one of them would have probed.
 func TestSelectorConcurrentSelects(t *testing.T) {
+	const n = 32
 	s, fakes, rec := selectNew(t, selectConfig())
-	fakes.beta.set(Status{}, NewError(KindCrash, "beta", "boom", nil))
+	var arrived sync.WaitGroup
+	arrived.Add(n)
+	release := make(chan struct{})
+	go func() {
+		arrived.Wait()
+		close(release)
+	}()
+	fakes.beta.setHook(func(context.Context) (Status, error) {
+		<-release
+		return Status{}, NewError(KindCrash, "beta", "boom", nil)
+	})
+	fakes.alpha.setHook(func(context.Context) (Status, error) {
+		<-release
+		return selectHealthy("alpha"), nil
+	})
 
 	var wg sync.WaitGroup
 	roles := domain.Roles()
-	for i := 0; i < 32; i++ {
+	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(role domain.Role) {
 			defer wg.Done()
+			arrived.Done()
 			c, err := s.Select(context.Background(), role)
 			assert.NoError(t, err)
 			if assert.NotNil(t, c) {
@@ -492,8 +576,147 @@ func TestSelectorConcurrentSelects(t *testing.T) {
 		}(roles[i%len(roles)])
 	}
 	wg.Wait()
-	assert.GreaterOrEqual(t, len(rec.warnings()), 1)
-	assert.LessOrEqual(t, fakes.beta.detects.Load(), int32(32))
+	assert.Len(t, rec.warnings(), 1, "one warning for the one failed probe")
+	assert.EqualValues(t, 1, fakes.beta.detects.Load(), "cold-cache Selects shared one beta probe")
+	assert.EqualValues(t, 1, fakes.alpha.detects.Load(), "cold-cache Selects shared one alpha probe")
+}
+
+// TestSelectorWaiterRetriesAfterLeaderCancelled: the goroutine that started
+// a probe has its context cancelled mid-probe; a waiter with a live
+// context must not inherit that failure but probe again itself.
+func TestSelectorWaiterRetriesAfterLeaderCancelled(t *testing.T) {
+	s, fakes, rec := selectNew(t, selectConfig())
+	probing := make(chan struct{}, 2)
+	fakes.beta.setHook(func(ctx context.Context) (Status, error) {
+		probing <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return Status{}, NewError(KindTimeout, "beta", "detect cancelled", ctx.Err())
+		case <-time.After(2 * time.Second):
+			return selectHealthy("beta"), nil
+		}
+	})
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	defer cancelLeader()
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := s.Select(leaderCtx, domain.RoleTester)
+		leaderErr <- err
+	}()
+	<-probing // the leader is inside Detect
+
+	waiterDone := make(chan struct{})
+	var waiterC Cartridge
+	var waiterErr error
+	go func() {
+		defer close(waiterDone)
+		waiterC, waiterErr = s.Select(context.Background(), domain.RoleTester)
+	}()
+	// Give the waiter time to join the in-flight probe rather than start
+	// one; it cannot have probed yet because the leader still holds it.
+	time.Sleep(50 * time.Millisecond)
+	assert.EqualValues(t, 1, fakes.beta.detects.Load(), "the waiter joined the leader's probe")
+
+	cancelLeader()
+	require.ErrorIs(t, <-leaderErr, context.Canceled)
+	fakes.beta.set(selectHealthy("beta"), nil)
+	// Do not wait on `probing` here: set() clears the hook, so whether the
+	// waiter's own probe reaches the hook (and sends) or the plain verdict
+	// is a race. Wait for the waiter itself and count the probes instead.
+	<-waiterDone
+	require.NoError(t, waiterErr)
+	assert.Equal(t, "beta", waiterC.Name())
+	assert.EqualValues(t, 2, fakes.beta.detects.Load(), "the waiter probed once with its own context")
+	assert.EqualValues(t, 0, fakes.alpha.detects.Load(), "no fallback for a cancelled caller")
+	assert.Empty(t, rec.warnings())
+}
+
+// TestSelectorWaiterOwnContextCancelled: a waiter whose own context ends
+// while it is queued behind another caller's probe gets a killed error
+// wrapping its context's cause, and the probe's eventual verdict is still
+// cached for everyone else.
+func TestSelectorWaiterOwnContextCancelled(t *testing.T) {
+	s, fakes, rec := selectNew(t, selectConfig())
+	probing := make(chan struct{}, 1)
+	release := make(chan struct{})
+	fakes.alpha.setHook(func(context.Context) (Status, error) {
+		probing <- struct{}{}
+		<-release
+		return selectHealthy("alpha"), nil
+	})
+
+	leaderDone := make(chan struct{})
+	go func() {
+		defer close(leaderDone)
+		_, err := s.Select(context.Background(), domain.RolePO)
+		assert.NoError(t, err)
+	}()
+	<-probing
+
+	cause := errors.New("agent slot withdrawn")
+	waiterCtx, cancelWaiter := context.WithCancelCause(context.Background())
+	cancelWaiter(cause)
+	_, err := s.Select(waiterCtx, domain.RoleEngineer)
+	require.ErrorIs(t, err, ErrKilled)
+	require.ErrorIs(t, err, cause)
+	assert.Equal(t, KindKilled, KindOf(err))
+
+	close(release)
+	<-leaderDone
+	c, err := s.Select(context.Background(), domain.RoleEngineer)
+	require.NoError(t, err)
+	assert.Equal(t, "alpha", c.Name())
+	assert.EqualValues(t, 1, fakes.alpha.detects.Load(), "the leader's verdict was cached")
+	assert.Empty(t, rec.warnings())
+}
+
+func TestSelectorDeadlineExceededNotCached(t *testing.T) {
+	s, fakes, rec := selectNew(t, selectConfig())
+	fakes.alpha.setHook(func(ctx context.Context) (Status, error) {
+		<-ctx.Done()
+		// The adapter reports the deadline without consulting ctx.Err on
+		// the Selector side: errors.Is on the cause must be enough.
+		return Status{}, NewError(KindTimeout, "alpha", "probe timed out", context.DeadlineExceeded)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	_, err := s.Select(ctx, domain.RolePO)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Empty(t, rec.warnings(), "a caller's deadline is not a cartridge failure")
+
+	fakes.alpha.set(selectHealthy("alpha"), nil)
+	c, err := s.Select(context.Background(), domain.RolePO)
+	require.NoError(t, err)
+	assert.Equal(t, "alpha", c.Name())
+	assert.EqualValues(t, 2, fakes.alpha.detects.Load())
+}
+
+// TestSelectorDetectOnUnusedCartridge: a direct Detect on a built cartridge
+// that no role uses still publishes a warning, but one that does not claim
+// any role falls back.
+func TestSelectorDetectOnUnusedCartridge(t *testing.T) {
+	cfg := selectConfig()
+	cfg.Roles = nil
+	s, fakes, rec := selectNew(t, cfg)
+	fakes.beta.set(Status{Installed: true, Version: "1.0.0", Auth: AuthMissing, Detail: "run beta login"}, nil)
+
+	_, err := s.Detect(context.Background(), "beta")
+	require.ErrorIs(t, err, ErrAuth)
+	warns := rec.warnings()
+	require.Len(t, warns, 1)
+	assert.Equal(t, `cartridge "beta" failed detection (version 1.0.0); no role is configured to use it`, warns[0].Message)
+	assert.Contains(t, warns[0].Err, "run beta login")
+	assert.NotContains(t, warns[0].Message, "fall back")
+
+	// A single override reads "role X falls back".
+	cfg = selectConfig()
+	s, fakes, rec = selectNew(t, cfg)
+	fakes.beta.set(Status{Installed: false, Detail: "beta not on PATH"}, nil)
+	_, err = s.Detect(context.Background(), "beta")
+	require.ErrorIs(t, err, ErrNotInstalled)
+	require.Len(t, rec.warnings(), 1)
+	assert.Equal(t, `cartridge "beta" failed detection; role tester falls back to the active cartridge "alpha"`, rec.warnings()[0].Message)
 }
 
 func TestPublisherFunc(t *testing.T) {

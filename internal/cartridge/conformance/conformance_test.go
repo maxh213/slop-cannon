@@ -465,13 +465,127 @@ func TestRun_CancelledContextFailsSessionChecks(t *testing.T) {
 	}
 	require.NoError(t, err)
 	assert.False(t, rep.Passed())
-	for _, name := range []string{CheckEcho, CheckStructured, CheckWrite, CheckRefuse, CheckTimeout} {
+	for _, name := range []string{CheckEcho, CheckStructured, CheckWrite, CheckRefuse, CheckTimeout, CheckKill} {
 		r := conformanceResult(t, rep, name)
 		assert.Equal(t, StatusFail, r.Status, name)
 		assert.True(t, errors.Is(r.Err, cartridge.ErrKilled), "%s: %v", name, r.Err)
 	}
-	// Kill is what the kill check wants, whoever did it.
-	assert.Equal(t, StatusPass, conformanceResult(t, rep, CheckKill).Status)
+	// The session died of the cancellation, not of the suite's Kill: that
+	// is not a pass, or a cancelled run would show a passing kill row.
+	kill := conformanceResult(t, rep, CheckKill)
+	assert.Contains(t, kill.Err.Error(), "before the suite called Kill")
+	assert.Contains(t, kill.Err.Error(), "context was cancelled")
+	assert.Contains(t, kill.Err.Error(), context.Canceled.Error())
+	assert.Equal(t, 0, strings.Count(rep.Table(), "PASS")-1, "only detect passes: %s", rep.Table())
+}
+
+// TestRun_RunErrorFailsChecksWithoutHanging scripts a cartridge whose Run
+// fails (no rule matches and there is no fallback) and asserts every
+// session check, the kill check included, reports the error and returns
+// promptly instead of waiting for a kill that never happens.
+func TestRun_RunErrorFailsChecksWithoutHanging(t *testing.T) {
+	t.Parallel()
+	const token = "sc-runerror"
+	a, err := mock.NewAdapter("", mock.NewScenario("norule"))
+	require.NoError(t, err)
+	opts := conformanceFastOptions(t, token)
+	opts.Checks = []string{CheckDetect, CheckEcho, CheckWrite, CheckRefuse, CheckTimeout, CheckKill}
+	done := make(chan struct{})
+	var rep Report
+	go func() {
+		defer close(done)
+		rep, err = Run(context.Background(), a, opts)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return although every session failed to start")
+	}
+	require.NoError(t, err)
+	assert.False(t, rep.Passed())
+	assert.Equal(t, StatusPass, conformanceStatuses(rep)[CheckDetect])
+	for _, name := range []string{CheckEcho, CheckWrite, CheckRefuse, CheckTimeout, CheckKill} {
+		r := conformanceResult(t, rep, name)
+		assert.Equal(t, StatusFail, r.Status, name)
+		require.Error(t, r.Err, name)
+		assert.Contains(t, r.Err.Error(), "start session:", name)
+		assert.True(t, errors.Is(r.Err, mock.ErrNoMatch), "%s: %v", name, r.Err)
+		assert.Less(t, r.Duration, opts.Timeout, name)
+	}
+	kill := conformanceResult(t, rep, CheckKill)
+	assert.Less(t, kill.Duration, opts.KillAfter+time.Second, "the kill check waited for a kill of a session that never started")
+	assert.Contains(t, rep.Table(), "1 passed, 5 failed, 2 skipped")
+	for _, c := range a.Calls() {
+		assert.False(t, c.Matched)
+	}
+}
+
+// TestRun_KilledBeforeKillAfterFails scripts a hung session that reports
+// ErrKilled on its own, well before the suite's Kill is due: the kill
+// check must not take credit for a kill it did not perform.
+func TestRun_KilledBeforeKillAfterFails(t *testing.T) {
+	t.Parallel()
+	const token = "sc-selfkill"
+	s := MockScenario(token)
+	for _, r := range s.Rules {
+		if r.Name == "hang" {
+			r.Steps = nil
+			r.Fail(mock.FailKilled, "died on its own")
+		}
+	}
+	a, err := mock.NewAdapter("", s)
+	require.NoError(t, err)
+	opts := conformanceFastOptions(t, token)
+	opts.KillAfter = 2 * time.Second
+	opts.Checks = []string{CheckKill}
+	rep, err := Run(context.Background(), a, opts)
+	require.NoError(t, err)
+	kill := conformanceResult(t, rep, CheckKill)
+	assert.Equal(t, StatusFail, kill.Status)
+	require.Error(t, kill.Err)
+	assert.True(t, errors.Is(kill.Err, cartridge.ErrKilled), kill.Err)
+	assert.Contains(t, kill.Err.Error(), "before the suite called Kill at 2s")
+	assert.NotContains(t, kill.Err.Error(), "context was cancelled")
+	assert.Less(t, kill.Duration, opts.KillAfter, "the check lingered until KillAfter although the session had ended")
+}
+
+// conformanceLeakyCartridge wraps a cartridge and, for a read_only session
+// carrying the write prompt, creates WriteFileName in the workdir behind
+// the session's back: a cartridge whose read_only policy does not hold.
+type conformanceLeakyCartridge struct{ cartridge.Cartridge }
+
+// Run implements cartridge.Cartridge.
+func (c conformanceLeakyCartridge) Run(ctx context.Context, spec cartridge.RunSpec) (cartridge.Session, error) {
+	if spec.ToolPolicy == cartridge.ToolReadOnly && strings.Contains(spec.Prompt, writeMarker) {
+		if err := os.WriteFile(filepath.Join(spec.Workdir, WriteFileName), []byte("leaked\n"), 0o644); err != nil {
+			return nil, err
+		}
+	}
+	return c.Cartridge.Run(ctx, spec)
+}
+
+// TestRun_RefuseFailsWhenReadOnlyLeaks covers the refuse check's negative
+// path: the read_write write passes, and the read_only run that leaves a
+// file behind fails naming the file.
+func TestRun_RefuseFailsWhenReadOnlyLeaks(t *testing.T) {
+	t.Parallel()
+	const token = "sc-leaky"
+	a, err := NewMock("", token)
+	require.NoError(t, err)
+	opts := conformanceFastOptions(t, token)
+	opts.Checks = []string{CheckDetect, CheckWrite, CheckRefuse}
+	rep, err := Run(context.Background(), conformanceLeakyCartridge{a}, opts)
+	require.NoError(t, err)
+	assert.False(t, rep.Passed())
+	st := conformanceStatuses(rep)
+	assert.Equal(t, StatusPass, st[CheckDetect])
+	assert.Equal(t, StatusPass, st[CheckWrite])
+	assert.Equal(t, StatusFail, st[CheckRefuse])
+	refuse := conformanceResult(t, rep, CheckRefuse)
+	require.Error(t, refuse.Err)
+	assert.Contains(t, refuse.Err.Error(), "read_only session created "+WriteFileName+" in the workdir")
+	assert.Contains(t, refuse.Detail, "1 refused tool call", "the mock itself still refused its Write")
+	assert.Contains(t, rep.Table(), "2 passed, 1 failed, 5 skipped")
 }
 
 func TestStreamContract(t *testing.T) {

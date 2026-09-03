@@ -3,9 +3,11 @@ package gitx
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -225,6 +227,80 @@ func TestRepo_Diff(t *testing.T) {
 		assert.Equal(t, DefaultMaxDiffBytes, def.MaxBytes, "zero keeps the default")
 	})
 
+	t.Run("the patch is the bytes git wrote, CRLF and all", func(t *testing.T) {
+		_, repo := dfBranch(t)
+		dfCommit(t, repo, "windows line endings", map[string]*string{"crlf.txt": dfStr("x\r\ny\r\n")})
+
+		d, err := repo.Diff(ctx, "main")
+		require.NoError(t, err)
+		assert.True(t, strings.HasSuffix(d.Patch, "+x\r\n+y\r\n"),
+			"the final line keeps its carriage return: %q", d.Patch)
+		assert.Equal(t, len(d.Patch), d.Bytes, "the size is the patch's own")
+	})
+
+	t.Run("a change with no changed lines is still a diff", func(t *testing.T) {
+		_, repo := dfBranch(t)
+		require.NoError(t, os.Chmod(filepath.Join(repo.Root, "main.go"), 0o755))
+		dfCommit(t, repo, "make main.go executable", nil)
+
+		d, err := repo.Diff(ctx, "main")
+		require.NoError(t, err)
+		assert.False(t, d.Empty(), "a mode-only change must reach the reviewers")
+		assert.Equal(t, 0, d.ChangedLines())
+		require.Len(t, d.Files, 1)
+		assert.Equal(t, DiffModified, d.Files[0].Status)
+		assert.Equal(t, "main.go", d.Files[0].Path)
+		assert.Contains(t, d.Patch, "new mode 100755\n")
+		assert.Contains(t, d.Stat(), "M main.go  +0 -0\n")
+	})
+
+	t.Run("no temporary files are left behind", func(t *testing.T) {
+		_, repo := dfBranch(t)
+		big := dfLines("line", 500)
+		dfCommit(t, repo, "big", map[string]*string{"big.txt": &big})
+		tmp := t.TempDir()
+		t.Setenv("TMPDIR", tmp)
+
+		full, err := repo.Diff(ctx, "main")
+		require.NoError(t, err)
+		require.NotEmpty(t, full.Patch)
+		capped, err := repo.Diff(ctx, "main", WithMaxDiffBytes(64))
+		require.NoError(t, err)
+		require.True(t, capped.Truncated)
+
+		entries, err := os.ReadDir(tmp)
+		require.NoError(t, err)
+		assert.Empty(t, entries, "the patch scratch directory is removed")
+		status, err := repo.Status(ctx)
+		require.NoError(t, err)
+		assert.Empty(t, status, "the repository is never written to")
+	})
+
+	t.Run("concurrent readers get the same diff", func(t *testing.T) {
+		_, repo := dfBranch(t)
+		dfCommit(t, repo, "work", map[string]*string{"NEW.md": dfStr(dfLines("l", 20))})
+		want, err := repo.Diff(ctx, "main")
+		require.NoError(t, err)
+
+		// Three testers review the same worktree at once (D-05).
+		const readers = 3
+		var wg sync.WaitGroup
+		got := make([]*Diff, readers)
+		errs := make([]error, readers)
+		wg.Add(readers)
+		for i := range readers {
+			go func() {
+				defer wg.Done()
+				got[i], errs[i] = repo.Diff(ctx, "main")
+			}()
+		}
+		wg.Wait()
+		for i := range readers {
+			require.NoError(t, errs[i])
+			assert.Equal(t, want, got[i])
+		}
+	})
+
 	t.Run("errors", func(t *testing.T) {
 		r, repo := dfBranch(t)
 		_, err := repo.Diff(ctx, "no-such-branch")
@@ -339,16 +415,22 @@ func TestRepo_ChangeRatio(t *testing.T) {
 		assert.True(t, c.Exceeds(DefaultReReviewThreshold))
 	})
 
-	t.Run("nil diffs and unknown heads are errors", func(t *testing.T) {
+	t.Run("nil diffs are errors", func(t *testing.T) {
 		_, err := repo.ChangeRatio(ctx, nil, round1)
 		require.Error(t, err)
 		_, err = repo.ChangeRatio(ctx, round1, nil)
 		require.Error(t, err)
+	})
+
+	t.Run("a head that is gone is an unknown revision", func(t *testing.T) {
+		// The previous round was rebased away and its commit pruned; the
+		// caller re-reviews rather than failing the round.
 		bogus := &Diff{Stats: DiffStats{Head: strings.Repeat("0", 40)}}
-		_, err = repo.ChangeRatio(ctx, bogus, round1)
-		require.Error(t, err)
+		_, err := repo.ChangeRatio(ctx, bogus, round1)
+		require.ErrorIs(t, err, ErrUnknownRevision)
 		var ge *GitError
 		require.ErrorAs(t, err, &ge)
+		assert.Equal(t, 128, ge.ExitCode)
 	})
 }
 
@@ -371,6 +453,12 @@ func TestRatioOf(t *testing.T) {
 	assert.False(t, ChangeRatio{Ratio: 0.4}.Exceeds(0.4), "exactly the threshold does not exceed it")
 	assert.True(t, ChangeRatio{Ratio: 0.41}.Exceeds(0.4))
 	assert.True(t, ChangeRatio{Ratio: 0.41}.Exceeds(-1), "negative means the default threshold")
+}
+
+func TestClampToInt(t *testing.T) {
+	assert.Equal(t, 0, clampToInt(0))
+	assert.Equal(t, 1234, clampToInt(1234))
+	assert.Equal(t, math.MaxInt, clampToInt(math.MaxInt64), "a size past int never wraps negative")
 }
 
 func TestParseNameStatus(t *testing.T) {
