@@ -1,2 +1,2 @@
-structured: schema (plan): 1 violation(s)
+structured: result does not match schema (plan): 1 violation(s)
   - at '/beads/0/priority': maximum: got 7, want 4

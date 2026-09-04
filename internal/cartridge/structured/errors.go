@@ -91,12 +91,19 @@ type ParseError struct {
 	Cause error
 }
 
-// Error renders "structured: <reason>: <detail>" followed by the problems,
-// one per line.
+// Error renders the sentence of the Reason's sentinel — the same words
+// docs/troubleshooting.md is keyed by — followed by the contract, the
+// detail and the problems, one per line: "structured: sc-result block is
+// not valid JSON (impl_report): invalid character 'h'". A Reason with no
+// sentinel falls back to "structured: <reason>".
 func (e *ParseError) Error() string {
 	var b strings.Builder
-	b.WriteString("structured: ")
-	b.WriteString(e.Reason.String())
+	if s := e.Reason.Sentinel(); s != nil {
+		b.WriteString(s.Error())
+	} else {
+		b.WriteString("structured: ")
+		b.WriteString(e.Reason.String())
+	}
 	if e.Contract != "" {
 		fmt.Fprintf(&b, " (%s)", e.Contract)
 	}

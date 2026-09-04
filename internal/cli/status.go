@@ -543,12 +543,20 @@ func statusVitalsSection(b *strings.Builder, r *StatusReport) {
 // statusHeader writes the label/value block that opens the report.
 func statusHeader(b *strings.Builder, r *StatusReport) {
 	row := func(label, value string) {
-		if value == "" {
+		// Values quote what a run recorded, which quotes what a cartridge
+		// and bd printed: the brief, a stop reason, a finish summary. Any
+		// of them can be several lines — a worktree cleanup names every
+		// worktree it kept, one per line — so a value keeps its shape and
+		// its continuation lines are indented under the label, the way
+		// statusVitalsSection lays its own out.
+		lines := statusRowLines(value)
+		if len(lines) == 0 {
 			return
 		}
-		// Values quote what a run recorded, which quotes what a cartridge
-		// and bd printed: the brief, a stop reason, a finish summary.
-		fmt.Fprintf(b, "%-*s%s\n", statusLabelWidth, label, statusScrub(value))
+		fmt.Fprintf(b, "%-*s%s\n", statusLabelWidth, label, lines[0])
+		for _, l := range lines[1:] {
+			fmt.Fprintf(b, "%-*s%s\n", statusLabelWidth, "", l)
+		}
 	}
 	row("run", string(r.Run))
 	row("phase", statusPhaseText(r))
@@ -582,6 +590,30 @@ func statusHeader(b *strings.Builder, r *StatusReport) {
 		}
 		row("safety", fmt.Sprintf("%s (%s)", safetyWord(snap.Safety), statusSafetyGloss(snap.Safety)))
 	}
+}
+
+// statusRowLines scrubs one header value into the lines it is printed as.
+// A single-line value is one line, which is the common case; a multi-line
+// one keeps its breaks, because [statusScrub] would otherwise drop them as
+// control characters and run the sentences of a finish summary together
+// ("2 beads (2 closed)removed 2 worktrees"). Blank lines are dropped: they
+// carry nothing and a header block is dense on purpose.
+func statusRowLines(value string) []string {
+	scrubbed := statusScrubBlock(value)
+	if !strings.Contains(scrubbed, "\n") {
+		if strings.TrimSpace(scrubbed) == "" {
+			return nil
+		}
+		return []string{strings.TrimRight(scrubbed, " \t")}
+	}
+	var out []string
+	for _, l := range strings.Split(scrubbed, "\n") {
+		if strings.TrimSpace(l) == "" {
+			continue
+		}
+		out = append(out, strings.TrimRight(l, " \t"))
+	}
+	return out
 }
 
 // statusSafetyGloss is the short form of the D-10 meaning; the long one
@@ -645,11 +677,13 @@ func statusFinishReason(r *StatusReport) events.FinishReason {
 // statusOutcome renders the finish summary, which carries what cleanup kept.
 func statusOutcome(st *orchestrator.State) string {
 	parts := make([]string, 0, 2)
-	if st.FinishSummary != "" {
-		parts = append(parts, st.FinishSummary)
+	// The summary is a report a run wrote, so it can end in a newline; the
+	// error is appended to its last line, not to a blank one.
+	if s := strings.TrimSpace(st.FinishSummary); s != "" {
+		parts = append(parts, s)
 	}
-	if st.FinishError != "" {
-		parts = append(parts, "error: "+st.FinishError)
+	if e := strings.TrimSpace(st.FinishError); e != "" {
+		parts = append(parts, "error: "+e)
 	}
 	return strings.Join(parts, "; ")
 }

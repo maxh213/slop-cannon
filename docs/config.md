@@ -60,9 +60,9 @@ pass silently. Durations are Go duration strings (`"10m"`, `"1h30m"`,
 | `gate_poll_interval` | duration > 0 | `"1m"` | both | Safety on only: how often the run asks bd whether the pull request behind a `gh:pr` gate has merged, so the bead closes (P6-10, D-20). Each poll runs `gh pr view` once per open gate. |
 | `max_beads_per_plan` | integer ≥ 1 | `8` | both | How many beads one PO planning firing may propose. A plan with more is rejected outright and the PO is asked to redo it — the surplus is never trimmed, because dropping beads would break the dependencies of the ones that stayed (P5-02). |
 | `limits.max_review_rounds` | integer ≥ 1 | `5` | both | Review rounds per bead before the PO escalates (D-08). |
-| `limits.max_pushback_rounds` | integer ≥ 0 | `2` | both | Pushback exchanges per feedback item before PO arbitration (D-08). |
+| `limits.max_pushback_rounds` | integer ≥ 1 | `2` | both | Pushback exchanges per feedback item before PO arbitration (D-08). At least one: the loop always lets the engineer answer an issue once before the PO rules on it, and `0` is refused rather than silently read as the default (P9-01). |
 | `limits.agent_timeout` | duration > 0 | `"30m"` | both | Maximum wall-clock time for one agent session. |
-| `limits.max_tokens` | integer ≥ 0 | `0` (unlimited) | both | Opt-in token budget for a run: input plus output tokens (cache tokens excluded), summed over every agent session that finished. Crossing it stops new work — no bead is implemented and no plan is made, while the reviews already in flight are still given their agents so the round can finish. An autopilot run then **pauses** with a banner and waits for you; resuming it grants another budget's worth, so it pauses again rather than carrying on unwatched (D-18). A brief run finishes once the reviews drain, with the budget in its summary. Enforced only as far as the cartridge reports usage: a CLI that counts nothing spends nothing. |
+| `limits.max_tokens` | integer ≥ 0 | `0` (unlimited) | both | Opt-in token budget for a run: input plus output tokens (cache tokens excluded), summed over every agent session that finished. Crossing it stops new work — no fresh bead is implemented and no plan is made, while the work that finishes what is in flight (a round's reviews and arbitrations, and a delivery conflict round over a bead already taken) still gets its agents. An autopilot run then **pauses** at once with a banner and waits for you: the pause stops the whole dispatch loop, so only the agents already running finish and everything queued waits with it. Resuming grants another budget's worth, so it pauses again rather than carrying on unwatched (D-18). A brief run has no pause: it keeps offering the finishing work and ends when that drains, with the budget in its summary. Enforced only as far as the cartridge reports usage: a CLI that counts nothing spends nothing. |
 | `limits.max_cost_usd` | number ≥ 0 | `0` (unlimited) | both | Opt-in cost budget, same semantics as `max_tokens`. It waits for a cartridge that reports a price: an adapter whose CLI prints tokens but no cost never trips it, however long the run goes on. |
 | `limits.max_plan_rejections` | integer ≥ 1 | `2` | both | How many plans in a row the planning validator may reject before the run gives up on that round of planning (P6-19). One rejection has already cost two plans: a rule failure is retried once inside the firing itself. A brief run that gives up finishes and says so; an autopilot run cools off and plans again (D-18). |
 | `limits.max_plan_failures` | integer ≥ 1 | `5` | both | How many planning firings in a row may fail for a reason that is not the plan's fault — a cartridge crash, an agent timeout, an unreadable rules file — before the run gives up on that round the same way. Looser than `max_plan_rejections` because the supervisor has already spent its own retries on those failures. |
@@ -71,6 +71,15 @@ pass silently. Durations are Go duration strings (`"10m"`, `"1h30m"`,
 | `cartridges.<name>.args` | string array | `[]` | global | Extra arguments prepended to every invocation. |
 | `cartridges.<name>.env` | table of strings | `{}` | global | Extra environment variables for the CLI process. |
 | `roles.<role>.cartridge` | string | `""` | both | Per-role cartridge override (`po`, `engineer`, `tester`), D-12. Parsed and validated now; it only has an effect once a second cartridge exists. |
+
+A budget pause is cleared from the TUI (`p` resumes a paused run), and only
+from there: `sc resume` restarts an *earlier* run from disk rather than
+resuming the live one. So an autopilot run started with `--headless` that
+crosses its budget stays paused, holding the repository's run lock, until you
+interrupt it with Ctrl-C, which finishes it as a user stop: the banner naming
+the cap stays in the run log, and the summary still reports what the run
+spent. Give a headless autopilot run a budget you are content for it to stop
+at, or run it in the TUI (P9-01, P9-14).
 
 Only `claude` is a valid cartridge name for now (D-19). Any other name, in a
 file or on the command line, fails with

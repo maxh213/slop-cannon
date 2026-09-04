@@ -33,7 +33,7 @@
 // write — the shutdown release of a held bead included, which is why a stop
 // during a review leaves the bead in_review instead of forcing it open.
 //
-// Exactly two bead-status writes in a run are not decided by that table:
+// Exactly three bead-status writes in a run are not decided by that table:
 //
 //   - the scheduler's claim (P6-13): bd's `update --claim` is atomic and sets
 //     in_progress itself, so [Scheduler.announceClaim] publishes that
@@ -48,7 +48,31 @@
 //     merged" is reached from any non-closed state, failed included, which
 //     D-07 has no edge out of. [Run.reconcileResume] therefore announces an
 //     entry only when gitx marked it applied, so a write bd refused is a
-//     warning and no event there too.
+//     warning and no event there too;
+//   - the external review bead's close (D-11, P8-04): [PRReview.close]
+//     writes `bd close` itself, because D-07 has no open -> closed edge and
+//     an external pull request is never delivered by us, so walking the
+//     bead through approved and delivering would record five transitions
+//     that did not happen. It publishes its own [events.BeadStateChanged],
+//     like the scheduler's claim does.
+//
+// The second and the third are also the two writes the P9-06 rules gate
+// never sees, and [RulesGate.GuardStore] says why neither is the run
+// shipping its own work. The first cannot ship anything: a claim lands the
+// bead in_progress.
+//
+// The [Conductor] (run.go) is the glue above all of that — the answer to
+// "what connects bd to those three work sources?" (P8-14). Beside the
+// scheduler, once a second, it lists the run's beads, publishes the
+// inventory and the graph the TUI relays out of (P6-32), offers the
+// `bd ready` set to [Feedback.Track], rebuilds a resumed run's threads from
+// the beads' own comments on its first pass ([Feedback.Restore], P8-16),
+// starts the delivery of every approved bead in the background and routes
+// each [DeliveryOutcome] back through [Conductor.ApplyOutcome]. It is also
+// where the prompt context comes from ([Conductor.BeadContext], the
+// [FeedbackOptions.Context] of the loop), which is why the D-14 leftovers
+// commit and the P9-05 secret filter both sit there: it is the only
+// production producer of the change set a prompt renders.
 //
 // The [GatePoller] (gates.go) is a sidecar rather than a loop: it resolves
 // the gh:pr gates of delivered beads (D-20), taking the P6-12 guard on a

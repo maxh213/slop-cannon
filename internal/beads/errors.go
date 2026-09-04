@@ -67,14 +67,19 @@ type Error struct {
 	Cause error
 }
 
-// Error renders "bd <command>: <message>", falling back to the exit status
-// or "timed out".
+// Error renders "bd <command>: <kind>: <message>" — sc's own sentence for
+// what happened, the one docs/troubleshooting.md is keyed by, followed by
+// the words bd printed — falling back to "bd <command>: <message>" when
+// the message matched no kind, and to the exit status or "timed out" when
+// bd said nothing.
 func (e *Error) Error() string {
 	head := Binary
 	if e.Command != "" {
 		head += " " + e.Command
 	}
 	switch {
+	case e.Message != "" && e.Kind != nil:
+		return head + ": " + e.Kind.Error() + ": " + e.Message
 	case e.Message != "":
 		return head + ": " + e.Message
 	case errors.Is(e.Cause, proc.ErrTimeout):

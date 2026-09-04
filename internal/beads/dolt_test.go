@@ -195,7 +195,7 @@ func TestDoltHistoryUnknownID(t *testing.T) {
 	var bdErr *Error
 	require.ErrorAs(t, err, &bdErr)
 	assert.Equal(t, "history", bdErr.Command)
-	assert.Equal(t, "bd history: no history for nope-1 (unknown id, or dolt.auto-commit is not \"on\")", err.Error())
+	assert.Equal(t, "bd history: bead not found: no history for nope-1 (unknown id, or dolt.auto-commit is not \"on\")", err.Error())
 }
 
 func TestDoltHistoryDecodesCapturedSample(t *testing.T) {

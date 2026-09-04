@@ -12,6 +12,8 @@ import (
 	"strings"
 
 	"slop-cannon/internal/agents/prompt"
+	"slop-cannon/internal/domain"
+	"slop-cannon/internal/events"
 	"slop-cannon/internal/gitx"
 	"slop-cannon/internal/logging"
 )
@@ -222,6 +224,87 @@ func (f *SecretFilter) Text(s string) string {
 // it somewhere else — a [logging.Options] for the run's log files, or the
 // event constructors of P9-09.
 func (f *SecretFilter) Redactor() *logging.Redactor { return f.resolve().redactor }
+
+// Texts is [SecretFilter.Text] over a list, on a copy; nil in, nil out. It
+// is what a prompt's free-form notes go through — the orchestrator's line
+// about a failed check command quotes what the command printed.
+func (f *SecretFilter) Texts(list []string) []string {
+	if len(list) == 0 {
+		return nil
+	}
+	f = f.resolve()
+	out := make([]string, len(list))
+	for i, s := range list {
+		out[i] = f.Text(s)
+	}
+	return out
+}
+
+// Message returns a copy of one structured agent message — a plan, an
+// implementation report, a verdict, responses, arbitrations, an escalation
+// or a bead — with the prose a model wrote masked by [SecretFilter.Text].
+// Anything else comes back unchanged. It is [events.RedactMessage] with
+// this run's rules, so the walk is the one [events.Redacted] makes rather
+// than a second copy of it.
+//
+// The two sinks that need it are the ones that are not events: the comment
+// the feedback loop writes on the bead, and the pull request body the
+// delivery hands to `gh`, which is the only one of the three that leaves the
+// machine.
+func (f *SecretFilter) Message(msg any) any {
+	return events.RedactMessage(msg, f.resolve().Text)
+}
+
+// Report is [SecretFilter.Message] for an implementation report, keeping the
+// pointer shape the delivery request uses. A nil report returns nil.
+func (f *SecretFilter) Report(r *domain.ImplReport) *domain.ImplReport {
+	if r == nil {
+		return nil
+	}
+	out, ok := f.Message(*r).(domain.ImplReport)
+	if !ok {
+		return r
+	}
+	return &out
+}
+
+// Verdicts is [SecretFilter.Message] for a list of tester verdicts, on a
+// copy; nil in, nil out.
+func (f *SecretFilter) Verdicts(list []domain.Verdict) []domain.Verdict {
+	if len(list) == 0 {
+		return nil
+	}
+	out, ok := f.Message(list).([]domain.Verdict)
+	if !ok {
+		return list
+	}
+	return out
+}
+
+// Items is [SecretFilter.Message] for a list of feedback items, on a copy;
+// nil in, nil out. The delivery raises one out of a failed check command's
+// output (P6-06), which is where a credential in the environment surfaces.
+func (f *SecretFilter) Items(list []domain.FeedbackItem) []domain.FeedbackItem {
+	if len(list) == 0 {
+		return nil
+	}
+	out, ok := f.Message(list).([]domain.FeedbackItem)
+	if !ok {
+		return list
+	}
+	return out
+}
+
+// Bead is [SecretFilter.Message] for a bead: the title, description and
+// acceptance criteria a product owner or a human wrote, masked. The id,
+// state and numbers are sc's own and are left alone.
+func (f *SecretFilter) Bead(b domain.Bead) domain.Bead {
+	out, ok := f.Message(b).(domain.Bead)
+	if !ok {
+		return b
+	}
+	return out
+}
 
 // Scan is [prompt.ScanRepo] with the excluded files removed: the repository
 // context an agent may see. Use it instead of prompt.ScanRepo wherever a

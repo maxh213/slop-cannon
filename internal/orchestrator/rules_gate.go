@@ -51,20 +51,24 @@ import (
 //   - It refuses the D-07 transitions that ship the work — anything landing
 //     in approved, delivering or closed — while a violation is open, at the
 //     [StateStore] the [StateMachine] writes through
-//     ([RulesGate.GuardStore]). That is the last line: no component of the
-//     run can move a bead past review with a rules blocker open, whether it
+//     ([RulesGate.GuardStore]). That is the last line: no work of the run's
+//     own can be moved past review with a rules blocker open, whether it
 //     went through the feedback loop, the delivery handoff, a resume or a
-//     gate poller.
+//     gate poller. The two status writes that do not go through that store
+//     are named, and are not the run's own work, in [RulesGate.GuardStore].
 //
-// Wiring is two decorators and nothing else, so nothing has to know the gate
+// Wiring is three lines and nothing else, so nothing has to know the gate
 // exists:
 //
 //	gate := orchestrator.NewRulesGate(orchestrator.RulesGateOptions{Run: run.ID(), Bus: run, Now: run.Now})
 //	states := orchestrator.NewStateMachine(gate.GuardStore(client), …)
 //	sup, _ := orchestrator.NewSupervisor(orchestrator.SupervisorOptions{Planner: gate.GuardPlanner(loop), …})
+//	cond, _ := orchestrator.NewConductor(orchestrator.ConductorOptions{RulesGate: gate, …})
 //
-// and, on a resume, [RulesGate.RestoreMessages] with the bead's comments
-// before the thread is replayed.
+// The third is the resume: [ConductorOptions.RulesGate] is what makes the
+// conductor tell the gate about a thread ([RulesGate.RestoreMessages])
+// before [Feedback.Restore] replays it, which is what closes the hole the
+// replay leaves — bd comments applied with no role check at all.
 
 // SourceRules is the [events.Warning] Source the rules compliance gate
 // stamps on a message or a transition it refused.
@@ -135,18 +139,25 @@ func (v RulesViolation) String() string {
 	return s
 }
 
-// RulesGateStats is what the gate has seen and done, for `sc status` and
-// the tests.
+// RulesGateStats is what the gate has seen and done. It is folded into the
+// run's vitals ([RunVitals.WithRules]), so it reaches state.json and the
+// `sc status` line [RunVitals.RulesLine] prints; a run that never saw a
+// rules item is zero here and prints nothing.
 type RulesGateStats struct {
 	// Beads is how many beads the gate has recorded a rules item on.
-	Beads int
+	Beads int `json:"beads,omitempty"`
 	// Blocked is how many of those still have one open.
-	Blocked int
+	Blocked int `json:"blocked,omitempty"`
 	// Violations is how many open violations there are in all.
-	Violations int
+	Violations int `json:"violations,omitempty"`
 	// Refused counts every message and transition the gate refused.
-	Refused int
+	Refused int `json:"refused,omitempty"`
 }
+
+// Zero reports whether the gate has seen nothing and refused nothing, which
+// is what a run with no violation of a rules file leaves in state.json and
+// what [RunVitals.RulesLine] prints nothing for.
+func (s RulesGateStats) Zero() bool { return s == RulesGateStats{} }
 
 // RulesGateOptions configures [NewRulesGate]. Every field is optional.
 type RulesGateOptions struct {
@@ -304,6 +315,18 @@ func (g *RulesGate) Observe(bead domain.BeadID, payload any) {
 	}
 }
 
+// RulesRestorer is the slice of [RulesGate] the run's glue holds: what a
+// resume must tell the gate before a thread rebuilt from bd's comments is
+// replayed. [ConductorOptions.RulesGate] is this interface, so the conductor
+// depends on the one method rather than on the gate.
+type RulesRestorer interface {
+	// RestoreMessages folds a bead's replayed comments into the gate.
+	RestoreMessages(bead domain.BeadID, msgs []beads.Message)
+}
+
+// The gate is the production restorer.
+var _ RulesRestorer = (*RulesGate)(nil)
+
 // RestoreMessages rebuilds a bead's rules state from the comments a resume
 // read back from bd (D-06, [Feedback.Restore]), in the order they were
 // written. Messages that failed to decode are skipped, like the loop skips
@@ -311,7 +334,9 @@ func (g *RulesGate) Observe(bead domain.BeadID, payload any) {
 //
 // A resumed run needs this: the replay applies the thread's own record
 // without re-validating it, so without the gate's memory a violation that
-// an old comment settled the wrong way would come back settled.
+// an old comment settled the wrong way would come back settled. It is
+// [Conductor.restoreThreads] that calls it, from [ConductorOptions.RulesGate],
+// on the same messages it then hands [Feedback.Restore].
 func (g *RulesGate) RestoreMessages(bead domain.BeadID, msgs []beads.Message) {
 	for _, m := range msgs {
 		if m.Err != nil {
@@ -394,6 +419,66 @@ func (g *RulesGate) openLocked(bead domain.BeadID) []RulesViolation {
 		}
 	}
 	return out
+}
+
+// --- what a person sees -----------------------------------------------
+
+// RulesReporter is the slice of [RulesGate] the run's vitals read.
+type RulesReporter interface {
+	// Stats is the gate's counters.
+	Stats() RulesGateStats
+}
+
+// The gate is the production reporter.
+var _ RulesReporter = (*RulesGate)(nil)
+
+// WithRules folds a rules gate's counters into the vitals, so what the gate
+// has refused reaches state.json and `sc status` with everything else the
+// run is waiting on:
+//
+//	run.UseVitals(func() orchestrator.RunVitals {
+//		return orchestrator.Vitals(now(), planner, poller, foreign).WithRules(gate)
+//	})
+//
+// A nil reporter leaves the snapshot alone, which is what a run assembled
+// without a gate produces.
+func (v RunVitals) WithRules(g RulesReporter) RunVitals {
+	if g == nil {
+		return v
+	}
+	v.Rules = g.Stats()
+	return v
+}
+
+// RulesLine says what the rules compliance gate is holding and what it has
+// refused, or "" when it has seen nothing — which is every run in a
+// repository whose rules files nobody broke, so the line appears only when
+// it means something.
+func (v RunVitals) RulesLine() string {
+	r := v.Rules
+	if r.Zero() {
+		return ""
+	}
+	parts := []string{rulesPlural(r.Beads, "bead", "beads") + " with a rules item"}
+	if r.Blocked > 0 {
+		parts = append(parts, fmt.Sprintf("%s blocked by %s",
+			rulesPlural(r.Blocked, "bead", "beads"),
+			rulesPlural(r.Violations, "open violation", "open violations")))
+	} else {
+		parts = append(parts, "none blocked")
+	}
+	if r.Refused > 0 {
+		parts = append(parts, rulesPlural(r.Refused, "refusal", "refusals"))
+	}
+	return "rules: " + strings.Join(parts, " · ")
+}
+
+// rulesPlural renders a count with the noun that agrees with it.
+func rulesPlural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
 }
 
 // --- what the gate refuses --------------------------------------------
@@ -545,10 +630,15 @@ func rulesVerb(n int) string {
 // be argued with, so it is the feedback the model should see before any
 // other complaint about the same reply.
 //
+// agent is the firing's agent, so a refusal made inside the retry loop is
+// attributed in the run log and on the TUI exactly like the one made as the
+// reply is applied ([RulesGate.Guard]); the empty id is allowed, for a
+// caller that has no agent record yet.
+//
 // msg says which payload the reply carries; a firing with no message type
 // (a caller that compiled its own contract) is left alone, because the gate
 // has no way to decode it.
-func (g *RulesGate) Check(bead domain.BeadID, msg domain.MessageType, next structured.ResultCheck) structured.ResultCheck {
+func (g *RulesGate) Check(bead domain.BeadID, agent domain.AgentID, msg domain.MessageType, next structured.ResultCheck) structured.ResultCheck {
 	if !rulesChecks(msg) {
 		return next
 	}
@@ -556,7 +646,7 @@ func (g *RulesGate) Check(bead domain.BeadID, msg domain.MessageType, next struc
 		payload, err := rulesDecode(msg, p.JSON)
 		if err == nil {
 			if err := g.CheckPayload(bead, payload); err != nil {
-				g.refused(bead, "", err)
+				g.refused(bead, agent, err)
 				return err
 			}
 		}
@@ -620,7 +710,7 @@ func (g *RulesGate) Guard(bead domain.BeadID, af AgentFiring) AgentFiring {
 			if err != nil {
 				return run, err
 			}
-			run.Check = g.Check(bead, run.Message, run.Check)
+			run.Check = g.Check(bead, af.Agent.ID, run.Message, run.Check)
 			return run, nil
 		}
 	}
@@ -658,6 +748,22 @@ func (g *RulesGate) GuardPlanner(next FiringPlanner) FiringPlanner {
 // The other writes pass untouched: claiming, reclaiming and releasing a
 // bead with an open violation are exactly what has to keep happening for
 // the engineer to fix it.
+//
+// Two status writes of a run do not go through this store, and neither is
+// the run shipping its own work, so neither is guarded (doc.go lists them
+// with the scheduler's atomic claim):
+//
+//   - [PRReview.close] closes an *external* review bead through the raw bd
+//     client. Nothing of ours ships: the cannon never merges somebody
+//     else's pull request, and the bead is the record of a review that is
+//     over. A rules item raised on such a review is a comment on the pull
+//     request, not a change the loop can make.
+//   - [ResumeTracker] reconciles a killed run's branches through its own
+//     D-07 guard ([gitx.Resumer], P6-15). Its writes record what git and
+//     GitHub already did — a branch that merged is merged — so refusing
+//     them would leave bd disagreeing with the repository rather than
+//     unship anything. The gate still holds the violation, so the *next*
+//     move the resumed run tries to make on that bead is refused.
 func (g *RulesGate) GuardStore(next StateStore) StateStore {
 	return rulesGuardedStore{gate: g, next: next}
 }

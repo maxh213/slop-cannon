@@ -1185,9 +1185,34 @@ func TestPRWorktreeCheckoutFetchesThePullRequest(t *testing.T) {
 		t.Error("the pull request's file landed in the target repository")
 	}
 
+	// D-23: nothing of ours is left in the user's repository. The worktree
+	// manager mints an sc/<bead> branch to create the worktree with; the
+	// checkout takes the worktree off it and deletes it, so reviewing
+	// somebody else's pull request adds no branch to their `git branch`.
+	if got := strings.TrimSpace(f.Git(t, "branch", "--list", gitx.BranchName(bead))); got != "" {
+		t.Errorf("the review left branch %q behind in the repository (D-23)", got)
+	}
+	wt, err := m.Open(ctx, bead.ID)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if got, err := wt.Git(ctx, "rev-parse", "--abbrev-ref", "HEAD"); err != nil || strings.TrimSpace(got) != "HEAD" {
+		t.Errorf("the review worktree is on branch %q (%v), want a detached HEAD", strings.TrimSpace(got), err)
+	}
+	if got, err := wt.Git(ctx, "rev-parse", "HEAD"); err != nil || strings.TrimSpace(got) != head {
+		t.Errorf("the detached worktree is at %q (%v), want the pull request head %q", strings.TrimSpace(got), err, head)
+	}
+
 	// A second checkout of the same pull request reuses the worktree.
-	if _, err := c.Checkout(ctx, bead, pr); err != nil {
+	ws2, err := c.Checkout(ctx, bead, pr)
+	if err != nil {
 		t.Fatalf("second Checkout: %v", err)
+	}
+	if ws2.HeadSHA != head {
+		t.Errorf("second checkout head = %q, want %q", ws2.HeadSHA, head)
+	}
+	if got := strings.TrimSpace(f.Git(t, "branch", "--list", gitx.BranchName(bead))); got != "" {
+		t.Errorf("the second checkout left branch %q behind", got)
 	}
 }
 
@@ -1198,4 +1223,318 @@ func prvBareGit(t *testing.T, f *testutil.FixtureRepo, args ...string) {
 		t.Fatal("the fixture has no bare remote")
 	}
 	f.Git(t, append([]string{"-C", f.RemoteDir}, args...)...)
+}
+
+// ---------------------------------------------------------------------------
+// D-11's "exactly one consolidated review", under a slow gh
+// ---------------------------------------------------------------------------
+
+// prvGate is a poster whose first post blocks until the test lets it
+// finish, and which records how many posts were ever in flight at once.
+// Every later post returns at once, so a reviewer that starts a second `gh
+// pr review` fails the test rather than deadlocking it.
+type prvGate struct {
+	entered chan struct{}
+	release chan struct{}
+
+	mu     sync.Mutex
+	calls  int
+	live   int
+	peak   int
+	posted []gitx.Review
+}
+
+func prvNewGate() *prvGate {
+	return &prvGate{entered: make(chan struct{}, 8), release: make(chan struct{})}
+}
+
+func (g *prvGate) PostReview(_ context.Context, pr gitx.PullRequest, verdicts []domain.Verdict) (gitx.Review, error) {
+	g.mu.Lock()
+	g.calls++
+	first := g.calls == 1
+	g.live++
+	if g.live > g.peak {
+		g.peak = g.live
+	}
+	g.mu.Unlock()
+
+	g.entered <- struct{}{}
+	if first {
+		<-g.release
+	}
+	review, err := gitx.BuildReview(pr, verdicts)
+	g.mu.Lock()
+	g.live--
+	if err == nil {
+		g.posted = append(g.posted, review)
+	}
+	g.mu.Unlock()
+	return review, err
+}
+
+func (g *prvGate) count() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.calls
+}
+
+func (g *prvGate) highWater() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.peak
+}
+
+func (g *prvGate) reviews() []gitx.Review {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]gitx.Review(nil), g.posted...)
+}
+
+// TestPRReviewNeverPostsTwoReviewsOfOnePullRequest is D-11's headline
+// promise where it can actually break: posting is a network call, and it
+// can easily outlive the poll interval. The polls that land while the first
+// `gh pr review` is still talking to GitHub see a bead with every verdict
+// in and no review posted; without the in-flight flag each of them starts
+// another review of somebody else's pull request.
+func TestPRReviewNeverPostsTwoReviewsOfOnePullRequest(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pr := prvPR()
+	gate := prvNewGate()
+	rig := prvNew(t, []*gitx.PollResult{prvResult(pr), {}, {}, {}}, func(o *PRReviewOptions) { o.Poster = gate })
+	if err := rig.review.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	ds := prvDemands(t, rig.review)
+	if len(ds) < 2 {
+		t.Fatalf("demands = %d, want one per lens", len(ds))
+	}
+	for _, d := range ds[:len(ds)-1] {
+		prvAnswer(t, rig, d, domain.VerdictApprove)
+	}
+	if got := gate.count(); got != 0 {
+		t.Fatalf("gh pr review called %d times before the round was complete, want 0", got)
+	}
+
+	// The last verdict starts the one post, on the firing's goroutine.
+	last := ds[len(ds)-1]
+	af, err := rig.review.PlanFiring(ctx, Firing{
+		Agent: domain.Agent{ID: domain.AgentID("tester-" + string(last.Lens) + "-sc-ext7-r1"),
+			Role: domain.RoleTester, Lens: last.Lens, Bead: last.Bead},
+		Demand: last,
+	})
+	if err != nil {
+		t.Fatalf("PlanFiring: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- af.Result(prvVerdict(last.Lens, domain.VerdictApprove), agents.Transcript{}) }()
+	<-gate.entered
+
+	// Three polls land while gh is still being talked to.
+	for i := 0; i < 3; i++ {
+		if err := rig.review.Sync(ctx); err != nil {
+			t.Fatalf("Sync while a review was in flight: %v", err)
+		}
+	}
+	if got := gate.count(); got != 1 {
+		t.Fatalf("gh pr review called %d times while one call was in flight, want exactly 1 (D-11)", got)
+	}
+
+	close(gate.release)
+	if err := <-done; err != nil {
+		t.Fatalf("the last verdict: %v", err)
+	}
+	if got, peak := gate.count(), gate.highWater(); got != 1 || peak != 1 {
+		t.Fatalf("gh pr review called %d times (%d at once), want exactly one review of pull request #%d", got, peak, pr.Number)
+	}
+	if posted := gate.reviews(); len(posted) != 1 || posted[0].Event != gitx.ReviewApprove {
+		t.Fatalf("posted = %+v, want one approving review", posted)
+	}
+	if _, closed := rig.store.closeReason("sc-ext7"); !closed {
+		t.Error("the review bead was not closed after the review went out")
+	}
+	if st := rig.review.Stats(); st.Posted != 1 || st.Closed != 1 {
+		t.Errorf("Stats = %+v, want one posted and one closed", st)
+	}
+
+	// And a poll after the review has gone out still posts nothing.
+	if err := rig.review.Sync(ctx); err != nil {
+		t.Fatalf("Sync after the review: %v", err)
+	}
+	if got := gate.count(); got != 1 {
+		t.Errorf("gh pr review called %d times in all, want 1", got)
+	}
+}
+
+// TestPRReviewPostIsBoundedEvenWhenTheFiringIsCancelled: the last verdict
+// posts with the firing's cancellation removed, so a stuck `gh pr review`
+// would otherwise hold a stopping run open for the whole subprocess
+// timeout. The deadline is the reviewer's, not the firing's.
+func TestPRReviewPostIsBoundedEvenWhenTheFiringIsCancelled(t *testing.T) {
+	t.Parallel()
+	pr := prvPR()
+	var deadline time.Time
+	var had bool
+	poster := prvPosterFunc(func(ctx context.Context, _ gitx.PullRequest, _ []domain.Verdict) (gitx.Review, error) {
+		deadline, had = ctx.Deadline()
+		if err := ctx.Err(); err != nil {
+			return gitx.Review{}, err
+		}
+		return gitx.Review{Event: gitx.ReviewApprove, Body: "ok"}, nil
+	})
+	rig := prvNew(t, []*gitx.PollResult{prvResult(pr)}, func(o *PRReviewOptions) {
+		o.Poster = poster
+		o.PostTimeout = 30 * time.Second
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := rig.review.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	ds := prvDemands(t, rig.review)
+	for i, d := range ds {
+		if i == len(ds)-1 {
+			// The firing's context is done by the time the verdict comes
+			// back, exactly as it is when the run is stopping.
+			cancel()
+		}
+		prvAnswer(t, rig, d, domain.VerdictApprove)
+	}
+	if !had {
+		t.Fatal("the post ran with no deadline: a stuck gh holds the run open")
+	}
+	if got := time.Until(deadline); got <= 0 || got > 30*time.Second {
+		t.Errorf("post deadline in %s, want it inside the 30s the reviewer was given", got)
+	}
+	if st := rig.review.Stats(); st.Posted != 1 {
+		t.Errorf("Stats = %+v, want the review posted although the firing was cancelled", st)
+	}
+}
+
+// prvPosterFunc is a poster written inline.
+type prvPosterFunc func(context.Context, gitx.PullRequest, []domain.Verdict) (gitx.Review, error)
+
+func (f prvPosterFunc) PostReview(ctx context.Context, pr gitx.PullRequest, vs []domain.Verdict) (gitx.Review, error) {
+	return f(ctx, pr, vs)
+}
+
+// ---------------------------------------------------------------------------
+// Settling a review the run cannot carry out (P6-31 + brief mode)
+// ---------------------------------------------------------------------------
+
+// TestPRReviewDemandsSayWhereTheReviewBeadIs is the half of the give-up
+// path that lives here. A review demand claims nothing, so the scheduler
+// has nothing else to go on: without Demand.From it cannot take the bead
+// down the D-07 failed edge when it gives up (Scheduler.parkFrom), the
+// review bead stays open for ever, and a brief run — which stops when every
+// bead of the run has settled — never finishes.
+func TestPRReviewDemandsSayWhereTheReviewBeadIs(t *testing.T) {
+	t.Parallel()
+	rig := prvNew(t, []*gitx.PollResult{prvResult(prvPR())}, nil)
+	if err := rig.review.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	ds := prvDemands(t, rig.review)
+	if len(ds) == 0 {
+		t.Fatal("no demands")
+	}
+	for _, d := range ds {
+		if d.From != domain.BeadStateOpen {
+			t.Errorf("demand(%s).From = %q, want the review bead's state %q", d.Lens, d.From, domain.BeadStateOpen)
+		}
+		from := parkFrom(d)
+		if from == "" {
+			t.Fatalf("parkFrom(%s) = \"\": the scheduler cannot park a review bead it gave up on", d.Lens)
+		}
+		to, err := Transition(from, BeadEventFailed)
+		if err != nil || to != domain.BeadStateFailed {
+			t.Fatalf("Transition(%q, failed) = %q, %v; want the bead to settle", from, to, err)
+		}
+	}
+}
+
+// TestPRReviewLetsGoOfAReviewBeadSomethingElseSettled is the other half:
+// once the bead has been settled by somebody else — the scheduler giving up
+// on its firings, or a human closing it — the reviewer stops offering work
+// on it instead of going on asking for testers no scheduler will fire.
+func TestPRReviewLetsGoOfAReviewBeadSomethingElseSettled(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	pr := prvPR()
+	// The second poll reads the bead back as failed, which is where the
+	// scheduler's give-up path puts it (P6-31).
+	settled := &gitx.PollResult{
+		External: []gitx.PullRequest{pr},
+		Existing: []gitx.ReviewBead{{Issue: prvIssue(pr, domain.BeadStateFailed), PR: pr}},
+	}
+	rig := prvNew(t, []*gitx.PollResult{prvResult(pr), settled, {}}, nil)
+	if err := rig.review.Sync(ctx); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	if len(prvDemands(t, rig.review)) == 0 {
+		t.Fatal("the reviewer offered no work for a pull request it had just adopted")
+	}
+
+	if err := rig.review.Sync(ctx); err != nil {
+		t.Fatalf("second Sync: %v", err)
+	}
+	if ds := prvDemands(t, rig.review); len(ds) != 0 {
+		t.Errorf("demands after the bead was settled elsewhere = %+v, want none", ds)
+	}
+	if rig.review.Handles(Demand{Kind: DemandReview, Bead: "sc-ext7",
+		Payload: PRReviewWork{Bead: "sc-ext7", PR: pr, Lens: domain.Lenses()[0], Round: PRReviewRound}}) {
+		t.Error("the reviewer still claims a demand for a bead it can no longer review")
+	}
+	if st := rig.review.Stats(); st.Tracked != 0 {
+		t.Errorf("Stats.Tracked = %d, want 0: nothing is being reviewed any more", st.Tracked)
+	}
+	if rs := rig.review.Reviews(); len(rs) != 1 || !rs[0].Settled || rs[0].Posted {
+		t.Errorf("Reviews = %+v, want the one review settled and unposted", rs)
+	}
+	said := false
+	for _, w := range prvOfKind[events.Warning](rig.sink) {
+		if strings.Contains(w.Message, "#7") && strings.Contains(w.Message, "failed") {
+			said = true
+		}
+	}
+	if !said {
+		t.Error("nothing said why the pull request is no longer being reviewed")
+	}
+	// Nothing was posted and the reviewer wrote nothing to the settled bead.
+	if got := len(rig.poster.reviews()); got != 0 {
+		t.Errorf("posted %d reviews on a pull request the run gave up on, want 0", got)
+	}
+	if _, closed := rig.store.closeReason("sc-ext7"); closed {
+		t.Error("the reviewer closed a bead somebody else had already settled")
+	}
+}
+
+// TestReviewedPullRequestsAreNotCountedAsOpened: the run summary and `sc
+// status` fold PROpened, and the reviewer publishes one per external pull
+// request so the run's readers can see it at all. Counting those as pull
+// requests the cannon opened tells a user it opened work it only reviewed —
+// and never merges (D-11).
+func TestReviewedPullRequestsAreNotCountedAsOpened(t *testing.T) {
+	t.Parallel()
+	pr := prvPR()
+	rig := prvNew(t, []*gitx.PollResult{prvResult(pr)}, nil)
+	if err := rig.review.Sync(context.Background()); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+	evs := rig.sink.events()
+	// One pull request the run opened itself, for the contrast.
+	evs = append(evs, events.PROpened{
+		Meta: events.MetaAt("run-prv", prvEpoch), Bead: "sc-1", Number: 12,
+		URL: "https://github.com/acme/widget/pull/12", Branch: "sc/sc-1", Base: "main",
+	})
+	s := Summarise(evs, 0)
+	if s.PRs != 1 {
+		t.Errorf("summary.PRs = %d, want 1: only the pull request the run opened", s.PRs)
+	}
+	if s.Reviewing != 1 {
+		t.Errorf("summary.Reviewing = %d, want the one external pull request being reviewed", s.Reviewing)
+	}
+	if s.Merges != 0 {
+		t.Errorf("summary.Merges = %d, want 0", s.Merges)
+	}
 }

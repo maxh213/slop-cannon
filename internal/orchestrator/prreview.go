@@ -72,7 +72,12 @@ import (
 //  4. When the last lens answers, exactly one review appears on the pull
 //     request on GitHub — approved, or requesting changes with the items —
 //     and the review bead closes. Check `gh pr view --json state`: the pull
-//     request is still open. The cannon never merges it.
+//     request is still open. The cannon never merges it. Two more things to
+//     look at while you are there: `gh pr view --json reviews` must hold
+//     exactly one review however slow GitHub was (a post that outlives the
+//     poll interval must not be started twice), and `git branch --list
+//     'sc/*'` in your clone must show nothing for the review bead — the
+//     checkout detaches and deletes the branch it borrowed (D-23).
 //  5. Merge or close the pull request yourself while a review is still in
 //     flight and watch P8-11: the next poll settles the review bead
 //     (closed, or needs_human under [StaleReviewNeedsHuman]) and no review
@@ -93,6 +98,16 @@ const PRReviewRound = 1
 // pr review` call, so a failure is usually GitHub being unreachable, which
 // the next poll may well fix.
 const DefaultPRReviewPostAttempts = 3
+
+// DefaultPRReviewPostTimeout bounds one consolidated review post. The last
+// verdict of a round posts on the firing's goroutine with the firing's
+// cancellation removed — the tester's session is over and the review must
+// still go out — so the deadline is what keeps a stuck `gh pr review` from
+// holding a stopping run open. It is deliberately shorter than
+// [gitx.DefaultTimeout], the git/gh subprocess timeout underneath: a post
+// that has not finished in a minute is not going to be finished by the
+// caller waiting, and the next poll retries it ([PRReview.Sync]).
+const DefaultPRReviewPostTimeout = time.Minute
 
 // Errors returned by the external pull request reviewer.
 var (
@@ -242,12 +257,16 @@ var _ PRWorktrees = (*gitx.Manager)(nil)
 // It only ever fetches and resets inside that worktree: the pull request's
 // head is fetched by its GitHub `pull/<n>/head` reference (falling back to
 // the head branch, which exists on the remote when the pull request comes
-// from the same repository), the worktree's own branch is moved onto it,
-// and the base is fetched so the diff is the pull request's, not the
-// difference from whatever the local default branch happens to be. Nothing
-// is ever pushed and the repository's own working tree is never touched,
-// so the safety guarantees of D-10 are untouched by reviewing somebody
-// else's code.
+// from the same repository), the worktree is moved onto it, and the base is
+// fetched so the diff is the pull request's, not the difference from
+// whatever the local default branch happens to be. Nothing is ever pushed
+// and the repository's own working tree is never touched, so the safety
+// guarantees of D-10 are untouched by reviewing somebody else's code.
+//
+// The checkout is then detached from the `sc/<bead>` branch the worktree
+// manager minted for it and that branch is deleted, so reviewing somebody
+// else's pull request leaves no branch of ours in the user's repository
+// (D-23); see [PRWorktreeCheckout.detach].
 type PRWorktreeCheckout struct {
 	wt     PRWorktrees
 	remote string
@@ -325,6 +344,7 @@ func (c *PRWorktreeCheckout) Checkout(ctx context.Context, bead domain.Bead, pr 
 	if _, err := repo.Git(ctx, "reset", "--hard", head); err != nil {
 		return PRWorkspace{}, fmt.Errorf("orchestrator: pr checkout: moving %s onto #%d: %w", path, pr.Number, err)
 	}
+	c.detach(ctx, repo, bead, pr)
 	ws := PRWorkspace{Worktree: repo.Root, Branch: pr.HeadRef, Base: pr.BaseRef, HeadSHA: head}
 	if ws.Worktree == "" {
 		ws.Worktree = path
@@ -338,6 +358,46 @@ func (c *PRWorktreeCheckout) Checkout(ctx context.Context, bead domain.Bead, pr 
 	}
 	ws.Diff = diff
 	return ws, nil
+}
+
+// detach takes the review worktree off the branch [gitx.Manager.Create]
+// minted for it and deletes that branch, leaving the checkout on a detached
+// HEAD at the pull request's commit.
+//
+// This is D-23 at its narrowest: reviewing somebody else's pull request
+// must leave nothing of ours in the user's repository, and an `sc/<bead>`
+// branch pointing at a contributor's commit is something of ours — it
+// outlives the run (cleanup keeps a branch that is not merged) and shows up
+// in every `git branch` the user types afterwards. The pull request's code
+// is still there to read: a detached HEAD is a checkout like any other.
+//
+// It never fails the checkout. A branch that could not be deleted is a
+// cosmetic leftover, not a reason to refuse to review the pull request, so
+// it is logged and the review goes on.
+func (c *PRWorktreeCheckout) detach(ctx context.Context, repo *gitx.Repo, bead domain.Bead, pr gitx.PullRequest) {
+	branch, err := repo.Git(ctx, "rev-parse", "--abbrev-ref", "HEAD")
+	name := strings.TrimSpace(branch)
+	if err != nil || name == "" || name == "HEAD" {
+		// Already detached (a second checkout of the same pull request), or
+		// git would not say: nothing to take off.
+		return
+	}
+	if name != gitx.BranchName(bead) {
+		// Not the branch we minted: somebody put this worktree somewhere
+		// else, and moving their branch is not ours to do.
+		c.log.WarnContext(ctx, "the review worktree is on a branch slop-cannon did not create; leaving it alone",
+			slog.Int("pr", pr.Number), slog.String("branch", name))
+		return
+	}
+	if _, err := repo.Git(ctx, "checkout", "--quiet", "--detach"); err != nil {
+		c.log.WarnContext(ctx, "could not detach the review worktree; its branch is left behind",
+			slog.Int("pr", pr.Number), slog.String("branch", name), slog.Any("err", err))
+		return
+	}
+	if _, err := repo.Git(ctx, "branch", "--quiet", "-D", name); err != nil {
+		c.log.WarnContext(ctx, "could not delete the review worktree's branch",
+			slog.Int("pr", pr.Number), slog.String("branch", name), slog.Any("err", err))
+	}
 }
 
 // fetchHead fetches the pull request's head and returns the revision the
@@ -445,6 +505,10 @@ type PRReviewOptions struct {
 	// PostAttempts bounds how often a failing `gh pr review` is retried
 	// before the bead is parked; zero means [DefaultPRReviewPostAttempts].
 	PostAttempts int
+	// PostTimeout bounds one post; zero means
+	// [DefaultPRReviewPostTimeout]. Negative leaves the post unbounded,
+	// which only a test that drives the poster itself should ask for.
+	PostTimeout time.Duration
 	// Clock is the time source; nil means the host's clock, else time.Now.
 	Clock func() time.Time
 	// Logger overrides the host's logger.
@@ -508,6 +572,11 @@ type prReviewEntry struct {
 	settled  bool
 	outcome  domain.VerdictOutcome
 	attempts int
+	// posting is set while a `gh pr review` for this bead is in flight, so
+	// a poll that lands mid-call cannot start a second review of one pull
+	// request (D-11: exactly one consolidated review). It is cleared when
+	// the call returns, whether it posted or failed.
+	posting bool
 }
 
 // PRReview is D-11's external pull request review, joined up: the watcher's
@@ -523,6 +592,7 @@ type PRReview struct {
 	interval time.Duration
 	stale    StaleReviewPolicy
 	attempts int
+	postWait time.Duration
 	now      func() time.Time
 	log      *slog.Logger
 
@@ -550,6 +620,7 @@ func NewPRReview(opts PRReviewOptions) (*PRReview, error) {
 		interval: opts.Interval,
 		stale:    opts.Stale,
 		attempts: opts.PostAttempts,
+		postWait: opts.PostTimeout,
 		now:      opts.Clock,
 		log:      opts.Logger,
 		tracked:  map[domain.BeadID]*prReviewEntry{},
@@ -569,6 +640,9 @@ func NewPRReview(opts PRReviewOptions) (*PRReview, error) {
 	}
 	if r.attempts <= 0 {
 		r.attempts = DefaultPRReviewPostAttempts
+	}
+	if r.postWait == 0 {
+		r.postWait = DefaultPRReviewPostTimeout
 	}
 	if r.now == nil {
 		if opts.Host != nil {
@@ -694,6 +768,12 @@ func (r *PRReview) Sync(ctx context.Context) error {
 // reviewed by an earlier run, or closed by a human — is not reviewed
 // again, and neither is one in a status the cannon never registered
 // (P6-12).
+//
+// A bead already being tracked is re-read rather than skipped: its pull
+// request is refreshed, and a bead something else has settled since the
+// last poll (a human, or the scheduler giving up on its firings) stops
+// being offered to testers here, which is how the reviewer lets go of work
+// it can no longer do.
 func (r *PRReview) adopt(rb gitx.ReviewBead, created bool) {
 	bead, _ := rb.Issue.SafeBead(r.opts.Statuses)
 	if bead.ID == "" {
@@ -701,10 +781,23 @@ func (r *PRReview) adopt(rb gitx.ReviewBead, created bool) {
 	}
 	r.mu.Lock()
 	if r.seen[bead.ID] {
+		gone := false
 		if e, ok := r.tracked[bead.ID]; ok {
 			e.pr = rb.PR
+			// bd is the truth about the bead. Somebody else may have
+			// settled it since the last poll — a human closing it, or the
+			// scheduler taking it down the failed edge after giving up on
+			// its firings (P6-31) — and a settled bead is not reviewed any
+			// further.
+			if !e.settled && BeadStateSettled(bead.State) {
+				e.bead.State, e.settled, gone = bead.State, true, true
+			}
 		}
 		r.mu.Unlock()
+		if gone {
+			r.warn(bead.ID, fmt.Sprintf("the review bead of pull request #%d is %s; no review will be posted",
+				rb.PR.Number, bead.State), nil)
+		}
 		return
 	}
 	r.seen[bead.ID] = true
@@ -757,6 +850,11 @@ func (r *PRReview) adopt(rb gitx.ReviewBead, created bool) {
 // Demands implements [WorkSource]: one review demand per lens that has not
 // answered yet, for every pull request still being reviewed. The scheduler
 // drops the ones already in flight, so this stays stateless.
+//
+// Each demand carries the review bead's state in [Demand.From] even though
+// it claims nothing, so the scheduler can settle the bead if it gives up on
+// the work (P6-31): a checkout that keeps failing must leave a failed bead
+// behind, not an open one nobody will ever finish.
 func (r *PRReview) Demands(_ context.Context) ([]Demand, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -777,8 +875,16 @@ func (r *PRReview) Demands(_ context.Context) ([]Demand, error) {
 				Round:     PRReviewRound,
 				Task:      events.TaskReview,
 				Claim:     ClaimNone,
-				Order:     e.order,
-				Payload:   PRReviewWork{Bead: e.bead.ID, PR: e.pr, Lens: l, Round: PRReviewRound},
+				// A review demand claims nothing — the tester never holds
+				// the review bead's lease — but the scheduler still has to
+				// know where the bead is to take it down the D-07 failed
+				// edge when it gives up on the demand (P6-31,
+				// Scheduler.parkFrom). Without From the give-up path
+				// cannot park the bead, and a run whose stop condition
+				// waits for every bead of the run to settle waits for ever.
+				From:    e.bead.State,
+				Order:   e.order,
+				Payload: PRReviewWork{Bead: e.bead.ID, PR: e.pr, Lens: l, Round: PRReviewRound},
 			})
 		}
 	}
@@ -1001,17 +1107,40 @@ func (r *PRReview) verdictReceived(ctx context.Context, w PRReviewWork, agent do
 	// A failure to post is not the tester's failure: the verdict is in and
 	// the firing succeeded, so it is reported and retried by the next poll
 	// rather than raised here (a Result error would fail the agent, D-06).
-	r.post(ctx, w.Bead)
+	pctx, cancel := r.postContext(ctx)
+	defer cancel()
+	r.post(pctx, w.Bead)
 	return nil
 }
 
+// postContext bounds the detached context the last verdict posts under.
+// The caller has already removed the firing's cancellation ([PRReview.
+// PlanFiring] hands the result callback a context.WithoutCancel, because a
+// review must still go out when the tester's session ends), which without a
+// deadline would let one unreachable GitHub hold a stopping run open for
+// the whole subprocess timeout.
+func (r *PRReview) postContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if r.postWait <= 0 {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, r.postWait)
+}
+
 // post builds and posts the one consolidated review of a bead whose lenses
-// have all answered, then closes the review bead. It is safe to call more
-// than once: a bead whose review has gone out is never posted again.
+// have all answered, then closes the review bead.
+//
+// It is safe to call more than once and safe to call concurrently, which is
+// what makes D-11's "exactly one consolidated review" true rather than
+// likely: a bead whose review has gone out is never posted again, and a
+// bead whose review is in flight is skipped instead of posted beside
+// itself. Posting can outlive a poll interval — `gh pr review` is a network
+// call — so without the in-flight flag the next [PRReview.Sync] would see a
+// bead with every verdict in and no review posted and start a second one
+// while the first was still talking to GitHub.
 func (r *PRReview) post(ctx context.Context, id domain.BeadID) {
 	r.mu.Lock()
 	e, tracked := r.tracked[id]
-	if !tracked || e.settled || e.posted || len(e.verdicts) < len(e.lenses) {
+	if !tracked || e.settled || e.posted || e.posting || len(e.verdicts) < len(e.lenses) {
 		r.mu.Unlock()
 		return
 	}
@@ -1024,7 +1153,13 @@ func (r *PRReview) post(ctx context.Context, id domain.BeadID) {
 	}
 	e.attempts++
 	attempt := e.attempts
+	e.posting = true
 	r.mu.Unlock()
+	defer func() {
+		r.mu.Lock()
+		e.posting = false
+		r.mu.Unlock()
+	}()
 
 	if r.opts.Poster == nil {
 		review, err := gitx.BuildReview(pr, verdicts)
@@ -1070,19 +1205,24 @@ func prOutcome(ev gitx.ReviewEvent) domain.VerdictOutcome {
 
 // retryPosts re-attempts every consolidated review that has all its
 // verdicts but never went out, so a poll can finish what a failed `gh pr
-// review` started.
+// review` started. A review that is still in flight is left alone: the
+// attempt that is running is the one attempt this pull request gets.
 func (r *PRReview) retryPosts(ctx context.Context) {
 	r.mu.Lock()
 	var ids []domain.BeadID
 	for id, e := range r.tracked {
-		if !e.settled && !e.posted && e.attempts > 0 && len(e.verdicts) >= len(e.lenses) {
+		if !e.settled && !e.posted && !e.posting && e.attempts > 0 && len(e.verdicts) >= len(e.lenses) {
 			ids = append(ids, id)
 		}
 	}
 	r.mu.Unlock()
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	for _, id := range ids {
-		r.post(ctx, id)
+		func() {
+			pctx, cancel := r.postContext(ctx)
+			defer cancel()
+			r.post(pctx, id)
+		}()
 	}
 }
 

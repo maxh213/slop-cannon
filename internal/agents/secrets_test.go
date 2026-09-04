@@ -112,8 +112,20 @@ func TestNewSecretFilterRejectsAMalformedPattern(t *testing.T) {
 }
 
 // TestPlantedSecretsNeverReachAPrompt is the P9-05 acceptance criterion for
-// prompts: with secrets planted in the repository, no prompt any role is
-// fired with names them or quotes what they hold.
+// prompts at the level this package can reach: with secrets planted in the
+// repository, no prompt any role is fired with names them or quotes what
+// they hold.
+//
+// It calls the filter itself, because a prompt builder is a pure function
+// and nothing in this package knows how a run is wired. That is exactly why
+// it is not the whole acceptance test: it would pass just as well if no
+// production code ever called [agents.SecretFilter.GitDiff], which is how
+// the diff half of P9-05 shipped unwired the first time.
+// [TestTheDiffHalfOfTheFilterHasAProductionCaller] below is the guard
+// against that, and the wiring itself is pinned end to end by
+// TestFeedbackNeverPutsAWithheldPathInAPrompt (internal/orchestrator) and
+// TestRunNeverPutsAPlantedSecretInAPrompt (internal/cli), which drive the
+// real loop and the real binary.
 func TestPlantedSecretsNeverReachAPrompt(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -434,4 +446,71 @@ func TestExcludeConfigKeyMergesAcrossLayers(t *testing.T) {
 	f := mustFilter(t, merged...)
 	assert.True(t, f.Excluded("vault/token"))
 	assert.True(t, f.Excluded("deploy/prod.key"))
+}
+
+// TestTheDiffHalfOfTheFilterHasAProductionCaller is a regression guard on
+// P9-05's own failure mode, not on the filter's behaviour.
+//
+// [agents.SecretFilter] shipped with the tree half wired into `sc run` and
+// the diff half wired into nothing: SecretFilter.GitDiff, SecretFilter.Diff
+// and SecretFilter.History had no caller anywhere in the module outside
+// this package's tests, so every reviewed change reached the tester prompt
+// with its .env, its keys and its excluded paths quoted line by line — and
+// the acceptance test passed, because the test did the filtering itself.
+//
+// A method of the filter with no production caller is a claim the product
+// does not keep, so each of these must be called from a non-test file
+// outside internal/agents.
+func TestTheDiffHalfOfTheFilterHasAProductionCaller(t *testing.T) {
+	t.Parallel()
+	sources := secretsProductionSources(t)
+	// The receiver is spelled differently at each call site (an option
+	// field, a struct field, a parameter), so the guard matches the method
+	// on any receiver whose name ends in "filter".
+	for _, method := range []string{"filter.GitDiff(", "filter.History(", "filter.Texts(", "filter.Message("} {
+		found := ""
+		for path, src := range sources {
+			if strings.Contains(strings.ToLower(src), strings.ToLower(method)) {
+				found = path
+				break
+			}
+		}
+		assert.NotEmpty(t, found,
+			"no production code calls %s: the filter is built and then not used, "+
+				"which is how the diff half of P9-05 shipped unwired", method)
+	}
+}
+
+// secretsProductionSources reads every non-test .go file of the module
+// outside internal/agents, keyed by path.
+func secretsProductionSources(t *testing.T) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	root := filepath.Join("..", "..")
+	for _, dir := range []string{"internal", "cmd"} {
+		err := filepath.WalkDir(filepath.Join(root, dir), func(path string, d os.DirEntry, err error) error {
+			switch {
+			case err != nil:
+				return err
+			case d.IsDir():
+				// internal/agents is where the filter lives; a call inside
+				// it is not a production caller for this guard's purpose.
+				if d.Name() == "testdata" || d.Name() == "agents" {
+					return filepath.SkipDir
+				}
+				return nil
+			case !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go"):
+				return nil
+			}
+			b, err := os.ReadFile(path) //nolint:gosec // test reading the module's own source
+			if err != nil {
+				return err
+			}
+			out[path] = string(b)
+			return nil
+		})
+		require.NoError(t, err)
+	}
+	require.NotEmpty(t, out)
+	return out
 }

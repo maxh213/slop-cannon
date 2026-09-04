@@ -1,5 +1,5 @@
 That was the first sc run in /repo.
-Nothing sc writes lives inside the repository; this is where it all went:
+Nothing the run wrote lives inside the repository; this is where it all went:
 
   run log     /state/runs/20260101-120000-abcd/sc.log
   agent logs  /state/runs/20260101-120000-abcd/agents

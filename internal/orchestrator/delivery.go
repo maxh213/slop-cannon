@@ -501,6 +501,13 @@ type DeliveryOptions struct {
 	// MaxConflictRounds bounds the conflict rounds one delivery may have;
 	// zero means [DefaultMaxConflictRounds].
 	MaxConflictRounds int
+	// Filter is the P9-05 secrets filter, applied to the pull request body
+	// the delivery hands to `gh`. That body is the only sink of agent prose
+	// that leaves the machine, and the report and verdicts quoted in it
+	// come from the feedback thread, which a resumed run rebuilt from bd's
+	// comments — so it is guarded here as well as at the point the agent
+	// replied. A nil filter still applies the built-in rules.
+	Filter *agents.SecretFilter
 }
 
 // Deliverer is the delivery handoff (P6-06): it ships approved beads, keeps
@@ -519,6 +526,7 @@ type Deliverer struct {
 	threshold float64
 	maxRounds int
 	safety    bool
+	filter    *agents.SecretFilter
 
 	mu       sync.Mutex
 	pending  map[domain.BeadID]PendingConflict
@@ -558,6 +566,7 @@ func NewDeliverer(opts DeliveryOptions) (*Deliverer, error) {
 		timeout:   opts.CheckTimeout,
 		threshold: opts.ReReviewThreshold,
 		maxRounds: opts.MaxConflictRounds,
+		filter:    opts.Filter,
 		safety:    opts.Host.Snapshot().Safety,
 		pending:   map[domain.BeadID]PendingConflict{},
 		attempts:  map[domain.BeadID]int{},
@@ -731,11 +740,14 @@ func (d *Deliverer) deliverPR(ctx context.Context, req DeliveryRequest, out *Del
 	if d.pr == nil {
 		return nil, fmt.Errorf("%w: safety is on and there is no pull request path", ErrNoDeliveryPath)
 	}
+	// P9-05: the pull request body quotes the bead, the implementation
+	// report and every verdict, and `gh` sends it to a remote. Whatever a
+	// credential rule matches is masked before it leaves the machine.
 	res, err := d.pr.Deliver(ctx, gitx.PRRequest{
-		Bead:     req.Bead,
+		Bead:     d.filter.Bead(req.Bead),
 		Run:      d.host.ID(),
-		Report:   req.Report,
-		Verdicts: req.Verdicts,
+		Report:   d.filter.Report(req.Report),
+		Verdicts: d.filter.Verdicts(req.Verdicts),
 		Rounds:   out.Round,
 		Base:     req.Base,
 	})

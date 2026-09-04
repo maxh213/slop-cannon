@@ -22,13 +22,34 @@ import (
 
 // P9-02 — safety invariant tests.
 //
-// Everything a run can do to the target repository goes through git, so the
-// guarantee "the cannon cannot damage the target repo" is a statement about
-// the git command lines a delivery produces. These tests run the real
-// deliverers over a real fixture repository with a bare origin behind a git
-// shim that records every invocation and then execs the real git (cuGit),
-// so the scenario happens for real while the exact argv is kept for
-// judgement. Two invariants are asserted, one per safety mode:
+// Almost everything a run does to the target repository goes through git,
+// so the guarantee "the cannon cannot damage the target repo" is largely a
+// statement about the command lines a run produces. These tests run the
+// real deliverers over a real fixture repository with a bare origin behind
+// a git shim that records every invocation and then execs the real git
+// (cuGit), so the scenario happens for real while the exact argv is kept
+// for judgement. Safety on records gh as well, because a pull request can
+// land work on the default branch with no git call at all (D-11), so
+// "damage in git terms" alone would miss it.
+//
+// What is watched, exactly: every git and gh invocation made by anything
+// running with the shims on PATH. That is the deliverers and the worktree
+// manager, and it is also the shell git an engineer session runs in its
+// own worktree — the "agent shell git" event below and
+// [TestAnAgentsOwnGitIsCaughtByTheSameChecker] put agent-issued commands
+// through the same checker, because the engineer's tool policy is
+// read/write (internal/agents maps events.TaskImplement,
+// TaskAddressFeedback and TaskResolveConflict to cartridge.ToolReadWrite,
+// which the Claude cartridge enforces with Bash allowed and no deny list),
+// so the only production guard on what an engineer does with git is a
+// sentence in its prompt. What is not watched: the production run path
+// around delivery — branch cleanup, resume, the delivery settler and the
+// external pull request reviewer — which is covered from the other side by
+// internal/orchestrator's end-to-end tests asserting that neither default
+// branch tip moves; running that path under this shim is a discovered task
+// rather than part of P9-02.
+//
+// Two invariants are asserted, one per safety mode:
 //
 //   - safety on (D-06's default, [PRDeliverer]): no invocation ever checks
 //     out, merges or pushes the default branch, and neither the local nor
@@ -41,21 +62,27 @@ import (
 //
 // A handful of rules hold in both modes, because they are damage rather
 // than delivery: the default branch is never deleted, renamed or checked
-// out, "git pull" is never run, and nothing that rewrites the branch it
-// runs on (commit, reset, revert, cherry-pick, rebase …) is ever run in the
-// main working tree, where the default branch is the one checked out.
+// out, "git pull" is never run, nothing that rewrites the branch it runs
+// on (commit, reset, revert, cherry-pick, rebase …) is ever run in the
+// main working tree, where the default branch is the one checked out, and
+// nothing that discards what is in that tree (clean, checkout of paths,
+// restore, stash) is run there either — the user's uncommitted work is
+// theirs. A file the test leaves untracked in the main working tree stands
+// in for it and is checked after every step, so the repository half of the
+// invariant sees that damage too and not only moved refs.
 //
-// Both are checked across the P6-09 scenario (two beads, one with a
-// dependency on the other, an engineer commit and a review round each,
-// a pull that lands upstream in between, then delivery) and across
-// randomised event sequences, where an event picks a bead and does one of
-// the things a run does to a worktree — commit, commit leftovers, deliver,
-// resolve a conflict, take an upstream change — in an order no scenario
-// test would think of.
+// Both are checked across the P6-09 scenario re-created here in git terms
+// (two beads, one with a dependency on the other, an engineer commit and a
+// review round each, a pull that lands upstream in between, then delivery)
+// and across randomised event sequences, where an event picks a bead and
+// does one of the things a run does to a worktree — commit, commit
+// leftovers, run git as the agent would, deliver, resolve a conflict, take
+// an upstream change — in an order no scenario test would think of.
 //
 // The invariants are asserted from the recorded argv, so a future change
-// that reaches for "git checkout main" or "git push --force origin main"
-// fails here even when the fixture happens to end in a healthy state.
+// that reaches for "git checkout main", "git push --force origin main" or
+// "gh pr merge" fails here even when the fixture happens to end in a
+// healthy state.
 
 // ivSafety names the delivery mode a scenario runs in (D-06).
 type ivSafety string
@@ -270,6 +297,17 @@ var ivWorktreeWriters = map[string]bool{
 	"filter-branch": true,
 }
 
+// ivTreeDestroyers are the subcommands that throw away what is in the
+// working tree they run in without touching a ref: "clean" deletes
+// untracked files, "checkout"/"switch" with paths and "restore" overwrite
+// modified ones. In a bead's worktree that is the agent tidying up after
+// itself; in the main working tree it is the user's uncommitted work, and
+// no part of a run has any business there — nothing in gitx runs any of
+// them, in either mode.
+var ivTreeDestroyers = map[string]bool{
+	"clean": true, "restore": true, "checkout": true, "switch": true,
+}
+
 // ivInspect judges one recorded invocation and returns a reason for every
 // invariant it breaks (usually none).
 func ivInspect(c ivCall, env ivEnv) []string {
@@ -338,7 +376,16 @@ func ivInspect(c ivCall, env ivEnv) []string {
 			flag("a push that carries every ref, %s included: %s", env.def, c)
 		}
 		forced := ivHasFlag(c.rest, "-f", "--force", "--force-with-lease")
-		for _, s := range ivRefspecs(c.rest) {
+		specs := ivRefspecs(c.rest)
+		if len(specs) == 0 && inMain {
+			// "git push" and "git push <remote>" carry no refspec, so git
+			// pushes the branch that is checked out where the command
+			// runs (push.default = simple or current). In the main working
+			// tree that is the default branch, spelled nowhere on the
+			// command line.
+			specs = []ivSpec{{src: env.def, dst: env.def}}
+		}
+		for _, s := range specs {
 			if !ivIsDefaultRef(s.dst, env) {
 				continue
 			}
@@ -378,7 +425,79 @@ func ivInspect(c ivCall, env ivEnv) []string {
 	if ivWorktreeWriters[c.sub] && inMain {
 		flag("%s in the main working tree moves %s: %s", c.sub, env.def, c)
 	}
+	if ivTreeDestroyers[c.sub] && inMain {
+		flag("%s in the main working tree discards the user's uncommitted work: %s", c.sub, c)
+	}
 	return out
+}
+
+// ivGHAllowed are the gh command lines a run is allowed to make: reading
+// pull requests, opening one for a bead's branch, leaving a review on it,
+// and making the label a pull request carries. Everything else is a
+// violation by default — "gh pr merge" above all, which lands work on the
+// default branch with no git call for the checker above to see and which
+// D-11 forbids outright for a pull request sc did not open.
+var ivGHAllowed = map[string]bool{
+	"pr list": true, "pr view": true, "pr diff": true, "pr status": true,
+	"pr create": true, "pr review": true,
+	"label create": true, "label list": true,
+	"auth status": true, "repo view": true,
+}
+
+// ivGHDamage names the gh commands worth reporting in their own words,
+// because they are the ones that would break the invariant rather than
+// merely being unrecognised.
+var ivGHDamage = map[string]string{
+	"pr merge":    "merges a pull request, landing work on the default branch with no git command for the checker above to see",
+	"pr close":    "closes a pull request a human may still be reading",
+	"repo delete": "deletes the repository",
+	"repo rename": "renames the repository",
+	"repo edit":   "can change the repository's default branch",
+	"repo sync":   "can force the repository's branches to match another's",
+}
+
+// ivGHKey is the "<command> <subcommand>" key of a gh invocation, "" for a
+// bare "gh" or one that only carries flags (gh --version, gh --help). A
+// flag's separate value would be read as a word, so a command line like
+// "gh --repo acme/x pr list" would key wrongly — nothing in gitx writes
+// one, and the allow list errs towards reporting rather than passing.
+func ivGHKey(args []string) string {
+	var words []string
+	for i := 0; i < len(args) && len(words) < 2; i++ {
+		a := args[i]
+		if strings.HasPrefix(a, "-") {
+			continue
+		}
+		words = append(words, a)
+	}
+	return strings.Join(words, " ")
+}
+
+// ivInspectGH judges one recorded gh invocation. gh is checked with an
+// allow list rather than a deny list: git can be reasoned about verb by
+// verb, but gh's surface is the whole GitHub API, so anything a delivery
+// has never needed is reported and a reviewer decides.
+func ivInspectGH(args []string) []string {
+	key := ivGHKey(args)
+	line := "gh " + strings.Join(args, " ")
+	switch {
+	case key == "" || ivGHAllowed[key]:
+		return nil
+	case ivGHDamage[key] != "":
+		return []string{fmt.Sprintf("gh %s %s: %s", key, ivGHDamage[key], line)}
+	default:
+		return []string{fmt.Sprintf("gh %s is not one of the commands a delivery makes: %s", key, line)}
+	}
+}
+
+// ivScanGH judges every gh invocation recorded so far.
+func ivScanGH(t *testing.T, gh *testutil.Shim) []string {
+	t.Helper()
+	var bad []string
+	for _, inv := range gh.Invocations(t) {
+		bad = append(bad, ivInspectGH(inv.Args)...)
+	}
+	return bad
 }
 
 // ivParse reads the shim's log and splits every invocation into an ivCall.
@@ -473,8 +592,20 @@ type ivFixture struct {
 
 	mainSeen   string // the local default branch tip last asserted
 	remoteSeen string // the remote default branch tip last asserted
+	statusSeen string // "git status" in the main working tree, last asserted
+	seen       int    // git invocations already returned by ivAssertStep
 	stats      ivStats
 }
+
+// ivUserFile is a file the test leaves untracked in the main working tree
+// and never mentions again: the user's own uncommitted work, which a run
+// must leave exactly where it found it. Nothing a bead does writes to this
+// path, so a merge can never legitimately collide with it.
+const ivUserFile = "the-users-own-notes.txt"
+
+// ivUserFileBody is what that file holds, so overwriting it is caught as
+// well as deleting it.
+const ivUserFileBody = "the user's own notes, uncommitted and untracked\n"
 
 // ivBeads are the two beads of the P6-09 scenario: the second depends on
 // the first, so it is delivered after the first has landed.
@@ -523,7 +654,13 @@ func ivSetup(t *testing.T, safety ivSafety) *ivFixture {
 		_, err := f.m.Create(ctx, bead)
 		require.NoError(t, err)
 	}
+	// The worktrees exist, so the repository may go dirty now (Create
+	// refuses a dirty one): leave the user's own file in the main working
+	// tree and watch it for the rest of the scenario.
+	require.NoError(t, os.WriteFile(filepath.Join(f.repo.Root, ivUserFile), []byte(ivUserFileBody), 0o644))
 	iv.mainSeen, iv.remoteSeen = iv.tips(t)
+	iv.statusSeen = iv.mainStatus(t)
+	require.Contains(t, iv.statusSeen, ivUserFile, "the user's own file is what the main working tree holds")
 	return iv
 }
 
@@ -582,47 +719,102 @@ func (f *ivFixture) isAncestor(t *testing.T, gitDir, old, newer string) bool {
 	return err == nil
 }
 
-// ivAssertRepo checks what the repository itself must look like after any
-// step: safety on leaves both default branch tips exactly where they were,
-// safety off may only move them forward and may never put a merge commit
-// on either. It updates the remembered tips, so the next call compares
-// against the state this one accepted.
-func (f *ivFixture) ivAssertRepo(t *testing.T, when string) {
+// mainStatus is "git status" in the main working tree, in the porcelain
+// form and including untracked files, so both the user's own file and any
+// change to a tracked one show up.
+func (f *ivFixture) mainStatus(t *testing.T) string {
 	t.Helper()
+	return ivMustRun(t, f.r, f.r.Dir, "status", "--porcelain", "--untracked-files=all")
+}
+
+// ivRepoViolations returns a reason for everything the repository itself
+// says a step should not have done: safety on leaves both default branch
+// tips exactly where they were, safety off may only move them forward and
+// may never put a merge commit on either, and in both modes the main
+// working tree — the user's, not the run's — must be untouched, the user's
+// own uncommitted file included.
+//
+// It updates the remembered state, so the next call compares against what
+// this one saw, and it returns reasons rather than asserting so that
+// [TestAnAgentsOwnGitIsCaughtByTheSameChecker] can prove this half fires on
+// real damage.
+func (f *ivFixture) ivRepoViolations(t *testing.T) []string {
+	t.Helper()
+	var bad []string
+	flag := func(format string, args ...any) { bad = append(bad, fmt.Sprintf(format, args...)) }
 	local, remote := f.tips(t)
 	switch f.env.safety {
 	case ivSafetyOn:
-		assert.Equal(t, f.mainSeen, local, "safety %s, %s: the local %s moved", f.env.safety, when, f.env.def)
-		assert.Equal(t, f.remoteSeen, remote, "safety %s, %s: %s/%s moved", f.env.safety, when, f.env.remote, f.env.def)
-	default:
-		if local != "" && f.mainSeen != "" && local != f.mainSeen {
-			assert.True(t, f.isAncestor(t, "", f.mainSeen, local),
-				"safety %s, %s: the local %s moved off its own history", f.env.safety, when, f.env.def)
+		if local != f.mainSeen {
+			flag("the local %s moved (%s -> %s)", f.env.def, f.mainSeen, local)
 		}
-		if remote != "" && f.remoteSeen != "" && remote != f.remoteSeen {
-			assert.True(t, f.isAncestor(t, f.r.RemoteDir, f.remoteSeen, remote),
-				"safety %s, %s: %s/%s moved off its own history", f.env.safety, when, f.env.remote, f.env.def)
+		if remote != f.remoteSeen {
+			flag("%s/%s moved (%s -> %s)", f.env.remote, f.env.def, f.remoteSeen, remote)
+		}
+	default:
+		if local != "" && f.mainSeen != "" && local != f.mainSeen && !f.isAncestor(t, "", f.mainSeen, local) {
+			flag("the local %s moved off its own history (%s -> %s)", f.env.def, f.mainSeen, local)
+		}
+		if remote != "" && f.remoteSeen != "" && remote != f.remoteSeen && !f.isAncestor(t, f.r.RemoteDir, f.remoteSeen, remote) {
+			flag("%s/%s moved off its own history (%s -> %s)", f.env.remote, f.env.def, f.remoteSeen, remote)
 		}
 	}
 	if local != "" {
-		assert.Empty(t, ivMustRun(t, f.r, f.r.Dir, "log", "--merges", "--oneline", "refs/heads/"+f.env.def),
-			"safety %s, %s: a merge commit reached the local %s (D-10)", f.env.safety, when, f.env.def)
+		if merges := ivMustRun(t, f.r, f.r.Dir, "log", "--merges", "--oneline", "refs/heads/"+f.env.def); merges != "" {
+			flag("a merge commit reached the local %s (D-10): %s", f.env.def, merges)
+		}
 	}
 	if remote != "" {
-		assert.Empty(t, ivMustRun(t, f.r, f.r.Dir, "--git-dir", f.r.RemoteDir, "log", "--merges", "--oneline", "refs/heads/"+f.env.def),
-			"safety %s, %s: a merge commit reached %s/%s (D-10)", f.env.safety, when, f.env.remote, f.env.def)
+		if merges := ivMustRun(t, f.r, f.r.Dir, "--git-dir", f.r.RemoteDir, "log", "--merges", "--oneline", "refs/heads/"+f.env.def); merges != "" {
+			flag("a merge commit reached %s/%s (D-10): %s", f.env.remote, f.env.def, merges)
+		}
+	}
+	if status := f.mainStatus(t); status != f.statusSeen {
+		flag("the main working tree changed under the user (%q -> %q)", f.statusSeen, status)
+		f.statusSeen = status
+	}
+	switch body, err := os.ReadFile(filepath.Join(f.repo.Root, ivUserFile)); {
+	case err != nil:
+		flag("the user's own uncommitted file is gone: %v", err)
+	case string(body) != ivUserFileBody:
+		flag("the user's own uncommitted file was rewritten: %q", body)
 	}
 	f.mainSeen, f.remoteSeen = local, remote
+	return bad
 }
 
-// ivAssert checks both halves of the invariant — the commands git was
-// asked to run and the state the repository is in — and returns the calls
-// recorded so far.
+// ivAssertRepo asserts that the repository half of the invariant holds.
+func (f *ivFixture) ivAssertRepo(t *testing.T, when string) {
+	t.Helper()
+	bad := f.ivRepoViolations(t)
+	assert.Empty(t, bad, "safety %s, %s: the repository is not where it should be:\n%s",
+		f.env.safety, when, strings.Join(bad, "\n"))
+}
+
+// ivAssert checks all three parts of the invariant — the git commands, the
+// gh commands and the state the repository is in — and returns every git
+// call recorded so far.
 func (f *ivFixture) ivAssert(t *testing.T, when string) []ivCall {
 	t.Helper()
 	calls := ivAssertCommands(t, f.git, f.env, when)
+	if f.gh != nil {
+		bad := ivScanGH(t, f.gh)
+		assert.Empty(t, bad, "safety %s, %s: gh was asked to do something a delivery may never do:\n%s",
+			f.env.safety, when, strings.Join(bad, "\n"))
+	}
 	f.ivAssertRepo(t, when)
 	return calls
+}
+
+// ivAssertStep is [ivFixture.ivAssert] for one step of a sequence: it
+// returns only the git invocations that step produced, so a caller can tell
+// an event that really exercised the code from one that did nothing at all.
+func (f *ivFixture) ivAssertStep(t *testing.T, when string) []ivCall {
+	t.Helper()
+	all := f.ivAssert(t, when)
+	fresh := all[min(f.seen, len(all)):]
+	f.seen = len(all)
+	return fresh
 }
 
 // ivWork writes a file in the bead's worktree and commits it, the way an
@@ -728,6 +920,46 @@ func (f *ivFixture) ivResolveConflict(t *testing.T, bead domain.Bead) bool {
 	return true
 }
 
+// ivAgentGit runs one git command line the way an engineer session's Bash
+// tool call would: through the shim on PATH, in the directory the session
+// works in, with nothing in gitx involved. The engineer's tool policy is
+// read/write with an unrestricted Bash, so these command lines are as real
+// a part of what a run does to the repository as the deliverers' own, and
+// the checker judges them the same way. The output and error are returned
+// for a caller that cares; a command that fails is still recorded, which
+// is what the invariant reads.
+func (f *ivFixture) ivAgentGit(t *testing.T, dir string, args ...string) (string, error) {
+	t.Helper()
+	cmd := f.git.Command(t, args...)
+	cmd.Dir = dir
+	cmd.Env = f.r.Env()
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// ivAgentCommands are the git command lines an engineer session plausibly
+// runs inside its own worktree: reading where it is and what it changed,
+// committing, and throwing away its own scratch work. Every one of them is
+// within the invariant, because the worktree is the agent's to write.
+var ivAgentCommands = [][]string{
+	{"status", "--porcelain"},
+	{"diff", "--stat"},
+	{"log", "--oneline", "-n", "5"},
+	{"rev-parse", "--abbrev-ref", "HEAD"},
+	{"commit", "--allow-empty", "--quiet", "-m", "checkpoint from the agent"},
+	{"checkout", "--", "."},
+}
+
+// ivAgentSession runs one of those command lines in the bead's worktree.
+// A failure is expected sometimes — the worktree may be mid-rebase — and
+// tolerated, because what is judged is the command line, not its exit code.
+func (f *ivFixture) ivAgentSession(t *testing.T, bead domain.Bead, args []string) {
+	t.Helper()
+	if out, err := f.ivAgentGit(t, f.m.PathFor(bead.ID), args...); err != nil {
+		t.Logf("agent ran git %s in %s: %v: %s", strings.Join(args, " "), bead.ID, err, out)
+	}
+}
+
 func TestSafetyOnNeverTouchesTheDefaultBranch(t *testing.T) {
 	ctx := context.Background()
 	f := ivSetup(t, ivSafetyOn)
@@ -739,6 +971,11 @@ func TestSafetyOnNeverTouchesTheDefaultBranch(t *testing.T) {
 	// request is still open leads to.
 	for i, bead := range f.beads {
 		f.ivWork(t, bead, fmt.Sprintf("engineer round 1 on %s\n", bead.ID), i == 0)
+		// The session's own git, run from its Bash the way an engineer
+		// would, is judged with everything else.
+		for _, args := range ivAgentCommands {
+			f.ivAgentSession(t, bead, args)
+		}
 		acWrite(t, f.m.PathFor(bead.ID), "stats/leftovers.md", "left uncommitted\n")
 		leftovers, err := f.m.CommitLeftovers(ctx, bead, 1)
 		require.NoError(t, err)
@@ -831,7 +1068,15 @@ func TestSafetyOffOnlyFastForwardsTheDefaultBranch(t *testing.T) {
 type ivEvent struct {
 	name   string
 	weight int
-	do     func(t *testing.T, f *ivFixture, rng *rand.Rand, bead domain.Bead, n int)
+	// expectGit is true when the event always reaches git through the
+	// shim, so a step that recorded nothing means the event did nothing
+	// and the checks after it prove nothing. It is false for the two
+	// events that legitimately run no git of ours: the upstream commit
+	// (deliberately made with the real git, so the test's own colleague is
+	// never mistaken for the code under test) and resolving a conflict,
+	// which returns immediately when there is no rebase in progress.
+	expectGit bool
+	do        func(t *testing.T, f *ivFixture, rng *rand.Rand, bead domain.Bead, n int)
 }
 
 // ivEvents is the alphabet the randomised sequences draw from. Everything
@@ -841,10 +1086,13 @@ type ivEvent struct {
 // a row, an upstream change landing while a worktree is mid-rebase, a
 // conflict resolved and then another one opened on top of it.
 var ivEvents = []ivEvent{
-	{name: "engineer commit", weight: 4, do: func(t *testing.T, f *ivFixture, rng *rand.Rand, bead domain.Bead, n int) {
+	{name: "engineer commit", weight: 4, expectGit: true, do: func(t *testing.T, f *ivFixture, rng *rand.Rand, bead domain.Bead, n int) {
 		f.ivWork(t, bead, fmt.Sprintf("round %d\n", n), rng.IntN(2) == 0)
 	}},
-	{name: "commit leftovers", weight: 2, do: func(t *testing.T, f *ivFixture, _ *rand.Rand, bead domain.Bead, n int) {
+	{name: "agent shell git", weight: 2, expectGit: true, do: func(t *testing.T, f *ivFixture, rng *rand.Rand, bead domain.Bead, _ int) {
+		f.ivAgentSession(t, bead, ivAgentCommands[rng.IntN(len(ivAgentCommands))])
+	}},
+	{name: "commit leftovers", weight: 2, expectGit: true, do: func(t *testing.T, f *ivFixture, _ *rand.Rand, bead domain.Bead, n int) {
 		acWrite(t, f.m.PathFor(bead.ID), fmt.Sprintf("stats/left-%d.md", n), "uncommitted\n")
 		if _, err := f.m.CommitLeftovers(context.Background(), bead, n); err != nil {
 			t.Logf("leftovers for %s: %v", bead.ID, err) // tolerated (P6-16)
@@ -853,18 +1101,18 @@ var ivEvents = []ivEvent{
 	{name: "upstream commit", weight: 2, do: func(t *testing.T, f *ivFixture, rng *rand.Rand, _ domain.Bead, n int) {
 		f.ivUpstream(t, fmt.Sprintf("change-%d", n), rng.IntN(2) == 0)
 	}},
-	{name: "deliver", weight: 4, do: func(t *testing.T, f *ivFixture, _ *rand.Rand, bead domain.Bead, _ int) {
+	{name: "deliver", weight: 4, expectGit: true, do: func(t *testing.T, f *ivFixture, _ *rand.Rand, bead domain.Bead, _ int) {
 		_ = f.ivDeliver(t, bead) // the outcome is counted in f.stats
 	}},
 	{name: "resolve conflict", weight: 2, do: func(t *testing.T, f *ivFixture, _ *rand.Rand, bead domain.Bead, _ int) {
 		f.ivResolveConflict(t, bead)
 	}},
-	{name: "reattach worktree", weight: 1, do: func(t *testing.T, f *ivFixture, _ *rand.Rand, bead domain.Bead, _ int) {
+	{name: "reattach worktree", weight: 1, expectGit: true, do: func(t *testing.T, f *ivFixture, _ *rand.Rand, bead domain.Bead, _ int) {
 		if _, err := f.m.Reattach(context.Background(), bead.ID); err != nil {
 			t.Logf("reattaching %s: %v", bead.ID, err)
 		}
 	}},
-	{name: "read the diff", weight: 1, do: func(t *testing.T, f *ivFixture, _ *rand.Rand, bead domain.Bead, _ int) {
+	{name: "read the diff", weight: 1, expectGit: true, do: func(t *testing.T, f *ivFixture, _ *rand.Rand, bead domain.Bead, _ int) {
 		if _, err := f.m.Diff(context.Background(), bead.ID); err != nil {
 			t.Logf("diffing %s: %v", bead.ID, err)
 		}
@@ -896,8 +1144,11 @@ const ivEventsPerSequence = 12
 // ivSeeds are the fixed seeds the randomised sequences run with. They are
 // constants rather than time-derived, so a failure is reproducible by
 // running the same subtest again, and the totals asserted at the end of
-// the test are the same on every machine.
-var ivSeeds = []uint64{1, 7, 42, 1729}
+// the test are the same on every machine. They are chosen against the
+// event alphabet above — adding an event changes every draw, so a seed set
+// that no longer reaches a rebase conflict fails the end-of-mode check
+// below rather than quietly testing less.
+var ivSeeds = []uint64{1, 5, 17, 1729}
 
 func TestSafetyInvariantsUnderRandomisedEventSequences(t *testing.T) {
 	for _, safety := range []ivSafety{ivSafetyOn, ivSafetyOff} {
@@ -914,7 +1165,7 @@ func TestSafetyInvariantsUnderRandomisedEventSequences(t *testing.T) {
 					f.ivWork(t, bead, fmt.Sprintf("first session on %s\n", bead.ID), i == 0)
 				}
 				log := []string{"0. first engineer session on every bead"}
-				f.ivAssert(t, log[0])
+				f.ivAssertStep(t, log[0]) // sets the mark the per-step check counts from
 
 				for i := 1; i <= ivEventsPerSequence; i++ {
 					event := ivPick(rng)
@@ -922,7 +1173,13 @@ func TestSafetyInvariantsUnderRandomisedEventSequences(t *testing.T) {
 					event.do(t, f, rng, bead, i)
 					step := fmt.Sprintf("%d. %s (%s)", i, event.name, bead.ID)
 					log = append(log, step)
-					assert.NotEmpty(t, f.ivAssert(t, "after event "+step), "the git shim recorded nothing")
+					// Only the invocations this event produced count: the
+					// log is never empty after step 0, so asserting on the
+					// whole of it would prove nothing about the step.
+					fresh := f.ivAssertStep(t, "after event "+step)
+					if event.expectGit {
+						assert.NotEmpty(t, fresh, "%s ran no git at all, so the checks after it judged nothing", step)
+					}
 					if t.Failed() {
 						t.Fatalf("sequence so far:\n%s", strings.Join(log, "\n"))
 					}
@@ -965,6 +1222,139 @@ func TestIvTheShimCatchesAForbiddenCommand(t *testing.T) {
 	bad := ivScan(ivParse(t, f.git), f.env)
 	require.Len(t, bad, 1, "the forbidden command is caught exactly once")
 	assert.Contains(t, bad[0], "pushing "+f.env.def)
+}
+
+// TestAnAgentsOwnGitIsCaughtByTheSameChecker closes the other half of the
+// question the invariant answers. An engineer session runs read/write with
+// an unrestricted Bash inside a linked worktree of the target repository,
+// so "git push origin HEAD:refs/heads/main" or "git clean -fdx" from an
+// agent is possible and the only production guard is a sentence in its
+// prompt. Here the agent's own command lines go through the same shim as
+// the deliverers', and the checker judges them identically: what is
+// legitimate inside the bead's worktree stays legitimate, and the same
+// verbs aimed at the default branch or at the user's own working tree are
+// caught — argv first, and for real damage the repository half as well.
+func TestAnAgentsOwnGitIsCaughtByTheSameChecker(t *testing.T) {
+	f := ivSetup(t, ivSafetyOn)
+	wt := f.m.PathFor(f.beads[0].ID)
+	require.Empty(t, ivScan(ivParse(t, f.git), f.env), "the fixture itself is within the invariant")
+
+	def := f.env.def
+	cases := []struct {
+		name string
+		dir  string
+		args []string
+		want string // a substring of the expected violation, "" for none
+	}{
+		{name: "the agent pushing the default branch from its worktree", dir: wt,
+			args: []string{"push", "--quiet", "origin", "refs/heads/" + def + ":refs/heads/" + def},
+			want: "pushing " + def},
+		{name: "the agent checking out the default branch", dir: f.r.Dir,
+			args: []string{"checkout", def}, want: "checking out " + def},
+		{name: "the agent pushing with no refspec from the main working tree", dir: f.r.Dir,
+			args: []string{"push", "--quiet", "origin"}, want: "pushing " + def},
+		{name: "the agent throwing away the user's working tree", dir: f.r.Dir,
+			args: []string{"checkout", "--", "."}, want: "discards the user's uncommitted work"},
+		// --dry-run so the fixture survives to the repository check below;
+		// the checker judges the command line, which is a commit in the
+		// user's own working tree either way.
+		{name: "the agent committing in the main working tree", dir: f.r.Dir,
+			args: []string{"commit", "--dry-run", "--allow-empty", "-m", "sneaky"},
+			want: "moves " + def},
+		{name: "the agent committing in its own worktree", dir: wt,
+			args: []string{"commit", "--allow-empty", "--quiet", "-m", "checkpoint"}},
+		{name: "the agent throwing away its own scratch work", dir: wt,
+			args: []string{"checkout", "--", "."}},
+		{name: "the agent reading the main working tree", dir: f.r.Dir,
+			args: []string{"status", "--porcelain"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f.git.Reset(t)
+			// The command may fail (no upstream, nothing to commit); the
+			// invocation is recorded either way and that is what is judged.
+			if out, err := f.ivAgentGit(t, tc.dir, tc.args...); err != nil {
+				t.Logf("git %s in %s: %v: %s", strings.Join(tc.args, " "), tc.dir, err, out)
+			}
+			calls := ivParse(t, f.git)
+			require.Len(t, calls, 1, "exactly the agent's command was recorded")
+			bad := ivScan(calls, f.env)
+			if tc.want == "" {
+				assert.Empty(t, bad, "the agent's own worktree is the agent's to write")
+				return
+			}
+			require.NotEmpty(t, bad, "the agent's command went unjudged")
+			assert.Contains(t, strings.Join(bad, "\n"), tc.want)
+		})
+	}
+
+	// Damage the repository half must see too, so this is not only a
+	// statement about strings: the agent deletes the user's untracked work.
+	require.Empty(t, f.ivRepoViolations(t), "the repository is still where the scenario left it")
+	f.git.Reset(t)
+	if out, err := f.ivAgentGit(t, f.r.Dir, "clean", "-fdx", "--quiet"); err != nil {
+		t.Logf("git clean in the main working tree: %v: %s", err, out)
+	}
+	assert.Contains(t, strings.Join(ivScan(ivParse(t, f.git), f.env), "\n"), "clean in the main working tree")
+	assert.Contains(t, strings.Join(f.ivRepoViolations(t), "\n"), "the user's own uncommitted file is gone",
+		"the repository half sees the user's work vanish, not only the command that did it")
+}
+
+// TestIvTheGHShimCatchesAPullRequestMerge is the gh half of
+// TestIvTheShimCatchesAForbiddenCommand: "gh pr merge" lands work on the
+// default branch without running a single git command, so the git checker
+// would never see it. It is caught by the gh allow list instead.
+func TestIvTheGHShimCatchesAPullRequestMerge(t *testing.T) {
+	f := ivSetup(t, ivSafetyOn)
+	require.Empty(t, ivScanGH(t, f.gh), "the fixture itself asks gh for nothing forbidden")
+
+	cmd := f.gh.Command(t, "pr", "merge", "12", "--squash", "--delete-branch")
+	cmd.Dir = f.r.Dir
+	cmd.Env = f.r.Env()
+	// The shim refuses the command; that it was asked for at all is the
+	// violation.
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Logf("gh pr merge: %v: %s", err, out)
+	}
+
+	bad := ivScanGH(t, f.gh)
+	require.Len(t, bad, 1, "the forbidden command is caught exactly once")
+	assert.Contains(t, bad[0], "landing work on the default branch")
+}
+
+func TestIvInspectGH(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want string // a substring of the expected violation, "" for none
+	}{
+		{name: "listing pull requests", args: []string{"pr", "list", "--head", "sc/fx-1", "--json", "number"}},
+		{name: "viewing one", args: []string{"pr", "view", "12", "--json", "state"}},
+		{name: "opening one", args: []string{"pr", "create", "--head", "sc/fx-1", "--base", "main", "--body-file", "-"}},
+		{name: "reviewing one", args: []string{"pr", "review", "12", "--request-changes", "--body-file", "-"}},
+		{name: "making the label", args: []string{"label", "create", "slop-cannon", "--force"}},
+		{name: "probing the binary", args: []string{"--version"}},
+		{name: "merging one", args: []string{"pr", "merge", "12", "--squash"},
+			want: "landing work on the default branch"},
+		{name: "closing one", args: []string{"pr", "close", "12"}, want: "still be reading"},
+		{name: "deleting the repository", args: []string{"repo", "delete", "acme/widgets", "--yes"},
+			want: "deletes the repository"},
+		{name: "changing the default branch", args: []string{"repo", "edit", "--default-branch", "sc/fx-1"},
+			want: "default branch"},
+		{name: "anything else at all", args: []string{"api", "-X", "DELETE", "repos/acme/widgets/git/refs/heads/main"},
+			want: "not one of the commands a delivery makes"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ivInspectGH(tc.args)
+			if tc.want == "" {
+				assert.Empty(t, got)
+				return
+			}
+			require.NotEmpty(t, got)
+			assert.Contains(t, strings.Join(got, "\n"), tc.want)
+		})
+	}
 }
 
 func TestIvInspect(t *testing.T) {
@@ -1016,6 +1406,32 @@ func TestIvInspect(t *testing.T) {
 			args: []string{"branch", "-m", "main", "old-main"}, want: "deleting or moving main"},
 		{name: "a fetch of the default branch's tracking ref is allowed", safety: ivSafetyOn,
 			args: []string{"fetch", "origin", "refs/heads/main:refs/remotes/origin/main"}},
+		// A push with no refspec names no branch at all: git pushes the one
+		// that is checked out where it runs, which in the main working tree
+		// is the default branch.
+		{name: "safety on refuses a refspec-less push from the main working tree", safety: ivSafetyOn, dir: "/repo",
+			args: []string{"push", "--quiet", "origin"}, want: "pushing main"},
+		{name: "safety on refuses a bare git push in the main working tree", safety: ivSafetyOn, dir: "/repo",
+			args: []string{"push"}, want: "pushing main"},
+		{name: "safety off refuses a forced refspec-less push from the main working tree", safety: ivSafetyOff, dir: "/repo",
+			args: []string{"push", "--force-with-lease", "origin"}, want: "not a fast-forward"},
+		{name: "safety off allows a refspec-less push from the main working tree", safety: ivSafetyOff, dir: "/repo",
+			args: []string{"push", "--quiet", "origin"}},
+		{name: "a refspec-less push from a worktree is allowed", safety: ivSafetyOn, dir: "/wt/fx-1",
+			args: []string{"push", "--quiet", "origin"}},
+		// The user's uncommitted work in the main working tree is theirs,
+		// in either mode; the same commands in a bead's worktree are the
+		// agent tidying up after itself.
+		{name: "git clean in the main working tree is refused", safety: ivSafetyOn, dir: "/repo",
+			args: []string{"clean", "-fdx"}, want: "discards the user's uncommitted work"},
+		{name: "git clean in a worktree is allowed", safety: ivSafetyOn, dir: "/wt/fx-1",
+			args: []string{"clean", "-fdx"}},
+		{name: "checking out paths in the main working tree is refused", safety: ivSafetyOff, dir: "/repo",
+			args: []string{"checkout", "--", "."}, want: "discards the user's uncommitted work"},
+		{name: "checking out paths in a worktree is allowed", safety: ivSafetyOff, dir: "/wt/fx-1",
+			args: []string{"checkout", "--", "stats/mean.go"}},
+		{name: "git restore in the main working tree is refused", safety: ivSafetyOff, dir: "/repo",
+			args: []string{"restore", "--staged", "--worktree", "."}, want: "discards the user's uncommitted work"},
 		{name: "git pull is refused", safety: ivSafetyOn, args: []string{"pull", "origin", "sc/fx-1"}, want: "merges into the checked-out branch"},
 	}
 	for _, tc := range cases {

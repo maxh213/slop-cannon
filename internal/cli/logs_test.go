@@ -427,3 +427,63 @@ func logsWaitFor(t *testing.T, w *logsBuffer, want string) {
 	}
 	t.Fatalf("sc logs --follow never printed %q; output so far:\n%s", want, w.String())
 }
+
+// TestLogsErrorsAreOnTheTroubleshootingPage closes the other half of P9-08
+// for this command. That test walks `errors.New` sentinels, so a message
+// built with fmt.Errorf — which is every user-facing error `sc logs` has —
+// can never fail it, and none of them were documented. Each stem below is
+// asserted in both directions: it is still the text logs.go prints, and it
+// still keys a row on docs/troubleshooting.md.
+func TestLogsErrorsAreOnTheTroubleshootingPage(t *testing.T) {
+	stems := []string{
+		"no runs recorded for",
+		"no run directory at",
+		"the run has no agent logs yet",
+		"the run wrote no log yet",
+		"this run has:",
+		"a followed log has no end to encode",
+	}
+	src, err := os.ReadFile("logs.go")
+	require.NoError(t, err)
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "troubleshooting.md"))
+	require.NoError(t, err)
+	for _, stem := range stems {
+		require.Contains(t, string(src), stem,
+			"logs.go no longer prints %q: reword docs/troubleshooting.md with it", stem)
+		require.Contains(t, string(doc), "| `"+stem+"` |",
+			"docs/troubleshooting.md has no row keyed %q, and it is a message sc logs prints", stem)
+	}
+}
+
+// TestLogsAdviceForAPrunedRunDirectoryIsTrue guards the row that used to
+// tell a user to run "`sc status` without arguments", which "lists the runs
+// that are still on disk". It does not: bare `sc status` reports exactly
+// one run, the most recent, and no command lists them. The row now points
+// at the runs directory itself, so this checks the directory it names is
+// the one runs actually live in.
+func TestLogsAdviceForAPrunedRunDirectoryIsTrue(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := logsFixture(t, repo, logsRunID)
+	require.Equal(t, filepath.Dir(dir), filepath.Join(config.StateDir(repo), config.RunsDirName),
+		"a run directory lives under <state-dir>/runs, which is what the page tells the user to list")
+
+	doc, err := os.ReadFile(filepath.Join("..", "..", "docs", "troubleshooting.md"))
+	require.NoError(t, err)
+	row := logsDocRow(t, string(doc), "no run directory at")
+	require.Contains(t, row, config.RunsDirName+"/`",
+		"the row must name the directory the runs are in")
+	require.NotContains(t, row, "lists the runs that are still on disk",
+		"sc status reports one run, never a list")
+}
+
+// logsDocRow returns the troubleshooting row keyed by stem.
+func logsDocRow(t *testing.T, doc, stem string) string {
+	t.Helper()
+	for _, line := range strings.Split(doc, "\n") {
+		if strings.HasPrefix(line, "| `"+stem+"` |") {
+			return line
+		}
+	}
+	t.Fatalf("docs/troubleshooting.md has no row keyed %q", stem)
+	return ""
+}

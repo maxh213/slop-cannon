@@ -1166,6 +1166,10 @@ type RunVitals struct {
 	// Foreign is how many beads the run reported it may not touch (P6-28);
 	// it counts every component's reports, not just the gate poller's.
 	Foreign int `json:"foreign,omitempty"`
+	// Rules is the rules compliance gate's counters (P9-06), zero for a run
+	// that never saw a violation of a rules file. It is folded in with
+	// [RunVitals.WithRules] and printed by [RunVitals.RulesLine].
+	Rules RulesGateStats `json:"rules,omitzero"`
 }
 
 // Vitals snapshots the run's parts. Every argument is optional: a nil
@@ -1183,11 +1187,15 @@ func Vitals(at time.Time, plan PlanningReporter, gates GateReporter, foreign *Fo
 }
 
 // Lines are the vitals as `sc status` prints them: one line for planning,
-// one for the gates, and one for the beads the run is passing over when
-// there are any.
+// one for the gates, one for the beads the run is passing over when there
+// are any, and one for the rules compliance gate when it has seen
+// anything.
 func (v RunVitals) Lines() []string {
 	out := []string{v.PlanningLine(), v.GatesLine()}
 	if l := v.ForeignLine(); l != "" {
+		out = append(out, l)
+	}
+	if l := v.RulesLine(); l != "" {
 		out = append(out, l)
 	}
 	return out

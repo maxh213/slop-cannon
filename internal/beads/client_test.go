@@ -326,7 +326,7 @@ func TestShowNotFound(t *testing.T) {
 		require.ErrorAs(t, err, &be)
 		assert.Equal(t, "no issues found matching the provided IDs", be.Message)
 		assert.Equal(t, 1, be.ExitCode)
-		assert.Equal(t, "bd show: no issues found matching the provided IDs", err.Error())
+		assert.Equal(t, "bd show: bead not found: no issues found matching the provided IDs", err.Error())
 	})
 	t.Run("some ids found", func(t *testing.T) {
 		c, _ := clientFake(t, map[string]string{"show": "error-not-found-mixed"})
@@ -482,7 +482,7 @@ func TestUpdateErrors(t *testing.T) {
 	c3, _ := clientFake(t, map[string]string{"update": "error-readonly"})
 	_, err = c3.Update(context.Background(), "fx-ctt", Patch{Status: domain.BeadStateOpen})
 	assert.ErrorIs(t, err, ErrReadOnly)
-	assert.Equal(t, "bd update: operation 'update' is not allowed in read-only mode", err.Error())
+	assert.Equal(t, "bd update: bd is in read-only mode: operation 'update' is not allowed in read-only mode", err.Error())
 }
 
 func TestClaim(t *testing.T) {
@@ -620,7 +620,7 @@ func TestAddDep(t *testing.T) {
 	c2, _ := clientFake(t, map[string]string{"dep-add": "error-dep-cycle"})
 	_, err = c2.AddDep(context.Background(), "fx-nvi.2", "fx-nvi.1")
 	assert.ErrorIs(t, err, ErrCycle)
-	assert.Equal(t, "bd dep add: adding dependency would create a cycle", err.Error())
+	assert.Equal(t, "bd dep add: dependency would create a cycle: adding dependency would create a cycle", err.Error())
 
 	c3, _ := clientFake(t, map[string]string{"dep-add": "error-dep-not-found"})
 	res, err = c3.AddDep(context.Background(), "fx-nvi.1", "nope-1")
@@ -750,7 +750,7 @@ func TestClientPing(t *testing.T) {
 	c2, _ := clientFake(t, map[string]string{"ping": "error-no-project"})
 	_, err = c2.Ping(context.Background())
 	assert.ErrorIs(t, err, ErrNoProject)
-	assert.Equal(t, `bd ping: cannot use -C directory "/tmp": no beads project found`, err.Error())
+	assert.Equal(t, `bd ping: no beads project found: cannot use -C directory "/tmp": no beads project found`, err.Error())
 }
 
 func TestClientPingUnhealthy(t *testing.T) {

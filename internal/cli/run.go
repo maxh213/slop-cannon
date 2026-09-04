@@ -79,6 +79,11 @@ type RunOptions struct {
 var (
 	runNow   = time.Now
 	runNewID = config.NewRunID
+	// runOnAssemble is a test seam: assembleRun hands it the cannon it has
+	// just built and fails the assembly when it returns an error, so what a
+	// failed assembly releases can be proven rather than reasoned about. It
+	// is nil in production.
+	runOnAssemble func(*cannon) error
 )
 
 const runLong = `Fire the cannon at a repository. PATH may be the repository root or any
@@ -419,6 +424,11 @@ var (
 	runConductorInterval = orchestrator.DefaultConductorInterval
 	runTickInterval      time.Duration
 	runSettleInterval    time.Duration
+	// runHelperGrace bounds how long the run waits for the conductor, the
+	// gate poller and the external reviewer to stop before it closes the
+	// event stream the renderers are reading. A helper that will not stop
+	// must not be able to hold the terminal.
+	runHelperGrace = 5 * time.Second
 )
 
 // runShimOptions configures the read-only bd shim every agent's worktree
@@ -444,7 +454,10 @@ func fireCannon(cmd *cobra.Command, gopts GlobalOptions, rc *config.RunConfig) e
 	headless := rc.Run.Config.Headless || gopts.JSON
 	if !headless {
 		if err := runRequireTerminal(); err != nil {
-			return err
+			// P8-06: the refusal goes through the same numbered fix list
+			// as every other startup failure, so "run it headless" is a
+			// step rather than a parenthesis.
+			return StartupFailure(cmd.Context(), stderr, rc.Run.RepoPath, err)
 		}
 	}
 
@@ -487,13 +500,22 @@ func fireCannon(cmd *cobra.Command, gopts GlobalOptions, rc *config.RunConfig) e
 		return err
 	}
 	defer func() { _ = runLog.Close() }()
-	logger := runLog.Logger()
+	handler := runLog.Logger().Handler()
 	if headless {
-		logger = slog.New(logging.NewMultiHandler(
-			logging.NewTerminalHandler(stderr, logOpts),
-			runLog.Logger().Handler(),
-		)).With(slog.String("run", rc.Run.ID.String()))
+		// Only the terminal half needs the run id stamped on it: the run
+		// log's handler already carries one.
+		handler = logging.NewMultiHandler(
+			logging.NewTerminalHandler(stderr, logOpts).
+				WithAttrs([]slog.Attr{slog.String("run", rc.Run.ID.String())}),
+			handler,
+		)
 	}
+	// P8-05: three layers stamp the run id — this one, logging.OpenRunLog
+	// and orchestrator.New — so every line used to carry "run" two or
+	// three times, and a repeated JSON key is ambiguous to whoever reads
+	// what `sc logs` prints. The first value stands; later copies are
+	// dropped (logattr.go).
+	logger := slog.New(logAttrOnce(handler, "run"))
 	prev := slog.Default()
 	slog.SetDefault(logger)
 	defer slog.SetDefault(prev)
@@ -503,6 +525,7 @@ func fireCannon(cmd *cobra.Command, gopts GlobalOptions, rc *config.RunConfig) e
 		Out:      stderr,
 		Lock:     policy,
 		Filter:   filter,
+		RunLog:   runLog,
 		Headless: headless,
 	})
 	if err != nil {
@@ -529,12 +552,15 @@ func fireCannon(cmd *cobra.Command, gopts GlobalOptions, rc *config.RunConfig) e
 // deep inside its input reader ("error creating cancelreader"), which says
 // nothing about what to do instead. It reuses [requireTerminal]'s predicate
 // and replaces its `sc tui-demo` wording.
+//
+// What to do instead is not in the message: fireCannon hands this to
+// [StartupFailure], whose "terminal" class prints `--headless` as a
+// numbered step (P8-06).
 func runRequireTerminal() error {
 	if err := requireTerminal(); err == nil {
 		return nil
 	}
-	return fmt.Errorf("the TUI needs a terminal: stdin and stdout are not a TTY (use --%s to render the run as log lines, or --%s --json for one JSON envelope per event)",
-		FlagRunHeadless, FlagRunHeadless)
+	return errors.New("the TUI needs a terminal: stdin and stdout are not a TTY")
 }
 
 // runSetup is what fireCannon resolved before any orchestrator part exists.
@@ -549,6 +575,9 @@ type runSetup struct {
 	Lock orchestrator.LockPolicy
 	// Filter is the P9-05 secret filter.
 	Filter *agents.SecretFilter
+	// RunLog owns the run's log files. The run writes one log per agent
+	// through it (P8-07), which is what `sc logs <agent-id>` reads back.
+	RunLog *logging.RunLogger
 	// Headless says whether the terminal is ours to write to.
 	Headless bool
 }
@@ -580,31 +609,58 @@ type cannon struct {
 	// prs is the external pull request reviewer (D-11, P8-04), or nil when
 	// this run does not review them.
 	prs *orchestrator.PRReview
-	// settle is told when a bead settles, so the deliverer forgets a
+	// pub is the one place every event the run publishes passes through:
+	// the redaction, the seal at events.RunFinished, the agent transcripts
+	// and the P6-41 settle hook all hang off it.
+	pub *runPublisher
+	// settleq tells the deliverer when a bead settles, so it forgets a
 	// safety-on delivery the gate poller closed (P6-41).
-	settle *orchestrator.Deliverer
-	spend  *runSpend
-	stop   []func()
+	settleq *settleQueue
+	spend   *runSpend
+	stop    []func()
+	// released records that close has already run, so the release a failed
+	// assembly does and fireCannon's own defer cannot double up.
+	released bool
 }
 
 // close shuts the assembled run's resources down, in reverse order. The
 // event log is closed first, since a summary folded from it must see every
-// line (P8-20).
+// line (P8-20). It is idempotent: a failed assembly releases what it had
+// already built through this same path, and fireCannon's defer then finds
+// nothing left to do.
 func (c *cannon) close() {
+	if c.released {
+		return
+	}
+	c.released = true
 	c.closeLog()
 	for i := len(c.stop) - 1; i >= 0; i-- {
 		c.stop[i]()
 	}
+	c.stop = nil
 }
 
 // assembleRun builds every part of the run over the resolved configuration.
 // It touches bd and git (registering the D-07 statuses, opening the
 // repository, creating the run directory) but starts nothing.
-func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cannon, error) {
+func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *cannon, err error) {
 	eff := rc.Effective
 	cfg := eff.Config
 	logger := set.Logger
 	c := &cannon{rc: rc, header: rc.Run, set: set, spend: &runSpend{}}
+
+	// Every failure below releases what the assembly had already built —
+	// the event bus, the interrupt registration, the supervisor, the settle
+	// queue and the event log — instead of leaving that to the process
+	// exiting, and then discards the run directory when nothing was ever
+	// recorded into it, so a later `--resume` cannot adopt the id of a run
+	// that never started.
+	defer func() {
+		if err != nil {
+			c.close()
+			discardRunDir(rc.Run.StateDir, logger)
+		}
+	}()
 
 	// bd: initialise the tracker if the repository has none (D-13), then
 	// register the D-07 custom statuses and read back what bd holds, so a
@@ -696,6 +752,10 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 		sup      *orchestrator.Supervisor
 		sched    *orchestrator.Scheduler
 		planFire orchestrator.FiringPlanner
+		// deliverer is the P6-15 resume hand-off as well as the delivery
+		// path: the run is given it through runResumeHandler below, and it
+		// is built further down (it needs the run).
+		deliverer *orchestrator.Deliverer
 	)
 	opts := orchestrator.Options{
 		Logger: logger,
@@ -711,9 +771,18 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 		Agents: stopperFunc(func(ctx context.Context, grace time.Duration) error {
 			return sup.StopAgents(ctx, grace)
 		}),
-		Leases:     client,
-		Cleaner:    manager,
-		Resumer:    resumer,
+		Leases:  client,
+		Cleaner: manager,
+		Resumer: resumer,
+		// P6-15/P9-03: acting on what the resumer found is the other half
+		// of a resume. Without this the run reconciles the worktrees,
+		// announces the states it wrote and then does nothing about the
+		// two entries that need doing something about: a bead left
+		// `delivering` with its pull request open and no gh:pr gate stays
+		// delivering for ever (nothing polls a gate that does not exist,
+		// so its dependents never become ready, D-20), and a worktree left
+		// mid-rebase is never handed back to its engineer.
+		OnResume:   runResumeHandler{deliverer: func() *orchestrator.Deliverer { return deliverer }},
 		LockPolicy: set.Lock,
 	}
 	signals, stopSignals := orchestrator.InterruptChannel()
@@ -732,11 +801,17 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 	// through the run's redaction hook once, here — the single point every
 	// event the run publishes passes through, in front of both the run log
 	// and the bus. A view's own scrub is then an idempotent second pass.
-	published := opts.Bus
-	redactor := set.Filter.Redactor()
-	opts.Bus = orchestrator.PublisherFunc(func(ev events.Event) {
-		published.Publish(redactor.SafeEvent(ev))
-	})
+	// P8-07: the per-agent log files are written from the same point, before
+	// the event is published, so a transcript cannot lose lines to a slow
+	// bus subscriber. The seal at events.RunFinished and the P6-41 settle
+	// hook need that same single point, so it is a type rather than a
+	// closure now (see runPublisher).
+	c.pub = &runPublisher{
+		to:       opts.Bus,
+		redactor: set.Filter.Redactor(),
+		before:   newAgentLogSink(set.RunLog, logger).Observe,
+	}
+	opts.Bus = c.pub
 
 	run, err := orchestrator.New(rc, opts)
 	if err != nil {
@@ -772,12 +847,16 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 	})
 
 	cond, err := orchestrator.NewConductor(orchestrator.ConductorOptions{
-		Run:          run,
-		Beads:        client,
-		Statuses:     statusMap,
-		Foreign:      foreign,
-		Worktrees:    manager,
-		Git:          dgit,
+		Run:       run,
+		Beads:     client,
+		Statuses:  statusMap,
+		Foreign:   foreign,
+		Worktrees: manager,
+		Git:       dgit,
+		// P9-05: the conductor produces the only diff an agent's prompt
+		// renders, so the run's filter — the built-in patterns plus the
+		// configured `exclude` list — goes with it.
+		Filter:       set.Filter,
 		Repo:         scan,
 		Brief:        rc.Run.Brief,
 		Rules:        rules,
@@ -787,6 +866,11 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 		Timeout:      limits.AgentTimeout.Duration(),
 		Interval:     runConductorInterval,
 		Logger:       logger,
+		// P9-06: a resume replays bd's comments without re-running any
+		// role check, so the gate reads the thread before the loop does.
+		// Without this the gate's memory is empty on `sc run --resume` and
+		// a violation an old comment settled the wrong way ships.
+		RulesGate: gate,
 	})
 	if err != nil {
 		return nil, err
@@ -797,13 +881,18 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 		Context:          cond.BeadContext,
 		Ratio:            cond.ChangeRatio,
 		ConflictResolved: cond.ConflictResolved,
-		States:           states,
-		Messages:         client,
-		Acceptance:       client,
-		Bus:              orchestrator.PublisherFunc(run.Publish),
-		Run:              rc.Run.ID,
-		Logger:           logger,
-		Limits:           limits,
+		// P9-05: the loop is the last hand a prompt passes through — the
+		// quoted history, the round's notes and the prose an agent replied
+		// with are all assembled here — and it is where an echoed
+		// credential is masked before bd stores it.
+		Filter:     set.Filter,
+		States:     states,
+		Messages:   client,
+		Acceptance: client,
+		Bus:        orchestrator.PublisherFunc(run.Publish),
+		Run:        rc.Run.ID,
+		Logger:     logger,
+		Limits:     limits,
 	})
 	if err != nil {
 		return nil, err
@@ -820,6 +909,9 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 	reviewer, _, err := newPRReviewer(ctx, prReviewSetup{
 		RC: rc, Repo: repo, Worktrees: manager, Beads: client, States: states,
 		Host: run, Statuses: statusMap, Context: cond.BeadContext, Logger: logger,
+		// P9-05: the reviewer's own diff of somebody else's pull request
+		// goes through the same filter as the run's own change sets.
+		Filter: set.Filter,
 	})
 	if err != nil {
 		return nil, err
@@ -855,11 +947,22 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 	}
 	planner.Attach(run)
 
-	deliverer, err := runDeliverer(run, states, dgit, client, manager, rc, logger)
+	deliverer, err = runDeliverer(run, states, dgit, client, manager, rc, set.Filter, logger)
 	if err != nil {
 		return nil, err
 	}
-	c.settle = deliverer
+	// P6-41: the deliverer keeps one entry per bead it delivered until it
+	// hears that the delivery ended, which for a safety-on delivery is the
+	// gate poller closing the bead — an event rather than a return value.
+	// The settler is fed from the run's single publication point rather
+	// than from a bus subscription, because events.Bus drops for a
+	// subscriber that is behind and a burst of agent output must not be
+	// able to lose the one event this exists for. It is asynchronous
+	// because Observe takes the deliverer's own lock and the deliverer
+	// publishes while holding it.
+	c.settleq = newSettleQueue(deliverer.Observe)
+	c.stop = append(c.stop, c.settleq.close)
+	c.pub.watch(c.settleq.push)
 
 	sched = orchestrator.NewScheduler(orchestrator.SchedulerOptions{
 		Allocation:          rc.Allocation,
@@ -891,9 +994,17 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 	// live planner or poller to ask — can say when the next plan is due,
 	// that gh has been down for an hour, or that a merge is still waiting
 	// on bd.
+	// P9-06's counters ride with them, so `sc status` can say how much the
+	// rules gate refused and how many beads it is still holding.
 	run.UseVitals(func() orchestrator.RunVitals {
-		return orchestrator.Vitals(run.Now(), planner, poller, foreign)
+		return orchestrator.Vitals(run.Now(), planner, poller, foreign).WithRules(gate)
 	})
+
+	if runOnAssemble != nil {
+		if err := runOnAssemble(c); err != nil {
+			return nil, err
+		}
+	}
 
 	if rc.Resume {
 		// A killed run left its beads claimed; the leases come back before
@@ -939,10 +1050,14 @@ func runResumer(m *gitx.Manager, client *beads.Client, statuses beads.StatusMap,
 // setting needs (D-10): a pull request with safety on, a rebase and
 // fast-forward merge with safety off.
 func runDeliverer(run *orchestrator.Run, states *orchestrator.StateMachine, dgit orchestrator.DeliveryGit,
-	client *beads.Client, m *gitx.Manager, rc *config.RunConfig, logger *slog.Logger) (*orchestrator.Deliverer, error) {
+	client *beads.Client, m *gitx.Manager, rc *config.RunConfig, filter *agents.SecretFilter,
+	logger *slog.Logger) (*orchestrator.Deliverer, error) {
 	opts := orchestrator.DeliveryOptions{
 		Host: run, States: states, Git: dgit, Beads: client,
 		CheckCommand: rc.Effective.CheckCommand,
+		// P9-05: the pull request body is the only sink of agent prose
+		// that leaves the machine.
+		Filter: filter,
 	}
 	if rc.Run.Config.Safety {
 		pr, err := gitx.NewPRDeliverer(m, client, gitx.WithPRLogger(logger))
@@ -954,6 +1069,40 @@ func runDeliverer(run *orchestrator.Run, states *orchestrator.StateMachine, dgit
 		opts.Merge = m
 	}
 	return orchestrator.NewDeliverer(opts)
+}
+
+// runResumeHandler is the run's [orchestrator.ResumeHandler] (P6-15): both
+// hand-offs belong to the delivery handoff, which is built after the run
+// and so cannot be named in the run's options. It is the same late-bound
+// indirection the supervisor and the scheduler use, and like them it is
+// only ever called once the assembly has finished — the run acts on a
+// resume inside [orchestrator.Run.Start].
+//
+// A deliverer that is somehow still missing is an assembly bug, not a
+// resume failure, so it is reported rather than silently skipped: the run
+// turns the error into a warning naming the bead.
+type runResumeHandler struct {
+	deliverer func() *orchestrator.Deliverer
+}
+
+// RedeliverPR re-runs the idempotent pull request delivery for a bead whose
+// pull request already exists, so its gh:pr gate is recreated (D-20).
+func (h runResumeHandler) RedeliverPR(ctx context.Context, e gitx.ResumeEntry) error {
+	d := h.deliverer()
+	if d == nil {
+		return errors.New("the run has no delivery handoff to re-run the pull request delivery with")
+	}
+	return d.RedeliverPR(ctx, e)
+}
+
+// ConflictRound sends a bead whose worktree was left mid-rebase back to its
+// engineer as a conflict round (D-10).
+func (h runResumeHandler) ConflictRound(ctx context.Context, e gitx.ResumeEntry) error {
+	d := h.deliverer()
+	if d == nil {
+		return errors.New("the run has no delivery handoff to open the conflict round with")
+	}
+	return d.ConflictRound(ctx, e)
 }
 
 // stopperFunc adapts a function to [orchestrator.AgentStopper]. It is how
@@ -993,6 +1142,177 @@ func (l *lateRun) Publish(ev events.Event) {
 		return
 	}
 	l.bus.Publish(ev)
+}
+
+// runPublisher is [orchestrator.Options.Bus]: the one place every event the
+// run publishes passes through, with the run log, the agent transcripts,
+// the event bus and the delivery settler all behind it. Four things need
+// exactly this point and nothing looser.
+//
+//   - P7-17/P9-09: the scrub and the redaction happen once, in front of
+//     every sink, so no view can forget to do them.
+//   - P8-07: an agent's transcript is written before the event is
+//     published, so it cannot lose lines to a slow bus subscriber.
+//   - P6-41: the delivery settler is fed from here rather than from a bus
+//     subscription, because [events.Bus] drops for a subscriber that is
+//     behind and the one event the settler exists for must never be one of
+//     them.
+//
+// Publishing is serialised on one mutex, so the sinks behind it are handed
+// the events in one order. The stream's seal at [events.RunFinished] is
+// *not* here: [orchestrator.Run.Publish] is the one place that bumps
+// state.json's LastSeq and it drops everything published after the
+// terminator, so nothing reaches this point once the run is over however
+// the helpers beside it are timed (P8-01, unified in round 3).
+type runPublisher struct {
+	to       orchestrator.Publisher
+	redactor *logging.Redactor
+	// before is handed every event before it is published (the agent
+	// transcripts). It must not block and must not publish.
+	before func(events.Event)
+
+	mu      sync.Mutex
+	watcher func(events.Event)
+}
+
+var _ orchestrator.Publisher = (*runPublisher)(nil)
+
+// watch names a sink every published event is handed to after the log and
+// the bus have it. Like before, it must not block and must not publish;
+// [settleQueue] is the one caller.
+func (p *runPublisher) watch(fn func(events.Event)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.watcher = fn
+}
+
+// Publish implements [orchestrator.Publisher].
+func (p *runPublisher) Publish(ev events.Event) {
+	if ev == nil {
+		return
+	}
+	// Redaction is pure and can be expensive, so it happens off the lock.
+	safe := p.redactor.SafeEvent(ev)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.before != nil {
+		p.before(safe)
+	}
+	p.to.Publish(safe)
+	if p.watcher != nil {
+		p.watcher(safe)
+	}
+}
+
+// watching reports whether a [watch] sink is attached, which is how a test
+// proves the P6-41 settler is still wired into the assembled run.
+func (p *runPublisher) watching() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.watcher != nil
+}
+
+// settleQueue hands the run's events to the deliverer's settler (P6-41) in
+// the order they were published, on a goroutine of its own and without ever
+// dropping one.
+//
+// It is neither synchronous nor a bus subscription, and both halves matter.
+// Synchronous would deadlock: [orchestrator.Deliverer.Observe] takes the
+// deliverer's lock, and the deliverer publishes while holding it. A bus
+// subscription drops: [events.Bus] never blocks a publisher, so a burst of
+// agent output while this goroutine is descheduled could lose the very
+// BeadStateChanged that says a safety-on delivery ended — the one event the
+// settler exists for. The queue grows instead, which is bounded in practice
+// by how fast Observe returns (a type switch and a map delete).
+type settleQueue struct {
+	observe func(events.Event)
+	done    chan struct{}
+
+	mu     sync.Mutex
+	cond   *sync.Cond
+	queue  []events.Event
+	closed bool
+}
+
+// newSettleQueue starts a queue that hands every pushed event to observe.
+func newSettleQueue(observe func(events.Event)) *settleQueue {
+	q := &settleQueue{observe: observe, done: make(chan struct{})}
+	q.cond = sync.NewCond(&q.mu)
+	go q.loop()
+	return q
+}
+
+// push queues one event. It never blocks and never drops.
+func (q *settleQueue) push(ev events.Event) {
+	if ev == nil {
+		return
+	}
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.closed {
+		return
+	}
+	q.queue = append(q.queue, ev)
+	q.cond.Signal()
+}
+
+// loop hands queued events to the observer until the queue is closed and
+// empty.
+func (q *settleQueue) loop() {
+	defer close(q.done)
+	for {
+		q.mu.Lock()
+		for len(q.queue) == 0 && !q.closed {
+			q.cond.Wait()
+		}
+		if len(q.queue) == 0 {
+			q.mu.Unlock()
+			return
+		}
+		ev := q.queue[0]
+		q.queue[0] = nil
+		q.queue = q.queue[1:]
+		q.mu.Unlock()
+		q.observe(ev)
+	}
+}
+
+// close stops the queue once everything already pushed has been observed.
+// It is idempotent.
+func (q *settleQueue) close() {
+	q.mu.Lock()
+	if !q.closed {
+		q.closed = true
+		q.cond.Broadcast()
+	}
+	q.mu.Unlock()
+	<-q.done
+}
+
+// discardRunDir removes the run directory of a run that never started, so
+// that `--resume` — which adopts the greatest run id on disk
+// (config.LatestRunID) — cannot later take the id of an assembly that
+// aborted and fire a fresh run under a dead run's name.
+//
+// It only ever removes a directory nothing was recorded into: a directory
+// with a state file, or with a single line in its event log, is left
+// exactly as it is, which is why a resumed run whose assembly failed keeps
+// everything the earlier invocation wrote. Best effort — what it cannot
+// remove is only ever a stale directory.
+func discardRunDir(dir string, logger *slog.Logger) {
+	if dir == "" {
+		return
+	}
+	if _, err := os.Stat(filepath.Join(dir, orchestrator.StateFileName)); err == nil {
+		return
+	}
+	if info, err := os.Stat(filepath.Join(dir, orchestrator.EventLogName)); err == nil && info.Size() > 0 {
+		return
+	}
+	if err := os.RemoveAll(dir); err != nil && logger != nil {
+		logger.Warn("could not remove the directory of a run that never started",
+			slog.String("dir", dir), slog.Any("err", err))
+	}
 }
 
 // runSpend totals what the run's agents cost. The P9-01 budget meters the
@@ -1059,16 +1379,6 @@ func (s *runSpend) total() (cartridge.Usage, int) {
 	return s.usage, s.firings
 }
 
-// observeSettled hands one event to the deliverer's settler, so a bead the
-// gate poller closed (or that reached any settled state) leaves nothing
-// behind in the deliverer's bookkeeping (P6-41).
-func (c *cannon) observeSettled(ev events.Event) {
-	if c.settle == nil || ev == nil {
-		return
-	}
-	c.settle.Observe(ev)
-}
-
 // fire starts the run and everything that runs beside it, renders it, and
 // returns the process exit code (D-15's contract: 0 completed or stopped, 1
 // failed, 3 credits exhausted).
@@ -1086,21 +1396,7 @@ func (c *cannon) fire(cmd *cobra.Command, gopts GlobalOptions, headless bool) (i
 
 	helpers, stopHelpers := context.WithCancel(context.WithoutCancel(ctx))
 	var wg sync.WaitGroup
-	wg.Add(3)
-	// P6-41: the deliverer keeps one entry per bead it delivered until it
-	// hears the delivery ended. A safety-on delivery ends when the gate
-	// poller closes the bead, which is an event rather than a return
-	// value, so the run watches its own stream for it. The subscription is
-	// asynchronous on purpose: Observe takes the deliverer's own lock, and
-	// the deliverer publishes while holding it.
-	settling := c.bus.Subscribe(helpers, 256)
-	go func() {
-		defer wg.Done()
-		defer settling.Unsubscribe()
-		for ev := range settling.Events() {
-			c.observeSettled(ev)
-		}
-	}()
+	wg.Add(2)
 	go func() { defer wg.Done(); _ = c.gates.Run(helpers) }()
 	go func() { defer wg.Done(); _ = c.cond.Run(helpers) }()
 	if c.prs != nil {
@@ -1112,8 +1408,26 @@ func (c *cannon) fire(cmd *cobra.Command, gopts GlobalOptions, headless bool) (i
 	// the moment the run is over rather than when fireCannon returns. A
 	// closed channel still yields what it holds, so the last events —
 	// events.RunFinished among them — are rendered before the stream ends.
+	//
+	// The helpers are stopped first. The run persists state.json for the
+	// last time as it publishes events.RunFinished, so a conductor pass or
+	// a gate poll already in flight when the run finished would otherwise
+	// write an event into events.jsonl that state.json's last_seq never
+	// counts — a log that no longer closes with run_finished.
+	// orchestrator.Run.Publish seals the stream so that cannot happen
+	// whatever the timing; stopping the helpers here is what keeps the
+	// seal from having to drop anything real. They are not waited for
+	// indefinitely: a helper that will not stop must not hold the
+	// renderers open.
 	go func() {
 		<-c.run.Done()
+		stopHelpers()
+		stopped := make(chan struct{})
+		go func() { defer close(stopped); wg.Wait() }()
+		select {
+		case <-stopped:
+		case <-time.After(runHelperGrace):
+		}
 		c.bus.Close()
 	}()
 
@@ -1140,6 +1454,11 @@ func (c *cannon) fire(cmd *cobra.Command, gopts GlobalOptions, headless bool) (i
 	stopHelpers()
 	wg.Wait()
 	c.closeLog()
+	if n := c.run.PublishedAfterFinish(); n > 0 {
+		// Not an error: the run was over. It is worth a line, because it
+		// means a helper was still going after events.RunFinished.
+		c.set.Logger.Debug("dropped events published after the run finished", slog.Int("events", n))
+	}
 
 	if !headless {
 		code = tui.ExitCodeFor(out.Reason)
@@ -1289,8 +1608,9 @@ func runPlural(n int, thing string) string {
 
 // runController is the orchestrator behind the TUI's run-control keys
 // (P7-10). Pause, resume and stop are the run's own lifecycle; the rest
-// need a seam no component offers yet, so they say so rather than pretend
-// (P8-21).
+// need a seam no component offers yet, so they say so rather than pretend.
+// P7-20 is the task that owns those four seams, and it is the id the
+// messages name.
 type runController struct{ run *orchestrator.Run }
 
 var _ tui.Controller = (*runController)(nil)
@@ -1306,20 +1626,20 @@ func (c *runController) Stop(_ context.Context, reason string) error { return c.
 
 // Refire implements [tui.Controller].
 func (c *runController) Refire(_ context.Context, bead domain.BeadID, _ string) error {
-	return fmt.Errorf("re-firing %s is not wired up yet (P8-21)", bead)
+	return fmt.Errorf("re-firing %s is not wired up yet (P7-20)", bead)
 }
 
 // MarkDone implements [tui.Controller].
 func (c *runController) MarkDone(_ context.Context, bead domain.BeadID, _ string) error {
-	return fmt.Errorf("marking %s done is not wired up yet (P8-21)", bead)
+	return fmt.Errorf("marking %s done is not wired up yet (P7-20)", bead)
 }
 
 // SetSafety implements [tui.Controller].
 func (c *runController) SetSafety(_ context.Context, _ bool) error {
-	return errors.New("changing safety mid-run is not wired up yet (P8-21)")
+	return errors.New("changing safety mid-run is not wired up yet (P7-20)")
 }
 
 // SetAmmo implements [tui.Controller].
 func (c *runController) SetAmmo(_ context.Context, _ int) error {
-	return errors.New("changing ammo mid-run is not wired up yet (P8-21)")
+	return errors.New("changing ammo mid-run is not wired up yet (P7-20)")
 }

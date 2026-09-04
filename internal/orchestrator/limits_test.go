@@ -59,6 +59,29 @@ func (p *limPauser) pauses() []string {
 	return append([]string(nil), p.reasons...)
 }
 
+// limPhasedPauser is a pauser that also knows the run's lifecycle phase,
+// as *Run does ([BudgetPhaser]).
+type limPhasedPauser struct {
+	limPauser
+	pmu   sync.Mutex
+	phase Phase
+}
+
+func (p *limPhasedPauser) Phase() Phase {
+	p.pmu.Lock()
+	defer p.pmu.Unlock()
+	return p.phase
+}
+
+// stop is what [Run.Stop] does to a paused run: the phase moves on and the
+// pause gate is opened, so Paused() is false although nobody resumed it.
+func (p *limPhasedPauser) stop() {
+	p.pmu.Lock()
+	p.phase = PhaseStopping
+	p.pmu.Unlock()
+	p.resume()
+}
+
 // limHost is an EventHost that keeps every event, on a fixed clock.
 type limHost struct {
 	mu     sync.Mutex
@@ -420,6 +443,102 @@ func TestRunBudgetGrantsMoreHeadroomWhenTheUserResumes(t *testing.T) {
 	}
 	if got := len(p.pauses()); got != 2 {
 		t.Errorf("pauses = %d, want 2", got)
+	}
+}
+
+// TestRunBudgetStillOffersADeliveryConflictRound is P9-01's other half of
+// "the work in flight finishes": a merge-conflict round is a DemandImplement
+// from the deliverer over a bead it has already moved to in_progress (D-10),
+// so holding it back strands that bead half-delivered — with no engineer
+// offered and, in brief mode, the run finishing as soon as the loop is idle.
+func TestRunBudgetStillOffersADeliveryConflictRound(t *testing.T) {
+	t.Parallel()
+	b, _, _ := limBudget(t, domain.RunModeBrief, 100, 0)
+	conflict := Demand{
+		Kind: DemandImplement, Bead: "b-3", Round: 2,
+		Task: events.TaskResolveConflict, Claim: ClaimRework, From: domain.BeadStateInProgress,
+	}
+	gated := b.Work(limWork{
+		{Kind: DemandImplement, Bead: "b-1"},
+		{Kind: DemandImplement, Bead: "b-2", Task: events.TaskAddressFeedback, Round: 2},
+		conflict,
+		{Kind: DemandPlan},
+	})
+
+	b.Record(cartridge.Usage{InputTokens: 200})
+	after, err := gated.Demands(t.Context())
+	if err != nil {
+		t.Fatalf("Demands: %v", err)
+	}
+	if len(after) != 1 || after[0].Bead != conflict.Bead || after[0].FiringTask() != events.TaskResolveConflict {
+		t.Fatalf("a tripped budget offered %+v, want only the conflict round of b-3", after)
+	}
+}
+
+// TestRunBudgetNeverReadsAStoppingRunAsAResume is P9-01: [Run.Stop] leaves
+// Paused() false because the phase moved to stopping, and reading that as
+// the user saying "carry on" published a false "the run was resumed over
+// its budget" notice — into the run log and the summary's notice count —
+// three lines above "run finished: stopped".
+func TestRunBudgetNeverReadsAStoppingRunAsAResume(t *testing.T) {
+	t.Parallel()
+	p, h := &limPhasedPauser{}, &limHost{}
+	b := NewRunBudget(RunBudgetOptions{
+		Limits: config.Limits{MaxTokens: 100},
+		Mode:   domain.RunModeAutopilot,
+		Run:    p,
+		Host:   h,
+	})
+	gated := b.Work(limWork{{Kind: DemandImplement, Bead: "b-1"}})
+
+	b.Record(cartridge.Usage{InputTokens: 250})
+	if !p.Paused() {
+		t.Fatal("the run was not paused over its budget")
+	}
+
+	p.stop()
+	for range 3 {
+		if ds, err := gated.Demands(t.Context()); err != nil || len(ds) != 0 {
+			t.Fatalf("a stopping run was offered %d demands (err=%v)", len(ds), err)
+		}
+	}
+	if !b.Tripped() {
+		t.Error("a stopping run forgave its budget")
+	}
+	if got := b.Grants(); got != 1 {
+		t.Errorf("Grants = %d, want the one grant the run started with", got)
+	}
+	if got := h.warnings(); len(got) != 1 {
+		t.Errorf("warnings = %v, want the banner alone: a stopping run was never resumed", got)
+	}
+}
+
+// TestRunBudgetGrantsHeadroomToAResumedRunThatKnowsItsPhase is the other
+// side of that: a pauser that reports [PhaseRunning] is a live run, and
+// clearing its pause is the resume it looks like.
+func TestRunBudgetGrantsHeadroomToAResumedRunThatKnowsItsPhase(t *testing.T) {
+	t.Parallel()
+	p, h := &limPhasedPauser{}, &limHost{}
+	p.phase = PhaseRunning
+	b := NewRunBudget(RunBudgetOptions{
+		Limits: config.Limits{MaxTokens: 100},
+		Mode:   domain.RunModeAutopilot,
+		Run:    p,
+		Host:   h,
+	})
+	gated := b.Work(limWork{{Kind: DemandImplement, Bead: "b-1"}})
+
+	b.Record(cartridge.Usage{InputTokens: 250})
+	p.resume()
+	ds, err := gated.Demands(t.Context())
+	if err != nil || len(ds) != 1 {
+		t.Fatalf("a resumed run was offered %d demands (err=%v), want its work back", len(ds), err)
+	}
+	if b.Tripped() {
+		t.Error("a resumed run is still holding new work back")
+	}
+	if got := h.warnings(); len(got) != 2 {
+		t.Errorf("warnings = %v, want the banner and the resume notice", got)
 	}
 }
 

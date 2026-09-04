@@ -10,6 +10,8 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -182,6 +184,8 @@ func TestStartupAdviceKnowsEveryClass(t *testing.T) {
 			require.True(t, ok, "every recognised class has something to tell the user")
 			require.NotEmpty(t, step.Fix)
 			require.NotEmpty(t, step.Problem)
+			require.NotEqual(t, startupReason(wrapped), step.Problem,
+				"the reason is printed above the list; a step must not repeat it")
 		})
 	}
 }
@@ -283,7 +287,28 @@ func TestFirstRunNoticeNamesTheRepoConfigWhenThereIsOne(t *testing.T) {
 
 	var buf bytes.Buffer
 	require.NoError(t, WriteFirstRunNotice(&buf, n))
-	require.Contains(t, buf.String(), "repo config "+path)
+	out := buf.String()
+	require.Contains(t, out, "repo config "+path)
+	// The header is about what the run wrote, and the one path above that
+	// is inside the repository says so itself, instead of standing under a
+	// sentence that denies it exists.
+	require.Contains(t, out, "Nothing the run wrote lives inside the repository")
+	require.Contains(t, out, "The repo config is the only sc file inside the repository")
+	require.Contains(t, out, "an sc config command wrote it, and the run only read it")
+}
+
+// TestFirstRunNoticeSaysNothingAboutARepoConfigThatIsNotThere keeps the
+// explanation with the row it explains.
+func TestFirstRunNoticeSaysNothingAboutARepoConfigThatIsNotThere(t *testing.T) {
+	doctorEnv(t)
+	repo := doctorRepoDir(t, true, false)
+	id := domain.RunID("20260101-120000-abcd")
+	frMakeRunDir(t, repo, id)
+
+	var buf bytes.Buffer
+	require.NoError(t, WriteFirstRunNotice(&buf, NewFirstRunNotice(frRun(repo, id))))
+	require.NotContains(t, buf.String(), "repo config")
+	require.NotContains(t, buf.String(), "only sc file inside the repository")
 }
 
 // TestFirstRunNoticeIsPrintedOnlyOnce is the whole point: the second run in
@@ -347,6 +372,168 @@ func frNormalise(out, repo string) string {
 	return strings.ReplaceAll(out, repo, "/repo")
 }
 
+// TestFirstRunNoticeIsNotRepeatedWhenTheSameRunIsResumed is the resume
+// half of "printed only once": `sc --resume` reuses the latest run
+// directory and its id, so counting run directories still finds exactly one
+// named after this run. The notice is owed to a repository, not to a run
+// directory, and the marker beside the run directories is what remembers
+// that it was paid.
+func TestFirstRunNoticeIsNotRepeatedWhenTheSameRunIsResumed(t *testing.T) {
+	doctorEnv(t)
+	repo := doctorRepoDir(t, true, false)
+	id := domain.RunID("20260101-120000-abcd")
+	frMakeRunDir(t, repo, id)
+
+	var first bytes.Buffer
+	require.NoError(t, ReportFirstRun(&first, frRun(repo, id)))
+	require.Contains(t, first.String(), "That was the first sc run in")
+
+	// Nothing on disk tells the two apart but the marker: the state
+	// directory still holds exactly one run directory, and it is still
+	// this run's, which is what made the count answer "first" twice.
+	entries, err := os.ReadDir(filepath.Join(config.StateDir(repo), config.RunsDirName))
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Equal(t, id.String(), entries[0].Name())
+
+	// The same run, resumed: same id, same directory, nothing new to say.
+	var again bytes.Buffer
+	require.NoError(t, ReportFirstRun(&again, frRun(repo, id)))
+	require.Empty(t, again.String(), "a resumed first run does not print the notice twice")
+	require.False(t, FirstRunInRepo(repo, id))
+
+	marker := firstRunNoticePath(repo)
+	require.FileExists(t, marker)
+	require.False(t, strings.HasPrefix(marker, repo+string(filepath.Separator)),
+		"D-23: the marker lives in the state directory, not in the repository")
+	data, err := os.ReadFile(marker)
+	require.NoError(t, err)
+	require.Equal(t, id.String()+"\n", string(data), "the marker names the run that earned the notice")
+}
+
+// TestFirstRunNoticeIsPrintedWhenTheMarkerCannotBeRead covers a state
+// directory that has been emptied by hand: the notice is a courtesy, so a
+// missing marker means "not printed yet" rather than an error.
+func TestFirstRunNoticeIsPrintedWhenTheMarkerCannotBeRead(t *testing.T) {
+	doctorEnv(t)
+	repo := doctorRepoDir(t, true, false)
+	id := domain.RunID("20260101-120000-abcd")
+	frMakeRunDir(t, repo, id)
+
+	var buf bytes.Buffer
+	require.NoError(t, ReportFirstRun(&buf, frRun(repo, id)))
+	require.NotEmpty(t, buf.String())
+
+	require.NoError(t, os.Remove(firstRunNoticePath(repo)))
+	buf.Reset()
+	require.NoError(t, ReportFirstRun(&buf, frRun(repo, id)))
+	require.NotEmpty(t, buf.String())
+}
+
+// TestRunResumedDoesNotRepeatTheFirstRunNotice drives the same thing
+// through the production command: a first run in a repository prints the
+// notice, and resuming that very run does not print it again.
+func TestRunResumedDoesNotRepeatTheFirstRunNotice(t *testing.T) {
+	env := runFireSetup(t, false)
+
+	_, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief, "--headless", "--cartridge", "mock")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stderr, "That was the first sc run in")
+
+	_, stderr, code = runFireExec(t, env.Repo.Dir, "--resume", "--headless", "--cartridge", "mock")
+	require.Equal(t, 0, code, stderr)
+	require.NotContains(t, stderr, "That was the first sc run in",
+		"resuming the first run reuses its directory and its id, and must not repeat the notice")
+}
+
+// TestStartupWithoutATerminalPrintsTheFixList is the "terminal" class
+// through the command a user actually types: `sc <repo>` with no TTY. The
+// refusal goes through the same numbered list as every other startup
+// failure, so --headless is a step rather than a parenthesis (P8-06).
+func TestStartupWithoutATerminalPrintsTheFixList(t *testing.T) {
+	_, repo := runTestEnv(t)
+	runAddCartridge(t, "claude", "fable")
+	runStubTerminal(t, false)
+	// The class asks sc doctor nothing, so this cannot probe the machine.
+	prev := firstRunDoctor
+	t.Cleanup(func() { firstRunDoctor = prev })
+	firstRunDoctor = func(context.Context, string) *DoctorReport {
+		t.Error("a missing terminal is not something sc doctor can see")
+		return &DoctorReport{}
+	}
+
+	stdout, stderr, code := runExec(t, repo)
+	require.Equal(t, 1, code)
+	require.Empty(t, stdout)
+	require.Contains(t, stderr, "the TUI needs a terminal")
+	require.Contains(t, stderr, "Fix it in this order:")
+	require.Contains(t, stderr, "1. terminal: sc was not started from a terminal")
+	require.Contains(t, stderr, "sc <repo> --"+FlagRunHeadless)
+	require.Contains(t, stderr, "Then check everything at once with: sc doctor")
+}
+
+// TestStartupAdviceNeverRepeatsTheReason covers the fallback path of every
+// class — the one taken when sc doctor has no row about the failure. The
+// error is the reason line at the top; a step that prints the same sentence
+// again is noise.
+func TestStartupAdviceNeverRepeatsTheReason(t *testing.T) {
+	prev := firstRunDoctor
+	t.Cleanup(func() { firstRunDoctor = prev })
+	firstRunDoctor = func(context.Context, string) *DoctorReport {
+		return &DoctorReport{OK: true, Checks: []DoctorCheck{{Name: "git", Status: DoctorPass, Detail: "fine"}}}
+	}
+
+	for _, err := range []error{
+		orchestrator.ErrLocked,
+		gitx.ErrNotRepository,
+		config.ErrNoCartridge,
+		cartridge.ErrAuth,
+		cartridge.ErrCreditsExhausted,
+		beads.ErrNoProject,
+		gitx.ErrGHUnauthenticated,
+		gitx.ErrRepoDirty,
+		&config.ParseError{Path: "/c.toml", Line: 3, Msg: "bad"},
+		config.ErrAmmoTooLow,
+		errors.New("the TUI needs a terminal: stdin and stdout are not a TTY"),
+	} {
+		wrapped := fmt.Errorf("wrapped: %w", err)
+		class := startupClassOf(wrapped)
+		t.Run(class.name+"/"+err.Error(), func(t *testing.T) {
+			a := AdviseStartup(context.Background(), "/repo", wrapped)
+			require.Len(t, a.Steps, 1, "no doctor row fails, so the class's own step is the list")
+			out := frRenderAdvice(t, a)
+			require.Equal(t, 1, strings.Count(out, a.Reason),
+				"the error is printed once, as the reason:\n%s", out)
+			require.NotEmpty(t, a.Steps[0].Fix, "and the step is worth its line")
+		})
+	}
+}
+
+// TestStartupRepoAdviceIsTheDoctorRowsOwnWords is P8-09 for the fallback
+// step: when the report carries no repo row, the advice still uses the row's
+// wording rather than a second spelling of it.
+func TestStartupRepoAdviceIsTheDoctorRowsOwnWords(t *testing.T) {
+	doctorEnv(t)
+	dir := doctorRepoDir(t, false, false)
+
+	report := RunDoctor(context.Background(), dir)
+	var hint string
+	for _, c := range report.Checks {
+		if c.Name == "repo" {
+			hint = c.Hint
+		}
+	}
+	require.NotEmpty(t, hint, "sc doctor has a repo row with a hint")
+	require.Equal(t, hint, startupFixRepo, "worded once (P8-09): the fallback step is the doctor row's hint")
+
+	prev := firstRunDoctor
+	t.Cleanup(func() { firstRunDoctor = prev })
+	firstRunDoctor = func(context.Context, string) *DoctorReport { return &DoctorReport{OK: true} }
+	a := AdviseStartup(context.Background(), dir, fmt.Errorf("wrapped: %w", gitx.ErrNotRepository))
+	require.Len(t, a.Steps, 1)
+	require.Equal(t, hint, a.Steps[0].Fix)
+}
+
 // ---------------------------------------------------------------------------
 // P9-08: the troubleshooting doc and the messages in the code
 // ---------------------------------------------------------------------------
@@ -354,22 +541,47 @@ func frNormalise(out, repo string) string {
 // tsDoc is the page every user-facing message is documented on.
 const tsDoc = "../../docs/troubleshooting.md"
 
-// tsPackages are the packages whose sentinel errors must be documented:
-// everything a user can reach through the CLI. internal/domain,
-// internal/events and internal/logging are left out on purpose — their
-// errors are the vocabulary of the libraries underneath, and every one that
-// reaches a terminal does so wrapped in a message from this list.
+// tsPackages are the packages — and every package under them — whose
+// exported sentinel errors must be documented: everything a user can reach
+// through the CLI. internal/domain, internal/events and internal/logging
+// are left out on purpose — their errors are the vocabulary of the
+// libraries underneath, and every one that reaches a terminal does so
+// wrapped in a message from this list.
 var tsPackages = []string{
 	"internal/cli",
 	"internal/config",
 	"internal/beads",
 	"internal/gitx",
 	"internal/cartridge",
-	"internal/cartridge/structured",
 	"internal/agents",
 	"internal/orchestrator",
 	"internal/proc",
 }
+
+// P9-09 shipped a second guard over the same ground
+// (internal/cli/troubleshooting_messages_test.go: internal/cli only, raw
+// format strings, its own exemption map). The integrator removed it in
+// round 3: this one is the strict superset — it covers internal/config as
+// well, and it renders a format's string constants instead of leaving them
+// as verbs — and two guards meant a new message had to satisfy two
+// contracts that disagreed about several existing ones.
+//
+// tsMessagePackages are the packages where *every* message a non-test file
+// builds — each fmt.Errorf as well as each errors.New — must be documented
+// or exempted, not only the exported sentinels. They are the two packages
+// the words a user reads are written in: internal/cli is the command layer,
+// which prints what it returns as `sc: <message>`, and internal/config
+// reads the files a user edits by hand. The deeper packages are covered by
+// their sentinels; their wrapped messages are P9-19.
+var tsMessagePackages = []string{
+	"internal/cli",
+	"internal/config",
+}
+
+// tsWildcard stands for a formatting verb whose argument is not a string
+// constant, so no documented key may span one: a key has to match text a
+// user can actually read, not text interrupted by a path or an id.
+const tsWildcard = "\x00"
 
 // tsExempt are the sentinels docs/troubleshooting.md deliberately does not
 // document, each with the reason. They are assembly-time invariants of sc's
@@ -377,7 +589,7 @@ var tsPackages = []string{
 // situation a user can be advised out of. A new sentinel must be documented
 // or listed here, and a stale entry fails too.
 var tsExempt = map[string]string{
-	"cli.ErrNotImplemented":               "placeholder for behaviour a later task fills in; never returned by a released command",
+	"cli.ErrNotImplemented":               "dead placeholder: no released command returns it, and P9-16 decides whether it is deleted",
 	"agents.ErrInvalidAgentRun":           "a firing sc assembled wrongly; the user cannot cause it",
 	"agents.ErrInvalidPlanRequest":        "same: the planning request is built by sc",
 	"agents.ErrIncompleteRuling":          "same: the arbitration request is built by sc",
@@ -388,6 +600,7 @@ var tsExempt = map[string]string{
 	"beads.ErrUnsupportedPayload":         "encoding guard for a message type sc did not define",
 	"beads.ErrShimLayout":                 "the read-only bd shim was asked for a directory that is not a run worktree: sc's own layout",
 	"beads.ErrNoGate":                     "control flow: 'this bead has no open gate', which the gate poller expects",
+	"mock.ErrNoMatch":                     "the mock cartridge is a test double; it is never fired at a user's repository",
 	"orchestrator.ErrNoDeliveryHost":      "assembly invariant: the deliverer is always built with a host",
 	"orchestrator.ErrNoGateStore":         "assembly invariant: the gate poller is always built with a store",
 	"orchestrator.ErrScopeNeedsBeads":     "assembly invariant: a scoped poller is always built with a bead reader",
@@ -415,6 +628,34 @@ var tsExempt = map[string]string{
 	"orchestrator.ErrNoFeedbackContext":   "control flow: no prompt context for a bead the loop dropped",
 }
 
+// tsExemptMessages are the messages of tsMessagePackages that the page does
+// not document, keyed by the text the code builds (with "…" wherever a verb
+// interpolates something that is not a string constant), each with the
+// reason. Almost all of them are wrappers: they name the step or the file
+// and hand on an error whose own message is what the user reads, and that
+// message is documented on its own row. A pure wrapper — one whose static
+// text is punctuation, like "%s: %w" — needs no entry: tsSaysSomething
+// skips it.
+var tsExemptMessages = map[string]string{
+	"editor …: …": "wraps the editor's own failure; the words a user reads come from the editor",
+	"read …: …":   "names the log file a read failed on; the message is the OS error's",
+	"--repo …: …": "names the flag; the wrapped error is the documented `no such directory`/`not a directory`/`is not a git repository`",
+	"--safety: …": "names the flag; the wrapped error is the documented `safety must be on or off, got`",
+	"…: … file …": "names the vibes or rules file that could not be read; the wrapped error is documented on its own row",
+	"… — add one with: sc cartridge --add claude --model <model>": "decorates the documented `no cartridge loaded` with the command that fixes it",
+	"cli: newPRReviewer: no run configuration":                    "assembly invariant: the pull request reviewer is always built with a run configuration",
+	"run config: effective configuration is nil":                  "assembly invariant: sc resolves the configuration before it builds a run",
+	"open repo config: repository root is empty":                  "assembly invariant: the repository path is resolved before a config file is read",
+	"save repo config: repository root is empty":                  "the same, for the write half",
+	"encode config: …":                                            "wraps the TOML encoder; reaching it means sc built a value TOML cannot hold",
+	"create config directory: …":                                  "names the step; the message is the OS error's, and `sc doctor` reports the directory",
+	"write config: …":                                             "the same, for the write itself",
+	"list runs: …":                                                "names the step; the message is the OS error's",
+	"read config: …":                                              "names the step; the message is the OS error's",
+	"migrate config from schema … to …: …":                        "names the step; the wrapped error is the migration's own",
+	"--ammo …: …":                                                 "names the flag; the wrapped error is the documented `ammo must be at least 3`",
+}
+
 // tsSentinel is one Err… = errors.New("…") declaration found in the source.
 type tsSentinel struct {
 	pkg  string // the package's base name, e.g. "beads"
@@ -426,23 +667,67 @@ type tsSentinel struct {
 // key is how a sentinel is named in tsExempt.
 func (s tsSentinel) key() string { return s.pkg + "." + s.name }
 
+// tsMessage is one message a non-test file builds with errors.New or
+// fmt.Errorf, rendered as far as the source allows: every verb whose
+// argument is a string constant is substituted, and the rest become
+// tsWildcard, so a documented key can only match text a user really sees.
+type tsMessage struct {
+	text string // the rendered text, with tsWildcard for unknown verbs
+	file string
+	line int
+}
+
+// display renders the message the way a failure should print it.
+func (m tsMessage) display() string { return strings.ReplaceAll(m.text, tsWildcard, "…") }
+
+// tsGoFiles lists every non-test .go file of a package and the packages
+// under it. Recursing matters: a sentinel in internal/cartridge/structured
+// is as user-facing as one in internal/cartridge.
+func tsGoFiles(t *testing.T, pkg string) []string {
+	t.Helper()
+	var out []string
+	dir := filepath.Join("..", "..", pkg)
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			if d.Name() == "testdata" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
+			out = append(out, path)
+		}
+		return nil
+	})
+	require.NoError(t, err, dir)
+	require.NotEmpty(t, out, pkg)
+	return out
+}
+
+// tsParse parses one file, failing the test if it cannot.
+func tsParse(t *testing.T, path string) *ast.File {
+	t.Helper()
+	f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+	require.NoError(t, err, path)
+	return f
+}
+
 // tsSentinels parses every package in tsPackages and returns its exported
 // sentinel errors declared as errors.New with a literal message.
 func tsSentinels(t *testing.T) []tsSentinel {
 	t.Helper()
 	var out []tsSentinel
+	seen := map[string]bool{}
 	for _, pkg := range tsPackages {
-		dir := filepath.Join("..", "..", pkg)
-		entries, err := os.ReadDir(dir)
-		require.NoError(t, err, dir)
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
-				continue
+		for _, path := range tsGoFiles(t, pkg) {
+			if seen[path] {
+				continue // a package listed under one already walked
 			}
-			path := filepath.Join(dir, e.Name())
-			fset := token.NewFileSet()
-			f, err := parser.ParseFile(fset, path, nil, 0)
-			require.NoError(t, err, path)
+			seen[path] = true
+			f := tsParse(t, path)
 			ast.Inspect(f, func(n ast.Node) bool {
 				spec, ok := n.(*ast.ValueSpec)
 				if !ok {
@@ -456,7 +741,7 @@ func tsSentinels(t *testing.T) []tsSentinel {
 					if !ok {
 						continue
 					}
-					out = append(out, tsSentinel{pkg: filepath.Base(pkg), name: name.Name, msg: msg, file: path})
+					out = append(out, tsSentinel{pkg: f.Name.Name, name: name.Name, msg: msg, file: path})
 				}
 				return true
 			})
@@ -480,15 +765,217 @@ func tsErrorsNew(expr ast.Expr) (string, bool) {
 	if !ok || pkg.Name != "errors" {
 		return "", false
 	}
-	lit, ok := call.Args[0].(*ast.BasicLit)
-	if !ok || lit.Kind != token.STRING {
+	return tsLiteral(call.Args[0])
+}
+
+// tsLiteral returns the value of a string literal, or of a concatenation of
+// string literals — how a long message is wrapped across lines.
+func tsLiteral(expr ast.Expr) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		if e.Kind != token.STRING {
+			return "", false
+		}
+		s, err := strconv.Unquote(e.Value)
+		if err != nil {
+			return "", false
+		}
+		return s, true
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return "", false
+		}
+		l, ok := tsLiteral(e.X)
+		if !ok {
+			return "", false
+		}
+		r, ok := tsLiteral(e.Y)
+		if !ok {
+			return "", false
+		}
+		return l + r, true
+	default:
 		return "", false
 	}
-	s, err := strconv.Unquote(lit.Value)
-	if err != nil {
+}
+
+// tsConsts holds every package-level string constant of the module, by the
+// directory it is declared in and by its package's base name, so a verb's
+// argument can be substituted: FlagRepo becomes "repo" and
+// logging.RunLogName becomes "sc.log". Without it a message like
+// "--%s requires --%s NAME" could only ever be documented by a fragment.
+type tsConsts struct {
+	byDir map[string]map[string]string
+	byPkg map[string]map[string]string
+}
+
+// lookup resolves an expression to the string it evaluates to at compile
+// time, within the file's directory.
+func (c tsConsts) lookup(dir string, expr ast.Expr) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit, *ast.BinaryExpr:
+		return tsLiteral(expr)
+	case *ast.Ident:
+		v, ok := c.byDir[dir][e.Name]
+		return v, ok
+	case *ast.SelectorExpr:
+		pkg, ok := e.X.(*ast.Ident)
+		if !ok {
+			return "", false
+		}
+		v, ok := c.byPkg[pkg.Name][e.Sel.Name]
+		return v, ok
+	default:
 		return "", false
 	}
-	return s, true
+}
+
+// tsStringConsts collects the module's package-level string constants.
+func tsStringConsts(t *testing.T) tsConsts {
+	t.Helper()
+	c := tsConsts{byDir: map[string]map[string]string{}, byPkg: map[string]map[string]string{}}
+	for path := range tsSources(t) {
+		f := tsParse(t, path)
+		dir, pkg := filepath.Dir(path), f.Name.Name
+		for _, decl := range f.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || (gen.Tok != token.CONST && gen.Tok != token.VAR) {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for i, name := range vs.Names {
+					if i >= len(vs.Values) {
+						continue
+					}
+					s, ok := tsLiteral(vs.Values[i])
+					if !ok {
+						continue
+					}
+					if c.byDir[dir] == nil {
+						c.byDir[dir] = map[string]string{}
+					}
+					if c.byPkg[pkg] == nil {
+						c.byPkg[pkg] = map[string]string{}
+					}
+					c.byDir[dir][name.Name] = s
+					c.byPkg[pkg][name.Name] = s
+				}
+			}
+		}
+	}
+	require.NotEmpty(t, c.byPkg["cli"])
+	return c
+}
+
+// tsVerb matches one formatting verb of a format string.
+var tsVerb = regexp.MustCompile(`%[-+# 0']*[0-9]*(?:\.[0-9]+)?[a-zA-Z%]`)
+
+// tsRender substitutes the arguments sc knows at compile time into a format
+// string and replaces the rest with tsWildcard.
+func tsRender(format string, args []ast.Expr, dir string, consts tsConsts) string {
+	i := 0
+	return tsVerb.ReplaceAllStringFunc(format, func(verb string) string {
+		if verb == "%%" {
+			return "%"
+		}
+		var arg ast.Expr
+		if i < len(args) {
+			arg = args[i]
+		}
+		i++
+		if arg == nil {
+			return tsWildcard
+		}
+		if s, ok := consts.lookup(dir, arg); ok {
+			return s
+		}
+		return tsWildcard
+	})
+}
+
+// tsCodeMessages returns every message the non-test files of the given
+// packages build with errors.New or fmt.Errorf, rendered by tsRender.
+func tsCodeMessages(t *testing.T, packages []string) []tsMessage {
+	t.Helper()
+	consts := tsStringConsts(t)
+	var out []tsMessage
+	for _, pkg := range packages {
+		for _, path := range tsGoFiles(t, pkg) {
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			require.NoError(t, err, path)
+			dir := filepath.Dir(path)
+			ast.Inspect(f, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok || len(call.Args) == 0 {
+					return true
+				}
+				sel, ok := call.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				pkgIdent, ok := sel.X.(*ast.Ident)
+				if !ok {
+					return true
+				}
+				switch {
+				case pkgIdent.Name == "errors" && sel.Sel.Name == "New":
+				case pkgIdent.Name == "fmt" && (sel.Sel.Name == "Errorf" || sel.Sel.Name == "Sprintf"):
+				default:
+					return true
+				}
+				format, ok := tsLiteral(call.Args[0])
+				if !ok {
+					return true
+				}
+				if pkgIdent.Name == "fmt" && sel.Sel.Name == "Sprintf" {
+					return true // Sprintf builds text, not errors; only Errorf/New are messages
+				}
+				out = append(out, tsMessage{
+					text: tsRender(format, call.Args[1:], dir, consts),
+					file: path,
+					line: fset.Position(call.Pos()).Line,
+				})
+				return true
+			})
+		}
+	}
+	require.NotEmpty(t, out)
+	return out
+}
+
+// tsWords matches three or more letters in a row: a message whose static
+// text has none says nothing of its own ("%s: %w"), so there is nothing to
+// document and nothing to exempt.
+var tsWords = regexp.MustCompile(`\p{L}{3,}`)
+
+// tsSaysSomething reports whether a rendered message has words of its own
+// outside the verbs.
+func tsSaysSomething(text string) bool {
+	for _, seg := range strings.Split(text, tsWildcard) {
+		if tsWords.MatchString(seg) {
+			return true
+		}
+	}
+	return false
+}
+
+// tsCovered reports whether a documented key matches the message: the key
+// has to sit inside one uninterrupted run of literal text, so a row can
+// never claim a phrase a verb splits in two.
+func tsCovered(text string, documented map[string]bool) bool {
+	for _, seg := range strings.Split(text, tsWildcard) {
+		for key := range documented {
+			if strings.Contains(seg, key) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // tsMessages returns every message documented in docs/troubleshooting.md:
@@ -528,6 +1015,16 @@ func tsMessages(t *testing.T) []string {
 		}
 	}
 	require.NotEmpty(t, out, "no messages documented")
+	return out
+}
+
+// tsDocumented is tsMessages as a set.
+func tsDocumented(t *testing.T) map[string]bool {
+	t.Helper()
+	out := map[string]bool{}
+	for _, msg := range tsMessages(t) {
+		out[msg] = true
+	}
 	return out
 }
 
@@ -579,6 +1076,11 @@ func tsSources(t *testing.T) map[string]string {
 // leaving a user searching for a string that no longer exists.
 func TestTroubleshootingMessagesStillExistInTheCode(t *testing.T) {
 	sources := tsSources(t)
+	// A key is usually literal source text. It may instead be text only the
+	// running command has — "--model requires --add NAME" is built from
+	// "--%s requires --%s NAME" and two flag constants — so the rendered
+	// messages count too: what matters is that a user can read it.
+	rendered := tsCodeMessages(t, tsMessagePackages)
 	seen := map[string]bool{}
 	for _, msg := range tsMessages(t) {
 		require.False(t, seen[msg], "documented twice: %q", msg)
@@ -590,8 +1092,16 @@ func TestTroubleshootingMessagesStillExistInTheCode(t *testing.T) {
 				break
 			}
 		}
-		require.NotEmpty(t, found, "docs/troubleshooting.md documents %q, which is in no .go file any more; "+
-			"reword the page with the message, or drop the row", msg)
+		if found == "" {
+			for _, m := range rendered {
+				if tsCovered(m.text, map[string]bool{msg: true}) {
+					found = m.file
+					break
+				}
+			}
+		}
+		require.NotEmpty(t, found, "docs/troubleshooting.md documents %q, which nothing in the code says "+
+			"any more; reword the page with the message, or drop the row", msg)
 	}
 }
 
@@ -600,10 +1110,7 @@ func TestTroubleshootingMessagesStillExistInTheCode(t *testing.T) {
 // exempted with a reason), which is what makes the page complete rather
 // than a sample.
 func TestTroubleshootingCoversEveryUserFacingSentinel(t *testing.T) {
-	documented := map[string]bool{}
-	for _, msg := range tsMessages(t) {
-		documented[msg] = true
-	}
+	documented := tsDocumented(t)
 	for _, s := range tsSentinels(t) {
 		if _, ok := tsExempt[s.key()]; ok {
 			require.False(t, documented[s.msg], "%s is both exempt and documented: drop the exemption", s.key())
@@ -615,8 +1122,53 @@ func TestTroubleshootingCoversEveryUserFacingSentinel(t *testing.T) {
 	}
 }
 
-// TestTroubleshootingExemptionsAreReal keeps the exemption list from
-// outliving the errors it excuses.
+// tsUndocumented returns every message the command layer builds that no
+// row of the page matches: the ones that need either a row or an entry in
+// tsExemptMessages. A message whose static text is only punctuation ("%s:
+// %w") is not one of them — the wrapped error is what a user reads — and
+// neither is an exempted sentinel, whose reason is in tsExempt.
+func tsUndocumented(t *testing.T) map[string]tsMessage {
+	t.Helper()
+	documented := tsDocumented(t)
+	exemptText := map[string]bool{}
+	for _, s := range tsSentinels(t) {
+		if _, ok := tsExempt[s.key()]; ok {
+			exemptText[s.msg] = true
+		}
+	}
+	out := map[string]tsMessage{}
+	for _, m := range tsCodeMessages(t, tsMessagePackages) {
+		if !tsSaysSomething(m.text) || exemptText[m.text] || tsCovered(m.text, documented) {
+			continue
+		}
+		out[m.display()] = m
+	}
+	return out
+}
+
+// TestTroubleshootingCoversEveryMessageTheCommandLayerBuilds is the
+// direction the sentinel test cannot reach: most of what a user reads is a
+// fmt.Errorf, not an errors.New, and a sentinel that is only an errors.Is
+// target is documented text nothing prints. Every message internal/cli and
+// internal/config build has to be matched by a row here (or exempted with a
+// reason), so `sc logs`' refusals cannot go undocumented the way they did
+// before this test existed.
+func TestTroubleshootingCoversEveryMessageTheCommandLayerBuilds(t *testing.T) {
+	var missing []string
+	for text, m := range tsUndocumented(t) {
+		if reason := tsExemptMessages[text]; reason != "" {
+			continue
+		}
+		missing = append(missing, fmt.Sprintf("%s:%d %q", m.file, m.line, text))
+	}
+	sort.Strings(missing)
+	require.Empty(t, missing,
+		"docs/troubleshooting.md matches no row for these messages: add a row keyed by a phrase of one "+
+			"that no verb interrupts, or add it to tsExemptMessages with the reason a user never has to look it up")
+}
+
+// TestTroubleshootingExemptionsAreReal keeps both exemption lists from
+// outliving the errors they excuse.
 func TestTroubleshootingExemptionsAreReal(t *testing.T) {
 	live := map[string]bool{}
 	for _, s := range tsSentinels(t) {
@@ -625,6 +1177,13 @@ func TestTroubleshootingExemptionsAreReal(t *testing.T) {
 	for key, reason := range tsExempt {
 		require.True(t, live[key], "tsExempt names %s, which no longer exists: drop the entry", key)
 		require.NotEmpty(t, reason, "%s needs a reason", key)
+	}
+	undocumented := tsUndocumented(t)
+	for text, reason := range tsExemptMessages {
+		require.Contains(t, undocumented, text,
+			"tsExemptMessages names %q, which nothing builds any more, or which a row of the page now "+
+				"documents: drop the entry", text)
+		require.NotEmpty(t, reason, "%q needs a reason", text)
 	}
 }
 
@@ -641,5 +1200,92 @@ func TestTroubleshootingLinksAreLocalFiles(t *testing.T) {
 		link, _, _ = strings.Cut(link, "#")
 		_, err := os.Stat(filepath.Join("..", "..", "docs", link))
 		require.NoError(t, err, "docs/troubleshooting.md links to %s", link)
+	}
+}
+
+// TestTroubleshootingIsReachableFromTheReadme is the other half of the
+// links test: a page nothing points at is a page nobody finds, whatever it
+// says. The README is where a user starts.
+func TestTroubleshootingIsReachableFromTheReadme(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "README.md"))
+	require.NoError(t, err)
+	require.Contains(t, string(data), "docs/troubleshooting.md",
+		"nothing links to the troubleshooting page: link it from the README")
+}
+
+// tsAgentLogsAreWritten reports whether any non-test file outside
+// internal/logging calls Agent(…) on a run logger, which is the only thing
+// that writes runs/<run-id>/agents/<id>.log. When P9-08 audited the page,
+// logging.RunLogger.Agent had that writer and no caller at all (P9-18), and
+// four rows still told a user to read the file it would have written.
+func tsAgentLogsAreWritten(t *testing.T) bool {
+	t.Helper()
+	for path, src := range tsSources(t) {
+		if strings.Contains(path, filepath.Join("internal", "logging")) {
+			continue
+		}
+		if !strings.Contains(src, `"slop-cannon/internal/logging"`) {
+			continue
+		}
+		found := false
+		ast.Inspect(tsParse(t, path), func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Agent" {
+				return true
+			}
+			if recv, ok := sel.X.(*ast.Ident); ok && recv.Name == "domain" {
+				return true // domain.Agent(nil), a conversion
+			}
+			found = true
+			return false
+		})
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// tsAdvice is what the page tells a user to do, line by line: every "What
+// to do" cell, plus the prose between the tables. The "Message" and "What
+// happened" columns are left out — a message may well be about the agent
+// logs; a remedy may not send anyone to one.
+func tsAdvice(t *testing.T) []string {
+	t.Helper()
+	data, err := os.ReadFile(tsDoc)
+	require.NoError(t, err)
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "|") {
+			out = append(out, line)
+			continue
+		}
+		if cells := tsCells(trimmed); len(cells) == 3 {
+			out = append(out, cells[2])
+		}
+	}
+	return out
+}
+
+// TestTroubleshootingSendsNobodyToAFileNothingWrites: a remedy that says
+// "read the agent log" cannot be followed while nothing writes one, and the
+// page's prose may not claim the file exists either. Both may name the
+// per-agent logs, as they do today, exactly as long as something writes
+// them; the day that writer goes away this fails instead of the user.
+func TestTroubleshootingSendsNobodyToAFileNothingWrites(t *testing.T) {
+	if tsAgentLogsAreWritten(t) {
+		return
+	}
+	for _, line := range tsAdvice(t) {
+		for _, phrase := range []string{"agents/", "the agent log", "an agent log"} {
+			require.NotContains(t, line, phrase,
+				"nothing calls logging.RunLogger.Agent, so runs/<run-id>/agents/ stays empty (P9-18): "+
+					"this remedy must name sc.log, `sc logs` or events.jsonl instead")
+		}
 	}
 }

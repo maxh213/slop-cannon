@@ -6,6 +6,34 @@ You will watch it generate a graph of task and dependencies and agents and feedb
 
 you will see cool cannon animations when you watch it from the TUI. 
 
+## Demo
+
+![The Slop Cannon TUI firing at a fixture repository: a plan lands, agents are fired at two beads, a tester asks for changes, and both beads close through pull requests](docs/demo.gif)
+
+That recording is `make demo`, and it is not a mock-up of the product — it is
+the product. The demo builds a throwaway machine for one run (a copy of
+`testdata/fixture-repo` with a bare origin, a stand-in for `bd` and for `gh`,
+and its own `HOME`, config and state directories, all inside a temporary
+directory it deletes afterwards) and then fires the real `sc run` at it. Only
+the model is scripted: the mock cartridge plays `scripts/demo/scenario.json`,
+so the same run happens every time, with no network, no API key and nothing
+written outside the temporary directory.
+
+- `make demo` — the TUI, as recorded above.
+- `make demo DEMO_ARGS=--headless` — one line per event; needs no terminal.
+- `make demo DEMO_ARGS=--check` — headless, then asserts from the run's own
+  `events.jsonl` that every cannon animation really happened.
+- `make demo DEMO_ARGS=--keep` — leaves the demo machine on disk and prints
+  its path, so you can read the run's beads, logs and worktrees.
+
+`scripts/demo/demo.sh --help` lists the rest. To re-record the GIF you need
+[VHS](https://github.com/charmbracelet/vhs) with `ttyd` and `ffmpeg` on
+`PATH`; `make demo DEMO_ARGS=--check` once to warm the build cache, then
+`vhs demo.tape`, which writes `docs/demo.gif`. `demo.tape` presses its keys
+while the run is still going, because the TUI hands the terminal back the
+moment the run finishes — `scripts/demo/scdemo/demo_test.go` holds that
+timing (and the scenario) to it.
+
 ## Ammo breakdown
 
 1. engineer
@@ -59,6 +87,7 @@ Go 1.27+ is required. All day-to-day work goes through the Makefile:
 | `make check` | `fmt` + `lint` + `test`; the gate CI runs and every task must pass |
 | `make install` | `go install ./cmd/sc` with the same version metadata |
 | `make integration` | Runs tests tagged `integration` (they need real `bd`, `git`, `gh`) |
+| `make demo` | Runs the deterministic demo above (`DEMO_ARGS=--check` asserts it, `--headless` needs no terminal) |
 | `make clean` | Removes `bin/`, `dist/`, and coverage output |
 | `make tools` | Installs the pinned developer tools into `bin/` |
 | `make update-golden` | Regenerates `testdata/**/*.golden` and `docs/cli.md` from the current output (`UPDATE_GOLDEN=1 go test ./...`) |
@@ -70,3 +99,5 @@ Go 1.27+ is required. All day-to-day work goes through the Makefile:
 CI (`.github/workflows/ci.yml`) runs `make check` on Ubuntu and macOS for every push and pull request, and runs `make integration` in a separate job that is skipped when `bd` is not installed.
 
 Golden files (including the TUI frames in `testdata/tui/`) are explained in [docs/goldens.md](docs/goldens.md): how they stay deterministic, how to regenerate them, and how to read a diff.
+
+When `sc` (or the demo) says something you did not expect, [docs/troubleshooting.md](docs/troubleshooting.md) is keyed by the message: what happened, and what to do about it.

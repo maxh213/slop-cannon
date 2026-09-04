@@ -8,7 +8,8 @@ run dir    <state>/runs/20260903-120000-abcd
 started    2026-09-03 12:00:00Z
 last event 2026-09-03 12:01:13Z
 finished   2026-09-03 12:01:13Z
-outcome    2 beads landed; kept 1 worktree
+outcome    removed 1 worktree, kept 1:
+             sc-2 (in_progress)
 stopped by SIGINT
 resumes    1
 cartridge  claude (model fable)
@@ -31,4 +32,4 @@ events     10 of 22 (1 output line, 1 warning)
   12:01:10 → bead sc-2 in_review → closed (round 1)
   12:01:11 ✔ tester-qa-sc-2-r1 (tester, sc-2) finished in 11s: verdict, exit 0
   12:01:12 ■ run stopping (SIGINT)
-  12:01:13 ◇ run finished: completed after 1m13s (exit 0) — 2 beads landed; kept 1 worktree
+  12:01:13 ◇ run finished: completed after 1m13s (exit 0) — removed 1 worktree, kept 1:   sc-2 (in_progress)

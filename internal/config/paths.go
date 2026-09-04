@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"slop-cannon/internal/logging"
 )
@@ -112,16 +113,77 @@ func canonicalPath(path string) string {
 	return abs
 }
 
-// RepoID derives a stable identifier for a repository path: its base name
-// (made file-system safe) plus the first 12 hex digits of the SHA-256 of
-// its canonical absolute path, for example "my-app-3f2c9a1b7d0e". Two
-// checkouts at different paths get different ids; the same path always gets
-// the same id.
+// RepoID derives a stable identifier for a repository: the base name of its
+// main working tree (made file-system safe) plus the first 12 hex digits of
+// the SHA-256 of that tree's canonical absolute path, for example
+// "my-app-3f2c9a1b7d0e". The same path always gets the same id, and two
+// unrelated checkouts get different ones.
+//
+// A linked `git worktree` gets the id of the repository it belongs to, not
+// its own (P9-04): a worktree shares the main checkout's .beads database,
+// default branch and remote, so a run in one is a run in the other, and one
+// state directory means one run lock covers both.
 func RepoID(repoPath string) string {
-	canon := canonicalPath(repoPath)
+	canon := repoIdentity(canonicalPath(repoPath))
 	sum := sha256.Sum256([]byte(canon))
 	base := logging.SafeFileName(filepath.Base(canon))
 	return base + "-" + hex.EncodeToString(sum[:])[:12]
+}
+
+// repoIdentity maps a canonical checkout path to the path that identifies
+// its repository. For a normal checkout, a bare repository or a submodule
+// that is itself, and for a linked worktree it is the main working tree —
+// found by following .git to the worktree's git directory and its
+// `commondir` pointer, which is how git itself finds the shared directory.
+// No git binary is needed, and anything unexpected leaves the path alone.
+func repoIdentity(canon string) string {
+	gitPath := filepath.Join(canon, ".git")
+	info, err := os.Lstat(gitPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return canon // a .git directory (or no repository here at all).
+	}
+	gitDir, ok := gitDirPointer(gitPath)
+	if !ok {
+		return canon
+	}
+	common, err := os.ReadFile(filepath.Join(gitDir, "commondir")) //nolint:gosec // a fixed name inside the git directory this checkout points at.
+	if err != nil {
+		return canon // a submodule: its git directory is its own common one.
+	}
+	rel := strings.TrimSpace(string(common))
+	if rel == "" {
+		return canon
+	}
+	commonDir := rel
+	if !filepath.IsAbs(commonDir) {
+		commonDir = filepath.Join(gitDir, commonDir)
+	}
+	commonDir = canonicalPath(commonDir)
+	if filepath.Base(commonDir) == ".git" {
+		return filepath.Dir(commonDir) // the main working tree.
+	}
+	return commonDir // a bare repository with worktrees hanging off it.
+}
+
+// gitDirPointer reads a .git *file* ("gitdir: <path>") and returns the
+// directory it names, resolved against the checkout that holds it.
+func gitDirPointer(gitFile string) (string, bool) {
+	data, err := os.ReadFile(gitFile) //nolint:gosec // the .git entry of a repository the user pointed sc at.
+	if err != nil {
+		return "", false
+	}
+	rest, ok := strings.CutPrefix(strings.TrimSpace(string(data)), "gitdir:")
+	if !ok {
+		return "", false
+	}
+	dir := strings.TrimSpace(rest)
+	if dir == "" {
+		return "", false
+	}
+	if !filepath.IsAbs(dir) {
+		dir = filepath.Join(filepath.Dir(gitFile), dir)
+	}
+	return filepath.Clean(dir), true
 }
 
 // StateDir is where everything sc keeps for one repository lives (D-23):

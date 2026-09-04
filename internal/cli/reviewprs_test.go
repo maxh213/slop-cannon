@@ -245,12 +245,6 @@ func TestPRReviewPlannerRoutesByPayload(t *testing.T) {
 	if inner != 2 {
 		t.Errorf("inner planner called %d times, want 2", inner)
 	}
-	if ids := prReviewBeadIDs(reviewer); len(ids) != 0 {
-		t.Errorf("review beads = %v, want none", ids)
-	}
-	if ids := prReviewBeadIDs(nil); ids != nil {
-		t.Errorf("review beads of no reviewer = %v, want nil", ids)
-	}
 	src := prReviewSources(reviewer, orchestrator.WorkSourceFunc(func(context.Context) ([]orchestrator.Demand, error) {
 		return []orchestrator.Demand{{Kind: orchestrator.DemandPlan}}, nil
 	}))

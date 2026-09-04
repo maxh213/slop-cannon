@@ -53,7 +53,7 @@ func TestClassifyCapturedErrors(t *testing.T) {
 		text    string
 	}{
 		{"error-not-found", []string{"show", "nope-1", "--json"}, ErrNotFound,
-			"no issues found matching the provided IDs", "bd show: no issues found matching the provided IDs"},
+			"no issues found matching the provided IDs", "bd show: bead not found: no issues found matching the provided IDs"},
 		{"error-close-not-found", []string{"close", "nope-1", "--json"}, ErrNotFound,
 			`resolving ID nope-1: no issue found matching "nope-1"`, ""},
 		{"error-comment-not-found", []string{"comment", "nope-1", "--stdin", "--json"}, ErrNotFound,
@@ -61,13 +61,13 @@ func TestClassifyCapturedErrors(t *testing.T) {
 		{"error-update-not-found", []string{"update", "nope-1", "-s", "open", "--json"}, ErrNotFound,
 			`Error resolving nope-1: no issue found matching "nope-1"`, ""},
 		{"error-parent-not-found", []string{"create", "X", "--parent", "nope-1", "--json"}, ErrNotFound,
-			"parent issue nope-1 not found", "bd create: parent issue nope-1 not found"},
+			"parent issue nope-1 not found", "bd create: bead not found: parent issue nope-1 not found"},
 		{"error-close-blocked", []string{"close", "fx-nvi.1", "--reason", "done", "--json"}, ErrBlockedOpen,
 			"cannot close fx-nvi.1: blocked by open issues [fx-nvi.2] (use --force to override)", ""},
 		{"error-close-blocked-2", []string{"close", "fx-ctt", "--json"}, ErrBlockedOpen,
 			"cannot close fx-ctt: blocked by open issues [fx-so0] (use --force to override)", ""},
 		{"error-readonly", []string{"--readonly", "-C", "/r", "update", "fx-ctt", "-s", "open", "--json"}, ErrReadOnly,
-			"operation 'update' is not allowed in read-only mode", "bd update: operation 'update' is not allowed in read-only mode"},
+			"operation 'update' is not allowed in read-only mode", "bd update: bd is in read-only mode: operation 'update' is not allowed in read-only mode"},
 		{"error-readonly-close", []string{"--readonly", "close", "fx-ctt", "--json"}, ErrReadOnly,
 			"operation 'close' is not allowed in read-only mode", ""},
 		{"error-readonly-comment", []string{"--readonly", "comment", "fx-ctt", "--stdin", "--json"}, ErrReadOnly,
@@ -75,7 +75,7 @@ func TestClassifyCapturedErrors(t *testing.T) {
 		{"error-claim-taken", []string{"update", "fx-so0", "--claim", "--json"}, ErrAlreadyClaimed,
 			"Error claiming fx-so0: issue already claimed by sc:engineer-1", ""},
 		{"error-dep-cycle", []string{"dep", "add", "fx-nvi.2", "fx-nvi.1", "--json"}, ErrCycle,
-			"adding dependency would create a cycle", "bd dep add: adding dependency would create a cycle"},
+			"adding dependency would create a cycle", "bd dep add: dependency would create a cycle: adding dependency would create a cycle"},
 		{"error-no-project", []string{"-C", "/tmp", "ready", "--json"}, ErrNoProject,
 			`cannot use -C directory "/tmp": no beads project found`, ""},
 		{"error-bad-status", []string{"update", "fx-ctt", "-s", "not_a_status", "--json"}, ErrInvalid, "", ""},
@@ -190,7 +190,7 @@ func TestClassifyTimeoutAndStartFailures(t *testing.T) {
 
 func TestErrorRendering(t *testing.T) {
 	e := &Error{Command: "close", Kind: ErrBlockedOpen, Message: "cannot close x"}
-	assert.Equal(t, "bd close: cannot close x", e.Error())
+	assert.Equal(t, "bd close: bead is blocked by open issues: cannot close x", e.Error())
 	assert.ErrorIs(t, e, ErrBlockedOpen)
 	assert.Equal(t, []error{ErrBlockedOpen}, e.Unwrap())
 	assert.Equal(t, "bd: failed", (&Error{}).Error())

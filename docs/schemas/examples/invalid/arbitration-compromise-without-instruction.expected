@@ -1,2 +1,2 @@
-structured: schema (arbitration): 1 violation(s)
+structured: result does not match schema (arbitration): 1 violation(s)
   - at '': missing property 'instruction'

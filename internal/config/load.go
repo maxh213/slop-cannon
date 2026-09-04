@@ -494,8 +494,11 @@ func (e *Effective) validate() error {
 	if e.Limits.MaxReviewRounds < 1 {
 		return &ValidationError{Path: e.pathOf(KeyMaxReviewRounds), Key: KeyMaxReviewRounds, Msg: "must be at least 1"}
 	}
-	if e.Limits.MaxPushbackRounds < 0 {
-		return &ValidationError{Path: e.pathOf(KeyMaxPushbackRounds), Key: KeyMaxPushbackRounds, Msg: "must not be negative"}
+	if e.Limits.MaxPushbackRounds < 1 {
+		// Zero used to be accepted, stored and shown, then read as "unset"
+		// by the feedback loop, which gave a user who asked for no pushback
+		// the default two exchanges. It is refused instead (P9-01).
+		return &ValidationError{Path: e.pathOf(KeyMaxPushbackRounds), Key: KeyMaxPushbackRounds, Msg: "must be at least 1"}
 	}
 	if e.Limits.AgentTimeout.Duration() <= 0 {
 		return &ValidationError{Path: e.pathOf(KeyAgentTimeout), Key: KeyAgentTimeout, Msg: "must be a positive duration"}

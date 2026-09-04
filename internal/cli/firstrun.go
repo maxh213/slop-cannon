@@ -109,12 +109,15 @@ func AdviseStartup(ctx context.Context, repo string, err error) StartupAdvice {
 	}
 	class := startupClassOf(err)
 
-	if ctx == nil {
-		ctx = context.Background()
+	var report *DoctorReport
+	if !class.skipDoctor {
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		dctx, cancel := context.WithTimeout(ctx, startupDoctorTimeout)
+		defer cancel()
+		report = firstRunDoctor(dctx, repo)
 	}
-	dctx, cancel := context.WithTimeout(ctx, startupDoctorTimeout)
-	defer cancel()
-	report := firstRunDoctor(dctx, repo)
 
 	// The rows about this failure lead, whatever order doctor reports in;
 	// the other failing rows follow, because they will stop the next run
@@ -240,6 +243,12 @@ type startupClass struct {
 	fix     string
 	// fixFor overrides fix when the error carries its own remedy.
 	fixFor func(error) string
+	// skipDoctor leaves the sc doctor probes out of the advice for a
+	// failure doctor has no row for and no other row can explain — the
+	// terminal. The probes cost seconds (gh's row talks to the network)
+	// and a user who piped sc into a file is not helped by the state of
+	// their git installation.
+	skipDoctor bool
 }
 
 // covers reports whether a doctor row named name belongs to this class.
@@ -270,8 +279,11 @@ func (c startupClass) step(err error) (StartupStep, bool) {
 	if problem == "" && fix == "" {
 		return StartupStep{}, false
 	}
-	if problem == "" {
-		problem = startupReason(err)
+	if problem == startupReason(err) {
+		// The reason is already printed above the list; a step that
+		// repeats it word for word says nothing twice. The check name
+		// alone leads the step instead.
+		problem = ""
 	}
 	return StartupStep{Check: c.name, Problem: problem, Fix: fix}, true
 }
@@ -301,7 +313,10 @@ const (
 	startupFixConfig = "fix the file at the line above, then read the merged result back with: sc config show"
 	startupFixAmmo   = "raise it with: sc ammo N (N at least 3), or pass --ammo N for this run only"
 	startupFixGH     = "run: gh auth login — or fire with --safety off to merge locally instead of opening pull requests (D-10)"
-	startupFixRepo   = "run sc from inside a git repository, or name one: sc /path/to/repo"
+	// startupFixRepo is the sc doctor repo row's own hint, not a second
+	// spelling of it (P8-09): the fallback step and the row a user reads
+	// in sc doctor must never drift apart.
+	startupFixRepo   = doctorHintRepo
 	startupFixNoRepo = "no bead tracker could be prepared: check that the path is a git repository you can write to"
 )
 
@@ -310,10 +325,11 @@ const (
 // the general ones.
 var startupClasses = []startupClass{
 	{
-		name:   "lock",
-		match:  func(err error) bool { return errors.Is(err, orchestrator.ErrLocked) },
-		fix:    startupFixLock,
-		checks: nil,
+		name:    "lock",
+		match:   func(err error) bool { return errors.Is(err, orchestrator.ErrLocked) },
+		problem: "another sc run is already firing at this repository",
+		fix:     startupFixLock,
+		checks:  nil,
 	},
 	{
 		name: "repo",
@@ -321,8 +337,9 @@ var startupClasses = []startupClass{
 			return errors.Is(err, gitx.ErrNotRepository) || errors.Is(err, beads.ErrNotGitRepo) ||
 				strings.Contains(err.Error(), "is not a git repository")
 		},
-		checks: []string{"repo"},
-		fix:    startupFixRepo,
+		checks:  []string{"repo"},
+		problem: "sc needs a git repository to fire at",
+		fix:     startupFixRepo,
 	},
 	{
 		name: "cartridge",
@@ -331,22 +348,25 @@ var startupClasses = []startupClass{
 				errors.Is(err, cartridge.ErrUnknownCartridge) || errors.Is(err, cartridge.ErrNotInstalled) ||
 				errors.Is(err, cartridge.ErrCartridgeNotBuilt)
 		},
-		checks: []string{"cartridge", "cartridge:", "config"},
-		fix:    "add one with: " + CartridgeAddHint,
+		checks:  []string{"cartridge", "cartridge:", "config"},
+		problem: "no cartridge is loaded",
+		fix:     "add one with: " + CartridgeAddHint,
 	},
 	{
-		name:   "cartridge",
-		match:  func(err error) bool { return errors.Is(err, cartridge.ErrAuth) },
-		checks: []string{"cartridge:"},
-		fix:    startupFixAuth,
+		name:    "cartridge",
+		match:   func(err error) bool { return errors.Is(err, cartridge.ErrAuth) },
+		checks:  []string{"cartridge:"},
+		problem: "the cartridge's CLI is not signed in",
+		fix:     startupFixAuth,
 	},
 	{
 		name: "cartridge",
 		match: func(err error) bool {
 			return errors.Is(err, cartridge.ErrCreditsExhausted) || errors.Is(err, cartridge.ErrRateLimited)
 		},
-		checks: []string{"cartridge:"},
-		fix:    startupFixSpent,
+		checks:  []string{"cartridge:"},
+		problem: "the cartridge has nothing left to spend",
+		fix:     startupFixSpent,
 	},
 	{
 		name: "bd",
@@ -355,8 +375,9 @@ var startupClasses = []startupClass{
 			return errors.As(err, &ce) || errors.Is(err, beads.ErrNoProject) ||
 				errors.Is(err, beads.ErrReadOnly) || errors.Is(err, beads.ErrLocked)
 		},
-		checks: []string{"bd", "beads"},
-		fix:    startupFixNoRepo,
+		checks:  []string{"bd", "beads"},
+		problem: "the bead tracker could not be prepared",
+		fix:     startupFixNoRepo,
 		fixFor: func(err error) string {
 			var ce *beads.CheckError
 			if errors.As(err, &ce) {
@@ -374,14 +395,16 @@ var startupClasses = []startupClass{
 			return errors.Is(err, gitx.ErrGHNotFound) || errors.Is(err, gitx.ErrGHUnauthenticated) ||
 				errors.Is(err, gitx.ErrNoGitHubRemote)
 		},
-		checks: []string{"gh"},
-		fix:    startupFixGH,
+		checks:  []string{"gh"},
+		problem: "the GitHub CLI cannot be used here",
+		fix:     startupFixGH,
 	},
 	{
-		name:   "repo",
-		match:  func(err error) bool { return errors.Is(err, gitx.ErrRepoDirty) },
-		checks: []string{"repo"},
-		fix:    startupFixDirty,
+		name:    "repo",
+		match:   func(err error) bool { return errors.Is(err, gitx.ErrRepoDirty) },
+		checks:  []string{"repo"},
+		problem: "the working tree has uncommitted changes",
+		fix:     startupFixDirty,
 	},
 	{
 		name: "config",
@@ -390,20 +413,25 @@ var startupClasses = []startupClass{
 			var ve *config.ValidationError
 			return errors.As(err, &pe) || errors.As(err, &ve)
 		},
-		checks: []string{"config"},
-		fix:    startupFixConfig,
+		checks:  []string{"config"},
+		problem: "the configuration could not be loaded",
+		fix:     startupFixConfig,
 	},
 	{
-		name:   "ammo",
-		match:  func(err error) bool { return errors.Is(err, config.ErrAmmoTooLow) },
-		fix:    startupFixAmmo,
-		checks: nil,
+		name:    "ammo",
+		match:   func(err error) bool { return errors.Is(err, config.ErrAmmoTooLow) },
+		problem: "there is not enough ammo to field a crew",
+		fix:     startupFixAmmo,
+		checks:  nil,
 	},
 	{
-		name:   "terminal",
-		match:  func(err error) bool { return strings.Contains(err.Error(), "needs a terminal") },
-		fix:    "or render the run as log lines instead: sc <repo> --" + FlagRunHeadless,
-		checks: nil,
+		name:    "terminal",
+		match:   func(err error) bool { return strings.Contains(err.Error(), "needs a terminal") },
+		problem: "sc was not started from a terminal",
+		fix: "fire again with the run as log lines: sc <repo> --" + FlagRunHeadless +
+			" (add --json for one JSON envelope per event)",
+		checks:     nil,
+		skipDoctor: true,
 	},
 }
 
@@ -478,11 +506,32 @@ func NewFirstRunNotice(run domain.Run) FirstRunNotice {
 	return n
 }
 
-// FirstRunInRepo reports whether id is the only run sc has ever recorded
-// for the repository, which is what makes it the first one. A run
-// directory that cannot be read answers false: the notice is a courtesy,
-// and printing it twice is worse than not printing it at all.
+// firstRunNoticeName is the file that records that the first-run notice
+// has been printed for a repository. It sits beside the run directories in
+// the D-23 state directory — never inside the repository — and holds the id
+// of the run that earned it.
+//
+// Counting run directories cannot answer the question on its own: `sc
+// --resume` reuses the latest run directory and its id, so a resumed first
+// run still sees exactly one directory named after itself, and without this
+// marker the same run would print the notice a second time.
+const firstRunNoticeName = "first-run-notice"
+
+// firstRunNoticePath is where that marker lives for repoPath.
+func firstRunNoticePath(repoPath string) string {
+	return filepath.Join(config.StateDir(repoPath), firstRunNoticeName)
+}
+
+// FirstRunInRepo reports whether the first-run notice is still owed for id:
+// sc has recorded exactly one run for the repository, that run is id, and
+// the notice has never been printed there — so resuming that same run says
+// nothing a second time. A run directory that cannot be read answers false:
+// the notice is a courtesy, and printing it twice is worse than not
+// printing it at all.
 func FirstRunInRepo(repoPath string, id domain.RunID) bool {
+	if _, err := os.Stat(firstRunNoticePath(repoPath)); err == nil {
+		return false
+	}
 	entries, err := os.ReadDir(filepath.Join(config.StateDir(repoPath), config.RunsDirName))
 	if err != nil {
 		return false
@@ -501,14 +550,40 @@ func FirstRunInRepo(repoPath string, id domain.RunID) bool {
 }
 
 // ReportFirstRun prints [FirstRunNotice] when run is the first one sc has
-// fired at its repository, and does nothing otherwise. Call it after a run
-// finishes; the caller decides what "successful" means, since a run that
-// ended badly still wrote logs worth finding.
+// fired at its repository and the notice has not been printed there before,
+// and does nothing otherwise — including when that same first run is
+// resumed. Call it after a run finishes; the caller decides what
+// "successful" means, since a run that ended badly still wrote logs worth
+// finding.
 func ReportFirstRun(w io.Writer, run domain.Run) error {
 	if !FirstRunInRepo(run.RepoPath, run.ID) {
 		return nil
 	}
+	if !frClaimNotice(run.RepoPath, run.ID) {
+		return nil
+	}
 	return WriteFirstRunNotice(w, NewFirstRunNotice(run))
+}
+
+// frClaimNotice records that the notice has been printed for repoPath and
+// reports whether this caller is the one that may print it. The marker is
+// created exclusively, so of two processes racing at one repository only
+// one prints; a marker that cannot be created at all (an unwritable state
+// directory) still prints, because the notice matters more than the
+// bookkeeping around it, and the run that got that far wrote its logs
+// somewhere else anyway.
+func frClaimNotice(repoPath string, id domain.RunID) bool {
+	path := firstRunNoticePath(repoPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return true
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return !errors.Is(err, os.ErrExist)
+	}
+	defer func() { _ = f.Close() }()
+	_, _ = fmt.Fprintln(f, id.String())
+	return true
 }
 
 // WriteFirstRunNotice prints the notice as an aligned list of locations.
@@ -525,7 +600,7 @@ func WriteFirstRunNotice(w io.Writer, n FirstRunNotice) error {
 		rows = append(rows, [2]string{"repo config", n.RepoConfig})
 	}
 	header := fmt.Sprintf("That was the first sc run in %s.\n"+
-		"Nothing sc writes lives inside the repository; this is where it all went:\n\n", n.Repo)
+		"Nothing the run wrote lives inside the repository; this is where it all went:\n\n", n.Repo)
 	if _, err := fmt.Fprint(w, header); err != nil {
 		return err
 	}
@@ -534,11 +609,19 @@ func WriteFirstRunNotice(w io.Writer, n FirstRunNotice) error {
 			return err
 		}
 	}
+	if n.RepoConfig != "" {
+		// The one path above that is inside the repository, and the run
+		// only read it: an sc config command wrote it (D-23).
+		if _, err := fmt.Fprint(w, "\nThe repo config is the only sc file inside the repository; "+
+			"an sc config command wrote it, and the run only read it.\n"); err != nil {
+			return err
+		}
+	}
 	_, err := fmt.Fprintf(w, "\nRead this run back at any time with: sc status --repo %s\n", n.Repo)
 	return err
 }
 
-// fileExists reports whether path is a readable regular file.
+// frFileExists reports whether path is a readable regular file.
 func frFileExists(path string) bool {
 	info, err := os.Stat(path)
 	return err == nil && info.Mode().IsRegular()

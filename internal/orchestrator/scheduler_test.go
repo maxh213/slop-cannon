@@ -2151,9 +2151,15 @@ func TestSchedulerTellsTwoHeldItemsOfOneRoundApart(t *testing.T) {
 		return FireResult{}, nil
 	})
 	f := schedSetup(t, 10, SchedulerOptions{Work: src, Fire: src.Fire(record)})
+	// Wait on what the firer recorded, not on Status().Fired: the counter is
+	// incremented in Scheduler.start, on the dispatch goroutine, before the
+	// agent goroutine it launches ever calls Fire, so Fired == 2 does not
+	// mean both ids have been appended (P9-07).
 	schedEventually(t, "both arbitrations to fire", func() bool {
 		f.Clock.Advance(2 * DefaultTickInterval)
-		return f.Sched.Status().Fired == 2
+		mu.Lock()
+		defer mu.Unlock()
+		return len(ids) == 2
 	})
 	for i := 0; i < 10; i++ {
 		f.Clock.Advance(2 * DefaultTickInterval)

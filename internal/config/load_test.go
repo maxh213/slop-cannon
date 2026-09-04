@@ -341,7 +341,10 @@ func TestLoadValidation(t *testing.T) {
 		{"zero beads per plan", "max_beads_per_plan = 0\n", "", KeyMaxBeadsPerPlan, "must be at least 1"},
 		{"negative beads per plan", "", "max_beads_per_plan = -3\n", KeyMaxBeadsPerPlan, "must be at least 1"},
 		{"zero rounds", "", "[limits]\nmax_review_rounds = 0\n", KeyMaxReviewRounds, "must be at least 1"},
-		{"negative pushback", "", "[limits]\nmax_pushback_rounds = -1\n", KeyMaxPushbackRounds, "must not be negative"},
+		{"negative pushback", "", "[limits]\nmax_pushback_rounds = -1\n", KeyMaxPushbackRounds, "must be at least 1"},
+		// Zero is refused rather than accepted and then read as "unset" by
+		// the feedback loop, which is the default two exchanges (P9-01).
+		{"zero pushback", "[limits]\nmax_pushback_rounds = 0\n", "", KeyMaxPushbackRounds, "must be at least 1"},
 		{"zero timeout", "[limits]\nagent_timeout = \"0s\"\n", "", KeyAgentTimeout, "must be a positive duration"},
 		{"negative tokens", "[limits]\nmax_tokens = -5\n", "", KeyMaxTokens, "must not be negative"},
 		{"negative cost", "", "[limits]\nmax_cost_usd = -0.5\n", KeyMaxCostUSD, "must not be negative"},

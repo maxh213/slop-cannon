@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"slop-cannon/internal/agents"
 	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/config"
@@ -447,6 +448,7 @@ func TestGlueDrivesAJobFromReadyToClosed(t *testing.T) {
 		// One last pass, so the log's picture of the beads is the one bd
 		// ends with rather than the one before the final delivery.
 		require.NoError(t, rig.Cond.Sync(context.Background()))
+		rig.Cond.WaitDeliveries()
 		return Outcome{Summary: "both beads shipped"}, nil
 	})
 
@@ -562,6 +564,10 @@ func TestGlueRoutesDeliveryOutcomesBackIntoTheLoops(t *testing.T) {
 			require.NoError(t, rig.Run.SetEpic("sc-epic"))
 
 			require.NoError(t, rig.Cond.Sync(context.Background()))
+			// The delivery runs in the background of the pass, so the
+			// assertions wait for the one this pass started rather than for
+			// the pass itself (P8-14 gap 5).
+			rig.Cond.WaitDeliveries()
 			require.Len(t, delivery.sent(), 1)
 			assert.Equal(t, 2, delivery.sent()[0].Round, "the thread's round names the delivery")
 
@@ -575,6 +581,7 @@ func TestGlueRoutesDeliveryOutcomesBackIntoTheLoops(t *testing.T) {
 			// A second pass must not ship the same bead twice unless the
 			// outcome released it.
 			require.NoError(t, rig.Cond.Sync(context.Background()))
+			rig.Cond.WaitDeliveries()
 			want := 1
 			if tc.redeliver {
 				want = 2
@@ -615,6 +622,7 @@ func TestGlueDeliveryCarriesTheReportAndTheVerdicts(t *testing.T) {
 	require.NoError(t, rig.Run.Start(context.Background()))
 	require.NoError(t, rig.Run.SetEpic("sc-epic"))
 	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
 
 	require.Len(t, delivery.sent(), 1)
 	req := delivery.sent()[0]
@@ -746,7 +754,11 @@ func TestGlueBeadContextCommitsLeftoversThroughDeliveryGit(t *testing.T) {
 	bc, err := rig.Cond.BeadContext(context.Background(), "sc-1")
 	require.NoError(t, err)
 	assert.Equal(t, []domain.BeadID{"sc-1"}, git.committed(), "the leftovers are committed before the review (D-14)")
-	assert.Equal(t, git.diff, bc.Diff)
+	// The change set is what gitx returned, put through the secret filter
+	// on the way out (P9-05); nothing here matches an exclude pattern, so
+	// only the copy is new.
+	require.NotNil(t, bc.Diff)
+	assert.Equal(t, git.diff.Patch, bc.Diff.Patch)
 	assert.Equal(t, "make it retry", bc.Brief)
 	assert.Equal(t, "go test ./...", bc.CheckCommand)
 	assert.Equal(t, "main", bc.Repo.DefaultBranch)
@@ -921,6 +933,7 @@ func TestGlueReadySetFailureStillDeliversTheApprovedBeads(t *testing.T) {
 
 	err := rig.Cond.Sync(context.Background())
 	require.Error(t, err, "the pass reports what it could not do")
+	rig.Cond.WaitDeliveries()
 	assert.Len(t, delivery.sent(), 1, "and still does the rest of it")
 
 	require.NoError(t, rig.Run.Stop("test"))
@@ -971,4 +984,400 @@ func TestGlueFinishRemovesThePlanningShim(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist, "a finished run leaves no <run-dir>/bin/po-plan")
 	_, err = os.Stat(perBead)
 	require.NoError(t, err, "the per-bead shims are the supervisor's (P6-17)")
+}
+
+// --- the restore is the resume's, not the run's --------------------------
+
+// glueThread is a previous run's comment thread: an implementation report
+// and a verdict per lens, all approving, which is what a bead the last run
+// had finished with carries.
+func glueThread(id domain.BeadID, round int) []beads.Message {
+	msgs := []beads.Message{
+		{Type: domain.MessageImplReport, IssueID: id,
+			Payload: domain.ImplReport{Summary: "added the retry"}},
+	}
+	for _, lens := range []domain.Lens{domain.LensQA, domain.LensTest, domain.LensUX} {
+		msgs = append(msgs, beads.Message{Type: domain.MessageVerdict, IssueID: id,
+			Payload: domain.Verdict{Lens: lens, Round: round, Outcome: domain.VerdictApprove,
+				Summary: "reads fine"}})
+	}
+	return msgs
+}
+
+// TestGlueRestoreNeverReplaysIntoALiveThread is the resume defect the brief
+// asked for: a run that can never finish.
+//
+// A graceful stop takes the D-07 `released` edge (in_progress -> open,
+// P6-03), so the most ordinary resume finds the bead *open* with the
+// previous run's whole thread still on it. The first pass tracks it, the
+// scheduler claims it (open -> in_progress), and a conductor that decided
+// what to restore from the bead's state on every pass would then read those
+// old comments and replay them into the thread the loop is holding right
+// now: the engineer it has just fired is abandoned, no tester is ever
+// fired, the bead is never delivered, and — sitting in in_progress — it is
+// not settled either, so a brief run idles for ever.
+//
+// The real *Feedback is driven here, not the recording fake: the damage is
+// what the replay does to a live thread.
+func TestGlueRestoreNeverReplaysIntoALiveThread(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "open", "add the retry"),
+	)
+	bd.msgs["sc-1"] = glueThread("sc-1", 1)
+
+	rig := glueSetup(t, bd, ConductorOptions{Restore: glueYes()}, config.RunSettings{})
+	loop, err := NewFeedback(FeedbackOptions{
+		Context: rig.Cond.BeadContext,
+		Run:     rig.Config.Run.ID,
+		Now:     rig.Fixture.Clock.Now,
+	})
+	require.NoError(t, err)
+	rig.Cond.Attach(ConductorParts{Feedback: loop})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	// Pass one: the bead is open, so it is adopted rather than restored.
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	assert.Zero(t, bd.count("messages"), "an open bead's comments are not replayed")
+	demands, err := loop.Demands(context.Background())
+	require.NoError(t, err)
+	require.Len(t, demands, 1, "the loop owes the bead an engineer")
+	require.Equal(t, DemandImplement, demands[0].Kind)
+
+	// The scheduler claims it: open -> in_progress, with the engineer live.
+	bd.set("sc-1", domain.BeadStateInProgress)
+
+	// Pass two, one interval later, must leave that thread alone.
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	assert.Zero(t, bd.count("messages"), "a bead the run itself moved is not a resume candidate")
+	assert.Zero(t, rig.Cond.Stats().Restored)
+
+	th, ok := loop.Thread("sc-1")
+	require.True(t, ok)
+	assert.NotEqual(t, FeedbackSettled, th.Phase, "the running engineer was not settled out from under the loop")
+	assert.Equal(t, FeedbackImplementing, th.Phase)
+	demands, err = loop.Demands(context.Background())
+	require.NoError(t, err)
+	require.Len(t, demands, 1, "the engineer the run fired is still owed")
+	assert.Equal(t, DemandImplement, demands[0].Kind)
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err = rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// The restore set is the one the first pass found, whatever the beads do
+// afterwards: a bead that becomes restorable later became so because this
+// run moved it.
+func TestGlueRestoreOnlyRebuildsWhatTheFirstPassFound(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "open", "add the retry"),
+		glueIssue("sc-2", domain.BeadTypeTask, "in_review", "test the retry"),
+	)
+	bd.msgs["sc-1"] = glueThread("sc-1", 1)
+	bd.msgs["sc-2"] = glueThread("sc-2", 1)
+	feedback := newGlueFeedback()
+	rig := glueSetup(t, bd, ConductorOptions{Feedback: feedback, Restore: glueYes()}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	_, restored, order := feedback.snapshot()
+	assert.Equal(t, []domain.BeadID{"sc-2"}, restored, "only the bead the resume found past open")
+	assert.Equal(t, []string{"restore:sc-2", "track:sc-1"}, order)
+
+	// The loop moves sc-1 on, exactly as a claim would.
+	bd.set("sc-1", domain.BeadStateInReview)
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+
+	_, restored, order = feedback.snapshot()
+	assert.Equal(t, []domain.BeadID{"sc-2"}, restored, "sc-1 is the run's own work, not a resume's")
+	assert.Equal(t, []string{"restore:sc-2", "track:sc-1"}, order)
+	assert.Equal(t, 1, bd.count("messages"))
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// A restore the loop already beat is left alone: the live thread is the
+// true one, and replaying the old comments over it would double-count the
+// D-08 pushback exchanges and drop a lens the loop is still waiting on.
+func TestGlueRestoreLeavesAThreadTheLoopAlreadyHolds(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "in_review", "add the retry"),
+	)
+	bd.msgs["sc-1"] = glueThread("sc-1", 1)
+	feedback := newGlueFeedback()
+	feedback.rounds["sc-1"] = 2 // the loop is already holding a thread
+	rig := glueSetup(t, bd, ConductorOptions{Feedback: feedback, Restore: glueYes()}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	_, restored, _ := feedback.snapshot()
+	assert.Empty(t, restored)
+	assert.Zero(t, bd.count("messages"), "there is nothing to read: the thread is live")
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// A transient failure is retried on the next pass rather than stranding the
+// bead: Restore goes through Conductor.BeadContext (bd Show, worktree
+// Create, the leftovers commit and the diff), all of which fail for a
+// moment and then do not. A bead marked done on the way in would never be
+// restored again, and — not being open — would never reach `bd ready`
+// either, so nothing in the run would touch it and a resumed brief run
+// could not finish.
+func TestGlueRestoreRetriesATransientFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fail func(bd *glueBD, f *glueFeedback, err error)
+	}{
+		{"the replay failed", func(_ *glueBD, f *glueFeedback, err error) { f.restoreEr = err }},
+		{"the comments could not be read", func(bd *glueBD, _ *glueFeedback, err error) { bd.msgErr = err }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bd := newGlueBD(
+				glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+				glueIssue("sc-1", domain.BeadTypeTask, "changes_requested", "add the retry"),
+			)
+			bd.msgs["sc-1"] = glueThread("sc-1", 1)
+			feedback := newGlueFeedback()
+			tc.fail(bd, feedback, errors.New("the worktree was busy"))
+			rig := glueSetup(t, bd, ConductorOptions{Feedback: feedback, Restore: glueYes()}, config.RunSettings{})
+			require.NoError(t, rig.Run.Start(context.Background()))
+			require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+			err := rig.Cond.Sync(context.Background())
+			require.Error(t, err, "the pass reports what it could not do")
+			_, restored, _ := feedback.snapshot()
+			assert.Empty(t, restored)
+
+			// The failure passes.
+			feedback.mu.Lock()
+			feedback.restoreEr = nil
+			feedback.mu.Unlock()
+			bd.mu.Lock()
+			bd.msgErr = nil
+			bd.mu.Unlock()
+
+			require.NoError(t, rig.Cond.Sync(context.Background()))
+			_, restored, _ = feedback.snapshot()
+			assert.Equal(t, []domain.BeadID{"sc-1"}, restored, "the next pass tries again")
+			assert.Equal(t, 1, rig.Cond.Stats().Restored)
+
+			// And still only once.
+			require.NoError(t, rig.Cond.Sync(context.Background()))
+			_, restored, _ = feedback.snapshot()
+			assert.Len(t, restored, 1)
+
+			require.NoError(t, rig.Run.Stop("test"))
+			_, err = rig.Run.Wait()
+			require.NoError(t, err)
+		})
+	}
+}
+
+// --- a delivery is not the pass ------------------------------------------
+
+// A delivery is a rebase, a check command, a push and a `gh pr create`:
+// minutes in a real repository. The pass must not wait for it, or nothing
+// offers `bd ready` to the loop while it runs and every engineer idles.
+func TestGlueADeliveryDoesNotHoldThePassUp(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "approved", "add the retry"),
+	)
+	feedback := newGlueFeedback()
+	release := make(chan struct{})
+	started := make(chan struct{})
+	var once sync.Once
+	delivery := &glueDelivery{deliver: func(req DeliveryRequest) (*DeliveryOutcome, error) {
+		once.Do(func() { close(started) })
+		<-release
+		return &DeliveryOutcome{Bead: req.Bead.ID, Kind: DeliveryMerged, State: domain.BeadStateClosed}, nil
+	}}
+	rig := glueSetup(t, bd, ConductorOptions{Feedback: feedback, Delivery: delivery}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the delivery never started")
+	}
+
+	// A bead becomes ready while the delivery is still going.
+	bd.add(glueIssue("sc-2", domain.BeadTypeTask, "open", "test the retry"))
+	done := make(chan error, 1)
+	go func() { done <- rig.Cond.Sync(context.Background()) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pass waited for the delivery")
+	}
+	tracked, _, _ := feedback.snapshot()
+	assert.Contains(t, tracked, domain.BeadID("sc-2"), "the loop was offered the newly ready bead")
+	assert.Len(t, delivery.sent(), 1, "and the bead in flight was not shipped twice")
+
+	close(release)
+	rig.Cond.WaitDeliveries()
+	assert.Equal(t, 1, rig.Cond.Stats().Shipped)
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// A bead that comes back to approved — a person resolves the needs_human
+// hand-off, a gate escalation is undone — is delivered again. Holding the
+// claim for the life of the run meant it never was.
+func TestGlueDeliversABeadThatComesBackToApproved(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "approved", "add the retry"),
+	)
+	delivery := &glueDelivery{deliver: func(req DeliveryRequest) (*DeliveryOutcome, error) {
+		bd.set(req.Bead.ID, domain.BeadStateNeedsHuman)
+		return &DeliveryOutcome{Bead: req.Bead.ID, Kind: DeliveryHandedOff,
+			State: domain.BeadStateNeedsHuman}, nil
+	}}
+	rig := glueSetup(t, bd, ConductorOptions{Feedback: newGlueFeedback(), Delivery: delivery}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	require.Len(t, delivery.sent(), 1)
+
+	// While a person owns it, nothing here picks it back up.
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	assert.Len(t, delivery.sent(), 1)
+
+	// The person hands it back.
+	delivery.mu.Lock()
+	delivery.deliver = func(req DeliveryRequest) (*DeliveryOutcome, error) {
+		bd.set(req.Bead.ID, domain.BeadStateClosed)
+		return &DeliveryOutcome{Bead: req.Bead.ID, Kind: DeliveryMerged, State: domain.BeadStateClosed}, nil
+	}
+	delivery.mu.Unlock()
+	bd.set("sc-1", domain.BeadStateApproved)
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	assert.Len(t, delivery.sent(), 2, "the bead came back to approved, so it is delivered again")
+	assert.Equal(t, domain.BeadStateClosed, bd.state("sc-1"))
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// --- the diff a prompt renders is filtered (P9-05) -----------------------
+
+// glueSecretDiff is a change set with an always-excluded path (".env"), a
+// configured one ("certs/"), and one ordinary file.
+func glueSecretDiff() *gitx.Diff {
+	patch := "diff --git a/retry.go b/retry.go\n" +
+		"--- a/retry.go\n+++ b/retry.go\n@@ -1 +1,2 @@\n+\tfor i := 0; i < 3; i++ {\n" +
+		"diff --git a/.env b/.env\n" +
+		"--- a/.env\n+++ b/.env\n@@ -0,0 +1 @@\n+AWS_SECRET_ACCESS_KEY=" + "wJalrXUtnFEMI" + "K7MDENGbPxRfiCYEXAMPLEKEY\n" +
+		"diff --git a/certs/server.key b/certs/server.key\n" +
+		"--- a/certs/server.key\n+++ b/certs/server.key\n@@ -0,0 +1 @@\n+-----BEGIN PRIVATE KEY-----\n"
+	files := []gitx.DiffFile{
+		{FileStat: gitx.FileStat{Path: "retry.go", Insertions: 1}},
+		{FileStat: gitx.FileStat{Path: ".env", Insertions: 1}},
+		{FileStat: gitx.FileStat{Path: "certs/server.key", Insertions: 1}},
+	}
+	stats := gitx.DiffStats{Files: 3, Insertions: 3, Changed: []gitx.FileStat{
+		{Path: "retry.go", Insertions: 1}, {Path: ".env", Insertions: 1},
+		{Path: "certs/server.key", Insertions: 1},
+	}}
+	return &gitx.Diff{Patch: patch, Files: files, Stats: stats}
+}
+
+// glueDiffPaths lists the paths a filtered diff still names.
+func glueDiffPaths(d *gitx.Diff) []string {
+	out := make([]string, 0, len(d.Files))
+	for _, f := range d.Files {
+		out = append(out, f.Path)
+	}
+	return out
+}
+
+// TestGlueBeadContextWithholdsAnExcludedPathsDiff is the P8-14 half of
+// P9-05: the conductor is the only production producer of the diff a
+// tester's prompt renders (Feedback.planTester puts it straight into
+// TesterRequest.Diff, and BuildTesterPrompt renders the whole patch), so
+// the filter has to be applied here or a change to ".env" reaches a model
+// verbatim.
+func TestGlueBeadContextWithholdsAnExcludedPathsDiff(t *testing.T) {
+	filter, err := agents.NewSecretFilter("certs")
+	require.NoError(t, err)
+	bd := newGlueBD(glueIssue("sc-1", domain.BeadTypeTask, "in_progress", "add the retry"))
+	git := &glueGit{diff: glueSecretDiff()}
+	rig := glueSetup(t, bd, ConductorOptions{Git: git, Filter: filter}, config.RunSettings{})
+
+	bc, err := rig.Cond.BeadContext(context.Background(), "sc-1")
+	require.NoError(t, err)
+	require.NotNil(t, bc.Diff)
+	assert.Contains(t, bc.Diff.Patch, "for i := 0", "the code under review is still there")
+	assert.NotContains(t, bc.Diff.Patch, "wJalrXUtnFEMI", "the key in .env never reaches a prompt")
+	assert.NotContains(t, bc.Diff.Patch, "BEGIN PRIVATE KEY", "nor a configured exclude's contents")
+	assert.Contains(t, bc.Diff.Patch, agents.SecretPlaceholder, "and the reviewer is told the diff is partial")
+	assert.Equal(t, []string{"retry.go"}, glueDiffPaths(bc.Diff))
+	assert.Equal(t, 1, bc.Diff.Stats.Files, `so "1 file changed" is honest about what can be seen`)
+	assert.NotEmpty(t, git.diff.Files, "the filter copies rather than mutating what gitx returned")
+	assert.Len(t, git.diff.Files, 3)
+}
+
+// TestGlueBeadContextMeasuresTheUnfilteredChangeSet is the other half of
+// the same seam, and the reason FeedbackBeadContext carries two diffs. The
+// filtered one is what a reviewer is shown; the D-09 re-review ratio has to
+// be taken from what git actually returned, or a round that only touched an
+// excluded file reads as no movement at all and every standing approval
+// stands (agents.SecretFilter.GitDiff says as much in its own doc).
+func TestGlueBeadContextMeasuresTheUnfilteredChangeSet(t *testing.T) {
+	filter, err := agents.NewSecretFilter("certs")
+	require.NoError(t, err)
+	bd := newGlueBD(glueIssue("sc-1", domain.BeadTypeTask, "in_progress", "add the retry"))
+	git := &glueGit{diff: glueSecretDiff()}
+	rig := glueSetup(t, bd, ConductorOptions{Git: git, Filter: filter}, config.RunSettings{})
+
+	bc, err := rig.Cond.BeadContext(context.Background(), "sc-1")
+	require.NoError(t, err)
+	require.NotNil(t, bc.Measure)
+	assert.Equal(t, glueDiffPaths(git.diff), glueDiffPaths(bc.Measure),
+		"the measurement counts every file the round touched")
+	assert.Equal(t, git.diff.Stats, bc.Measure.Stats)
+	assert.NotEqual(t, bc.Diff.Stats, bc.Measure.Stats,
+		"and is therefore not the diff the reviewer is shown")
+	assert.Equal(t, bc.Measure, fbMeasured(bc), "which is what the loop measures")
+	assert.Equal(t, bc.Diff, fbMeasured(FeedbackBeadContext{Diff: bc.Diff}),
+		"a context with no unfiltered copy falls back to the one it has")
+}
+
+// A conductor with no filter configured is not a conductor with no filter:
+// the built-in patterns still apply, so the seam cannot be off by omission.
+func TestGlueBeadContextFiltersEvenWithNoConfiguredExcludes(t *testing.T) {
+	bd := newGlueBD(glueIssue("sc-1", domain.BeadTypeTask, "in_progress", "add the retry"))
+	git := &glueGit{diff: glueSecretDiff()}
+	rig := glueSetup(t, bd, ConductorOptions{Git: git}, config.RunSettings{})
+
+	bc, err := rig.Cond.BeadContext(context.Background(), "sc-1")
+	require.NoError(t, err)
+	require.NotNil(t, bc.Diff)
+	assert.NotContains(t, bc.Diff.Patch, "wJalrXUtnFEMI")
+	assert.Contains(t, bc.Diff.Patch, agents.SecretPlaceholder)
+	assert.Equal(t, []string{"retry.go", "certs/server.key"}, glueDiffPaths(bc.Diff),
+		"certs is only excluded when it is configured")
 }

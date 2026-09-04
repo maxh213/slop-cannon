@@ -74,8 +74,11 @@ func EffectiveLimits(cfg *config.RunConfig) config.Limits {
 		lim.MaxReviewRounds = def.MaxReviewRounds
 	}
 	if lim.MaxPushbackRounds < 1 {
-		// Zero is not "no pushback": NewFeedback reads it as "unset" too,
-		// and config.Load never leaves the key at zero.
+		// Zero is not "no pushback": [NewFeedback] reads it as "unset" too,
+		// so a run that honoured it here would still get the default. The
+		// key is validated as >= 1 (`limits.max_pushback_rounds`, P9-01), so
+		// only a hand-built config reaches this line, and the substitution
+		// is what keeps such a config behaving like a loaded one.
 		lim.MaxPushbackRounds = def.MaxPushbackRounds
 	}
 	if lim.AgentTimeout.Duration() <= 0 {
@@ -124,8 +127,24 @@ type BudgetPauser interface {
 	Paused() bool
 }
 
-// *Run is the production pauser.
-var _ BudgetPauser = (*Run)(nil)
+// BudgetPhaser is the optional half of [BudgetPauser]: a pauser that can
+// also say where the run is in its lifecycle. [RunBudget] uses it to tell
+// the user clearing a budget pause from the run ending underneath it —
+// [Run.Stop] leaves [Run.Paused] false because the phase moved to
+// [PhaseStopping], and reading that as "the user said carry on" published a
+// resume notice three lines above "run finished: stopped" (P9-01).
+//
+// A pauser that does not implement it is simply never seen to be ending.
+type BudgetPhaser interface {
+	// Phase is the run's lifecycle phase.
+	Phase() Phase
+}
+
+// *Run is the production pauser, and it knows its own phase.
+var (
+	_ BudgetPauser = (*Run)(nil)
+	_ BudgetPhaser = (*Run)(nil)
+)
 
 // RunBudgetOptions configures [NewRunBudget]. The zero value is a budget
 // with no caps, which is what an unconfigured run has: every wrapper it
@@ -161,16 +180,26 @@ type RunBudgetOptions struct {
 //		sch := NewScheduler(SchedulerOptions{Work: budget.Work(sources), Stop: budget.Stop(planner), …})
 //
 //	  - [RunBudget.MeterPlanner] meters every firing the scheduler makes.
-//	  - [RunBudget.Work] stops new work once a budget is crossed: no bead is
-//	    implemented and no plan is made, while the reviews already in flight
-//	    are still offered their agents so the round they are in can finish.
+//	  - [RunBudget.Work] stops new work once a budget is crossed: no fresh
+//	    bead is implemented and no plan is made, while the work that finishes
+//	    what is already in flight — the reviews and arbitrations of a round
+//	    under way, and a delivery conflict round over a bead the deliverer
+//	    has taken — is still offered its agents.
 //	  - [RunBudget.Stop] finishes a brief run once that has drained, with the
 //	    budget in the summary. It never finishes an autopilot run.
 //
 // Crossing a budget in autopilot pauses the run with a banner instead
-// (D-18). Resuming it is the user saying "carry on": the budget then grants
-// itself as much headroom again as the cap allows, so the run pauses once
-// more after another budget's worth rather than at once.
+// (D-18), and the pause is immediate: the scheduler's dispatch loop blocks
+// on [Run.AwaitResume], so the queued reviews wait with everything else and
+// only the agents already running finish. The draining that
+// [RunBudget.Work] describes is what a brief run — or an autopilot run with
+// no pauser — does instead.
+//
+// Resuming a paused run is the user saying "carry on": the budget then
+// grants itself as much headroom again as the cap allows, so the run pauses
+// once more after another budget's worth rather than at once. Only a resume
+// counts as that; a run that is stopping or finished never earns a grant
+// ([BudgetPhaser]).
 //
 // A nil *RunBudget is usable and does nothing, so a caller with no budget
 // can wire the wrappers unconditionally. All methods are safe for
@@ -413,9 +442,11 @@ func (b *RunBudget) describeLocked() (reason, banner string) {
 }
 
 // Work wraps a work source so that a crossed budget stops new work: while
-// the budget is tripped the run is offered only the reviews and
-// arbitrations that finish a round already in flight, never a bead to
-// implement and never a plan to make.
+// the budget is tripped the run is offered only what finishes something
+// already in flight — the reviews and arbitrations of a round under way,
+// and the delivery conflict rounds of a bead already taken (see
+// [budgetFinishing]) — never a fresh bead to implement and never a plan to
+// make.
 //
 // It is also where a resume is noticed: an autopilot run the user resumed
 // is no longer paused, so the budget grants itself the headroom to carry on
@@ -449,7 +480,13 @@ func (b *RunBudget) holding() bool {
 	// no longer paused is one the user told to carry on. A budget that
 	// could not pause the run has nothing to read a resume from, and holds
 	// new work back until the run ends.
-	if !b.paused || b.pauser == nil || b.pauser.Paused() {
+	//
+	// A run that is stopping or finished is the exception: its phase left
+	// PhasePaused because [Run.Stop] moved it on, not because anybody
+	// resumed it (P9-01). Granting it more headroom there would announce a
+	// resume that never happened, in the run log and in the summary's
+	// notice count, while the run was already shutting down.
+	if !b.paused || b.pauser == nil || b.pauser.Paused() || budgetEnding(b.pauser) {
 		b.mu.Unlock()
 		return true
 	}
@@ -463,6 +500,21 @@ func (b *RunBudget) holding() bool {
 			"the run was resumed over its budget: it will pause again at %s", ceiling)})
 	}
 	return false
+}
+
+// budgetEnding reports whether the run is shutting down or over, so that a
+// pause it never cleared is not mistaken for a resume ([BudgetPhaser]).
+func budgetEnding(p BudgetPauser) bool {
+	ph, ok := p.(BudgetPhaser)
+	if !ok {
+		return false
+	}
+	switch ph.Phase() {
+	case PhaseStopping, PhaseFinished:
+		return true
+	default:
+		return false
+	}
 }
 
 // grantLocked widens the ceilings until the spend so far is under them
@@ -485,14 +537,24 @@ func (b *RunBudget) grantLocked() (grants int, ceiling string) {
 	return b.grants, ceiling
 }
 
-// budgetFinishing keeps only the demands that finish a review round already
-// in flight. Implementation and planning are the new work a crossed budget
+// budgetFinishing keeps only the demands that finish something already in
+// flight: the reviews and arbitrations of a round under way, and the
+// delivery conflict rounds of a bead the deliverer has already taken.
+// Fresh implementation and planning are the new work a crossed budget
 // stops.
+//
+// A conflict round ([Deliverer.Demands]) is a [DemandImplement] like any
+// other, but it is finishing work: the deliverer has already moved the bead
+// to in_progress (D-10), so holding it back strands a half-delivered bead
+// there — with no engineer offered, and, in brief mode, [RunBudget.Stop]
+// finishing the run as soon as the loop goes idle (P9-01).
 func budgetFinishing(ds []Demand) []Demand {
 	kept := make([]Demand, 0, len(ds))
 	for _, d := range ds {
-		switch d.Kind {
-		case DemandReview, DemandArbitrate:
+		switch {
+		case d.Kind == DemandReview, d.Kind == DemandArbitrate:
+			kept = append(kept, d)
+		case d.Kind == DemandImplement && d.FiringTask() == events.TaskResolveConflict:
 			kept = append(kept, d)
 		}
 	}

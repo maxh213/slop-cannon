@@ -664,9 +664,14 @@ type RunSummary struct {
 	Fired     int `json:"agents_fired,omitempty"`
 	Completed int `json:"agents_finished,omitempty"`
 	Failed    int `json:"agents_failed,omitempty"`
-	// PRs counts PROpened, Merges counts Merged.
-	PRs    int `json:"prs_opened,omitempty"`
-	Merges int `json:"merged,omitempty"`
+	// PRs counts the pull requests the run opened, Merges counts Merged.
+	// A PROpened the reviewer publishes for somebody else's pull request
+	// (events.PROpened.External, D-11) is counted in Reviewing instead:
+	// the cannon reviews those and never opens or merges them, so counting
+	// them here would tell a user it had opened pull requests it did not.
+	PRs       int `json:"prs_opened,omitempty"`
+	Merges    int `json:"merged,omitempty"`
+	Reviewing int `json:"prs_reviewing,omitempty"`
 	// Warnings and Errors count Warning and Error events.
 	Warnings int `json:"warnings,omitempty"`
 	Errors   int `json:"errors,omitempty"`
@@ -1046,7 +1051,11 @@ func (f *logFold) add(ev events.Event) {
 		s.Failed++
 		f.dropAgent(e.Agent)
 	case events.PROpened:
-		s.PRs++
+		if e.External {
+			s.Reviewing++
+		} else {
+			s.PRs++
+		}
 		b := f.bead(e.Bead, at)
 		if b == nil {
 			f.skip(e.Kind())

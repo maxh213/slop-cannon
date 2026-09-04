@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"slop-cannon/internal/agents"
 	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/config"
@@ -254,10 +255,27 @@ type Run struct {
 	abortOnce  sync.Once
 	done       chan struct{}
 
-	mu         sync.Mutex
-	st         State
-	started    bool
-	finished   bool
+	// pubMu orders the publishes themselves. The counter under mu is not
+	// enough on its own: two publishers can be counted in one order and
+	// reach the bus in the other, which is how a conductor pass still in
+	// flight put a graph_changed line after run_finished in the run log
+	// even though the count agreed (P9-06 review). Held for the whole of
+	// [Run.Publish], including the bus write; nothing a publisher reaches
+	// takes it back, because a subscriber reads its own channel.
+	pubMu sync.Mutex
+
+	mu       sync.Mutex
+	st       State
+	started  bool
+	finished bool
+	// sealed is set by the [events.RunFinished] publish and makes every
+	// later publish a no-op, so the run log's last line really is the
+	// terminator and state.json's LastSeq really is the whole log (P9-07).
+	sealed bool
+	// afterSeal counts the publishes the seal refused, so a caller can
+	// report that a helper beside the run was still going when it
+	// finished. It is a diagnosis rather than an error.
+	afterSeal  int
 	stopping   bool
 	stopReason string
 	resumeCh   chan struct{}
@@ -424,11 +442,32 @@ func (r *Run) Epic() domain.BeadID {
 // method writes: the wiring is Options.Bus = Tee(OpenEventLog(dir), bus),
 // with the log first so a line is durable before any subscriber renders it
 // (P6-08).
+//
+// [events.RunFinished] is the terminator: publishing it seals the run, and
+// every publish after it is dropped. The whole method is serialised, so the
+// order the events are counted in is the order they reach the bus and the
+// run log, and nothing can slip past the terminator on its way out.
 func (r *Run) Publish(ev events.Event) {
 	if ev == nil {
 		return
 	}
+	r.pubMu.Lock()
+	defer r.pubMu.Unlock()
 	r.mu.Lock()
+	// Nothing may follow the terminator. A pass that was still in flight
+	// when the run finished — a conductor sync publishing
+	// [events.GraphChanged], say — would otherwise land after
+	// [events.RunFinished] and leave the run log one line longer than the
+	// frozen state.json, which every reader of a finished run (`sc status`,
+	// `sc logs`, resume) takes as the invariant it is not (P9-07).
+	if r.sealed {
+		r.afterSeal++
+		r.mu.Unlock()
+		return
+	}
+	if _, terminal := ev.(events.RunFinished); terminal {
+		r.sealed = true
+	}
 	r.st.LastSeq++
 	r.st.LastEventKind = ev.Kind()
 	r.st.LastEventAt = ev.At()
@@ -436,6 +475,17 @@ func (r *Run) Publish(ev events.Event) {
 	if r.bus != nil {
 		r.bus.Publish(ev)
 	}
+}
+
+// PublishedAfterFinish reports how many events were published after
+// [events.RunFinished] sealed the stream and were therefore dropped. A
+// non-zero count means something beside the run — a conductor pass, a gate
+// poll — was still in flight when the run ended; the run log and state.json
+// still agree, which is the point of the seal.
+func (r *Run) PublishedAfterFinish() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.afterSeal
 }
 
 // Warn publishes an [events.Warning] for something recoverable a human
@@ -932,6 +982,16 @@ func (r *Run) ResumeResult() *gitx.ResumeResult {
 	return r.resumeRes
 }
 
+// ResumeHandler returns what the run acts on a resume with ([Options.OnResume]),
+// or nil when it was given none — in which case [Run.reconcileResume]
+// reconciles the worktrees and stops there, leaving a bead whose pull
+// request is open without its gh:pr gate and a mid-rebase worktree without
+// its engineer. Whoever assembles a run is meant to pass one, and this is
+// how a test pins that they did (P9-03).
+func (r *Run) ResumeHandler() ResumeHandler {
+	return r.opts.OnResume
+}
+
 // reconcileResume is the --resume half of P6-15: gitx reattaches the
 // worktrees and reconciles branch state into bead state, then the entries
 // that need an action get one. A bead left mid-rebase goes back to its
@@ -1365,14 +1425,42 @@ func (DefaultLockPolicy) Stale(h LockHolder) bool {
 	return !processAlive(h.PID)
 }
 
-// processAlive reports whether a process with that id exists. P9-04
-// replaces this with something that also tells "not mine" from "not there".
+// processAlive reports whether a process with that id exists on this
+// machine. It is P6-01's signal-0 probe, read carefully (P9-04): kill(2)
+// answers EPERM for a process that *exists* but belongs to another user —
+// `sudo sc /repo` in one terminal and `sc /repo` in another — and reading
+// that as "the holder is gone" would reap a live run's lock, which is the
+// one direction that must never happen. Only "no such process" counts as
+// gone; an answer this probe cannot interpret is treated as alive, because
+// a lock can always be taken with --force, while two runs firing at one
+// repository cannot be undone.
+//
+// It still cannot say the process is the *same* one that took the lock —
+// that is what [ProcessStart] adds.
 func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
 	p, err := os.FindProcess(pid)
 	if err != nil {
 		return false
 	}
-	return p.Signal(syscall.Signal(0)) == nil
+	return aliveFromSignal(p.Signal(syscall.Signal(0)))
+}
+
+// aliveFromSignal reads the answer kill(pid, 0) gave. It is separate from
+// [processAlive] so the EPERM case can be tested without a second user.
+func aliveFromSignal(err error) bool {
+	switch {
+	case err == nil:
+		return true // the signal was accepted: the process is there.
+	case errors.Is(err, syscall.ESRCH), errors.Is(err, os.ErrProcessDone):
+		return false // no such process, or one this sc already waited for.
+	case errors.Is(err, syscall.EPERM):
+		return true // it exists; it simply belongs to somebody else.
+	default:
+		return true // an answer we cannot read is not proof it is gone.
+	}
 }
 
 // LockPath returns the run lock of the repository a run directory belongs
@@ -1409,31 +1497,103 @@ func acquireLock(runDir string, run domain.RunID, policy LockPolicy, now time.Ti
 	data = append(data, '\n')
 
 	for attempt := 0; attempt < 2; attempt++ {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, runFilePerm)
+		err := publishLock(path, data)
 		if err == nil {
-			_, werr := f.Write(data)
-			cerr := f.Close()
-			if werr != nil || cerr != nil {
-				_ = os.Remove(path)
-				return nil, fmt.Errorf("orchestrator: write the run lock: %w", errors.Join(werr, cerr))
-			}
 			return &lockFile{path: path, holder: holder}, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("orchestrator: take the run lock: %w", err)
 		}
 		existing, readErr := readLock(path)
-		if readErr == nil && !policy.Stale(existing) {
+		if cause := lockUnusable(existing, readErr); cause != nil {
+			// A lock this sc cannot read is not automatically rubbish: it
+			// may be the half-written file of a run starting this very
+			// instant. The policy decides, with a grace period (P9-04);
+			// the read failure alone never does.
+			if !unreadableLockStale(policy, path, cause) {
+				return nil, &LockedError{Path: path, State: LockCorrupt, Age: lockFileAge(path, LockOptions{}), cause: cause}
+			}
+		} else if !policy.Stale(existing) {
 			return nil, fmt.Errorf("%w: run %s (pid %d on %s, since %s) is using %s; stop it first, or resume it",
 				ErrLocked, existing.Run, existing.PID, existing.Host,
 				existing.TakenAt.Format(time.RFC3339), filepath.Dir(path))
 		}
-		// Stale, or unreadable and therefore useless: take it over.
+		// Stale, or debris the policy agreed to clear: take it over.
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return nil, fmt.Errorf("orchestrator: drop the stale run lock: %w", err)
 		}
 	}
 	return nil, fmt.Errorf("%w: %s keeps being retaken", ErrLocked, path)
+}
+
+// lockUnusable says why an existing lock cannot be reasoned about: it could
+// not be read or parsed (readErr), or it names no process at all. A usable
+// lock returns nil, and is then the [LockPolicy]'s business.
+func lockUnusable(h LockHolder, readErr error) error {
+	if readErr != nil {
+		return readErr
+	}
+	if h.PID <= 0 {
+		return fmt.Errorf("the run lock names no process (pid %d)", h.PID)
+	}
+	return nil
+}
+
+// publishLock writes the lock record so that it becomes visible *complete*:
+// the bytes go to a temporary file in the same directory and that file is
+// hard-linked into place, which fails when somebody already holds the lock
+// (os.ErrExist) and otherwise publishes the whole record in one step.
+//
+// The plain O_EXCL create P6-01 used left a window of exactly the wrong
+// kind (P9-04): between the create and the write the lock is a zero-byte
+// file, and a second sc arriving in that window read it as debris, deleted
+// it and started — two runs at one repository, each holding a lock the
+// other had unlinked. A file system with no hard links (rare, and never
+// where a state directory lives) falls back to the old create-then-write.
+func publishLock(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, LockFileName+".tmp-*")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer func() { _ = os.Remove(name) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(name, runFilePerm); err != nil {
+		return err
+	}
+	if err := os.Link(name, path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return os.ErrExist
+		}
+		return publishLockExclusive(path, data)
+	}
+	return nil
+}
+
+// publishLockExclusive is publishLock's fallback for a file system that
+// cannot hard-link: O_EXCL, then the write.
+func publishLockExclusive(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, runFilePerm)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return os.ErrExist
+		}
+		return err
+	}
+	_, werr := f.Write(data)
+	cerr := f.Close()
+	if werr != nil || cerr != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("orchestrator: write the run lock: %w", errors.Join(werr, cerr))
+	}
+	return nil
 }
 
 // readLock reads a lock file.
@@ -1449,10 +1609,17 @@ func readLock(path string) (LockHolder, error) {
 	return h, nil
 }
 
-// release removes the lock file if it is still ours.
+// release removes the lock file if it is still ours. A lock that names
+// another run, and one that cannot be read at all, is left where it is: an
+// unreadable file cannot be proved to be ours, and it may be another sc's
+// lock caught mid-write (P9-04). Real debris is cleared by the next run,
+// once it is older than the grace period.
 func (l *lockFile) release() error {
 	existing, err := readLock(l.path)
-	if err == nil && (existing.Run != l.holder.Run || existing.PID != l.holder.PID) {
+	if err != nil {
+		return nil
+	}
+	if existing.Run != l.holder.Run || existing.PID != l.holder.PID {
 		// Somebody took it over; leave theirs alone.
 		return nil
 	}
@@ -1606,6 +1773,16 @@ type ConductorOptions struct {
 	// (ErrRebaseInProgress, P6-16(b), P8-18). Nil commits nothing and
 	// measures no diffs.
 	Git DeliveryGit
+	// Filter is the run's secret filter (P9-05). It is the last thing
+	// between the repository and a prompt: the change set
+	// [Conductor.BeadContext] hands the feedback loop goes through
+	// [agents.SecretFilter.GitDiff], so a change to ".env", a key or any
+	// configured `exclude` path arrives as [agents.SecretPlaceholder]
+	// rather than as its own lines. A nil filter is not "no filtering" —
+	// it is the built-in patterns alone — so the seam can never be off by
+	// omission; pass the run's filter to add the configured `exclude`
+	// patterns to it.
+	Filter *agents.SecretFilter
 
 	// Repo, Brief, Rules, Vibes, Budget and CheckCommand are the parts of
 	// the prompt context that do not change from firing to firing.
@@ -1640,6 +1817,14 @@ type ConductorOptions struct {
 	// from the beads' comments (P8-16). The zero value follows the run:
 	// a resumed run restores, a fresh one does not.
 	Restore *bool
+	// RulesGate is the run's rules compliance gate (P9-06). A resume replays
+	// bd's comments without re-running any role check, so the gate is told
+	// about a thread ([RulesRestorer.RestoreMessages]) before
+	// [Feedback.Restore] applies it: without that the gate's memory is
+	// empty on a resumed run and a violation an old comment settled the
+	// wrong way comes back settled. Nil restores without a gate, which only
+	// a test wants.
+	RulesGate RulesRestorer
 	// Logger is where the glue logs; nil means the run's logger.
 	Logger *slog.Logger
 }
@@ -1689,16 +1874,24 @@ type Conductor struct {
 	log      *slog.Logger
 	restore  bool
 
+	// deliveries counts the delivery goroutines in flight; a delivery is
+	// not part of a pass (P8-14 gap 5), so the pass does not wait for it.
+	deliveries sync.WaitGroup
+
 	mu       sync.Mutex
 	feedback ConductorFeedback
 	delivery ConductorDelivery
 	gates    GateKicker
 	inflight map[domain.BeadID]bool
-	restored map[domain.BeadID]bool
+	shipped  map[domain.BeadID]bool
+	owed     map[domain.BeadID]bool
+	frozen   bool
 	seen     map[domain.BeadID]bool
 	snapshot []beads.Issue
 	warned   string
 	stats    ConductorStats
+	dctx     context.Context
+	dcancel  context.CancelFunc
 }
 
 // NewConductor builds the glue. It gives the run its bead source when it
@@ -1723,7 +1916,8 @@ func NewConductor(opts ConductorOptions) (*Conductor, error) {
 		delivery: opts.Delivery,
 		gates:    opts.Gates,
 		inflight: map[domain.BeadID]bool{},
-		restored: map[domain.BeadID]bool{},
+		shipped:  map[domain.BeadID]bool{},
+		owed:     map[domain.BeadID]bool{},
 		seen:     map[domain.BeadID]bool{},
 	}
 	if c.interval <= 0 {
@@ -1737,6 +1931,11 @@ func NewConductor(opts ConductorOptions) (*Conductor, error) {
 			Host: opts.Run, Statuses: opts.Statuses, Logger: c.log,
 		})
 	}
+	// P9-05: the tree summary a prompt renders is filtered once here, so an
+	// assembler that forgets to filter its scan still cannot leak a path
+	// the exclude patterns cover. The filter is idempotent, so the run's
+	// own already-filtered scan passes through unchanged.
+	c.opts.Repo = opts.Filter.RepoContext(opts.Repo)
 	c.restore = opts.Run.RunConfig().Resume
 	if opts.Restore != nil {
 		c.restore = *opts.Restore
@@ -1837,8 +2036,15 @@ var _ BeadLister = (*beads.Client)(nil)
 // between passes is the longer of the interval and the time the last pass
 // took, so a slow bd — every pass spawns subprocesses through one
 // serialised client — makes the glue run less often rather than starving
-// the agents' own calls.
+// the agents' own calls. That pacing is about bd's latency: a delivery is
+// not part of a pass at all ([Conductor.deliverApproved]), so a rebase, a
+// check command and a `gh pr create` never hold the loop up.
+//
+// On the way out it cancels the deliveries still in flight and waits for
+// them, bounded by [deliveryDrain], so nothing is left running behind a
+// finished run.
 func (c *Conductor) Run(ctx context.Context) error {
+	defer c.stopDeliveries()
 	for {
 		started := time.Now()
 		if err := c.Sync(ctx); err != nil && ctx.Err() == nil {
@@ -1863,10 +2069,15 @@ func (c *Conductor) Run(ctx context.Context) error {
 
 // Sync is one pass: read the run's beads, announce the ones the log has not
 // seen, adopt the ready ones into the feedback loop (rebuilding the threads
-// of a resumed run first), and deliver the approved ones. Every step is
-// attempted even when an earlier one failed — a pass that cannot read the
-// ready set can still ship an approved bead — and the failures come back
-// joined.
+// of a resumed run first), and start the delivery of the approved ones.
+// Every step is attempted even when an earlier one failed — a pass that
+// cannot read the ready set can still ship an approved bead — and the
+// failures come back joined.
+//
+// The deliveries run in the background ([Conductor.deliverApproved]), so
+// the error a pass returns is the bookkeeping's, not theirs; a delivery
+// that fails warns and is counted like a failed pass. [Conductor.Deliver]
+// is the synchronous form, for a caller that wants the outcome.
 func (c *Conductor) Sync(ctx context.Context) error {
 	issues, err := c.beads.ListRun(ctx, c.run.ID(), true)
 	if err != nil {
@@ -1878,6 +2089,7 @@ func (c *Conductor) Sync(ctx context.Context) error {
 
 	var errs []error
 	if c.restore {
+		c.freezeRestorable(list)
 		if err := c.restoreThreads(ctx, list); err != nil {
 			errs = append(errs, err)
 		}
@@ -1885,9 +2097,7 @@ func (c *Conductor) Sync(ctx context.Context) error {
 	if err := c.trackReady(ctx); err != nil {
 		errs = append(errs, err)
 	}
-	if err := c.deliverApproved(ctx, list); err != nil {
-		errs = append(errs, err)
-	}
+	c.deliverApproved(ctx, list)
 	joined := errors.Join(errs...)
 	c.record(true, joined)
 	return joined
@@ -1915,48 +2125,108 @@ func (c *Conductor) trackReady(ctx context.Context) error {
 	return nil
 }
 
+// freezeRestorable takes the resume's restore set from the first pass's
+// listing and never adds to it again (P8-14 gap 1). Restore is a *resume*
+// step: it replays a bead's whole comment thread into a thread the loop is
+// not holding yet. Anything that becomes restorable later became so because
+// this run moved it — the scheduler claims an open bead the moment it is
+// offered, which takes it to in_progress — and replaying an old thread over
+// a live one abandons the engineer the run has just fired, double-counts
+// the D-08 pushback exchanges and can settle the bead out from under the
+// loop that is waiting on it.
+//
+// The set is the beads the run found already past open, whatever happens to
+// them afterwards; a bead in it that turns out to have no thread to replay,
+// or one the loop has already adopted, is dropped by [Conductor.restoreThreads].
+func (c *Conductor) freezeRestorable(list []domain.Bead) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.frozen {
+		return
+	}
+	c.frozen = true
+	for _, b := range list {
+		if b.ID == "" || b.Type == domain.BeadTypeEpic || !conductorRestorable(b) {
+			continue
+		}
+		c.owed[b.ID] = true
+	}
+}
+
+// restoreOwed returns the beads of list whose threads the resume still owes,
+// in the listing's order.
+func (c *Conductor) restoreOwed(list []domain.Bead) []domain.Bead {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.owed) == 0 {
+		return nil
+	}
+	out := make([]domain.Bead, 0, len(c.owed))
+	for _, b := range list {
+		if c.owed[b.ID] {
+			out = append(out, b)
+		}
+	}
+	return out
+}
+
+// restoreSettled marks a bead's restore finished — replayed, adopted
+// instead, or already live — so no later pass touches its thread again.
+func (c *Conductor) restoreSettled(id domain.BeadID) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.owed, id)
+}
+
 // restoreThreads rebuilds the feedback threads of a resumed run from the
 // beads' own comments (P8-16), once per bead. Without it a resumed run
 // re-fires a changes_requested bead in implement mode and throws its items,
 // responses, holds and rulings away.
 //
-// Only a bead that is past the open state and actually carries structured
-// comments is restored: [Feedback.Restore] concludes the thread it replays,
-// and a bead with nothing to replay would be concluded out of a state it
-// never left. Everything else is adopted the ordinary way.
+// The candidates are frozen at the first pass ([Conductor.freezeRestorable])
+// and only a bead that is past the open state and actually carries
+// structured comments is restored: [Feedback.Restore] concludes the thread
+// it replays, and a bead with nothing to replay would be concluded out of a
+// state it never left. Everything else is adopted the ordinary way.
+//
+// A bead the loop already holds a thread for is left alone — the resume
+// lost that race, and the live thread is the true one — and a bead whose
+// comments or replay failed stays owed, so a transient bd or worktree
+// failure is retried on the next pass instead of stranding the bead for the
+// rest of the run (P8-14 gap 2).
 func (c *Conductor) restoreThreads(ctx context.Context, list []domain.Bead) error {
 	feedback, _, _ := c.parts()
 	if feedback == nil {
 		return nil
 	}
 	var errs []error
-	for _, b := range list {
-		if b.ID == "" || b.Type == domain.BeadTypeEpic || !conductorRestorable(b) {
-			continue
-		}
-		c.mu.Lock()
-		done := c.restored[b.ID]
-		c.restored[b.ID] = true
-		c.mu.Unlock()
-		if done {
+	for _, b := range c.restoreOwed(list) {
+		if _, live := feedback.Thread(b.ID); live {
+			c.restoreSettled(b.ID)
 			continue
 		}
 		msgs, err := c.beads.Messages(ctx, b.ID)
 		if err != nil {
-			c.mu.Lock()
-			delete(c.restored, b.ID)
-			c.mu.Unlock()
 			errs = append(errs, fmt.Errorf("orchestrator: conductor: reading %s's comments: %w", b.ID, err))
 			continue
 		}
 		if len(msgs) == 0 {
+			c.restoreSettled(b.ID)
 			feedback.Track(b)
 			continue
+		}
+		// P9-06: the gate reads the thread before the loop replays it, so a
+		// violation these comments settled the wrong way is open again by
+		// the time the replay tries to ship the bead through the guarded
+		// state store.
+		if c.opts.RulesGate != nil {
+			c.opts.RulesGate.RestoreMessages(b.ID, msgs)
 		}
 		if err := feedback.Restore(ctx, b, msgs); err != nil {
 			errs = append(errs, fmt.Errorf("orchestrator: conductor: restoring %s's thread: %w", b.ID, err))
 			continue
 		}
+		c.restoreSettled(b.ID)
 		c.mu.Lock()
 		c.stats.Restored++
 		c.mu.Unlock()
@@ -1982,26 +2252,102 @@ func conductorRestorable(b domain.Bead) bool {
 	}
 }
 
-// deliverApproved ships every bead the loop approved, at most once at a
-// time per bead.
-func (c *Conductor) deliverApproved(ctx context.Context, list []domain.Bead) error {
+// deliveryDrain bounds how long the conductor waits for the deliveries it
+// cancelled on the way out. It is wall-clock rather than the run's clock on
+// purpose: it bounds goroutines, not the run's behaviour.
+const deliveryDrain = 30 * time.Second
+
+// deliverApproved starts the delivery of every bead the loop approved, at
+// most one at a time per bead, and does not wait for it: a delivery is a
+// rebase, the repository's check command, a push and a `gh pr create` —
+// minutes in a real repository — and holding the pass open for it would
+// stop `bd ready` reaching [Feedback.Track], so every engineer would idle
+// until the delivery returned (P8-14 gap 5). The pass keeps offering work
+// while the delivery runs; [Conductor.claim] is what stops the next pass
+// shipping the same bead twice.
+//
+// Seeing a bead anywhere but approved also clears the mark a finished
+// delivery left ([Conductor.shipped]), so a bead that comes back to
+// approved — a person resolves a needs_human hand-off, a gate escalation is
+// undone — is delivered again rather than ignored for the rest of the run
+// (P8-14 gap 6).
+func (c *Conductor) deliverApproved(ctx context.Context, list []domain.Bead) {
 	_, delivery, _ := c.parts()
 	if delivery == nil {
-		return nil
+		return
 	}
-	var errs []error
 	for _, b := range list {
-		if b.State != domain.BeadStateApproved || b.Type == domain.BeadTypeEpic {
+		if b.ID == "" || b.Type == domain.BeadTypeEpic {
+			continue
+		}
+		if b.State != domain.BeadStateApproved {
+			c.leftApproved(b.ID)
 			continue
 		}
 		if !c.claim(b.ID) {
 			continue
 		}
-		if err := c.Deliver(ctx, b); err != nil {
-			errs = append(errs, err)
-		}
+		bead := b
+		dctx := c.deliveryContext(ctx)
+		c.deliveries.Add(1)
+		go func() {
+			defer c.deliveries.Done()
+			if err := c.Deliver(dctx, bead); err != nil && dctx.Err() == nil {
+				c.record(false, err)
+				c.warn(err)
+			}
+		}()
 	}
-	return errors.Join(errs...)
+}
+
+// deliveryContext is the context a background delivery runs under: the
+// pass's values without its cancellation, cancelled when the run finishes,
+// when [Conductor.Run] returns or by [Conductor.stopDeliveries]. A pass is
+// over long before the delivery it started, so the pass's own cancellation
+// must not reach it.
+func (c *Conductor) deliveryContext(ctx context.Context) context.Context {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dctx == nil {
+		c.dctx, c.dcancel = context.WithCancel(context.WithoutCancel(ctx))
+		dctx, cancel := c.dctx, c.dcancel
+		go func() {
+			select {
+			case <-c.run.Done():
+				cancel()
+			case <-dctx.Done():
+			}
+		}()
+	}
+	return c.dctx
+}
+
+// WaitDeliveries blocks until every delivery this conductor has started has
+// finished. [Conductor.Run] waits on the way out, and a caller driving
+// [Conductor.Sync] by hand — a test — waits when it wants the outcome of
+// the pass it just made.
+func (c *Conductor) WaitDeliveries() { c.deliveries.Wait() }
+
+// stopDeliveries cancels the deliveries in flight and waits for them,
+// bounded by [deliveryDrain] so a delivery that ignores its context cannot
+// hold the run's shutdown open for ever.
+func (c *Conductor) stopDeliveries() {
+	c.mu.Lock()
+	cancel := c.dcancel
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	done := make(chan struct{})
+	go func() { defer close(done); c.deliveries.Wait() }()
+	timer := time.NewTimer(deliveryDrain)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		c.log.Warn("a delivery is still running after the conductor stopped",
+			slog.Duration("waited", deliveryDrain))
+	}
 }
 
 // Deliver ships one bead and routes the outcome back into the loops. The
@@ -2049,6 +2395,12 @@ func (c *Conductor) Deliver(ctx context.Context, b domain.Bead) error {
 // loop is only told where the bead went (P6-06). A pull request that is now
 // waiting for its gate kicks the gate poller so the merge is noticed
 // without waiting for its next tick (D-20).
+//
+// It also ends the bead's claim on the conductor. An outcome that gives the
+// bead back to the loop releases it outright; one that leaves it somewhere
+// else — behind its gate, merged, or with a person — marks it shipped,
+// which a later listing that finds it anywhere but approved clears
+// ([Conductor.leftApproved]).
 func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *DeliveryOutcome) error {
 	feedback, _, gates := c.parts()
 	if out == nil {
@@ -2062,6 +2414,7 @@ func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *Del
 	switch out.Kind {
 	case DeliveryPending:
 		// Safety on: the bead waits in delivering behind its gh:pr gate.
+		c.ship(id)
 		c.mu.Lock()
 		c.stats.Shipped++
 		c.mu.Unlock()
@@ -2069,6 +2422,7 @@ func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *Del
 			gates.Kick()
 		}
 	case DeliveryMerged:
+		c.ship(id)
 		c.mu.Lock()
 		c.stats.Shipped++
 		c.mu.Unlock()
@@ -2086,7 +2440,10 @@ func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *Del
 		// The engineer has the bead (D-10), or the attempt may be retried.
 		c.release(id)
 	case DeliveryHandedOff:
-		// A person owns it now; nothing here may pick it back up.
+		// A person owns it now, so the conductor does not pick it back up
+		// — until bd shows it out of approved and back in it again, which
+		// is what resolving the hand-off looks like from here.
+		c.ship(id)
 	}
 	if feedback != nil {
 		feedback.Observe(id, out.State)
@@ -2134,6 +2491,21 @@ func (c *Conductor) ChangeRatio(ctx context.Context, id domain.BeadID, previous,
 // failure of the round — there is simply nothing to commit until the
 // engineer has resolved the conflict, and nothing to diff either, since
 // mid-rebase HEAD is the commit the branch is being rebased onto.
+//
+// This is the only production producer of the diff a tester's prompt
+// renders, so it is where the P9-05 secret filter has to sit: the change
+// set goes through [agents.SecretFilter.GitDiff] before it leaves, and a
+// change to ".env", a key or any configured `exclude` path arrives as
+// [agents.SecretPlaceholder] instead of as its own lines. The filter is
+// applied even when [ConductorOptions.Filter] is nil, because a nil filter
+// is the built-in patterns rather than none. The notes go through
+// [agents.SecretFilter.Texts] for the same reason: they quote the
+// repository.
+//
+// The D-09 change ratio is measured on this filtered diff, which the loop
+// compares with the previous filtered one; the excluded paths are missing
+// from both sides, so the comparison stays honest about everything a
+// reviewer can actually see.
 func (c *Conductor) BeadContext(ctx context.Context, id domain.BeadID) (FeedbackBeadContext, error) {
 	feedback, _, _ := c.parts()
 	issues, err := c.beads.Show(ctx, id)
@@ -2182,6 +2554,14 @@ func (c *Conductor) BeadContext(ctx context.Context, id domain.BeadID) (Feedback
 			}
 		}
 	}
+	// P9-05: nothing below this line may carry an excluded path's
+	// contents. The unfiltered copy goes on as
+	// FeedbackBeadContext.Measure, which is only ever measured (the D-09
+	// ratio has to count the lines a withheld file moved) and never
+	// rendered.
+	measure := diff
+	diff = c.opts.Filter.GitDiff(diff)
+	notes = c.opts.Filter.Texts(notes)
 
 	return FeedbackBeadContext{
 		Bead: prompt.BeadContext{
@@ -2199,6 +2579,7 @@ func (c *Conductor) BeadContext(ctx context.Context, id domain.BeadID) (Feedback
 		Budget:       c.opts.Budget,
 		CheckCommand: c.opts.CheckCommand,
 		Diff:         diff,
+		Measure:      measure,
 		Model:        c.opts.Model,
 		MaxTurns:     c.opts.MaxTurns,
 		Timeout:      c.opts.Timeout,
@@ -2262,11 +2643,13 @@ func (c *Conductor) announce(issues []beads.Issue, list []domain.Bead) {
 	c.run.Publish(events.GraphChanged{Meta: c.run.Meta(), Epic: epic, Beads: work})
 }
 
-// claim reserves a bead for delivery so two passes never ship one twice.
+// claim reserves a bead for delivery so two passes never ship one twice: a
+// delivery is in flight, or the last one ended somewhere the bead has not
+// come back from yet.
 func (c *Conductor) claim(id domain.BeadID) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.inflight[id] {
+	if c.inflight[id] || c.shipped[id] {
 		return false
 	}
 	c.inflight[id] = true
@@ -2278,6 +2661,27 @@ func (c *Conductor) claim(id domain.BeadID) bool {
 func (c *Conductor) release(id domain.BeadID) {
 	c.mu.Lock()
 	delete(c.inflight, id)
+	c.mu.Unlock()
+}
+
+// ship records a delivery that ended somewhere the conductor may not pick
+// the bead back up from on its own: it is behind its gh:pr gate, it has
+// merged, or a person owns it now. The mark is dropped the moment bd shows
+// the bead anywhere but approved ([Conductor.leftApproved]), so a bead that
+// really does come back to approved is delivered again.
+func (c *Conductor) ship(id domain.BeadID) {
+	c.mu.Lock()
+	delete(c.inflight, id)
+	c.shipped[id] = true
+	c.mu.Unlock()
+}
+
+// leftApproved forgets a finished delivery once the bead has moved on from
+// approved, which is what makes a later return to approved a new delivery
+// rather than one the conductor refuses for ever.
+func (c *Conductor) leftApproved(id domain.BeadID) {
+	c.mu.Lock()
+	delete(c.shipped, id)
 	c.mu.Unlock()
 }
 

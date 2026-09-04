@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"log/slog"
 
+	"slop-cannon/internal/agents"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/config"
-	"slop-cannon/internal/domain"
 	"slop-cannon/internal/gitx"
 	"slop-cannon/internal/orchestrator"
 )
@@ -54,6 +54,11 @@ type prReviewSetup struct {
 	// Context describes a bead for the prompt builders
 	// ([orchestrator.Conductor.BeadContext]).
 	Context orchestrator.FeedbackContextFunc
+	// Filter is the run's P9-05 secrets filter. The pull request's diff is
+	// the one change set that does not come from the conductor, so it is
+	// filtered here instead ([filterPRDiffs]); nil still applies the
+	// built-in patterns.
+	Filter *agents.SecretFilter
 	// Logger is the run's logger.
 	Logger *slog.Logger
 }
@@ -138,7 +143,9 @@ func newPRReviewer(ctx context.Context, s prReviewSetup) (*orchestrator.PRReview
 		if err != nil {
 			return nil, decision, err
 		}
-		checkout = c
+		// P9-05: a contributor's branch may carry a .env or a key, and the
+		// tester's prompt quotes this diff.
+		checkout = filterPRDiffs(c, s.Filter)
 	}
 	reviewer, err := orchestrator.NewPRReview(orchestrator.PRReviewOptions{
 		Watcher:  watcher,
@@ -194,18 +201,4 @@ func prReviewSources(r *orchestrator.PRReview, sources ...orchestrator.WorkSourc
 		sources = append(sources, r)
 	}
 	return orchestrator.WorkSources(sources...)
-}
-
-// prReviewBeadIDs lists the review beads the reviewer is tracking, for a
-// caller that wants to name them (the finish report, `sc status`).
-func prReviewBeadIDs(r *orchestrator.PRReview) []domain.BeadID {
-	if r == nil {
-		return nil
-	}
-	rs := r.Reviews()
-	out := make([]domain.BeadID, 0, len(rs))
-	for _, s := range rs {
-		out = append(out, s.Bead)
-	}
-	return out
 }

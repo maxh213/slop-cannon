@@ -1,21 +1,27 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
 	"testing"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
+
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
 )
 
 // Benchmarks for the graph view (P9-07). The budget the task sets is that
-// laying a 200-bead run out takes less than 100 ms, which is what
-// [BenchmarkGraphLayout] and [BenchmarkGraphView] measure: the layering that
-// [BuildGraphLayout] does, and the whole frame — layering, canvas paint,
-// edge routing and clipping — that [GraphModel.View] renders from it.
+// laying a 200-bead run out takes less than 100 ms, which three benchmarks
+// measure at three widths: [BenchmarkGraphLayout] is the layering
+// [BuildGraphLayout] does, [BenchmarkGraphView] is the graph pane
+// [GraphModel.View] paints from it — canvas paint, edge routing and the clip
+// to the pane — and [BenchmarkFullFrame] is the whole terminal frame
+// [Model.View] draws around that pane, header, tab bar, footer and animation
+// layer included. The last is the one a key press really costs.
 //
 // The numbers these produce are written up in docs/performance.md. Run them
 // with:
@@ -54,6 +60,29 @@ var benchEpoch = time.Date(2026, 4, 1, 9, 0, 0, 0, time.UTC)
 // one bead and a fan gives one level of n, and both are cheaper to lay out
 // and to paint than the layered diamond a planned run actually produces.
 func benchGraphState(n int) *State {
+	st := NewState(benchRun())
+	for _, ev := range benchGraphEvents(n) {
+		st.Apply(ev)
+	}
+	return st
+}
+
+// benchRun is the run every benchmark fixture is built for.
+func benchRun() domain.Run {
+	return domain.Run{
+		ID:        "sc-bench-001",
+		RepoPath:  "/tmp/repo",
+		Mode:      domain.RunModeAutopilot,
+		Brief:     "make the thing work",
+		StartedAt: benchEpoch,
+		Config:    domain.ConfigSnapshot{Ammo: 8, Safety: true, Cartridge: "mock"},
+	}
+}
+
+// benchGraphEvents is the event stream behind [benchGraphState], so a
+// benchmark that drives the whole [Model] can replay exactly the run that
+// the graph-only benchmarks fold straight into a [State].
+func benchGraphEvents(n int) []events.Event {
 	const wave = 20
 	beads := make([]domain.Bead, 0, n)
 	for i := range n {
@@ -74,25 +103,19 @@ func benchGraphState(n int) *State {
 		beads = append(beads, b)
 	}
 
-	st := NewState(domain.Run{
-		ID:        "sc-bench-001",
-		RepoPath:  "/tmp/repo",
-		Mode:      domain.RunModeAutopilot,
-		Brief:     "make the thing work",
-		StartedAt: benchEpoch,
-		Config:    domain.ConfigSnapshot{Ammo: 8, Safety: true, Cartridge: "mock"},
-	})
-	st.Apply(events.RunStarted{Meta: events.MetaAt("sc-bench-001", benchEpoch), Info: st.Run})
-	st.Apply(events.GraphChanged{
-		Meta:  events.MetaAt("sc-bench-001", benchEpoch.Add(time.Minute)),
-		Epic:  "sc-epic",
-		Beads: beads,
-	})
+	out := []events.Event{
+		events.RunStarted{Meta: events.MetaAt("sc-bench-001", benchEpoch), Info: benchRun()},
+		events.GraphChanged{
+			Meta:  events.MetaAt("sc-bench-001", benchEpoch.Add(time.Minute)),
+			Epic:  "sc-epic",
+			Beads: beads,
+		},
+	}
 	for i, b := range beads {
 		if b.State != domain.BeadStateInProgress && b.State != domain.BeadStateInReview {
 			continue
 		}
-		st.Apply(events.AgentSpawned{
+		out = append(out, events.AgentSpawned{
 			Meta: events.MetaAt("sc-bench-001", benchEpoch.Add(time.Duration(i)*time.Second)),
 			Agent: domain.Agent{
 				ID:        domain.AgentID("eng-" + string(b.ID)),
@@ -108,7 +131,7 @@ func benchGraphState(n int) *State {
 			Attempt:   1,
 		})
 	}
-	return st
+	return out
 }
 
 // benchBeadState spreads the D-07 states over the run the way a run halfway
@@ -144,9 +167,11 @@ func BenchmarkGraphLayout(b *testing.B) {
 	}
 }
 
-// BenchmarkGraphView measures a whole frame, which is what the 100 ms budget
-// is really about: the layering plus the canvas paint, the edge routing and
-// the clip to the pane, in every layout the view can pick.
+// BenchmarkGraphView measures the graph pane alone — the layering plus the
+// canvas paint, the edge routing and the clip to the pane, in every layout
+// the view can pick. It is not a whole frame: [GraphModel.View] draws no
+// header, tab bar, footer or overlay, so a real frame costs this plus what
+// [BenchmarkFullFrame] measures on top.
 func BenchmarkGraphView(b *testing.B) {
 	st := benchGraphState(benchBeadCount)
 	views := []struct {
@@ -207,6 +232,56 @@ func BenchmarkGraphScroll(b *testing.B) {
 	}
 }
 
+// benchFullModel builds the whole TUI over the [benchGraphState] run: the
+// model, its five views and the animation layer, sized to the benchmark
+// pane and fed the run's events the way the subscription feeds them. It has
+// no bus and no input, so nothing but the caller drives it.
+func benchFullModel(tb testing.TB, n int) Model {
+	tb.Helper()
+	m := New(context.Background(), Options{
+		NoColor: true,
+		NoAnim:  true,
+		Run:     benchRun(),
+		Now:     func() time.Time { return benchEpoch.Add(time.Hour) },
+	})
+	next, _ := m.Update(tea.WindowSizeMsg{Width: benchPaneWidth, Height: benchPaneHeight})
+	m = benchAsModel(tb, next)
+	for _, ev := range benchGraphEvents(n) {
+		next, _ = m.Update(EventMsg{Event: ev})
+		m = benchAsModel(tb, next)
+	}
+	if m.tab != TabGraph {
+		tb.Fatalf("the model opened on tab %v, want the graph tab", m.tab)
+	}
+	return m
+}
+
+// benchAsModel is the type assertion [Model.Update]'s tea.Model return needs,
+// with the failure reported rather than swallowed.
+func benchAsModel(tb testing.TB, msg tea.Model) Model {
+	tb.Helper()
+	m, ok := msg.(Model)
+	if !ok {
+		tb.Fatalf("Model.Update returned a %T, want a tui.Model", msg)
+	}
+	return m
+}
+
+// BenchmarkFullFrame measures what pressing a key with the graph tab open
+// actually costs: [Model.View] over a 200-bead run, which is the graph pane
+// plus the header, the tab bar, the footer and the overlay layer. This is
+// the number the 100 ms budget is really about — [BenchmarkGraphView] is
+// only the pane inside it.
+func BenchmarkFullFrame(b *testing.B) {
+	m := benchFullModel(b, benchBeadCount)
+	b.ReportAllocs()
+	for b.Loop() {
+		if m.View() == "" {
+			b.Fatal("the frame drew nothing")
+		}
+	}
+}
+
 // BenchmarkStateApplyGraph measures folding a graph snapshot into the state,
 // which happens on every GraphChanged the orchestrator publishes.
 func BenchmarkStateApplyGraph(b *testing.B) {
@@ -233,6 +308,7 @@ func TestGraphPerformanceBudgets(t *testing.T) {
 		t.Skip("set SC_PERF_BUDGETS=1 to check the P9-07 timing budgets")
 	}
 	st := benchGraphState(benchBeadCount)
+	full := benchFullModel(t, benchBeadCount)
 	cases := []struct {
 		name string
 		fn   func()
@@ -248,6 +324,7 @@ func TestGraphPerformanceBudgets(t *testing.T) {
 				Resize(benchPaneWidth, benchPaneHeight)
 			_ = v.View(st)
 		}},
+		{"whole frame", func() { _ = full.View() }},
 	}
 	for _, tc := range cases {
 		res := testing.Benchmark(func(b *testing.B) {

@@ -135,7 +135,7 @@ func TestExtractEdgeCases(t *testing.T) {
 
 func TestParseErrorRendering(t *testing.T) {
 	pe := &ParseError{Reason: ReasonSchema, Contract: "verdict", Detail: "2 violation(s)", Problems: []string{"at '/outcome': value must be one of 'approve', 'request_changes'", "at '/items/0': missing property 'severity'"}, Cause: errors.New("x")}
-	assert.Equal(t, "structured: schema (verdict): 2 violation(s)\n  - at '/outcome': value must be one of 'approve', 'request_changes'\n  - at '/items/0': missing property 'severity'", pe.Error())
+	assert.Equal(t, "structured: result does not match schema (verdict): 2 violation(s)\n  - at '/outcome': value must be one of 'approve', 'request_changes'\n  - at '/items/0': missing property 'severity'", pe.Error())
 	assert.Contains(t, pe.Feedback(), `did not match the "verdict" schema:`)
 	assert.Contains(t, pe.Feedback(), "\n- at '/items/0': missing property 'severity'")
 	assert.NotContains(t, pe.Feedback(), "2 violation(s)", "the count is a log detail, not model feedback")

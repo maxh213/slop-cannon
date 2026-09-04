@@ -271,8 +271,9 @@ func (e *LockedError) Error() string {
 			ErrLocked, e.Path, e.Err())
 	default:
 		return fmt.Sprintf("%s: run %s is already going in this repository (pid %d, since %s); "+
-			"run `sc status` to see it, then stop it or wait for it to finish",
-			ErrLocked, e.Record.Run, e.Record.PID, lockStamp(e.Record.TakenAt))
+			"run `sc status` to see it, then either wait for it to finish or stop it with Ctrl-C "+
+			"in the terminal it is running in (kill %d if that terminal is gone)",
+			ErrLocked, e.Record.Run, e.Record.PID, lockStamp(e.Record.TakenAt), e.Record.PID)
 	}
 }
 
@@ -539,8 +540,54 @@ func (p *RunLockPolicy) Stale(h LockHolder) bool {
 	return !p.opts.alive(h.PID)
 }
 
-// *RunLockPolicy is the policy Run.Start applies (P6-01's seam).
-var _ LockPolicy = (*RunLockPolicy)(nil)
+// CorruptLockPolicy is the other half of the decision [Run.Start] makes
+// when it finds the lock already taken, and P9-04's answer to a lock file
+// that cannot be read. [LockPolicy.Stale] is handed a parsed [LockHolder]
+// and so cannot be asked about one; without this hook an unreadable lock
+// was simply deleted, which is exactly the half-written-lock case
+// [DefaultLockGrace] exists for.
+//
+// A [LockPolicy] that does not implement it keeps P6-01's rule (an
+// unreadable lock is debris). *[RunLockPolicy] implements it.
+type CorruptLockPolicy interface {
+	// Unreadable reports whether the lock at path, which could not be read
+	// or parsed (cause says why), may be removed and taken over.
+	Unreadable(path string, cause error) bool
+}
+
+// unreadableLockStale asks policy about an unreadable lock, falling back to
+// P6-01's rule for a policy that has no opinion.
+func unreadableLockStale(policy LockPolicy, path string, cause error) bool {
+	cp, ok := policy.(CorruptLockPolicy)
+	if !ok {
+		return true
+	}
+	return cp.Unreadable(path, cause)
+}
+
+// Unreadable implements [CorruptLockPolicy] with the same rule
+// [ClaimRunLock] applies in the preflight: an unreadable lock is respected
+// until it is older than the grace period, so a run whose lock is being
+// written this instant is never overrun, and real debris still never
+// wedges the repository. `--force` clears it immediately.
+func (p *RunLockPolicy) Unreadable(path string, cause error) bool {
+	if p.opts.Force {
+		p.opts.notify(fmt.Sprintf("--force: removed an unreadable run lock (%s): %v", path, cause))
+		return true
+	}
+	if lockFileAge(path, p.opts) < p.opts.grace() {
+		return false
+	}
+	p.opts.notify(fmt.Sprintf("removed an unreadable run lock (%s): %v", path, cause))
+	return true
+}
+
+// *RunLockPolicy is the policy Run.Start applies (P6-01's seam), and it
+// decides the unreadable case too (P9-04).
+var (
+	_ LockPolicy        = (*RunLockPolicy)(nil)
+	_ CorruptLockPolicy = (*RunLockPolicy)(nil)
+)
 
 // ProcessStart returns an opaque token identifying the incarnation of the
 // process with that id: two calls for the same running process agree, and a

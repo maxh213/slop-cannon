@@ -3,6 +3,8 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -10,6 +12,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -803,4 +807,292 @@ func lockRun(t *testing.T, repo string, id domain.RunID, opts Options) *Run {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = r.Close() })
 	return r
+}
+
+// ------------------------------------------- taking the lock (P9-04 round 4)
+
+// The gaps a review found in the first round of P9-04, each pinned by a
+// test: [acquireLock] used to bypass the policy whenever the existing lock
+// could not be read (deleting it with no grace period and no notice, which
+// is exactly what [DefaultLockGrace] exists to prevent), it published its
+// own lock as a zero-byte file first and wrote the record afterwards
+// (giving a second sc that very window to read), release() removed a lock
+// it could not parse even when somebody else owned it, and the liveness
+// probe read EPERM — "it exists, it is just not yours" — as "it is gone".
+
+// lockRunDir is a run directory under the fixture's state directory; its
+// LockPath is the fixture's one run lock.
+func lockRunDir(t *testing.T, f lockFixture, id string) string {
+	t.Helper()
+	dir := config.RunDir(f.Repo, id)
+	require.Equal(t, RepoLockPath(f.State), LockPath(dir))
+	return dir
+}
+
+// TestAcquireLockRespectsAHalfWrittenLock is the race the zero-byte window
+// used to open: a lock file that exists but cannot be read yet is another
+// sc starting *right now*, so Run.Start refuses it for one grace period
+// instead of deleting it and firing at the same repository.
+func TestAcquireLockRespectsAHalfWrittenLock(t *testing.T) {
+	f := lockSetup(t)
+	path := RepoLockPath(f.State)
+	require.NoError(t, os.WriteFile(path, nil, 0o600)) // 0 bytes: mid-write.
+
+	policy := NewLockPolicy(lockOpts())
+	_, err := acquireLock(lockRunDir(t, f, "20260904-100000-000b"), "20260904-100000-000b", policy, lockEpoch)
+	require.ErrorIs(t, err, ErrLocked)
+	require.ErrorContains(t, err, "cannot be read")
+	require.ErrorContains(t, err, path)
+	require.FileExists(t, path, "the other sc's lock is left where it is")
+
+	data, readErr := os.ReadFile(path) //nolint:gosec // the test's own temp state directory.
+	require.NoError(t, readErr)
+	require.Empty(t, data, "nothing wrote over it either")
+}
+
+// TestAcquireLockClearsDebrisOnceItIsOld: the same unreadable file, older
+// than the grace period, is debris — it must not wedge the repository.
+func TestAcquireLockClearsDebrisOnceItIsOld(t *testing.T) {
+	f := lockSetup(t)
+	path := RepoLockPath(f.State)
+	require.NoError(t, os.WriteFile(path, []byte("{not json"), 0o600))
+	require.NoError(t, os.Chtimes(path, lockEpoch.Add(-time.Hour), lockEpoch.Add(-time.Hour)))
+
+	var n notices
+	opts := lockOpts()
+	opts.Notice = n.sink()
+	lock, err := acquireLock(lockRunDir(t, f, "20260904-100000-000c"), "20260904-100000-000c", NewLockPolicy(opts), lockEpoch)
+	require.NoError(t, err)
+	require.NotNil(t, lock)
+	require.Len(t, n.lines, 1)
+	require.Contains(t, n.lines[0], "removed an unreadable run lock")
+
+	holder, err := readLock(path)
+	require.NoError(t, err)
+	require.Equal(t, domain.RunID("20260904-100000-000c"), holder.Run)
+	require.NoError(t, lock.release())
+	require.NoFileExists(t, path)
+}
+
+// TestAcquireLockRefusesAPidZeroLock: a record that parses but names no
+// process is as unusable as one that does not parse, and gets the same
+// grace — a lock whose pid field has not been filled in yet is a run
+// starting this instant.
+func TestAcquireLockRefusesAPidZeroLock(t *testing.T) {
+	f := lockSetup(t)
+	path := writeLock(t, f.State, LockRecord{LockHolder: LockHolder{Run: "20260904-090000-000d", TakenAt: lockEpoch}})
+
+	_, err := acquireLock(lockRunDir(t, f, "20260904-100000-000e"), "20260904-100000-000e", NewLockPolicy(lockOpts()), lockEpoch)
+	require.ErrorIs(t, err, ErrLocked)
+	require.ErrorContains(t, err, "names no process")
+	require.FileExists(t, path)
+
+	// --force is the way past it, as it is for every other verdict.
+	forced := lockOpts()
+	forced.Force = true
+	lock, err := acquireLock(lockRunDir(t, f, "20260904-100000-000f"), "20260904-100000-000f", NewLockPolicy(forced), lockEpoch)
+	require.NoError(t, err)
+	require.NoError(t, lock.release())
+}
+
+// TestAcquireLockKeepsP6PolicyForUnreadableLocks: a LockPolicy with no
+// opinion about unreadable locks (P6-01's [DefaultLockPolicy], and anything
+// else that only implements Stale) keeps the old rule, so this hardening
+// changes nothing for an embedder that has not asked for it.
+func TestAcquireLockKeepsP6PolicyForUnreadableLocks(t *testing.T) {
+	f := lockSetup(t)
+	path := RepoLockPath(f.State)
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+
+	lock, err := acquireLock(lockRunDir(t, f, "20260904-100000-0010"), "20260904-100000-0010", DefaultLockPolicy{}, lockEpoch)
+	require.NoError(t, err)
+	require.NoError(t, lock.release())
+}
+
+// TestAcquireLockPublishesTheWholeRecordAtOnce fires many runs at one
+// repository at the same moment: exactly one may take the lock, and the
+// file must never be readable in a half-written state, because a reader
+// that saw a zero-byte lock used to delete it and start a second run.
+func TestAcquireLockPublishesTheWholeRecordAtOnce(t *testing.T) {
+	f := lockSetup(t)
+	path := RepoLockPath(f.State)
+	require.NoError(t, os.MkdirAll(f.State, 0o700))
+
+	// Every contender sees the others as live processes it is not.
+	opts := LockOptions{Self: -1, Alive: func(int) bool { return true }, StartOf: func(int) string { return "" }}
+
+	const contenders = 8
+	var (
+		mu     sync.Mutex
+		won    []*lockFile
+		errs   []error
+		stop   = make(chan struct{})
+		start  = make(chan struct{})
+		reader sync.WaitGroup
+		wg     sync.WaitGroup
+	)
+	reader.Add(1)
+	go func() {
+		defer reader.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			data, err := os.ReadFile(path) //nolint:gosec // the test's own temp state directory.
+			if err != nil {
+				continue // not taken yet, or gone again: both are fine.
+			}
+			var h LockHolder
+			if err := json.Unmarshal(data, &h); err != nil {
+				mu.Lock()
+				errs = append(errs, fmt.Errorf("a reader saw a half-written lock (%d bytes): %w", len(data), err))
+				mu.Unlock()
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < contenders; i++ {
+		id := domain.RunID(fmt.Sprintf("20260904-1000%02d-00%02d", i, i))
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			lock, err := acquireLock(config.RunDir(f.Repo, string(id)), id, NewLockPolicy(opts), lockEpoch)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				won = append(won, lock)
+			case errors.Is(err, ErrLocked):
+			default:
+				errs = append(errs, err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(stop)
+	reader.Wait()
+
+	require.Empty(t, errs)
+	require.Len(t, won, 1, "exactly one run may hold the repository")
+	holder, err := readLock(path)
+	require.NoError(t, err)
+	require.Equal(t, won[0].holder.Run, holder.Run)
+	require.NoError(t, won[0].release())
+	require.NoFileExists(t, path)
+}
+
+// TestReleaseLeavesALockItCannotReadAlone: a lock file that cannot be
+// parsed cannot be proved to be ours, so releasing must not delete it —
+// it may be the lock of an sc that is writing it this instant.
+func TestReleaseLeavesALockItCannotReadAlone(t *testing.T) {
+	f := lockSetup(t)
+	path := RepoLockPath(f.State)
+	lock, err := acquireLock(lockRunDir(t, f, "20260904-100000-0011"), "20260904-100000-0011", NewLockPolicy(lockOpts()), lockEpoch)
+	require.NoError(t, err)
+
+	require.NoError(t, os.WriteFile(path, nil, 0o600)) // somebody else's, mid-write.
+	require.NoError(t, lock.release())
+	require.FileExists(t, path, "an unreadable lock is not ours to remove")
+
+	// A lock another run took over is left alone too (P6-01's rule).
+	writeLock(t, f.State, liveRecord())
+	require.NoError(t, lock.release())
+	require.FileExists(t, path)
+}
+
+// ------------------------------------------------- the liveness probe again
+
+// TestAliveFromSignal reads the kernel's answers the way the lock has to:
+// only "no such process" means the holder is gone. EPERM means it exists
+// and belongs to another user (`sudo -E sc /repo` in the other terminal),
+// which used to be read as death — the one direction that lets two runs
+// fire at one repository.
+func TestAliveFromSignal(t *testing.T) {
+	require.True(t, aliveFromSignal(nil), "the signal was accepted")
+	require.True(t, aliveFromSignal(syscall.EPERM), "another user's live process")
+	require.True(t, aliveFromSignal(&os.SyscallError{Syscall: "kill", Err: syscall.EPERM}), "wrapped the same way")
+	require.False(t, aliveFromSignal(syscall.ESRCH), "no such process")
+	require.False(t, aliveFromSignal(os.ErrProcessDone), "a child this process already waited for")
+	require.True(t, aliveFromSignal(errors.New("something new")), "an answer we cannot read is not proof of death")
+}
+
+// TestProcessAliveOnAProcessWeMayNotSignal uses pid 1, which always exists
+// and (unless the tests run as root) cannot be signalled by this user.
+func TestProcessAliveOnAProcessWeMayNotSignal(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("pid 1 is only certainly there on Linux")
+	}
+	require.True(t, ProcessAlive(1), "pid 1 always exists")
+
+	if os.Geteuid() == 0 {
+		t.Skip("as root every signal is permitted, so EPERM cannot be shown here")
+	}
+	p, err := os.FindProcess(1)
+	require.NoError(t, err)
+	err = p.Signal(syscall.Signal(0))
+	require.ErrorIs(t, err, syscall.EPERM, "the kernel says it exists but is not ours")
+	require.True(t, aliveFromSignal(err))
+}
+
+// TestInspectLockRespectsAnotherUsersRun is the same thing through the
+// verdicts: a lock naming a process this user may not signal is live, not
+// stale, so the second sc is refused instead of reaping it.
+func TestInspectLockRespectsAnotherUsersRun(t *testing.T) {
+	if runtime.GOOS != "linux" || os.Geteuid() == 0 {
+		t.Skip("needs a live process this user may not signal")
+	}
+	f := lockSetup(t)
+	writeLock(t, f.State, LockRecord{LockHolder: LockHolder{
+		Run: "20260904-090000-0012", PID: 1, TakenAt: lockEpoch.Add(-time.Minute),
+	}})
+
+	// Real liveness probe; only "am I that process" is answered for us.
+	p := InspectLock(f.State, LockOptions{Self: -1, Now: func() time.Time { return lockEpoch }})
+	require.Equal(t, LockLive, p.State)
+	require.True(t, p.Held())
+
+	_, err := ClaimRunLock(f.State, LockOptions{Self: -1, Now: func() time.Time { return lockEpoch }})
+	require.ErrorIs(t, err, ErrLocked)
+	require.FileExists(t, RepoLockPath(f.State))
+}
+
+// TestLockedErrorOffersRemediesThatExist: the refusal used to say "stop
+// it", and there is no `sc stop` (D-18 names one, but it is not built), so
+// it now names the two things a user can actually do.
+func TestLockedErrorOffersRemediesThatExist(t *testing.T) {
+	err := &LockedError{State: LockLive, Record: liveRecord()}
+	msg := err.Error()
+	require.Contains(t, msg, "sc status")
+	require.Contains(t, msg, "Ctrl-C")
+	require.Contains(t, msg, "kill 777")
+	require.NotContains(t, msg, "sc stop")
+}
+
+// TestRunRefusesToStartBesideAHalfWrittenLock drives the same rule through
+// the lifecycle: Run.Start, not just the preflight, respects a lock it
+// cannot read yet.
+func TestRunRefusesToStartBesideAHalfWrittenLock(t *testing.T) {
+	f := lockSetup(t)
+	path := RepoLockPath(f.State)
+	require.NoError(t, os.MkdirAll(f.State, 0o700))
+	require.NoError(t, os.WriteFile(path, nil, 0o600))
+
+	bus := events.NewBus()
+	t.Cleanup(bus.Close)
+	r := lockRun(t, f.Repo, "20260904-100000-0013", Options{
+		Bus: bus, Logger: lockLogger(), Now: func() time.Time { return lockEpoch },
+		StopGrace: time.Second, LockPolicy: NewLockPolicy(LockOptions{}),
+	})
+	err := r.Start(context.Background())
+	require.ErrorIs(t, err, ErrLocked)
+	require.ErrorContains(t, err, "cannot be read")
+	out, waitErr := r.Wait()
+	require.ErrorIs(t, waitErr, ErrLocked)
+	require.Equal(t, events.FinishFailed, out.Reason)
+	require.FileExists(t, path, "the refused run leaves the other one's lock alone")
 }

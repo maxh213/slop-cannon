@@ -202,6 +202,12 @@ func TestStatusRunningGolden(t *testing.T) {
 	rootGolden(t, "status-running", statusNormalise(out, base, repo))
 }
 
+// statusFinishSummary is the shape a real run records: gitx's worktree
+// cleanup report, which names every worktree it kept on a line of its own
+// (internal/gitx.CleanupResult.Summary). It is multi-line on purpose — that
+// is what the header block has to print without running the lines together.
+const statusFinishSummary = "removed 1 worktree, kept 1:\n  sc-2 (in_progress)"
+
 func TestStatusFinishedGolden(t *testing.T) {
 	base, repo := statusEnv(t)
 	dir := statusRecord(t, repo, true,
@@ -209,7 +215,7 @@ func TestStatusFinishedGolden(t *testing.T) {
 		events.AgentFinished{Meta: statusAt(71), Agent: "tester-qa-sc-2-r1", Role: domain.RoleTester, Bead: "sc-2", Duration: 11 * time.Second, Produced: domain.MessageVerdict},
 		events.RunStopped{Meta: statusAt(72), Reason: "SIGINT"},
 		events.RunFinished{Meta: statusAt(73), Reason: events.FinishCompleted,
-			Summary: "2 beads landed; kept 1 worktree", Duration: 73 * time.Second},
+			Summary: statusFinishSummary, Duration: 73 * time.Second},
 	)
 	statusUnlock(t, dir) // a run that ended released the lock
 	st, err := orchestrator.LoadState(dir)
@@ -217,7 +223,7 @@ func TestStatusFinishedGolden(t *testing.T) {
 	st.Phase = orchestrator.PhaseFinished
 	st.StopReason = "SIGINT"
 	st.Finish = events.FinishCompleted
-	st.FinishSummary = "2 beads landed; kept 1 worktree"
+	st.FinishSummary = statusFinishSummary
 	st.FinishedAt = statusEpoch.Add(73 * time.Second)
 	st.Resumes = 1
 	require.NoError(t, orchestrator.WriteState(dir, st))
@@ -225,6 +231,47 @@ func TestStatusFinishedGolden(t *testing.T) {
 	out, err := rootRun(t, "--repo", repo, "status")
 	require.NoError(t, err)
 	rootGolden(t, "status-finished", statusNormalise(out, base, repo))
+}
+
+// TestStatusHeaderKeepsAMultiLineValueOnItsOwnLines pins the fix for a
+// header row that ran two sentences together: the finish summary a run
+// records is legitimately several lines, and dropping the newline as a
+// control character printed "kept 1:  sc-2" as one word-jam. Every line of
+// a value is now its own row, indented under the label.
+func TestStatusHeaderKeepsAMultiLineValueOnItsOwnLines(t *testing.T) {
+	var b strings.Builder
+	statusHeader(&b, &StatusReport{
+		Run: statusRunID,
+		State: &orchestrator.State{
+			Phase:         orchestrator.PhaseFinished,
+			Finish:        events.FinishCompleted,
+			FinishSummary: "2 beads (2 closed)\nremoved 2 worktrees",
+			Run:           domain.Run{ID: statusRunID, Brief: "first line\nsecond line"},
+		},
+	})
+	lines := strings.Split(b.String(), "\n")
+	require.Contains(t, lines, "outcome    2 beads (2 closed)")
+	require.Contains(t, lines, "           removed 2 worktrees")
+	require.Contains(t, lines, "brief      first line")
+	require.Contains(t, lines, "           second line")
+	require.NotContains(t, b.String(), "(2 closed)removed", "the two lines must not run together")
+
+	// The error half still joins with "; " on the summary's last line, and
+	// a value that is blank once its control characters are gone prints no
+	// row at all.
+	b.Reset()
+	statusHeader(&b, &StatusReport{
+		Run: statusRunID,
+		State: &orchestrator.State{
+			Phase:         orchestrator.PhaseFinished,
+			FinishSummary: "removed 1 worktree\n\n",
+			FinishError:   "bd was unreachable",
+			StopReason:    "\x1b[31m",
+			Run:           domain.Run{ID: statusRunID},
+		},
+	})
+	require.Contains(t, b.String(), "outcome    removed 1 worktree; error: bd was unreachable\n")
+	require.NotContains(t, b.String(), "stopped by")
 }
 
 func TestStatusNoStateFileGolden(t *testing.T) {

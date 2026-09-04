@@ -66,8 +66,10 @@ func (c perfClock) Now() time.Time { return c.now }
 
 func (c perfClock) After(time.Duration) <-chan time.Time { return make(chan time.Time) }
 
-// perfRun builds a hermetic run in temp directories (D-23) with no bus, so
-// what a benchmark measures is the loop rather than the log.
+// perfRun builds a hermetic run in temp directories (D-23) publishing to
+// bus, which may be nil: a benchmark that wants to measure the loop rather
+// than the log passes nil, and one that wants what a real run pays passes
+// the teed publisher [perfTeedRun] builds.
 func perfRun(tb testing.TB, ammo int, bus Publisher) *Run {
 	tb.Helper()
 	home := tb.TempDir()
@@ -102,6 +104,40 @@ func perfRun(tb testing.TB, ammo int, bus Publisher) *Run {
 		tb.Fatalf("could not make the run directory: %v", err)
 	}
 	return run
+}
+
+// perfTeedRun builds a run wired the way `sc run` wires one: every event it
+// publishes goes to the JSONL run log first and to a live bus behind it,
+// with one subscriber draining. A benchmark that fires agents needs this,
+// because [Scheduler.start] publishes an [events.AgentSpawned] per agent on
+// the dispatch goroutine — a cost a run with a nil publisher does not pay
+// and a real cold tick does.
+func perfTeedRun(tb testing.TB, ammo int) *Run {
+	tb.Helper()
+	dir := tb.TempDir()
+	bus := events.NewBus()
+	ctx, cancel := context.WithCancel(context.Background())
+	sub := bus.Subscribe(ctx, 4096)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range sub.Events() {
+		}
+	}()
+	opts := Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	log, err := TeeRunLog(&opts, dir, bus)
+	if err != nil {
+		tb.Fatalf("could not open the run log: %v", err)
+	}
+	tb.Cleanup(func() {
+		cancel()
+		bus.Close()
+		<-done
+		if err := log.Close(); err != nil {
+			tb.Errorf("could not close the run log: %v", err)
+		}
+	})
+	return perfRun(tb, ammo, opts.Bus)
 }
 
 // perfAllocation is the D-05 split of perfAmmo ammo the scheduler
@@ -151,6 +187,32 @@ func perfWork(n int) []Demand {
 	return out
 }
 
+// perfSource returns a work source shaped like the one a real run wires up:
+// [WorkSources] over the feedback engine, the planning loop and the delivery
+// handoff, which allocates a fresh slice and concatenates the parts into it
+// on every call.
+//
+// The allocation is the point, not an accident of the fixture.
+// [Scheduler.dispatch] calls sortDemands on the slice its source hands back,
+// in place. A source that returned the same backing array every tick would
+// be sorted once and then asked to re-sort already-sorted input for the rest
+// of the benchmark, which is not what any real tick does and understates the
+// tick by about a third. Splitting perfWork's interleaved list into three
+// contiguous parts keeps the concatenation unsorted with respect to the D-05
+// order, exactly as a real run's three sources are.
+func perfSource(n int) WorkSource {
+	all := perfWork(n)
+	third := len(all) / 3
+	parts := [][]Demand{all[:third], all[third : 2*third], all[2*third:]}
+	sources := make([]WorkSource, 0, len(parts))
+	for _, part := range parts {
+		sources = append(sources, WorkSourceFunc(func(context.Context) ([]Demand, error) {
+			return part, nil
+		}))
+	}
+	return WorkSources(sources...)
+}
+
 // perfGate is a [Firer] whose agents hold their slot until the benchmark
 // releases them, which is how the tick benchmarks get a scheduler with
 // exactly perfAmmo agents live.
@@ -179,11 +241,10 @@ func (g *perfGate) Open() { g.once.Do(func() { close(g.release) }) }
 // call the returned stop function.
 func perfSaturated(tb testing.TB) (*Scheduler, *Run, func()) {
 	tb.Helper()
-	demands := perfWork(perfDemands)
 	gate := newPerfGate()
 	sched := NewScheduler(SchedulerOptions{
 		Allocation: perfAllocation(tb),
-		Work:       WorkSourceFunc(func(context.Context) ([]Demand, error) { return demands, nil }),
+		Work:       perfSource(perfDemands),
 		Fire:       gate,
 		Clock:      perfClock{now: perfEpoch},
 	})
@@ -221,13 +282,15 @@ func BenchmarkSchedulerTick(b *testing.B) {
 
 // BenchmarkSchedulerTickCold measures the opposite end: an empty scheduler
 // filling all 50 slots in one dispatch, which is what the first tick of a
-// run and the tick after a wave of agents finish both do. It includes the
-// state.json write [Run.AgentStarted] does per agent, because that write is
-// on the dispatch goroutine.
+// run and the tick after a wave of agents finish both do. It runs against a
+// run wired as a real one is ([perfTeedRun]), so it includes both of the
+// per-agent costs that land on the dispatch goroutine: the state.json write
+// [Run.AgentStarted] does, and the [events.AgentSpawned] publish through the
+// teed run log.
 func BenchmarkSchedulerTickCold(b *testing.B) {
-	demands := perfWork(perfDemands)
+	src := perfSource(perfDemands)
 	alloc := perfAllocation(b)
-	run := perfRun(b, perfAmmo, nil)
+	run := perfTeedRun(b, perfAmmo)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -237,7 +300,7 @@ func BenchmarkSchedulerTickCold(b *testing.B) {
 		gate := newPerfGate()
 		sched := NewScheduler(SchedulerOptions{
 			Allocation: alloc,
-			Work:       WorkSourceFunc(func(context.Context) ([]Demand, error) { return demands, nil }),
+			Work:       src,
 			Fire:       gate,
 			Clock:      perfClock{now: perfEpoch},
 		})
@@ -444,26 +507,20 @@ func TestOrchestratorPerformanceBudgets(t *testing.T) {
 		perfAssert(t, "a dispatch with 50 live agents", res, perfTickBudget)
 	})
 
-	t.Run("event bus", func(t *testing.T) {
-		bus := events.NewBus()
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		sub := bus.Subscribe(ctx, 1024)
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			for range sub.Events() {
-			}
-		}()
-		ev := perfEvent(0)
+	// The budget is asserted over the path a real run publishes through —
+	// [Run.Publish] in front of [TeeRunLog], so the JSONL line is durable
+	// before the bus fans it out — and not over a bare bus publish. A bare
+	// publish is three orders of magnitude inside the budget, so nothing
+	// could ever regress it; the teed path is the one that carries the run
+	// log's cost and the only one where a regression is plausible.
+	t.Run("event wiring", func(t *testing.T) {
+		run := perfTeedRun(t, config.MinAmmo)
 		res := testing.Benchmark(func(b *testing.B) {
-			for b.Loop() {
-				bus.Publish(ev)
+			for i := 0; b.Loop(); i++ {
+				run.Publish(perfEvent(i))
 			}
 		})
-		bus.Close()
-		<-done
-		perfAssert(t, "a publish to one subscriber", res, perfBusBudget)
+		perfAssert(t, "a publish through the run log and the bus", res, perfBusBudget)
 	})
 }
 

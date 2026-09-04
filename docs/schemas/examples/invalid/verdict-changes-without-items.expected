@@ -1,2 +1,2 @@
-structured: schema (verdict): 1 violation(s)
+structured: result does not match schema (verdict): 1 violation(s)
   - at '': missing property 'items'

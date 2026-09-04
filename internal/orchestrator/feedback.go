@@ -203,10 +203,18 @@ type FeedbackBeadContext struct {
 	Budget prompt.Budget
 	// CheckCommand overrides the repository's check command for engineers.
 	CheckCommand string
-	// Diff is the change set under review. The loop keeps the diff of the
-	// round it started, so every tester of a round reviews the same code;
-	// this one is used when the loop has none yet.
+	// Diff is the change set under review, already through the P9-05
+	// secret filter: it is what a reviewer is shown. The loop keeps the
+	// diff of the round it started, so every tester of a round reviews the
+	// same code; this one is used when the loop has none yet.
 	Diff *gitx.Diff
+	// Measure is the same change set as git returned it, with nothing
+	// withheld. It is only ever measured, never rendered: the D-09 ratio
+	// has to count the lines an excluded file moved or a round that
+	// touched nothing else reads as no movement at all
+	// ([agents.SecretFilter.GitDiff] says the same). Nil falls back to
+	// Diff, so a caller that does not filter needs no second field.
+	Measure *gitx.Diff
 	// Model, MaxTurns and Timeout are passed to the cartridge; zero values
 	// mean the adapter's defaults (and, for Timeout, the supervisor's).
 	Model    string
@@ -293,6 +301,14 @@ type FeedbackOptions struct {
 	// the narrowed criteria, but bd does not, so a resumed run has only the
 	// ruling comment to recover them from.
 	Acceptance BeadAcceptanceWriter
+	// Filter is the P9-05 secrets filter. Everything the loop puts into a
+	// prompt that came from outside sc goes through it: the diff a tester
+	// reviews, the diffstat and notes filed in the prompt history, and the
+	// notes an escalation quotes. A nil filter still applies
+	// [agents.DefaultSecretPatterns] — the built-in patterns are the floor,
+	// not an opt-in — so a loop built without one is safe by default and
+	// only the user's `exclude` key is missing.
+	Filter *agents.SecretFilter
 	// ConflictResolved is called when the engineer of a delivery conflict
 	// round has finished (P6-06 raises those demands; the loop plans the
 	// firing because building an engineer request is the role layer's job).
@@ -642,11 +658,15 @@ type fbThread struct {
 	// evaluating are the lenses owed a pushback evaluation this round.
 	evaluating []domain.Lens
 
-	report     *domain.ImplReport
-	diff       *gitx.Diff
-	prevDiff   *gitx.Diff
-	fullReview bool
-	ratio      gitx.ChangeRatio
+	report   *domain.ImplReport
+	diff     *gitx.Diff
+	prevDiff *gitx.Diff
+	// measure and prevMeasure are the unfiltered counterparts of diff and
+	// prevDiff, and the only thing the D-09 ratio is taken from.
+	measure     *gitx.Diff
+	prevMeasure *gitx.Diff
+	fullReview  bool
+	ratio       gitx.ChangeRatio
 
 	conflict  agents.EngineerConflict
 	history   []prompt.Round
@@ -683,6 +703,7 @@ type fbThread struct {
 // goroutines of the agents being fired.
 type Feedback struct {
 	opts    FeedbackOptions
+	filter  *agents.SecretFilter
 	lenses  []domain.Lens
 	rounds  int
 	pushbk  int
@@ -704,6 +725,7 @@ func NewFeedback(opts FeedbackOptions) (*Feedback, error) {
 	}
 	f := &Feedback{
 		opts:    opts,
+		filter:  opts.Filter,
 		lenses:  append([]domain.Lens(nil), opts.Lenses...),
 		rounds:  opts.Limits.MaxReviewRounds,
 		pushbk:  opts.Limits.MaxPushbackRounds,
@@ -1327,7 +1349,7 @@ func (f *Feedback) planEngineer(ctx context.Context, t *fbThread, w FeedbackWork
 		Brief:        bc.Brief,
 		Rules:        bc.Rules,
 		Vibes:        bc.Vibes,
-		History:      append([]prompt.Round(nil), t.history...),
+		History:      f.filter.History(t.history),
 		CheckCommand: bc.CheckCommand,
 		Model:        bc.Model,
 		MaxTurns:     bc.MaxTurns,
@@ -1337,6 +1359,13 @@ func (f *Feedback) planEngineer(ctx context.Context, t *fbThread, w FeedbackWork
 	}
 	if w.Engineer == agents.EngineerResolveConflict {
 		req.Conflict = t.conflict
+		// P9-05: git's conflict output is quoted verbatim, so a value in a
+		// conflicted line reaches the prompt with it. The file list is
+		// deliberately left whole: an excluded path that is conflicted
+		// still has to be resolved for the rebase to continue, and hiding
+		// it would strand the worktree rather than protect anything the
+		// engineer cannot already open.
+		req.Conflict.Output = f.filter.Text(req.Conflict.Output)
 	}
 	if w.Engineer == agents.EngineerAddressFeedback {
 		for _, i := range t.items {
@@ -1425,12 +1454,12 @@ func (f *Feedback) planTester(ctx context.Context, t *fbThread, w FeedbackWork, 
 		Brief:      bc.Brief,
 		Rules:      bc.Rules,
 		Vibes:      bc.Vibes,
-		History:    append([]prompt.Round(nil), t.history...),
+		History:    f.filter.History(t.history),
 		Report:     t.report,
-		Diff:       diff,
+		Diff:       f.filter.GitDiff(diff),
 		Items:      items,
 		Responses:  responses,
-		Notes:      append(append([]string(nil), t.notes...), bc.Notes...),
+		Notes:      f.filter.Texts(append(append([]string(nil), t.notes...), bc.Notes...)),
 		Budget:     bc.Budget,
 		Model:      bc.Model,
 		MaxTurns:   bc.MaxTurns,
@@ -1484,7 +1513,7 @@ func (f *Feedback) planArbitration(ctx context.Context, t *fbThread, w FeedbackW
 			RulingContext: agents.RulingContext{
 				RunID: f.opts.Run, AgentID: fi.Agent.ID, Brief: bc.Brief,
 				Rules: bc.Rules, Vibes: bc.Vibes, Repo: bc.Repo, Bead: &bc.Bead,
-				History: append([]prompt.Round(nil), t.history...), Budget: bc.Budget,
+				History: f.filter.History(t.history), Budget: bc.Budget,
 			},
 			Dispute:           item.dispute(),
 			MaxPushbackRounds: f.pushbk,
@@ -1527,11 +1556,11 @@ func (f *Feedback) planEscalation(ctx context.Context, t *fbThread, w FeedbackWo
 		RulingContext: agents.RulingContext{
 			RunID: f.opts.Run, AgentID: fi.Agent.ID, Brief: bc.Brief,
 			Rules: bc.Rules, Vibes: bc.Vibes, Repo: bc.Repo, Bead: &bc.Bead,
-			History: append([]prompt.Round(nil), t.history...), Budget: bc.Budget,
+			History: f.filter.History(t.history), Budget: bc.Budget,
 		},
 		Round:     t.round,
 		MaxRounds: f.rounds,
-		Notes:     append([]string(nil), t.notes...),
+		Notes:     f.filter.Texts(t.notes),
 	}
 	for _, i := range t.items {
 		if !i.settled() {
@@ -1606,6 +1635,10 @@ func fbFind(t *fbThread, id string) *fbItem {
 // (implement, resolve conflict) submits the bead for review, a set of
 // responses answers the round's items.
 func (f *Feedback) engineerReplied(ctx context.Context, w FeedbackWork, agent domain.AgentID, payload any) error {
+	// P9-05: mask the values before the payload is stored, so the bead
+	// comment, the pull request body and every later prompt quote the
+	// masked text rather than the credential the agent echoed.
+	payload = f.filter.Message(payload)
 	f.mu.Lock()
 	t, ok := f.threads[w.Bead]
 	f.mu.Unlock()
@@ -1743,7 +1776,7 @@ func (f *Feedback) answered(ctx context.Context, t *fbThread, agent domain.Agent
 
 // testerReplied folds a verdict into the thread.
 func (f *Feedback) testerReplied(ctx context.Context, w FeedbackWork, agent domain.AgentID, payload any) error {
-	v, ok := payload.(domain.Verdict)
+	v, ok := f.filter.Message(payload).(domain.Verdict) // P9-05
 	if !ok {
 		return fmt.Errorf("orchestrator: tester %s produced %T, not a verdict", agent, payload)
 	}
@@ -1942,7 +1975,7 @@ func (f *Feedback) poRuled(ctx context.Context, w FeedbackWork, agent domain.Age
 	if !ok {
 		return fmt.Errorf("%w: %s", ErrNoFeedbackThread, w.Bead)
 	}
-	switch v := payload.(type) {
+	switch v := f.filter.Message(payload).(type) { // P9-05
 	case domain.Arbitration:
 		return f.arbitrated(ctx, t, agent, v)
 	case domain.Escalation:
@@ -2254,11 +2287,13 @@ func (f *Feedback) closeRound(t *fbThread) {
 		r.Escalation = t.escalation
 	}
 	if t.diff != nil {
-		r.Diff = t.diff.Stat()
+		// P9-05: the stat names every changed path, so an excluded one has
+		// to be dropped here rather than by SecretFilter.Diff, which only
+		// understands a patch. t.diff itself stays unfiltered: it is what
+		// the D-09 ratio is measured on.
+		r.Diff = f.filter.GitDiff(t.diff).Stat()
 	}
-	if len(t.notes) > 0 {
-		r.Notes = append([]string(nil), t.notes...)
-	}
+	r.Notes = f.filter.Texts(t.notes)
 	t.history = append(t.history, r)
 	t.verdicts = map[domain.Lens]domain.Verdict{}
 	t.responses = nil
@@ -2281,8 +2316,9 @@ func (f *Feedback) refreshDiff(ctx context.Context, t *fbThread) {
 		return
 	}
 	f.mu.Lock()
-	prev, cur := t.diff, bc.Diff
-	t.prevDiff, t.diff = prev, cur
+	t.prevDiff, t.diff = t.diff, bc.Diff
+	prev, cur := t.measure, fbMeasured(bc)
+	t.prevMeasure, t.measure = prev, cur
 	t.fullReview = false
 	f.mu.Unlock()
 	if cur == nil || prev == nil || f.opts.Ratio == nil {
@@ -2302,6 +2338,16 @@ func (f *Feedback) refreshDiff(ctx context.Context, t *fbThread) {
 	t.ratio = ratio
 	t.fullReview = ratio.Exceeds(f.thresh)
 	f.mu.Unlock()
+}
+
+// fbMeasured is the change set the D-09 ratio is taken from: what git
+// returned, before the secret filter withheld anything (P9-05). A context
+// that carries no unfiltered copy falls back to the one it does carry.
+func fbMeasured(bc FeedbackBeadContext) *gitx.Diff {
+	if bc.Measure != nil {
+		return bc.Measure
+	}
+	return bc.Diff
 }
 
 // move applies a state transition and remembers where the bead now is.
@@ -2369,6 +2415,9 @@ func (f *Feedback) CheckFailed(ctx context.Context, bead domain.Bead, round int,
 	if len(items) == 0 {
 		return fmt.Errorf("orchestrator: a failed check on %s raised no items to answer", bead.ID)
 	}
+	// P9-05: the items quote what the check command printed, which is
+	// exactly where a credential in the environment surfaces.
+	items = f.filter.Items(items)
 	f.Track(bead)
 	f.mu.Lock()
 	t, ok := f.threads[bead.ID]
@@ -2491,7 +2540,7 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 		if m.Err != nil {
 			continue
 		}
-		switch payload := m.Payload.(type) {
+		switch payload := f.filter.Message(m.Payload).(type) { // P9-05
 		case domain.ImplReport:
 			rep := payload
 			t.report = &rep
