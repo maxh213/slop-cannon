@@ -270,6 +270,47 @@ func (m *Manager) Reattach(ctx context.Context, id domain.BeadID) (*Worktree, er
 	return nil, fmt.Errorf("%w: no worktree registered at %s", ErrWorktreeMissing, path)
 }
 
+// clearStaleIndexLock removes a `.git/index.lock` left behind in the bead's
+// worktree by a process that died holding it, and reports whether it did.
+//
+// git takes that lock for the whole of `git add`, `git commit` and a rebase
+// step, and never cleans it up after a SIGKILL — so a run killed mid-commit
+// (a second Ctrl-C, an OOM kill, a machine that lost power) leaves every
+// later git command in that worktree failing with "Another git process
+// seems to be running in this repository". Nothing else ever notices,
+// because git's advice is addressed to a human.
+//
+// It is safe only because of where it is used: the manager's worktrees live
+// under the run directory (D-23), sc creates them and nothing else writes
+// there, and the resumer runs before the run has fired an agent, so no git
+// of ours can be holding the lock. It is deliberately not exported for that
+// reason — see [Resumer.Resume], its only caller.
+func (m *Manager) clearStaleIndexLock(ctx context.Context, id domain.BeadID) (bool, error) {
+	path := m.PathFor(id)
+	if !isWithin(m.dir, path) || samePath(m.dir, path) {
+		return false, fmt.Errorf("gitx: refusing to clear a lock outside %s: %s", m.dir, path)
+	}
+	wtRepo, err := Open(ctx, path, WithEnv(m.repo.env), WithTimeout(m.repo.timeout))
+	if err != nil {
+		return false, err
+	}
+	out, err := wtRepo.Git(ctx, "rev-parse", "--absolute-git-dir")
+	if err != nil {
+		return false, err
+	}
+	lock := filepath.Join(strings.TrimSpace(out), "index.lock")
+	if _, err := os.Stat(lock); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := os.Remove(lock); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, fmt.Errorf("gitx: removing the stale index lock %s: %w", lock, err)
+	}
+	return true, nil
+}
+
 // Open returns a [Repo] rooted in the bead's worktree, sharing the
 // manager's environment and timeout, so callers can run git (commit, diff,
 // rebase) inside it. It fails with [ErrWorktreeMissing] like Reattach.

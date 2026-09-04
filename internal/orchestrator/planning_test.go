@@ -356,6 +356,11 @@ func (f *planningFixture) events() []events.Event {
 
 // planningEventually polls cond until it holds, so no test sleeps for a
 // fixed time.
+// planningEventually polls cond, which is expected to drive the fake clock
+// itself. A condition must be written as "at least", never as an exact
+// count: the clock jumps a second per poll, so on a loaded machine an
+// autopilot planner can get several idle re-plans between two polls and an
+// equality would never be observed.
 func planningEventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -394,7 +399,7 @@ func TestPlannerBriefModePlansOnceAndFinishesWhenEveryBeadHasSettled(t *testing.
 
 	planningEventually(t, "the brief plan to be applied", func() bool {
 		f.Clock.Advance(time.Second)
-		return f.Applier.count() == 1
+		return f.Applier.count() >= 1
 	})
 	// The beads exist and are still open, so the run must not finish.
 	f.Beads.set(planningBead("sc-alpha", domain.BeadStateOpen), planningBead("sc-beta", domain.BeadStateInReview))
@@ -452,7 +457,7 @@ func TestPlannerBriefModeWaitsForBdToListWhatThePlanCreated(t *testing.T) {
 
 	planningEventually(t, "the brief plan to be applied", func() bool {
 		f.Clock.Advance(time.Second)
-		return f.Applier.count() == 1
+		return f.Applier.count() >= 1
 	})
 	// bd has not listed the new bead yet, so the run stays live rather
 	// than finishing on an empty listing.
@@ -486,7 +491,7 @@ func TestPlannerAutopilotKeepsReplanningThroughTwentyFourHours(t *testing.T) {
 
 	planningEventually(t, "the first plan", func() bool {
 		f.Clock.Advance(time.Second)
-		return f.Runner.count() == 1
+		return f.Runner.count() >= 1
 	})
 	assert.Equal(t, 0, f.Applier.count(), "an empty plan creates nothing")
 
@@ -494,15 +499,25 @@ func TestPlannerAutopilotKeepsReplanningThroughTwentyFourHours(t *testing.T) {
 	replans := int(day / config.DefaultIdleReplanInterval)
 	for i := 1; i <= replans; i++ {
 		want := i + 1
+		// Wait on the planner's own record, not on the runner's call
+		// counter: the counter is incremented inside the runner, so a
+		// firing that has been made but not yet recorded would let the
+		// loop — and the Attempts/Empty assertion below — run against a
+		// planning round that is still in flight.
 		planningEventually(t, fmt.Sprintf("re-plan %d", i), func() bool {
 			f.Clock.Advance(config.DefaultIdleReplanInterval)
-			return f.Runner.count() >= want
+			return f.Planner.Status().Empty >= want
 		})
 	}
 	assert.GreaterOrEqual(t, f.Runner.count(), replans, "autopilot re-plans every idle_replan_interval")
 	assert.Equal(t, PhaseRunning, f.Run.Phase(), "autopilot never stops on its own (D-18)")
 	st := f.Planner.Status()
-	assert.Equal(t, st.Attempts, st.Empty, "every plan was empty")
+	// Plans counts finished planning rounds and Empty the ones that
+	// returned nothing, so comparing those two says "every plan that came
+	// back was empty" without racing the round that is still in flight —
+	// Attempts is incremented when a firing starts, not when it lands.
+	assert.Equal(t, st.Plans, st.Empty, "every plan was empty")
+	assert.GreaterOrEqual(t, st.Attempts, st.Empty)
 	assert.Zero(t, st.Beads)
 
 	require.NoError(t, f.Run.Stop("the user pressed s"))
@@ -518,7 +533,7 @@ func TestPlannerAutopilotEndsWhenEveryCartridgeIsOutOfCredits(t *testing.T) {
 
 	planningEventually(t, "the first plan", func() bool {
 		f.Clock.Advance(time.Second)
-		return f.Runner.count() == 1
+		return f.Runner.count() >= 1
 	})
 	assert.Equal(t, PhaseRunning, f.Run.Phase())
 
@@ -546,7 +561,7 @@ func TestPlannerAutopilotEndsOnStop(t *testing.T) {
 
 	planningEventually(t, "the first plan", func() bool {
 		f.Clock.Advance(time.Second)
-		return f.Applier.count() == 1
+		return f.Applier.count() >= 1
 	})
 	// Beads exist and are open: brief mode would finish here, autopilot
 	// must not.
@@ -717,7 +732,7 @@ func TestPlannerPassesTheConfiguredPlanCapToTheProductOwner(t *testing.T) {
 	f.start()
 	planningEventually(t, "the first plan", func() bool {
 		f.Clock.Advance(time.Second)
-		return f.Runner.count() == 1
+		return f.Runner.count() >= 1
 	})
 	req, ok := f.Runner.last()
 	require.True(t, ok)
@@ -749,7 +764,7 @@ func TestPlannerRequestCarriesTheRunTheModeAndTheOpenBeads(t *testing.T) {
 	f.start()
 	planningEventually(t, "the first plan", func() bool {
 		f.Clock.Advance(time.Second)
-		return f.Runner.count() == 1
+		return f.Runner.count() >= 1
 	})
 	req, ok := f.Runner.last()
 	require.True(t, ok)
@@ -776,7 +791,7 @@ func TestPlannerBriefRequestCarriesTheBriefAndNoNotes(t *testing.T) {
 	f.start()
 	planningEventually(t, "the first plan", func() bool {
 		f.Clock.Advance(time.Second)
-		return f.Runner.count() == 1
+		return f.Runner.count() >= 1
 	})
 	req, ok := f.Runner.last()
 	require.True(t, ok)

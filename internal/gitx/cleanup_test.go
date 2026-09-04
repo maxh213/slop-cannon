@@ -1239,6 +1239,49 @@ func TestResumer_Resume(t *testing.T) {
 	})
 }
 
+// TestResumer_Resume_ClearsAStaleIndexLock covers the trap a killed run
+// sets for the next one: git holds .git/index.lock for the whole of an add,
+// a commit or a rebase step and never clears it after a SIGKILL, so without
+// this every command in that worktree fails for ever with "Another git
+// process seems to be running in this repository" — and the run that
+// resumes the bead re-fires its engineer, fails to commit, and spins.
+func TestResumer_Resume_ClearsAStaleIndexLock(t *testing.T) {
+	ctx := context.Background()
+	f := wtSetup(t, nil)
+	killed := cuBead("fx-k1", "killed mid-commit", domain.BeadStateInProgress)
+	cuWork(t, f, killed)
+
+	wtRepo, err := f.m.Open(ctx, killed.ID)
+	require.NoError(t, err)
+	gitDir, err := wtRepo.Git(ctx, "rev-parse", "--absolute-git-dir")
+	require.NoError(t, err)
+	lock := filepath.Join(strings.TrimSpace(gitDir), "index.lock")
+	require.NoError(t, os.WriteFile(lock, []byte("<pid of the process that died>\n"), 0o600))
+
+	// git really is stuck until the lock goes.
+	acWrite(t, f.m.PathFor(killed.ID), "work/more.txt", "written after the kill\n")
+	_, err = wtRepo.CommitAll(ctx, "this cannot work")
+	require.Error(t, err, "git refuses to touch the index while the lock is there")
+
+	r, err := NewResumer(f.m, nil, WithoutGH())
+	require.NoError(t, err)
+	res, err := r.Resume(ctx, []domain.Bead{killed})
+	require.NoError(t, err)
+	assert.NoFileExists(t, lock, "the resume cleared the stale lock")
+	assert.Contains(t, strings.Join(res.Warnings, "\n"), "cleared a stale git index lock in fx-k1's worktree")
+
+	c, err := wtRepo.CommitAll(ctx, "and now it works again")
+	require.NoError(t, err)
+	assert.True(t, c.Committed, "the bead can be worked on again")
+
+	// A worktree with no lock is left alone and says nothing.
+	clean := cuBead("fx-k2", "no lock", domain.BeadStateInProgress)
+	cuWork(t, f, clean)
+	res, err = r.Resume(ctx, []domain.Bead{clean})
+	require.NoError(t, err)
+	assert.NotContains(t, strings.Join(res.Warnings, "\n"), "stale git index lock")
+}
+
 func TestResumer_Resume_WithRemote(t *testing.T) {
 	ctx := context.Background()
 

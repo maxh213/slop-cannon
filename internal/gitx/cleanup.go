@@ -899,6 +899,19 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 		if wt.Branch != "" {
 			wtBranch = wt.Branch
 		}
+		// A run killed mid-commit leaves git's index lock behind, and git
+		// never clears it: every later command in that worktree would fail
+		// with "Another git process seems to be running in this
+		// repository", so the bead could never be worked on again. Nothing
+		// of ours holds it at this point — the run has not fired an agent.
+		switch cleared, cerr := r.m.clearStaleIndexLock(ctx, bead.ID); {
+		case cerr != nil:
+			res.Warnings = append(res.Warnings,
+				fmt.Sprintf("could not check %s for a stale git index lock: %v", bead.ID, cerr))
+		case cleared:
+			res.Warnings = append(res.Warnings,
+				fmt.Sprintf("cleared a stale git index lock in %s's worktree, left by the interrupted run", bead.ID))
+		}
 	case !errors.Is(err, ErrWorktreeMissing):
 		e.Err = err
 		return e
