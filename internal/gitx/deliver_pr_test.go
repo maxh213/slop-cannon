@@ -32,7 +32,10 @@ type dpTracker struct {
 	statuses []domain.BeadState
 	gates    []beads.Gate
 	created  []int
-	err      error
+	resolved []string // "<gate>: <reason>"
+
+	err        error
+	resolveErr error
 }
 
 func (tr *dpTracker) SetMetadata(_ context.Context, id domain.BeadID, meta map[string]any) (beads.Issue, error) {
@@ -94,6 +97,24 @@ func (tr *dpTracker) GateFor(_ context.Context, bead domain.BeadID) (beads.Gate,
 		}
 	}
 	return beads.Gate{}, fmt.Errorf("beads: %w: %s", beads.ErrNoGate, bead)
+}
+
+func (tr *dpTracker) ResolveGate(_ context.Context, id domain.BeadID, reason string) error {
+	tr.mu.Lock()
+	defer tr.mu.Unlock()
+	if tr.resolveErr != nil {
+		return tr.resolveErr
+	}
+	for i, g := range tr.gates {
+		if g.ID != id {
+			continue
+		}
+		g.Status, g.CloseReason = "closed", reason
+		tr.gates[i] = g
+		tr.resolved = append(tr.resolved, fmt.Sprintf("%s: %s", id, reason))
+		return nil
+	}
+	return fmt.Errorf("beads: %w: gate %s", beads.ErrNotFound, id)
 }
 
 // dpSeedGate registers an open gh:pr gate for bead and PR number n, the
@@ -472,7 +493,12 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		assert.Equal(t, []string{"pr list", "label create", "pr create"}, dpCalls(t, f.gh))
 	})
 
-	t.Run("warns about a gate for another pull request and still creates the right one", func(t *testing.T) {
+	// P6-14/P6-22, the retry half: a gh:pr gate left behind by a pull
+	// request that was abandoned is resolved before the gate for this one
+	// is created. Under D-20 a bead cannot close while any gate blocks it,
+	// so a second gate beside the first would leave the bead unable to
+	// close even after this pull request merges.
+	t.Run("clears a gate for an abandoned pull request before creating the right one", func(t *testing.T) {
 		f := dpSetup(t, true)
 		stale := f.tracker.dpSeedGate(wtBead.ID, 9)
 		res, err := f.d.Deliver(ctx, dpRequest())
@@ -480,9 +506,50 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		assert.Equal(t, PRCreated, res.Status)
 		assert.Equal(t, domain.BeadID("gate-2"), res.Gate)
 		assert.Equal(t, []int{7}, f.tracker.created)
+		assert.Equal(t, []string{"seed-9: superseded by pull request #7"}, f.tracker.resolved)
 		require.Len(t, res.Warnings, 1)
 		assert.Contains(t, res.Warnings[0], string(stale.ID))
 		assert.Contains(t, res.Warnings[0], "not for PR #7")
+		assert.Contains(t, res.Warnings[0], "it was resolved")
+
+		// Exactly one gate blocks the bead, and it is this delivery's.
+		open, err := f.tracker.GateFor(ctx, wtBead.ID)
+		require.NoError(t, err)
+		assert.Equal(t, res.Gate, open.ID)
+		n, ok := open.PRNumber()
+		require.True(t, ok)
+		assert.Equal(t, 7, n)
+	})
+
+	// If the stale gate cannot be cleared, no second gate is created: the
+	// delivery fails and says why, so a retry can try again rather than
+	// leaving the bead permanently blocked.
+	t.Run("refuses to add a second gate when the stale one will not clear", func(t *testing.T) {
+		f := dpSetup(t, true)
+		f.tracker.dpSeedGate(wtBead.ID, 9)
+		f.tracker.resolveErr = errors.New("bd: exit status 1")
+
+		_, err := f.d.Deliver(ctx, dpRequest())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "clearing the stale gh:pr gate seed-9")
+		assert.Empty(t, f.tracker.created, "no second gate is created")
+	})
+
+	// A gate of another type is not delivery's to clear: it is reported and
+	// left for whoever created it.
+	t.Run("warns about a gate of another type and leaves it alone", func(t *testing.T) {
+		f := dpSetup(t, true)
+		f.tracker.gates = append(f.tracker.gates, beads.Gate{
+			ID: "gate-human", Status: "open", AwaitType: "human", AwaitID: "review", Blocks: wtBead.ID,
+		})
+		res, err := f.d.Deliver(ctx, dpRequest())
+		require.NoError(t, err)
+		assert.Equal(t, PRCreated, res.Status)
+		assert.Equal(t, []int{7}, f.tracker.created)
+		assert.Empty(t, f.tracker.resolved)
+		require.Len(t, res.Warnings, 1)
+		assert.Contains(t, res.Warnings[0], "gate-human")
+		assert.Contains(t, res.Warnings[0], "is already blocked by")
 	})
 
 	t.Run("opens the pull request without a label when the label cannot be created", func(t *testing.T) {

@@ -1172,7 +1172,7 @@ func TestSchedulerMovesOneBeadThroughTwoEngineers(t *testing.T) {
 	}, claims.Calls())
 	assert.Equal(t, schedBead{status: domain.BeadStateChangesRequested, assignee: "eng-sc-1-r2"}, claims.State("sc-1"))
 	for _, w := range f.warnings() {
-		assert.NotEqual(t, SchedulerWarningSource, w.Source, "no claim was refused: %s", w.Message)
+		assert.NotEqual(t, SourceScheduler, w.Source, "no claim was refused: %s", w.Message)
 	}
 }
 
@@ -1254,7 +1254,7 @@ func TestSchedulerSkipsADemandItCannotClaim(t *testing.T) {
 	assert.Zero(t, f.Sched.Live(), "the reservation was given back")
 	var found bool
 	for _, w := range f.warnings() {
-		if w.Source == SchedulerWarningSource {
+		if w.Source == SourceScheduler {
 			found = true
 			assert.Contains(t, w.Message, "could not claim sc-1")
 			assert.Contains(t, w.Err, "not claimable")
@@ -1308,7 +1308,7 @@ func TestSchedulerWarnsWhenTheLeaseIsLost(t *testing.T) {
 	})
 	schedEventually(t, "the warning", func() bool {
 		for _, w := range f.warnings() {
-			if w.Source == SchedulerWarningSource {
+			if w.Source == SourceScheduler {
 				return true
 			}
 		}
@@ -1648,7 +1648,7 @@ func TestSchedulerDrainGivesUpAfterItsGrace(t *testing.T) {
 
 	var warned bool
 	for _, w := range f.warnings() {
-		if w.Source == SchedulerWarningSource {
+		if w.Source == SourceScheduler {
 			warned = true
 			assert.Contains(t, w.Message, "still running after 30s")
 			assert.Contains(t, w.Message, "leaving them to the supervisor")

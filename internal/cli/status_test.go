@@ -448,6 +448,104 @@ func TestStatusScrubsUntrustedEventText(t *testing.T) {
 	}
 }
 
+// TestStatusScrubsTheAgentsAndBeadsSections: the two sections that print
+// ids, roles and state names borrowed from bd and from a plan a model
+// wrote. They are as untrusted as an event message, and the reviewer's
+// repro plants escapes in exactly those fields.
+func TestStatusScrubsTheAgentsAndBeadsSections(t *testing.T) {
+	_, repo := statusEnv(t)
+	statusRecord(t, repo, true,
+		events.AgentSpawned{Meta: statusAt(62), Task: events.TaskImplement, Round: 1,
+			Agent: domain.Agent{
+				ID: "eng-\x1b[31mRED\x1b[0m-1", Role: domain.RoleEngineer,
+				Bead: "sc-\x1b[1;41mX\x1b[0m", State: domain.AgentStateRunning, PID: 42,
+			}},
+		events.BeadStateChanged{Meta: statusAt(63), Bead: "sc-\x1b[1;41mX\x1b[0m",
+			From: domain.BeadStateOpen, To: domain.BeadStateInReview},
+	)
+
+	out, err := rootRun(t, "--repo", repo, "status")
+	require.NoError(t, err)
+	require.Contains(t, out, "eng-RED-1", "the agent id is printed, without its escapes")
+	require.Contains(t, out, "sc-X", "so is the bead id")
+	require.Contains(t, out, "pid 42")
+	// A state name is a closed set (domain.BeadState refuses to marshal
+	// anything else), so scrubbing it is belt and braces; the ids are not.
+	require.Contains(t, out, "in_review")
+	for _, line := range strings.Split(out, "\n") {
+		require.False(t, strings.ContainsFunc(line, func(r rune) bool {
+			return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+		}), "control character in %q", line)
+	}
+}
+
+// TestStatusScrubsTheBeadTimeline: `sc status <bead-id>` prints a bead
+// title a product owner invented and the headline of every message an
+// agent wrote. None of it may repaint the terminal, and the report's line
+// structure survives the scrubbing.
+func TestStatusScrubsTheBeadTimeline(t *testing.T) {
+	_, repo := statusEnv(t)
+	issue := statusIssue(t)
+	issue.Title = "Add \x1b[2Jretry"
+	issue.Assignee = "sc:eng-\x1b[31mRED\x1b[0m"
+	report := domain.ImplReport{
+		Summary: "\x1b[1;41m spoofed \x1b[0m\rERASED\x07 and\tdone",
+	}
+	body, err := beads.EncodeMessage(report)
+	require.NoError(t, err)
+	issue.Comments = append(issue.Comments, beads.Comment{
+		ID: "c2", IssueID: "sc-1", Author: "sc:eng-sc-1-r1",
+		CreatedAt: statusEpoch.Add(40 * time.Second), Text: body,
+	})
+	statusInstallBeads(t, repo, &statusFakeBeads{issues: []beads.Issue{issue}})
+
+	out, err := rootRun(t, "--repo", repo, "status", "sc-1")
+	require.NoError(t, err)
+	require.Contains(t, out, "Add retry", "the title survives, its escape does not")
+	require.Contains(t, out, " spoofed ERASED and done")
+	raw := beads.FormatTimeline(issue, beads.ParseMessages(issue.Comments))
+	require.Equal(t, strings.Count(raw, "\n"), strings.Count(out, "\n"),
+		"scrubbing is per line: the timeline keeps its shape")
+	for _, line := range strings.Split(out, "\n") {
+		require.False(t, strings.ContainsFunc(line, func(r rune) bool {
+			return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+		}), "control character in %q", line)
+	}
+}
+
+// TestStatusReadsPastADamagedRunLogLine is the command-level regression for
+// a fold that stopped at the first unreadable line: a run log torn by a
+// short write (the run then carries on appending, D-15) used to make
+// `sc status` describe the run as it stood at the tear. It must describe
+// the run as it stands now, and say the line was skipped.
+func TestStatusReadsPastADamagedRunLogLine(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := statusRecord(t, repo, true)
+	path := orchestrator.EventLogPath(dir)
+	whole, err := os.ReadFile(path) //nolint:gosec // a temp run directory
+	require.NoError(t, err)
+	lines := strings.SplitAfter(string(whole), "\n")
+	require.Greater(t, len(lines), 6)
+	// Tear the third line in half, exactly as a short write would.
+	lines[2] = lines[2][:len(lines[2])/2]
+	require.NoError(t, os.WriteFile(path, []byte(strings.Join(lines, "")), 0o600))
+
+	out, err := rootRun(t, "--repo", repo, "status")
+	require.NoError(t, err)
+	require.Contains(t, out, "closed", "the states the log records after the damage still count")
+	require.Contains(t, out, "in_review")
+	require.Contains(t, out, "note: 1 line of the run log did not parse and was skipped")
+	require.NotContains(t, out, "events     0 of")
+}
+
+// TestStatusScrubBlock covers the multi-line scrubber: every line is
+// scrubbed, the newlines between them are not.
+func TestStatusScrubBlock(t *testing.T) {
+	require.Equal(t, "a\nb\n", statusScrubBlock("a\nb\n"), "clean text is returned unchanged")
+	require.Equal(t, "sc-1  title\n  red\n", statusScrubBlock("sc-1  \x1b[2Jtitle\n  \x1b[31mred\x1b[0m\n"))
+	require.Equal(t, "\n\n", statusScrubBlock("\r\n\x07\n"))
+}
+
 // TestStatusScrub covers the scrubber directly, including the sequences a
 // line of cartridge output is most likely to carry.
 func TestStatusScrub(t *testing.T) {

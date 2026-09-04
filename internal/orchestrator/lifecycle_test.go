@@ -633,7 +633,7 @@ func TestLifecycleStopKeepsABeadThatCannotTakeTheReleasedEdge(t *testing.T) {
 			require.Equal(t, domain.BeadID("sc-3"), c.Bead, "no other bead may be announced as moved")
 		}
 		if w, ok := ev.(events.Warning); ok {
-			require.NotEqual(t, StateWarningSource, w.Source,
+			require.NotEqual(t, SourceState, w.Source,
 				"a bead that cannot be released is kept quietly, not refused noisily")
 		}
 	}
@@ -818,7 +818,8 @@ func TestLifecycleResumeActsOnTheGitResumeResult(t *testing.T) {
 			{Bead: beadList[0], State: domain.BeadStateDelivering, PRState: "OPEN", Reason: "the pull request is open"},
 			{Bead: beadList[1], State: domain.BeadStateInProgress, Conflict: true,
 				ConflictFiles: []string{"a.go"}, Reason: "the worktree is mid-rebase"},
-			{Bead: beadList[2], State: domain.BeadStateClosed, Reason: "the branch landed on main"},
+			// Applied: gitx wrote the close to bd, so the run announces it.
+			{Bead: beadList[2], State: domain.BeadStateClosed, Applied: true, Reason: "the branch landed on main"},
 		},
 	}}
 	handler := &lifecycleResumeHandler{}

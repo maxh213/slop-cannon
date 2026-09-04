@@ -35,9 +35,13 @@ import (
 //     [beads.FormatTimeline] over its structured messages (P6-15), rather
 //     than re-deriving a history the messages already record (D-06).
 //
-// Every line the first report prints is scrubbed before it reaches the
-// terminal ([statusScrub]): a run log quotes what a cartridge and bd
-// printed, and that text must not be able to repaint the user's screen.
+// Every line either report prints is scrubbed before it reaches the
+// terminal ([statusScrub], [statusScrubBlock]): a run log quotes what a
+// cartridge and bd printed and a bead timeline quotes what an agent wrote
+// into a bd comment — a bead title the product owner invented, the prose of
+// a verdict — and none of that text may be able to repaint the user's
+// screen. Nothing upstream validates control characters in what a model
+// produced, so the guarantee is made here, at the one place it is printed.
 
 // Flag names of `sc status`.
 const (
@@ -270,8 +274,10 @@ func RunStatus(repo string, runID domain.RunID, recent int) (*StatusReport, erro
 	case errors.Is(err, orchestrator.ErrNoEventLog):
 		rep.Notes = append(rep.Notes, "no "+orchestrator.EventLogName+" in "+rep.Dir)
 	default:
-		// A truncated last line still leaves everything before it usable;
-		// a log that yielded nothing at all is reported as a note alone.
+		// Only a stream that cannot be read on gets here — an I/O failure,
+		// or a line past the reader's size limit. A line that does not
+		// parse is skipped by the fold and reported in Summary.Notes
+		// below, so a damaged log still describes the run as it stands.
 		if summary.Events > 0 {
 			rep.Summary = &summary
 		}
@@ -442,14 +448,20 @@ func statusBeadsSection(b *strings.Builder, r *StatusReport) {
 	if len(s.Beads) == 0 {
 		return
 	}
+	// A state is bd's word for it, and bd's words include whatever a
+	// repository (or an agent talking to bd) invented, so they are scrubbed
+	// like everything else and measured after scrubbing.
+	order := statusStateOrder(s.Counts)
+	names := make([]string, len(order))
 	width := 0
-	for state := range s.Counts {
-		if n := len(state); n > width {
+	for i, state := range order {
+		names[i] = statusScrub(string(state))
+		if n := len(names[i]); n > width {
 			width = n
 		}
 	}
-	for _, state := range statusStateOrder(s.Counts) {
-		fmt.Fprintf(b, "  %-*s  %d\n", width, state, s.Counts[state])
+	for i, state := range order {
+		fmt.Fprintf(b, "  %-*s  %d\n", width, names[i], s.Counts[state])
 	}
 }
 
@@ -512,8 +524,12 @@ func statusAgentsSection(b *strings.Builder, r *StatusReport) {
 		if a.Lens != "" {
 			role += "/" + a.Lens.String()
 		}
-		rows = append(rows, [3]string{string(a.ID), role, statusAgentDetail(a)})
-		if n := len(a.ID); n > idW {
+		// An agent id carries a bd bead id and a role carries a configured
+		// lens name, so both quote text sc did not write: scrub before
+		// measuring, or an escape would also break the column widths.
+		id, role := statusScrub(string(a.ID)), statusScrub(role)
+		rows = append(rows, [3]string{id, role, statusAgentDetail(a)})
+		if n := len(id); n > idW {
 			idW = n
 		}
 		if n := len(role); n > roleW {
@@ -525,14 +541,15 @@ func statusAgentsSection(b *strings.Builder, r *StatusReport) {
 	}
 }
 
-// statusAgentDetail renders the bead, state and pid of one live agent.
+// statusAgentDetail renders the bead, state and pid of one live agent. The
+// bead id is bd's, so it is scrubbed like every other borrowed string.
 func statusAgentDetail(a domain.Agent) string {
 	parts := make([]string, 0, 3)
 	if a.Bead != "" {
-		parts = append(parts, string(a.Bead))
+		parts = append(parts, statusScrub(string(a.Bead)))
 	}
 	if a.State != "" {
-		parts = append(parts, a.State.String())
+		parts = append(parts, statusScrub(a.State.String()))
 	}
 	if a.PID > 0 {
 		parts = append(parts, fmt.Sprintf("pid %d", a.PID))
@@ -615,6 +632,26 @@ func statusScrub(s string) string {
 	return b.String()
 }
 
+// statusScrubBlock scrubs a multi-line report — [beads.FormatTimeline]'s
+// output — line by line, keeping the line structure the report laid out and
+// making every line as safe as [statusScrub] makes one. A timeline prints a
+// bead title and the first line of a message's prose, both written by a
+// model into bd, so the same guarantee has to hold there.
+func statusScrubBlock(s string) string {
+	if !strings.ContainsFunc(s, statusIsControlInBlock) {
+		return s
+	}
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = statusScrub(line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// statusIsControlInBlock is [statusIsControl] minus the newline the block
+// itself is built from.
+func statusIsControlInBlock(r rune) bool { return r != '\n' && statusIsControl(r) }
+
 // statusIsControl reports whether r is read by a terminal as an instruction
 // rather than as text: a C0 control (ESC, CR, LF and tab included), DEL, or
 // a C1 control.
@@ -688,6 +725,9 @@ func statusBead(cmd *cobra.Command, repo string, id domain.BeadID, asJSON bool) 
 		}
 		return writeJSON(out, rep)
 	}
-	_, err = io.WriteString(out, beads.FormatTimeline(issue, msgs))
+	// The timeline quotes a bead title and the prose of every message an
+	// agent wrote: scrub it before it reaches the terminal, exactly as the
+	// run report scrubs the events it prints.
+	_, err = io.WriteString(out, statusScrubBlock(beads.FormatTimeline(issue, msgs)))
 	return err
 }

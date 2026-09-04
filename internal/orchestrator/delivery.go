@@ -58,7 +58,11 @@ import (
 //     markers of a worktree left mid-rebase by an earlier delivery. Every
 //     delivery therefore probes the worktree first and, when a rebase is in
 //     progress, commits nothing and sends the bead straight to the engineer
-//     as a conflict round. The same guard sits inside [DeliveryGit] itself,
+//     as a conflict round — including when the probe could not list the
+//     conflicted paths, because a worktree full of markers is its
+//     engineer's work with or without a file list, and retrying the probe
+//     would leave the bead in delivering with nobody on it. The same guard
+//     sits inside [DeliveryGit] itself,
 //     because the delivery is not the only caller: the feedback engine
 //     commits leftovers before it builds a round's prompt too.
 //
@@ -96,6 +100,11 @@ const SourceDelivery = "delivery"
 // engineer and no testers unless D-09 asks for them. A run that wants a
 // different number sets [DeliveryOptions.MaxConflictRounds]; there is no
 // configuration key for it yet.
+//
+// Only a round an engineer was really given is counted. A conflict round
+// whose bd write failed is a [DeliveryRetryable] outcome the caller answers
+// by delivering again, so counting it would let transient bd failures spend
+// the whole budget and park the bead in needs_human having fired nobody.
 const DefaultMaxConflictRounds = 3
 
 // DefaultCheckItemCategory is the [domain.FeedbackItem] Category of the qa
@@ -590,15 +599,25 @@ func (d *Deliverer) Deliver(ctx context.Context, req DeliveryRequest) (*Delivery
 	if d.git != nil {
 		rs, err := d.git.RebaseState(ctx, bead.ID)
 		switch {
+		case rs.InProgress:
+			// The mid-rebase fact outranks the error, because the probe
+			// returns both: [managerGit.RebaseState] reports InProgress
+			// with the branch even when listing the unmerged paths failed.
+			// Treating that as a retryable inspection failure would leave
+			// the bead in delivering with nobody working on it and every
+			// retry repeating the same probe, when what the worktree needs
+			// is its engineer — with whatever files are known, or none.
+			if err != nil {
+				d.warn(bead.ID, "the conflicted paths could not be listed; opening the conflict round without them", err)
+			}
+			// No baseline: mid-rebase there is no branch tip to diff, so
+			// the resolution cannot be measured and D-09 errs on a review.
+			return d.conflictRound(ctx, req, out, d.conflictOf(ctx, rs.Files, midRebaseOutput(rs)),
+				"the worktree was left mid-rebase", nil)
 		case errors.Is(err, gitx.ErrWorktreeMissing):
 			return d.handOff(ctx, req, out, "the bead has no worktree to deliver from", "", err)
 		case err != nil:
 			return d.retryable(out, "the worktree could not be inspected", err)
-		case rs.InProgress:
-			// No baseline: mid-rebase there is no branch tip to diff, so
-			// the resolution cannot be measured and D-09 errs on a review.
-			return d.conflictRound(ctx, req, out, d.conflictOf(ctx, rs.Files, ""),
-				"the worktree was left mid-rebase", nil)
 		}
 		if err := d.commitLeftovers(ctx, bead, round, out); err != nil {
 			switch {
@@ -914,8 +933,32 @@ func (d *Deliverer) retryable(out *DeliveryOutcome, reason string, err error) (*
 
 // conflictOf builds the engineer's view of a failed rebase (P5-12): the
 // target branch it was rebasing onto, the conflicted files and git's output.
+// The result may still be empty (git named none of the three);
+// [Deliverer.conflictRound] is where that is made good, because a conflict
+// reaches it from other callers too.
 func (d *Deliverer) conflictOf(ctx context.Context, files []string, output string) agents.EngineerConflict {
 	return agents.NewEngineerConflict(d.defaultBranch(ctx), files, output)
+}
+
+// DefaultConflictOutput is what a conflict round tells the engineer when git
+// named neither a target branch, nor a conflicted file, nor any output of
+// its own. It exists because an empty [agents.EngineerConflict] is refused
+// by [agents.EngineerRequest.Validate] ("a resolve_conflict with no conflict
+// to resolve"), so a round built from one could be demanded for ever and
+// never fire. Everything that opens a conflict round does know this much.
+const DefaultConflictOutput = "The worktree is in the middle of a rebase whose conflicts are still unresolved. " +
+	"Run \"git status\" in the worktree for the unmerged paths."
+
+// midRebaseOutput describes a worktree the mid-rebase probe found, for the
+// engineer of the conflict round that probe opens. Git itself said nothing
+// here — the delivery only looked — so the description is this package's.
+func midRebaseOutput(rs RebaseState) string {
+	branch := strings.TrimSpace(rs.Branch)
+	if branch == "" {
+		return DefaultConflictOutput
+	}
+	return fmt.Sprintf("The worktree is in the middle of a rebase of %s whose conflicts are still unresolved. "+
+		"Run \"git status\" in the worktree for the unmerged paths.", branch)
 }
 
 // defaultBranch is the branch a delivery rebases onto; the empty string when
@@ -969,7 +1012,12 @@ func ConflictFromResume(e gitx.ResumeEntry, target string) (agents.EngineerConfl
 // baseline means the branch could not be diffed, which counts as
 // "everything changed" and buys the resolution a full review.
 func (d *Deliverer) conflictRound(ctx context.Context, req DeliveryRequest, out *DeliveryOutcome, conflict agents.EngineerConflict, reason string, baseline *gitx.Diff) (*DeliveryOutcome, error) {
-	attempt := d.nextAttempt(req.Bead.ID)
+	if conflict.Empty() {
+		// agents refuses a resolve_conflict request with nothing in it, so
+		// an empty conflict is a round that can be offered but never fired.
+		conflict = agents.NewEngineerConflict("", nil, DefaultConflictOutput)
+	}
+	attempt := d.peekAttempt(req.Bead.ID)
 	if attempt > d.maxRounds {
 		return d.handOff(ctx, req, out,
 			fmt.Sprintf("%s and %d conflict rounds did not resolve it", reason, d.maxRounds), "", nil)
@@ -980,9 +1028,15 @@ func (d *Deliverer) conflictRound(ctx context.Context, req DeliveryRequest, out 
 			Bead: req.Bead.ID, From: out.State, Event: BeadEventConflict,
 			Agent: agent, Round: out.Round, Reason: reason,
 		}); err != nil {
+			// The round was never opened, so it must not be counted: the
+			// caller's answer to DeliveryRetryable is to deliver again, and
+			// a budget spent on bd hiccups would park the bead in
+			// needs_human having fired no engineer at all.
 			return d.retryable(out, "the conflict round could not be opened", err)
 		}
 	}
+	// The bead really is with its engineer now; this attempt is spent.
+	d.spendAttempt(req.Bead.ID, attempt)
 	bead := req.Bead
 	bead.State = domain.BeadStateInProgress
 	pending := PendingConflict{
@@ -1055,12 +1109,27 @@ func (d *Deliverer) engineerFor(req DeliveryRequest, round, attempt int) domain.
 	return domain.AgentID(id)
 }
 
-// nextAttempt counts the conflict rounds one delivery has had.
-func (d *Deliverer) nextAttempt(id domain.BeadID) int {
+// peekAttempt numbers the conflict round a delivery is about to open —
+// one more than the rounds it has already had — without spending it. The
+// count is only committed by [Deliverer.spendAttempt], once the bead has
+// actually moved to its engineer, so a delivery that failed to open the
+// round keeps its budget (MaxConflictRounds bounds rounds an engineer was
+// given, not bd write failures).
+func (d *Deliverer) peekAttempt(id domain.BeadID) int {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.attempts[id]++
-	return d.attempts[id]
+	return d.attempts[id] + 1
+}
+
+// spendAttempt records the conflict round [Deliverer.peekAttempt] numbered
+// as opened. It never lowers the count, so it is safe to call twice for one
+// round.
+func (d *Deliverer) spendAttempt(id domain.BeadID, attempt int) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if attempt > d.attempts[id] {
+		d.attempts[id] = attempt
+	}
 }
 
 // forget drops the per-bead bookkeeping of a delivery that ended.

@@ -175,15 +175,17 @@ func (a *planningApplier) count() int {
 
 // planningBeadStore is the mutable bead listing behind a [BeadSource].
 type planningBeadStore struct {
-	mu   sync.Mutex
-	list []domain.Bead
-	err  error
+	mu    sync.Mutex
+	list  []domain.Bead
+	err   error
+	calls int
 }
 
 func (s *planningBeadStore) source() BeadSource {
 	return func(context.Context) ([]domain.Bead, error) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
+		s.calls++
 		if s.err != nil {
 			return nil, s.err
 		}
@@ -194,7 +196,21 @@ func (s *planningBeadStore) source() BeadSource {
 func (s *planningBeadStore) set(list ...domain.Bead) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.list = list
+	s.list, s.err = list, nil
+}
+
+// fail makes every later listing return err; nil heals the store.
+func (s *planningBeadStore) fail(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+}
+
+// count is how many listings the store has been asked for.
+func (s *planningBeadStore) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
 }
 
 // planningCredits is a fake [CreditsWatcher] a test can flip.
@@ -601,20 +617,63 @@ func TestPlannerAutopilotReplansOnlyWhenNothingIsInFlight(t *testing.T) {
 	// Pretend the first plan landed.
 	planningApply(p, map[string]domain.BeadID{"alpha": "sc-alpha"}, nil)
 
+	status = SchedulerStatus{Live: 1, Quiet: true, ByRole: map[domain.Role]int{domain.RoleEngineer: 1}}
 	ds, err = p.Demands(context.Background())
 	require.NoError(t, err)
-	assert.Empty(t, ds, "an engineer is running, so there is nothing to re-plan for")
+	assert.Empty(t, ds, "an engineer is still carrying out the last plan")
 
-	status = SchedulerStatus{Live: 0, Idle: false}
+	status = SchedulerStatus{Live: 0, Idle: false, Quiet: false}
 	ds, err = p.Demands(context.Background())
 	require.NoError(t, err)
 	assert.Empty(t, ds, "the last dispatch still found work to fire")
 
-	status = SchedulerStatus{Live: 0, Idle: true}
+	status = SchedulerStatus{Live: 0, Idle: true, Quiet: true}
 	ds, err = p.Demands(context.Background())
 	require.NoError(t, err)
 	assert.Len(t, ds, 1, "the ready queue is empty and nothing is running: re-plan (D-18)")
 	assert.Contains(t, ds, planDemand())
+}
+
+// TestPlannerAutopilotReplansWhileANonEngineerIsStillRunning pins P6-05's
+// own words — "whenever the ready queue is empty and no engineer is
+// running" — rather than the stricter "the run is completely quiescent" the
+// first implementation used, which left every free slot idle behind a
+// single tester.
+func TestPlannerAutopilotReplansWhileANonEngineerIsStillRunning(t *testing.T) {
+	rc := planningRunConfig(t, "")
+	clock := newPlanningClock()
+	status := SchedulerStatus{}
+	p, err := NewPlanner(PlannerOptions{
+		Config: rc, Runner: &planningRunner{plan: planningPlan("alpha")},
+		Applier: &planningApplier{}, Now: clock.Now, NoShim: true,
+		Status: func() SchedulerStatus { return status },
+	})
+	require.NoError(t, err)
+	planningApply(p, map[string]domain.BeadID{"alpha": "sc-alpha"}, nil)
+
+	for _, tc := range []struct {
+		name string
+		role domain.Role
+		want int
+	}{
+		{name: "a tester reviewing one bead does not hold planning up", role: domain.RoleTester, want: 1},
+		{name: "nor does the run's own product owner", role: domain.RolePO, want: 1},
+		{name: "an engineer does", role: domain.RoleEngineer, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Quiet without Idle is the state the gap describes: one agent
+			// is live, the ready queue behind it is empty, and eight of the
+			// ten slots are free.
+			status = SchedulerStatus{
+				Live: 1, Idle: false, Quiet: true,
+				Caps:   SlotCaps{Ammo: 10, PO: 1},
+				ByRole: map[domain.Role]int{tc.role: 1},
+			}
+			ds, err := p.Demands(context.Background())
+			require.NoError(t, err)
+			assert.Len(t, ds, tc.want)
+		})
+	}
 }
 
 func TestPlannerBriefModeAsksForOnlyOnePlan(t *testing.T) {
@@ -932,6 +991,11 @@ func TestBeadSettled(t *testing.T) {
 		{planningBead("a", domain.BeadStateEscalated), false},
 		{domain.Bead{ID: "epic", Type: domain.BeadTypeEpic, State: domain.BeadStateOpen}, true},
 		{domain.Bead{ID: "gate", Type: domain.BeadTypeGate, State: domain.BeadStateOpen}, true},
+		// A state that is not a bd status at all is never settled
+		// (P6-36): a malformed listing must not finish a brief run.
+		{planningBead("a", ""), false},
+		{planningBead("a", domain.BeadState("wat")), false},
+		{planningBead("a", BeadStateUnrecorded), false},
 	}
 	for _, tc := range tests {
 		t.Run(string(tc.bead.ID)+"/"+tc.bead.State.String(), func(t *testing.T) {
@@ -1287,7 +1351,8 @@ func (p *planningPrioritiser) Update(_ context.Context, id domain.BeadID, patch 
 		return beads.Issue{}, fmt.Errorf("the planner must only ever set a priority, got %+v", patch)
 	}
 	p.calls = append(p.calls, planningPriorityCall{Bead: id, Priority: *patch.Priority})
-	return beads.Issue{ID: id}, nil
+	// bd echoes the updated issue back, and the planner publishes it.
+	return beads.Issue{ID: id, Status: string(domain.BeadStateOpen), Priority: *patch.Priority}, nil
 }
 
 func (p *planningPrioritiser) applied() []planningPriorityCall {
@@ -1645,4 +1710,224 @@ func TestPlannerReportsItsMode(t *testing.T) {
 	auto, err := NewPlanner(PlannerOptions{Config: planningRunConfig(t, "")})
 	require.NoError(t, err)
 	assert.Equal(t, domain.RunModeAutopilot, auto.Mode())
+}
+
+// --- P6-19: planning that keeps failing for a reason that is not the plan --
+
+// TestPlannerBriefModeGivesUpWhenPlanningItselfKeepsFailing is the brief-mode
+// terminal condition for a planner that never gets as far as a plan: a
+// cartridge that crashes, an agent that times out, a rules file that cannot
+// be read. A rejected plan already ended such a run (P6-19); without a cap
+// on the other failures a brief run fired the product owner every idle
+// interval for ever, and only the user could end it.
+func TestPlannerBriefModeGivesUpWhenPlanningItselfKeepsFailing(t *testing.T) {
+	f := planningSetup(t, "ship the thing", nil)
+	f.Runner.setErr(errors.New("the cartridge crashed"))
+	f.start()
+
+	planningEventually(t, "the brief run to give up on planning that never works", func() bool {
+		f.Clock.Advance(time.Minute)
+		select {
+		case <-f.Run.Done():
+			return true
+		default:
+			return false
+		}
+	})
+	out, err := f.wait()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPlanningGaveUp)
+	assert.Contains(t, err.Error(), "the cartridge crashed", "the finish names what kept going wrong")
+	assert.Equal(t, events.FinishFailed, out.Reason)
+	assert.Contains(t, out.Summary, "could not produce a usable plan")
+
+	st := f.Planner.Status()
+	assert.Equal(t, DefaultPlanFailureLimit, f.Runner.count(), "the firings are bounded, not endless")
+	assert.Equal(t, DefaultPlanFailureLimit, st.Attempts)
+	assert.Equal(t, 1, st.GaveUp)
+	assert.Zero(t, st.Failures, "the counter resets when the round is dropped")
+	assert.Zero(t, st.Plans)
+	assert.True(t, st.Finished)
+	assert.Zero(t, f.Applier.count())
+
+	var runs bool
+	for _, ev := range f.events() {
+		if w, ok := ev.(events.Warning); ok && w.Source == SourcePlanning &&
+			strings.Contains(w.Message, "in a row") {
+			runs = true
+		}
+	}
+	assert.True(t, runs, "the warnings say how long the failure has been going on")
+}
+
+// TestPlannerAutopilotBacksOffWhenPlanningKeepsFailingAndComesBack is the
+// same policy in autopilot, where D-18 forbids the run ending: the round is
+// dropped, the planner cools off, and it fires again.
+func TestPlannerAutopilotBacksOffWhenPlanningKeepsFailingAndComesBack(t *testing.T) {
+	f := planningSetup(t, "", nil)
+	f.Runner.setErr(errors.New("the cartridge crashed"))
+	f.start()
+
+	planningEventually(t, "the planner to give up on the round", func() bool {
+		f.Clock.Advance(time.Minute)
+		return f.Planner.Status().GaveUp >= 1
+	})
+	st := f.Planner.Status()
+	assert.False(t, st.Finished, "autopilot never stops on its own (D-18)")
+	assert.False(t, st.NextAt.IsZero(), "the next round is scheduled, not immediate")
+	assert.Zero(t, st.Failures)
+
+	before := f.Runner.count()
+	planningEventually(t, "the planner to try again after the backoff", func() bool {
+		f.Clock.Advance(time.Minute)
+		return f.Runner.count() > before
+	})
+	assert.Equal(t, PhaseRunning, f.Run.Phase(), "the run is still going")
+}
+
+func TestPlannerFailureLimitIsConfigurable(t *testing.T) {
+	rc := planningRunConfig(t, "ship it")
+	clock := newPlanningClock()
+	p, err := NewPlanner(PlannerOptions{
+		Config: rc, Runner: &planningRunner{}, Applier: &planningApplier{}, Now: clock.Now, NoShim: true,
+		FailureLimit: -1, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	for i := 0; i < DefaultPlanFailureLimit+3; i++ {
+		planningApply(p, nil, errors.New("the cartridge crashed"))
+	}
+	st := p.Status()
+	assert.Zero(t, st.GaveUp, "a negative limit never gives up")
+	assert.Equal(t, DefaultPlanFailureLimit+3, st.Failures)
+	assert.False(t, st.Finished, "and a brief run with one goes on for ever, as asked")
+}
+
+// TestPlannerCountsOnlyConsecutiveRejectionsTowardsTheLimit pins the word
+// "consecutive" in the P6-19 contract: a crash in the middle of two
+// rejections breaks the run, and the two counters never add up to a
+// give-up between them.
+func TestPlannerCountsOnlyConsecutiveRejectionsTowardsTheLimit(t *testing.T) {
+	rc := planningRunConfig(t, "ship it")
+	clock := newPlanningClock()
+	p, err := NewPlanner(PlannerOptions{
+		Config: rc, Runner: &planningRunner{}, Applier: &planningApplier{}, Now: clock.Now, NoShim: true,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	rejected := fmt.Errorf("%w: bead \"a\" duplicates open bead sc-1", agents.ErrPlanRejected)
+
+	planningApply(p, nil, rejected)
+	planningApply(p, nil, errors.New("the cartridge crashed"))
+	planningApply(p, nil, rejected)
+
+	st := p.Status()
+	assert.Zero(t, st.GaveUp, "the two rejections were not consecutive")
+	assert.Equal(t, 1, st.Rejections)
+	assert.Zero(t, st.Failures, "and a rejection breaks a run of failures too")
+	assert.False(t, st.Finished)
+
+	// Two in a row do end it.
+	planningApply(p, nil, rejected)
+	st = p.Status()
+	assert.Equal(t, 1, st.GaveUp)
+	assert.True(t, st.Finished)
+}
+
+// TestPlanningStopConditionDoesNotFloodWhenTheBeadListingKeepsFailing pins
+// the rate limit on the brief-mode stop condition: the scheduler consults it
+// after every dispatch, so a bd that is failing must not mean one listing
+// and one warning per tick down the single serialised bd queue (D-21).
+func TestPlanningStopConditionDoesNotFloodWhenTheBeadListingKeepsFailing(t *testing.T) {
+	store := &planningBeadStore{}
+	f := planningSetup(t, "ship it", func(o *PlannerOptions) { o.Beads = store.source() })
+	planningApply(f.Planner, map[string]domain.BeadID{"a": "sc-a"}, nil)
+	busy := errors.New("bd is busy")
+	store.fail(busy)
+
+	const polls = 40
+	for i := 0; i < polls; i++ {
+		f.Clock.Advance(time.Second)
+		_, done, err := f.Planner.Done(context.Background(), f.Run, SchedulerStatus{Idle: true})
+		require.NoError(t, err, "a listing failure must not fail the run")
+		require.False(t, done)
+	}
+	listings := store.count()
+	assert.LessOrEqual(t, listings, polls/int(DefaultSettleInterval/time.Second)+1,
+		"one listing per settle interval, not one per tick")
+	assert.Equal(t, 1, planningWarnings(f.events(), "settled"), "one warning, not one per poll")
+
+	// A different failure is news, so it is warned about again.
+	store.fail(errors.New("bd is gone"))
+	f.Clock.Advance(DefaultSettleInterval)
+	_, _, err := f.Planner.Done(context.Background(), f.Run, SchedulerStatus{Idle: true})
+	require.NoError(t, err)
+	assert.Equal(t, 1, planningWarnings(f.events(), "settled"))
+
+	// So is the first failure after a listing that worked.
+	store.set(planningBead("sc-a", domain.BeadStateOpen))
+	f.Clock.Advance(DefaultSettleInterval)
+	_, done, err := f.Planner.Done(context.Background(), f.Run, SchedulerStatus{Idle: true})
+	require.NoError(t, err)
+	assert.False(t, done, "an open bead is not settled")
+	store.fail(busy)
+	f.Clock.Advance(DefaultSettleInterval)
+	_, _, err = f.Planner.Done(context.Background(), f.Run, SchedulerStatus{Idle: true})
+	require.NoError(t, err)
+	assert.Equal(t, 1, planningWarnings(f.events(), "settled"))
+}
+
+// planningWarnings counts the planning warnings whose message contains want.
+func planningWarnings(evs []events.Event, want string) int {
+	n := 0
+	for _, ev := range evs {
+		w, ok := ev.(events.Warning)
+		if ok && w.Source == SourcePlanning && strings.Contains(w.Message, want) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestPlannerPublishesTheDeprioritisationItCarriedOut covers the other half
+// of Q-04: the bd write the cannon makes on the product owner's behalf is a
+// change to a bead that already existed, and the run log is where it has to
+// show up — events.PlanProduced carries the plan as applied, with the
+// restated bead taken out of it, so without this event nothing would record
+// that the priority moved.
+func TestPlannerPublishesTheDeprioritisationItCarriedOut(t *testing.T) {
+	pr := &planningPrioritiser{}
+	f := planningSetup(t, "", func(o *PlannerOptions) { o.Prioritiser = pr })
+	f.Beads.set(domain.Bead{
+		ID: "sc-old", Title: "Do alpha", Type: domain.BeadTypeTask,
+		State: domain.BeadStateOpen, Priority: domain.Priority(1),
+	})
+	f.Runner.setPlan(planningRestate(domain.PriorityLowest, "beta"))
+
+	_, err := f.Planner.Fire(context.Background(), Firing{
+		Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}, Run: f.Run,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []planningPriorityCall{{Bead: "sc-old", Priority: domain.PriorityLowest}}, pr.applied())
+
+	var updates []events.BeadUpdated
+	var plans []events.PlanProduced
+	for _, ev := range f.events() {
+		switch e := ev.(type) {
+		case events.BeadUpdated:
+			updates = append(updates, e)
+		case events.PlanProduced:
+			plans = append(plans, e)
+		}
+	}
+	require.Len(t, updates, 1, "a bd write the cannon makes is never silent")
+	assert.Equal(t, domain.BeadID("sc-old"), updates[0].Bead.ID)
+	assert.Equal(t, domain.PriorityLowest, updates[0].Bead.Priority)
+	assert.Equal(t, "Do alpha", updates[0].Bead.Title)
+	assert.Equal(t, domain.BeadStateOpen, updates[0].Bead.State, "the bead bd echoed back, not a blank one")
+	assert.Equal(t, []string{"priority"}, updates[0].Fields)
+	assert.Equal(t, f.Run.ID(), updates[0].Run)
+
+	require.Len(t, plans, 1)
+	require.Len(t, plans[0].Plan.Beads, 1, "the announced plan is the one that was applied")
+	assert.Equal(t, "beta", plans[0].Plan.Beads[0].Key)
 }

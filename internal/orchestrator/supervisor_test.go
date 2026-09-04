@@ -1347,3 +1347,227 @@ func TestSupervisorRemovesTheDirectoryOfAFailedWorktreeCopy(t *testing.T) {
 	_, statErr = os.Stat(copyDir)
 	assert.True(t, os.IsNotExist(statErr))
 }
+
+// supStartedCount is how many agents the supervisor still remembers having
+// fired — the set reap() matches its own agents against. It must not grow
+// with the run.
+func supStartedCount(s *Supervisor) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.started)
+}
+
+// supFireOne runs one scheduler firing through [Supervisor.Fire]. The
+// post-session Result hook — where the run's own bookkeeping (the bead
+// comment, the D-07 transition) happens in production — is set by the
+// fixture's planner.
+func supFireOne(t *testing.T, f *supFixture, sup *Supervisor, id domain.AgentID, bead domain.BeadID) (FireResult, error) {
+	t.Helper()
+	return sup.Fire(context.Background(), Firing{
+		Agent:  domain.Agent{ID: id, Role: domain.RoleTester, Lens: domain.LensQA, Bead: bead},
+		Demand: Demand{Kind: DemandReview, Bead: bead, Lens: domain.LensQA, Round: 1, BeadTitle: "review me"},
+		Run:    f.Run,
+		Update: func(domain.Agent) {},
+	})
+}
+
+func TestSupervisorDoesNotRetryAFailedPostSessionHook(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+	wt := f.worktree(t, "bd-27")
+
+	// What Feedback.move does when bd is having a bad day: the session is
+	// over and the impl_report comment is already written, and only the
+	// state transition afterwards fails.
+	bdErr := errors.New("beads: could not record the verdict: connection reset")
+	var hookCalls int
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.RetryBackoff = time.Second
+		o.Planner = FiringPlannerFunc(func(_ context.Context, sf Firing) (AgentFiring, error) {
+			af := supTesterFiring(sf.Agent.ID, sf.Demand.Bead, wt)
+			af.Agent = sf.Agent
+			af.Result = func(any, agents.Transcript) error {
+				hookCalls++
+				return bdErr
+			}
+			return af, nil
+		})
+	})
+
+	res, err := supFireOne(t, f, sup, "tester-qa-bd-27-r1", "bd-27")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPostSession, "the failure is the run's bookkeeping, not the session's")
+	assert.ErrorIs(t, err, bdErr, "and the hook's own error is still reachable")
+
+	// One session, one hook call, no back-off: the whole point.
+	assert.Equal(t, 1, hookCalls)
+	assert.Len(t, f.Adapters[supAlpha].Calls(), 1,
+		"a successful session is never fired again because the bookkeeping after it failed")
+	assert.Empty(t, f.Sleeper.Waits(), "nothing was retried, so nothing backed off")
+
+	assert.Equal(t, events.FailureInternal, res.Failure)
+	assert.Empty(t, res.Produced)
+
+	evs := f.supEvents()
+	fails := supFailuresIn(evs)
+	require.Len(t, fails, 1)
+	assert.Equal(t, events.FailureInternal, fails[0].Failure, "it is not a cartridge crash")
+	assert.False(t, fails[0].WillRetry)
+	assert.Equal(t, 1, fails[0].Attempt)
+	assert.Contains(t, fails[0].Err, "connection reset")
+
+	var errored []events.Error
+	for _, ev := range evs {
+		if e, ok := ev.(events.Error); ok {
+			errored = append(errored, e)
+		}
+	}
+	require.Len(t, errored, 1, "the human is told the run, not the cartridge, is at fault")
+	assert.Equal(t, SourceSupervisor, errored[0].Source)
+	assert.Contains(t, errored[0].Message, "could not record its result")
+	assert.Contains(t, errored[0].Err, "connection reset")
+
+	assert.Empty(t, f.Run.Agents())
+	assert.Zero(t, supStartedCount(sup))
+}
+
+func TestSupervisorRetriesTheSessionButNotTheBookkeepingAroundIt(t *testing.T) {
+	// A crash is retried as before, and the hook runs once, on the attempt
+	// that worked: the new rule narrows nothing else.
+	sc := mock.NewScenario("flaky")
+	sc.Rule("crash", mock.Match{}).Times(1).FailWith(mock.Failure{Kind: mock.FailCrash, ExitCode: 3})
+	sc.Otherwise("approve").Say("fine").Structured(json.RawMessage(`{"outcome":"approve"}`))
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: sc})
+	wt := f.worktree(t, "bd-28")
+
+	var hookCalls int
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.RetryBackoff = time.Second
+		o.Planner = FiringPlannerFunc(func(_ context.Context, sf Firing) (AgentFiring, error) {
+			af := supTesterFiring(sf.Agent.ID, sf.Demand.Bead, wt)
+			af.Agent = sf.Agent
+			af.Result = func(any, agents.Transcript) error {
+				hookCalls++
+				return nil
+			}
+			return af, nil
+		})
+	})
+
+	res, err := supFireOne(t, f, sup, "tester-qa-bd-28-r1", "bd-28")
+	require.NoError(t, err)
+	assert.Equal(t, domain.MessageVerdict, res.Produced)
+	assert.Equal(t, 1, hookCalls, "the bookkeeping runs once, after the session that worked")
+	assert.Len(t, f.Adapters[supAlpha].Calls(), 2, "the crash itself is still retried")
+	assert.Equal(t, []time.Duration{time.Second}, f.Sleeper.Waits())
+	assert.Zero(t, supStartedCount(sup))
+}
+
+func TestSupervisorStartsNoSessionAfterStopAgentsHasReturned(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+
+	preparing := make(chan struct{})
+	released := make(chan struct{})
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		// Installing the shim stands in for every slow step between the
+		// stop check at the top of the attempt and the session itself:
+		// the rate-limit pause, the worktree copy, the builder.
+		o.Shims = ShimInstallerFunc(func(ctx context.Context, wtDir string, so beads.ShimOptions) (beads.Shim, error) {
+			close(preparing)
+			<-released
+			return beads.InstallForWorktree(ctx, wtDir, so)
+		})
+	})
+	wt := f.worktree(t, "bd-29")
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := FireAgent[domain.Verdict](context.Background(), sup,
+			supTesterFiring("tester-qa-bd-29-r1", "bd-29", wt))
+		done <- err
+	}()
+
+	<-preparing
+	// The stop lands and returns while the firing is still preparing.
+	require.NoError(t, sup.StopAgents(context.Background(), 0))
+	assert.True(t, sup.Stopped())
+	close(released)
+
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		require.ErrorIs(t, err, ErrSupervisorStopped)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the firing never returned")
+	}
+
+	assert.Empty(t, f.Adapters[supAlpha].Calls(),
+		"StopAgents returned, so no session may start behind it")
+	assert.Empty(t, sup.Live())
+	assert.Empty(t, f.Run.Agents(), "and nothing is left recorded as running")
+
+	for _, ev := range f.supEvents() {
+		if sp, ok := ev.(events.AgentSpawned); ok {
+			t.Fatalf("a firing refused by the stop announced itself: %+v", sp)
+		}
+	}
+}
+
+func TestSupervisorForgetsTheAgentsItHasFinishedWith(t *testing.T) {
+	sc := mock.NewScenario("mixed")
+	sc.Rule("crash", mock.Match{Bead: "bd-31"}).FailWith(mock.Failure{Kind: mock.FailCrash})
+	sc.Otherwise("approve").Say("fine").Structured(json.RawMessage(`{"outcome":"approve"}`))
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: sc})
+	sup := f.supervisor(t, func(o *SupervisorOptions) { o.CrashRetries = -1 })
+
+	// An autopilot run never ends by itself (D-18), so the bookkeeping of
+	// every firing it has ever made must not accumulate.
+	for i := range 5 {
+		bead := domain.BeadID(fmt.Sprintf("bd-30-%d", i))
+		_, _, err := FireAgent[domain.Verdict](context.Background(), sup,
+			supTesterFiring(domain.AgentID("tester-qa-"+bead+"-r1"), bead, f.worktree(t, bead)))
+		require.NoError(t, err)
+		assert.Zero(t, supStartedCount(sup), "a finished agent is forgotten")
+	}
+
+	_, _, err := FireAgent[domain.Verdict](context.Background(), sup,
+		supTesterFiring("tester-qa-bd-31-r1", "bd-31", f.worktree(t, "bd-31")))
+	require.Error(t, err)
+	assert.Zero(t, supStartedCount(sup), "so is one that failed terminally")
+
+	// A record the run could not clear is still remembered, because the
+	// stop path has to reap it.
+	sup.mu.Lock()
+	sup.started["ghost-agent"] = true
+	sup.mu.Unlock()
+	require.NoError(t, f.Run.AgentStarted(domain.Agent{
+		ID: "ghost-agent", Role: domain.RoleTester, Bead: "bd-32", State: domain.AgentStateRunning,
+	}))
+	require.NoError(t, sup.StopAgents(context.Background(), 0))
+	assert.Empty(t, f.Run.Agents(), "the stop still reaps what the supervisor started")
+}
+
+func TestSupervisorRefusesAnAgentIDThatEscapesTheCopiesDirectory(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+	bare := &supBareCartridge{}
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.Cartridges = supSelectorFor(t, supBare, map[string]cartridge.Cartridge{supBare: bare})
+	})
+
+	// filepath.Join(<run-dir>, "copies", "..") is the run directory
+	// itself, and prepare deletes the copy before making it (D-23).
+	for _, id := range []domain.AgentID{"..", "a/../..", ".", "/"} {
+		_, err := sup.copyDir(id)
+		require.ErrorIs(t, err, ErrInvalidFiring, "agent id %q", id)
+	}
+
+	wt := f.worktree(t, "bd-33")
+	firing := supTesterFiring("..", "bd-33", wt)
+	_, _, err := FireAgent[domain.Verdict](context.Background(), sup, firing)
+	require.ErrorIs(t, err, ErrInvalidFiring)
+
+	// The run's own directory survived it.
+	assert.DirExists(t, f.Run.Dirs().Dir)
+	assert.DirExists(t, f.Run.Dirs().Worktrees)
+	assert.FileExists(t, filepath.Join(wt, "source.txt"))
+	assert.Empty(t, bare.Workdirs())
+}

@@ -44,6 +44,11 @@ import (
 //     guarantee) and, when nothing is left, closes
 //     [Supervisor.CreditsExhausted] so the planning loop can finish the run
 //     with events.FinishCreditsExhausted;
+//   - a failure of the firing's own post-session hook
+//     ([AgentFiring.Result]) is the run's bookkeeping failing after a
+//     session that worked, so it is terminal (retrying would fire the
+//     whole session again and repeat its side effects, D-06) and is
+//     reported as events.FailureInternal, never as a crash;
 //   - the bead's lease is renewed every [DefaultLeaseRenewInterval] while
 //     the agent runs (P3-05), and a lost lease is reported;
 //   - [Supervisor.StopAgents] cancels every live firing, waits out the
@@ -99,6 +104,10 @@ var (
 	ErrNoLiveCartridge = errors.New("orchestrator: no live cartridge is left for this run")
 	// ErrInvalidFiring is wrapped by every rejected [AgentFiring].
 	ErrInvalidFiring = errors.New("orchestrator: invalid firing")
+	// ErrPostSession is matched by every error [AgentFiring.Result]
+	// returned: the agent session succeeded and the run's own bookkeeping
+	// after it did not. Such a firing is never retried.
+	ErrPostSession = errors.New("orchestrator: the agent session succeeded but the run could not record its result")
 )
 
 // SupervisorHost is what the supervisor needs from the run it belongs to.
@@ -429,7 +438,11 @@ type AgentFiring struct {
 	// Result, when set, receives the decoded payload and the transcript of
 	// a successful firing made through [Supervisor.Fire], which has nowhere
 	// else to hand the reply back (the scheduler's [FireResult] carries
-	// none). An error from it fails the firing.
+	// none). It runs after the session, so an error from it fails the
+	// firing terminally: the firing reports events.FailureInternal and
+	// matches [ErrPostSession], and the session is never fired again,
+	// because the agent has already done the work and had its side effects
+	// (D-06).
 	Result func(payload any, tr agents.Transcript) error
 	// Build returns the agent run for one attempt. It is called once per
 	// attempt with the resolved cartridge, working directory and
@@ -595,13 +608,18 @@ func (s *Supervisor) Fire(ctx context.Context, f Firing) (FireResult, error) {
 			payload, tr, rerr = agents.RunAgent[any](ctx, r)
 		}
 		if rerr == nil && af.Result != nil {
-			rerr = af.Result(payload, tr)
+			// The session is over and its reply is decoded: anything the
+			// hook reports is the run's own bookkeeping failing, and
+			// supervise must not mistake it for a crashed session.
+			if herr := af.Result(payload, tr); herr != nil {
+				rerr = &supPostSessionError{err: herr}
+			}
 		}
 		return tr, rerr
 	})
 	res.ExitCode = tr.ExitCode
 	if err != nil {
-		res.Produced, res.Failure = "", agents.FailureOf(err)
+		res.Produced, res.Failure = "", supFailureOf(err)
 		return res, err
 	}
 	return res, nil
@@ -682,13 +700,27 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 		s.stamp(&run, f, agent, prep, h)
 		agent.Model = run.Spec.Model
 
+		// Tracking comes before anything else this attempt does, and is
+		// refused once StopAgents has run: taking the stop flag and
+		// registering the firing under one lock is what makes the
+		// snapshot the stop path takes of s.live complete. Preparing an
+		// attempt is slow — the rate-limit pause, the shim, the worktree
+		// copy, the builder — and a stop landing in that window must not
+		// leave a subprocess behind that nothing tracks or cancels.
+		start := s.now()
+		fctx, cancel := context.WithTimeout(ctx, s.Timeout()+killSlack)
+		entry, tracked := s.track(agent, cancel)
+		if !tracked {
+			cancel()
+			prep.discard()
+			return tr, abandon(fmt.Errorf("%w: %s was stopped before its session started",
+				ErrSupervisorStopped, f.Agent.ID))
+		}
+
 		s.record(h, f, agent)
 		// The agent is recorded and about to be announced again: whatever
 		// the previous attempt left pending is now this attempt's story.
 		pending = nil
-		s.mu.Lock()
-		s.started[agent.ID] = true
-		s.mu.Unlock()
 		h.Publish(events.AgentSpawned{
 			Meta: h.Meta(), Agent: agent, Task: f.Task,
 			BeadTitle: f.BeadTitle, Round: f.Round, Attempt: attempt,
@@ -698,9 +730,6 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 			slog.String("task", f.Task.String()), slog.Int("attempt", attempt),
 			slog.String("workdir", prep.workdir))
 
-		start := s.now()
-		fctx, cancel := context.WithTimeout(ctx, s.Timeout()+killSlack)
-		entry := s.track(agent, cancel)
 		stopRenew := s.renewLease(fctx, f, agent)
 
 		tr, err = exec(fctx, run)
@@ -715,6 +744,27 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 			s.clearBackoff(name)
 			s.finished(h, f, agent, run, tr, dur)
 			return tr, nil
+		}
+
+		var hookErr *supPostSessionError
+		if errors.As(err, &hookErr) {
+			// The session did its job: the agent answered and the reply
+			// was decoded. Only the run's bookkeeping afterwards failed —
+			// a bead comment, a D-07 transition, a bd call — so firing the
+			// cartridge again would repeat work that has already happened
+			// (and its side effects, D-06), burn another session of
+			// credits, and tell the human the cartridge crashed when it
+			// did not.
+			s.clearBackoff(name)
+			s.failed(h, agent, f, tr, dur, events.FailureInternal, err, attempt, false)
+			h.Publish(events.Error{
+				Meta: h.Meta(), Source: SourceSupervisor, Agent: agent.ID, Bead: agent.Bead,
+				Message: fmt.Sprintf(
+					"the session for %s finished, but the run could not record its result; it is not fired again",
+					agent.ID),
+				Err: hookErr.err.Error(),
+			})
+			return tr, err
 		}
 
 		lastErr = err
@@ -833,7 +883,9 @@ func (s *Supervisor) stamp(run *agents.AgentRun, f AgentFiring, agent domain.Age
 func (s *Supervisor) finished(h SupervisorHost, f AgentFiring, agent domain.Agent, run agents.AgentRun, tr agents.Transcript, dur time.Duration) {
 	done := agent
 	done.State = domain.AgentStateFinished
-	s.unrecord(h, f, done)
+	if s.unrecord(h, f, done) {
+		s.forget(agent.ID)
+	}
 	h.Publish(events.AgentFinished{
 		Meta: h.Meta(), Agent: agent.ID, Role: agent.Role, Bead: agent.Bead,
 		Duration: dur, ExitCode: tr.ExitCode, Produced: run.Message,
@@ -855,7 +907,9 @@ func (s *Supervisor) failed(h SupervisorHost, agent domain.Agent, f AgentFiring,
 		if failure == events.FailureKilled {
 			done.State = domain.AgentStateKilled
 		}
-		s.unrecord(h, f, done)
+		if s.unrecord(h, f, done) {
+			s.forget(agent.ID)
+		}
 	}
 	h.Publish(events.AgentFailed{
 		Meta: h.Meta(), Agent: agent.ID, Role: agent.Role, Bead: agent.Bead,
@@ -877,15 +931,20 @@ func (s *Supervisor) record(h SupervisorHost, f AgentFiring, a domain.Agent) {
 }
 
 // unrecord takes a finished agent out of state.json, or reports its final
-// state to the caller that owns the record.
-func (s *Supervisor) unrecord(h SupervisorHost, f AgentFiring, a domain.Agent) {
+// state to the caller that owns the record. It reports whether the record
+// is now clear: only then may the supervisor forget the agent, because an
+// agent still listed as running is one [Supervisor.reap] must recognise as
+// its own at the stop.
+func (s *Supervisor) unrecord(h SupervisorHost, f AgentFiring, a domain.Agent) bool {
 	if f.Update != nil {
 		f.Update(a)
-		return
+		return true
 	}
 	if err := h.AgentStopped(a.ID); err != nil {
 		h.Warn(SourceSupervisor, fmt.Sprintf("could not clear agent %s", a.ID), err)
+		return false
 	}
+	return true
 }
 
 // supRetryable reports whether firing the same job again can plausibly
@@ -893,6 +952,12 @@ func (s *Supervisor) unrecord(h SupervisorHost, f AgentFiring, a domain.Agent) {
 // cartridge kind, with an unusable reply never retried (the schema retry
 // inside RunAgent is already spent).
 func supRetryable(err error, failure events.Failure, kind cartridge.Kind) bool {
+	var pe *supPostSessionError
+	if errors.As(err, &pe) {
+		// The session already succeeded; only the run's bookkeeping after
+		// it failed. Firing again would repeat the whole LLM session.
+		return false
+	}
 	var ae *agents.AgentError
 	if errors.As(err, &ae) {
 		return ae.Retryable()
@@ -901,6 +966,35 @@ func supRetryable(err error, failure events.Failure, kind cartridge.Kind) bool {
 		return false
 	}
 	return kind.Retryable()
+}
+
+// supPostSessionError is what [AgentFiring.Result] returned: the agent
+// session succeeded and its reply was decoded, and what failed afterwards
+// is the run's own bookkeeping — a bead comment, a D-07 transition, a bd
+// call. It is kept distinguishable from a session failure on purpose,
+// because retrying it would fire the whole LLM session again and repeat
+// the side effects the successful one already had (D-06).
+type supPostSessionError struct{ err error }
+
+// Error implements error.
+func (e *supPostSessionError) Error() string { return ErrPostSession.Error() + ": " + e.err.Error() }
+
+// Unwrap exposes the hook's own error, so a caller can still match what
+// went wrong underneath (a beads error, say).
+func (e *supPostSessionError) Unwrap() error { return e.err }
+
+// Is makes errors.Is(err, [ErrPostSession]) true for every hook failure.
+func (e *supPostSessionError) Is(target error) bool { return target == ErrPostSession }
+
+// supFailureOf classifies a firing's error for events and [FireResult]. A
+// post-session bookkeeping failure is the run's own: agents.FailureOf would
+// call it a crash, because it is an ordinary error the cartridge never saw.
+func supFailureOf(err error) events.Failure {
+	var pe *supPostSessionError
+	if errors.As(err, &pe) {
+		return events.FailureInternal
+	}
+	return agents.FailureOf(err)
 }
 
 // supPending copies the agent a retry left recorded as running, so the
@@ -921,7 +1015,7 @@ func supAbandonFailure(err error) events.Failure {
 		errors.Is(err, context.DeadlineExceeded):
 		return events.FailureKilled
 	default:
-		return agents.FailureOf(err)
+		return supFailureOf(err)
 	}
 }
 
@@ -1234,13 +1328,35 @@ func (s *Supervisor) Backoff(name string) time.Duration {
 	return s.backoff[name]
 }
 
-// track registers a live firing so the stop path can cancel it.
-func (s *Supervisor) track(a domain.Agent, cancel context.CancelFunc) *supFiring {
-	e := &supFiring{agent: a, cancel: cancel, done: make(chan struct{})}
+// track registers a live firing so the stop path can cancel it, and
+// refuses once [Supervisor.StopAgents] has run: the stop flag and the
+// registration are read and written under one lock, so a firing either
+// appears in the snapshot the stop path takes of s.live — and is cancelled
+// and waited for — or never starts its session at all. ok is false when it
+// is refused.
+//
+// It is also where an agent joins s.started, the set [Supervisor.reap] uses
+// to tell this supervisor's agents from another component's.
+func (s *Supervisor) track(a domain.Agent, cancel context.CancelFunc) (e *supFiring, ok bool) {
+	e = &supFiring{agent: a, cancel: cancel, done: make(chan struct{})}
 	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stopped {
+		return nil, false
+	}
 	s.live[a.ID] = e
+	s.started[a.ID] = true
+	return e, true
+}
+
+// forget drops an agent from the set this supervisor has fired. A firing
+// that ended terminally is already out of state.json, so [Supervisor.reap]
+// has nothing left to recognise; keeping it would grow the map for the
+// whole life of an autopilot run, which never ends by itself (D-18).
+func (s *Supervisor) forget(id domain.AgentID) {
+	s.mu.Lock()
+	delete(s.started, id)
 	s.mu.Unlock()
-	return e
 }
 
 func (s *Supervisor) untrack(e *supFiring) {
@@ -1270,6 +1386,11 @@ func (s *Supervisor) Live() []domain.Agent {
 // whatever is left out of state.json, and removes the run's bd shims and
 // worktree copies. A grace of zero still allows the cancelled sessions the
 // moment they need to die.
+//
+// "Nothing new" includes a firing that was still preparing when the stop
+// landed — waiting out a rate-limit pause, installing a shim, copying a
+// worktree: [Supervisor.track] refuses it before it starts a session, so no
+// subprocess can appear behind a StopAgents that has already returned.
 func (s *Supervisor) StopAgents(ctx context.Context, grace time.Duration) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1539,7 +1660,12 @@ func (s *Supervisor) copyDir(id domain.AgentID) (string, error) {
 		return "", ErrNoSupervisorHost
 	}
 	name := filepath.Base(filepath.Clean(id.String()))
-	if name == "" || name == "." || name == string(filepath.Separator) {
+	switch name {
+	// "..", like "." and the separator, names a directory that is not the
+	// copy: filepath.Join(<run-dir>, "copies", "..") is the run directory
+	// itself, which prepare would then delete along with state.json, the
+	// event log and every worktree (D-23).
+	case "", ".", "..", string(filepath.Separator):
 		return "", fmt.Errorf("%w: agent id %q is not usable as a directory name", ErrInvalidFiring, id)
 	}
 	return filepath.Join(h.Dirs().Dir, CopiesDirName, name), nil

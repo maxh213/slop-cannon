@@ -223,10 +223,22 @@ func TestModelSendsEveryControlKeyToTheController(t *testing.T) {
 		want:   "safety(true)",
 		footer: "safety on for future deliveries",
 	}, {
+		// The prompt opens pre-filled with the run's ammo, and the first
+		// digit replaces it: at a two-digit ammo the field is already at
+		// the digit limit, so an appending prompt would drop every
+		// keystroke and there would be no way to type a number at all.
 		name:   "ammo",
-		keys:   []string{"a", "backspace", "backspace", "6", "enter"},
+		keys:   []string{"a", "6", "enter"},
 		want:   "ammo(6)",
 		footer: "ammo 6 for future ticks",
+	}, {
+		// Backspace still edits the pre-fill rather than replacing it, so
+		// a two-digit number is reachable by correcting the one that is
+		// there.
+		name:   "ammo edited digit by digit",
+		keys:   []string{"a", "backspace", "2", "enter"},
+		want:   "ammo(12)",
+		footer: "ammo 12 for future ticks",
 	}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

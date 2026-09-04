@@ -540,6 +540,13 @@ type ControlsModel struct {
 	confirming bool
 	prompting  bool
 	buf        string
+	// bufFresh says buf is still the value openAmmo pre-filled and the
+	// user has not edited it yet, so the first digit typed replaces it
+	// rather than appending to it. Without that the prompt is unusable at
+	// the ammo the run is most likely to have: the field is capped at as
+	// many digits as the ceiling has, so a pre-filled "10" leaves no room
+	// for a keystroke and every digit is silently dropped.
+	bufFresh bool
 
 	flash    string
 	flashErr bool
@@ -798,11 +805,11 @@ func (v ControlsModel) openAmmo(st *State) (ControlsModel, tea.Cmd, bool) {
 	if reason, ok := v.refuse(st); !ok {
 		return v.deny(reason), nil, true
 	}
-	v.prompting, v.buf = true, ""
+	v.prompting, v.buf, v.bufFresh = true, "", false
 	total, ceiling := v.Ammo(st), v.maxAmmoFor(st)
 	v.ammoBase = controlsAmmo(st)
 	if total >= v.minAmmo && total <= ceiling {
-		v.buf = strconv.Itoa(total)
+		v.buf, v.bufFresh = strconv.Itoa(total), true
 	}
 	v.flash, v.flashErr = "", false
 	return v, nil, true
@@ -867,21 +874,28 @@ func (v ControlsModel) typeAmmo(km tea.KeyMsg, st *State) (ControlsModel, tea.Cm
 			return v, nil, true
 		}
 		if v.Ammo(st) == ammo {
-			v.prompting, v.buf = false, ""
+			v.prompting, v.buf, v.bufFresh = false, "", false
 			v.flash, v.flashErr = fmt.Sprintf("ammo is already %d", ammo), false
 			return v, nil, true
 		}
-		v.prompting, v.buf = false, ""
+		v.prompting, v.buf, v.bufFresh = false, "", false
 		return v.dispatch(ControlRequest{Action: ControlAmmo, Ammo: ammo})
 	case key.Matches(km, v.keys.Dismiss):
-		v.prompting, v.buf = false, ""
+		v.prompting, v.buf, v.bufFresh = false, "", false
 		v.flash, v.flashErr = "cancelled", false
 	case km.Type == tea.KeyBackspace || km.Type == tea.KeyDelete:
 		if v.buf != "" {
 			v.buf = v.buf[:len(v.buf)-1]
 		}
+		v.bufFresh = false
 		v.flash, v.flashErr = "", false
 	case km.Type == tea.KeyRunes:
+		// The first digit typed over an untouched pre-fill replaces it, the
+		// way a field opened with its value selected behaves; after that the
+		// digits append as usual.
+		if v.bufFresh {
+			v.buf, v.bufFresh = "", false
+		}
 		v.buf, v.flash, v.flashErr = controlAppendDigits(v.buf, km.Runes, v.maxAmmoFor(st)), "", false
 	}
 	return v, nil, true

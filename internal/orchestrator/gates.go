@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"slop-cannon/internal/beads"
+	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
 )
@@ -40,17 +41,22 @@ import (
 // A merge verdict arrives exactly once. `bd gate check` *closes* the gate
 // as it resolves it, so the very next check prints "No open gates of type
 // 'gh:pr' found." (verified against bd 1.2.2) and nothing would ever bring
-// the bead up again. A `bd close` that fails — the bead picked up a blocker
-// while the pull request was in review, a Dolt lock, any transient bd
-// failure — would therefore strand the bead in `delivering` for the life of
-// the run: its dependents would never become ready, a brief run would never
-// finish and an autopilot run would idle for ever (D-18). The poller
-// instead *remembers* every bead whose close did not go through
-// ([gatePendingClose]) and retries it on every later poll, including the
-// polls skipped because gh is down (the close is bd's business, not gh's),
-// until the bead is closed or turns out to be someone else's. Memory the
-// process loses to a kill is what `--resume` reconciles: gitx maps
-// `delivering` + a MERGED pull request to RedeliverPR.
+// the bead up again. Anything that fails between that one verdict and the
+// closed bead — the `bd gate show` that says which bead the gate blocks,
+// the `bd show` of the bead itself, the `bd close` (the bead picked up a
+// blocker while the pull request was in review, a Dolt lock, any transient
+// bd failure) — would therefore strand the bead in `delivering` for the
+// life of the run: its dependents would never become ready, a brief run
+// would never finish and an autopilot run would idle for ever (D-18). The
+// poller instead *remembers* the whole merge, from the moment it is told
+// about it and by the gate's id ([gatePendingClose]), and retries it on
+// every later poll — including the polls skipped because gh is down (the
+// close is bd's business, not gh's) — until the bead is closed or turns
+// out to be someone else's. A remembered merge whose gate has not been
+// read yet reads it again first; nothing about a merge is dropped for a
+// transient failure. Memory the process loses to a kill is what `--resume`
+// reconciles: gitx maps `delivering` + a MERGED pull request to
+// RedeliverPR.
 //
 // P6-14 — the policy for an escalated gate. bd 1.2.2 reports ESCALATE for a
 // PR that was closed without merging (or that no longer exists) but changes
@@ -65,19 +71,23 @@ import (
 // rather leave the gate for a human to clear by hand.
 //
 // The other half of P6-14 is a delivery retry meeting a gate left over from
-// an earlier pull request: [ClearStaleGate] resolves an open gh:pr gate
-// whose PR number is not the one about to be delivered, so the retry does
-// not end up with two gates on one bead.
+// an earlier pull request, and it belongs to the step that creates the
+// gate: [gitx.PRDeliverer] resolves an open gh:pr gate whose PR number is
+// not the one it is delivering before it creates its own (P6-22), so the
+// retry cannot end up with two gates on one bead — which under D-20 would
+// mean the bead never closes, whichever pull request merges.
 
-// GateWarningSource is the [events.Warning] Source the gate poller stamps
+// SourceGates is the [events.Warning] Source the gate poller stamps
 // on everything it reports.
-const GateWarningSource = "gates"
+const SourceGates = "gates"
 
 // DefaultGatePollInterval is how often the poller runs `bd gate check`
-// when the caller sets no interval (`gate_poll_interval`, P6-10). A human
-// merge is not urgent and every poll shells out to `gh` once per open
-// gate, so a minute is the documented default.
-const DefaultGatePollInterval = 60 * time.Second
+// when the caller sets no interval. A human merge is not urgent and every
+// poll shells out to `gh` once per open gate, so a minute is the
+// documented default; it is the configuration key `gate_poll_interval`
+// (P6-10, P1-17), and this is the same constant the loader defaults it to,
+// not a second copy of the number.
+const DefaultGatePollInterval = config.DefaultGatePollInterval
 
 // ErrNoGateStore is returned by [NewGatePoller] when no gate store was
 // given: there is nothing to poll.
@@ -223,9 +233,10 @@ type GatePollStats struct {
 	// Retries counts the close attempts made for a bead whose gate had
 	// already resolved: a bead that bd refused to close first time round.
 	Retries int
-	// Pending is how many merged beads are waiting for their close to be
-	// retried right now. Anything but zero for long means bd keeps refusing
-	// a close, which the Warnings explain.
+	// Pending is how many merges are waiting to be finished right now: a
+	// bead whose close bd refused, or a gate whose read failed. Anything
+	// but zero for long means bd keeps refusing, which the Warnings
+	// explain.
 	Pending int
 	// LastAt is the clock time of the last completed poll.
 	LastAt time.Time
@@ -244,11 +255,18 @@ type GatePollResult struct {
 	Blocked []domain.BeadID
 	// Resolved lists the gates the P6-14 policy closed.
 	Resolved []domain.BeadID
-	// Pending lists the beads whose pull request merged but whose close bd
-	// refused, in id order. The poller retries each of them on every later
-	// poll; the list is the state after this one, so a bead closed by this
-	// poll's retry is in Closed and not here.
+	// Pending lists the beads whose pull request merged but which are not
+	// closed yet, in id order. The poller retries each of them on every
+	// later poll; the list is the state after this one, so a bead closed by
+	// this poll's retry is in Closed and not here. A merge whose gate could
+	// not be read yet names no bead, so it appears in PendingGates only.
 	Pending []domain.BeadID
+	// PendingGates lists the gates of every remembered merge, in id order:
+	// the ones in Pending and the ones whose `bd gate show` has not
+	// succeeded yet, which have no bead id to name. It is the complete
+	// picture of what the poller still owes, and its length is
+	// [GatePollStats.Pending].
+	PendingGates []domain.BeadID
 	// Skipped is true when gh was unavailable and no gate was checked.
 	Skipped bool
 	// Reason explains a skip.
@@ -266,9 +284,12 @@ func (r GatePollResult) Empty() bool {
 // [GatePoller.Poll] runs a single pass for a caller that wants to drive the
 // timing itself.
 //
-// All methods are safe for concurrent use, but the polls themselves are
-// serialised: a [GatePoller.Kick] while a poll is in flight makes the next
-// one happen immediately afterwards rather than at the same time.
+// All methods are safe for concurrent use, and the polls themselves are
+// serialised by a lock of their own: a [GatePoller.Kick] while a poll is in
+// flight makes the next one happen immediately afterwards rather than at
+// the same time, and a second caller of [GatePoller.Poll] waits for the
+// first to finish rather than double-counting the retries, closing a bead
+// twice or publishing two [events.Merged] for one merge.
 type GatePoller struct {
 	gates    GateStore
 	reader   GateBeadReader
@@ -287,6 +308,11 @@ type GatePoller struct {
 
 	kickCh chan struct{}
 
+	// pollMu serialises whole polls. It is never held while mu is taken in
+	// the other order — mu is only ever taken *under* it — so the two
+	// cannot deadlock.
+	pollMu sync.Mutex
+
 	mu      sync.Mutex
 	stats   GatePollStats
 	warned  map[string]bool
@@ -294,22 +320,37 @@ type GatePoller struct {
 	pending map[domain.BeadID]gatePendingClose
 }
 
-// gatePendingClose is a bead whose gate resolved — the pull request merged
-// and bd closed the gate as it said so — but whose own `bd close` did not
-// go through. bd reports a resolved gate exactly once, so without this the
-// bead would stay `delivering` for ever; the poller keeps the gate it read
-// and tries the close again on every poll. Keyed by gate id, so a bead that
-// somehow ends up behind two gates is remembered once per gate and the
-// second close finds the bead already closed and forgets it.
+// gatePendingClose is a merge the poller has been told about but has not
+// finished: bd reported the gate resolved — the pull request landed and bd
+// closed the gate as it said so — and something between that verdict and
+// the closed bead failed. bd reports a resolved gate exactly once, so
+// without this the bead would stay `delivering` for ever; the poller keeps
+// what it knows and tries again on every poll.
+//
+// It is keyed and identified by the *gate* id, not the bead's, because the
+// gate id is the only thing bd's verdict carries: a `bd gate show` that
+// fails leaves the bead unknown, and a merge must survive that too. A bead
+// that somehow ends up behind two gates is therefore remembered once per
+// gate, and the second close finds the bead already closed and forgets it.
 type gatePendingClose struct {
+	// id is the gate the merge verdict named. Always set.
+	id domain.BeadID
 	// gate is the resolved gate, kept because it is no longer in the cache
 	// and `bd gate show` need not be asked again for something immutable.
+	// It is the zero Gate until read is true.
 	gate beads.Gate
-	// since is the clock time of the first failed close, and tries how many
-	// closes have been attempted, for the log line.
+	// read says whether gate holds a gate `bd gate show` returned. False
+	// means the show failed and the next poll must ask again before it can
+	// know which bead the merge closes.
+	read bool
+	// since is the clock time of the first failure, and tries how many
+	// attempts have been made, for the log line.
 	since time.Time
 	tries int
 }
+
+// bead is the bead the merge closes, or "" while the gate is unread.
+func (e gatePendingClose) bead() domain.BeadID { return e.gate.Blocks }
 
 // NewGatePoller returns a poller configured by opts. It fails when there is
 // no gate store to poll ([ErrNoGateStore]) and when a scope was asked for
@@ -438,7 +479,12 @@ func (p *GatePoller) Run(ctx context.Context) error {
 // gate can get wrong is a Warning and another attempt next time — for a
 // merge, whose verdict bd hands out exactly once, that attempt comes from
 // the poller's own pending list rather than from bd.
+//
+// Polls are serialised: a second caller waits for the one in flight rather
+// than acting on the same verdicts beside it.
 func (p *GatePoller) Poll(ctx context.Context) (GatePollResult, error) {
+	p.pollMu.Lock()
+	defer p.pollMu.Unlock()
 	var res GatePollResult
 	check, err := p.gates.CheckGates(ctx, beads.GateCheckOptions{})
 	p.mu.Lock()
@@ -508,33 +554,53 @@ func (p *GatePoller) record(res *GatePollResult) {
 	p.stats.Blocked += len(res.Blocked)
 	p.stats.Resolved += len(res.Resolved)
 	p.stats.Pending = len(p.pending)
-	for id := range p.pending {
-		res.Pending = append(res.Pending, p.pending[id].gate.Blocks)
+	for id, e := range p.pending {
+		res.PendingGates = append(res.PendingGates, id)
+		if bead := e.bead(); bead != "" {
+			res.Pending = append(res.Pending, bead)
+		}
 	}
 	slices.Sort(res.Pending)
+	slices.Sort(res.PendingGates)
 }
 
-// retryPendingCloses tries again to close every bead whose gate resolved in
-// an earlier poll but which bd would not close then. Gates this poll has
-// already acted on are skipped, so one verdict is never applied twice.
+// retryPendingCloses tries again to finish every merge an earlier poll
+// could not: a gate whose `bd gate show` failed is read again first, and a
+// bead bd would not close is closed again. Gates this poll has already
+// acted on are skipped, so one verdict is never applied twice.
 func (p *GatePoller) retryPendingCloses(ctx context.Context, seen map[domain.BeadID]bool, res *GatePollResult) {
-	for _, g := range p.pendingGates() {
+	for _, e := range p.pendingCloses() {
 		if ctx.Err() != nil {
 			return
 		}
-		if seen[g.ID] {
+		if seen[e.id] {
 			continue
 		}
 		p.mu.Lock()
 		p.stats.Retries++
 		p.mu.Unlock()
+		g := e.gate
+		if !e.read {
+			// The merge is known, the gate it named is not: read it again
+			// before anything else can be decided about the bead.
+			var verdict gateBeadVerdict
+			g, verdict = p.gate(ctx, e.id)
+			switch verdict {
+			case gateBeadSkip:
+				p.settle(e.id) // a gate naming no bead never will
+				continue
+			case gateBeadRetry:
+				p.rememberGate(e.id) // still unreadable; try again next poll
+				continue
+			}
+		}
 		p.finishMerge(ctx, g, res)
 	}
 }
 
-// pendingGates snapshots the pending gates in id order, so a poll is
-// deterministic and the lock is not held across bd calls.
-func (p *GatePoller) pendingGates() []beads.Gate {
+// pendingCloses snapshots the unfinished merges in gate-id order, so a poll
+// is deterministic and the lock is not held across bd calls.
+func (p *GatePoller) pendingCloses() []gatePendingClose {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.pending) == 0 {
@@ -545,29 +611,44 @@ func (p *GatePoller) pendingGates() []beads.Gate {
 		ids = append(ids, id)
 	}
 	slices.Sort(ids)
-	out := make([]beads.Gate, 0, len(ids))
+	out := make([]gatePendingClose, 0, len(ids))
 	for _, id := range ids {
-		out = append(out, p.pending[id].gate)
+		out = append(out, p.pending[id])
 	}
 	return out
 }
 
-// remember queues a bead whose close did not go through for another attempt
-// on the next poll. The gate is dropped from the cache at the same time:
-// it is closed in bd now, the pending entry holds the copy, and nothing
-// should keep growing in a process meant to run for days.
-func (p *GatePoller) remember(g beads.Gate) {
+// remember queues a merge whose bead was not closed for another attempt on
+// the next poll. The gate is dropped from the cache at the same time: it is
+// closed in bd now, the pending entry holds the copy, and nothing should
+// keep growing in a process meant to run for days.
+func (p *GatePoller) remember(g beads.Gate) { p.rememberMerge(g.ID, g, true) }
+
+// rememberGate queues a merge whose gate could not be read. The gate id is
+// all bd's verdict carried, and it is enough: the next poll reads the gate
+// again and finishes the merge from there. Without this the one verdict bd
+// hands out would be lost to a transient `bd gate show` failure and the
+// bead would stay `delivering` for ever (D-20).
+func (p *GatePoller) rememberGate(id domain.BeadID) { p.rememberMerge(id, beads.Gate{}, false) }
+
+// rememberMerge records or refreshes one unfinished merge. A gate that has
+// been read is never forgotten by a later attempt that could not read it.
+func (p *GatePoller) rememberMerge(id domain.BeadID, g beads.Gate, read bool) {
 	now := p.clock.Now()
 	p.mu.Lock()
-	e, ok := p.pending[g.ID]
+	e, ok := p.pending[id]
 	if !ok {
-		e = gatePendingClose{gate: g, since: now}
+		e = gatePendingClose{id: id, since: now}
 	}
-	e.gate = g
+	if read || !e.read {
+		e.gate, e.read = g, read
+	}
+	e.id = id
 	e.tries++
-	p.pending[g.ID] = e
-	delete(p.cache, g.ID)
+	p.pending[id] = e
+	delete(p.cache, id)
 	tries, since := e.tries, e.since
+	bead := e.bead()
 	p.mu.Unlock()
 	// The first attempt is worth a line; the repeats are not, because a
 	// bead bd keeps refusing would otherwise log once a minute for days.
@@ -576,9 +657,10 @@ func (p *GatePoller) remember(g beads.Gate) {
 	if tries == 1 {
 		level = slog.LevelInfo
 	}
-	p.log.Log(context.Background(), level, "the merged bead will be closed again on the next poll",
-		slog.String("bead", string(g.Blocks)),
-		slog.String("gate", string(g.ID)),
+	p.log.Log(context.Background(), level, "the merge will be finished on the next poll",
+		slog.String("bead", string(bead)),
+		slog.String("gate", string(id)),
+		slog.Bool("gate_read", read || bead != ""),
 		slog.Int("attempts", tries),
 		slog.Time("since", since))
 }
@@ -594,9 +676,19 @@ func (p *GatePoller) settle(id domain.BeadID) {
 
 // merged closes the bead of a gate whose pull request landed (D-20) and
 // publishes [events.Merged].
+//
+// bd hands out this verdict exactly once — it closed the gate as it
+// resolved it — so a gate it cannot read is *remembered by its id* and read
+// again on the next poll rather than dropped: dropping it would strand the
+// bead in `delivering` for the life of the run.
 func (p *GatePoller) merged(ctx context.Context, r beads.GateResult, res *GatePollResult) {
-	g, ok := p.gate(ctx, r.GateID)
-	if !ok {
+	g, verdict := p.gate(ctx, r.GateID)
+	switch verdict {
+	case gateBeadSkip:
+		p.settle(r.GateID) // the gate names no bead; nothing to close, ever
+		return
+	case gateBeadRetry:
+		p.rememberGate(r.GateID)
 		return
 	}
 	p.finishMerge(ctx, g, res)
@@ -676,10 +768,14 @@ func (p *GatePoller) finishMerge(ctx context.Context, g beads.Gate, res *GatePol
 
 // escalated parks the bead of a gate whose pull request was closed without
 // merging and applies the P6-14 policy to the gate itself.
+//
+// Nothing here is remembered when a step fails, because bd leaves an
+// escalated gate open and reports it again on the very next poll — the
+// opposite of a merge, whose verdict arrives once.
 func (p *GatePoller) escalated(ctx context.Context, r beads.GateResult, res *GatePollResult) {
-	g, ok := p.gate(ctx, r.GateID)
-	if !ok {
-		return
+	g, verdict := p.gate(ctx, r.GateID)
+	if verdict != gateBeadAct {
+		return // unreadable or nameless; bd escalates it again next poll
 	}
 	issue, state, verdict := p.bead(ctx, g)
 	if verdict != gateBeadAct {
@@ -728,7 +824,12 @@ func (p *GatePoller) escalated(ctx context.Context, r beads.GateResult, res *Gat
 // does not change once created, so the lookup is cached — but only until
 // the gate is closed ([GatePoller.settle], [GatePoller.remember]), so the
 // cache holds the open gates rather than every gate the run has ever seen.
-func (p *GatePoller) gate(ctx context.Context, id domain.BeadID) (beads.Gate, bool) {
+//
+// The verdict is the same three-way answer [GatePoller.bead] gives, and
+// for the same reason: gateBeadRetry means the read failed and is worth
+// another go, gateBeadSkip means the gate names no bead it blocks and
+// never will, so trying again would only reach the same answer.
+func (p *GatePoller) gate(ctx context.Context, id domain.BeadID) (beads.Gate, gateBeadVerdict) {
 	p.mu.Lock()
 	g, ok := p.cache[id]
 	p.mu.Unlock()
@@ -740,7 +841,7 @@ func (p *GatePoller) gate(ctx context.Context, id domain.BeadID) (beads.Gate, bo
 				p.warnOnce("show-gate:"+string(id), "",
 					fmt.Sprintf("could not read gate %s", id), err)
 			}
-			return beads.Gate{}, false
+			return beads.Gate{}, gateBeadRetry
 		}
 		p.clearWarning("show-gate:" + string(id))
 		p.mu.Lock()
@@ -750,9 +851,9 @@ func (p *GatePoller) gate(ctx context.Context, id domain.BeadID) (beads.Gate, bo
 	if g.Blocks == "" {
 		p.warnOnce("gate-blocks:"+string(id), "",
 			fmt.Sprintf("gate %s names no bead it blocks; leaving it alone", id), nil)
-		return beads.Gate{}, false
+		return beads.Gate{}, gateBeadSkip
 	}
-	return g, true
+	return g, gateBeadAct
 }
 
 // gateBeadVerdict says what the poller may do with the bead behind a gate.
@@ -794,13 +895,16 @@ func (p *GatePoller) bead(ctx context.Context, g beads.Gate) (beads.Issue, domai
 	if p.scope != "" && !issue.InRun(p.scope) {
 		return beads.Issue{}, "", gateBeadSkip // another tool's gate; not ours to act on
 	}
-	state, origin := beads.SafeState(issue.Status, p.statuses[issue.Status])
-	if origin == beads.OriginForeign {
+	// The P6-12 guard lives in state.go and is called, not re-implemented:
+	// a foreign status is refused on its origin even when it maps onto a
+	// workflow state, and bd's read-only built-ins are refused on the state.
+	state, err := ResolveBeadStatus(issue.Status, p.statuses)
+	switch {
+	case errors.Is(err, ErrForeignStatus):
 		p.warnOnce("foreign:"+string(g.Blocks)+":"+issue.Status, g.Blocks,
 			fmt.Sprintf("%s carries the status %q, which slop-cannon did not register; leaving it alone", g.Blocks, issue.Status), nil)
 		return beads.Issue{}, "", gateBeadSkip
-	}
-	if !state.Workflow() {
+	case err != nil:
 		p.warnOnce("nonworkflow:"+string(g.Blocks)+":"+string(state), g.Blocks,
 			fmt.Sprintf("%s is %s, which slop-cannon only reads; leaving it alone", g.Blocks, state), nil)
 		return beads.Issue{}, "", gateBeadSkip
@@ -871,11 +975,11 @@ func (p *GatePoller) ghAvailable() {
 
 // warn publishes an events.Warning and logs it.
 func (p *GatePoller) warn(bead domain.BeadID, message string, err error) {
-	w := events.Warning{Meta: p.meta(), Source: GateWarningSource, Message: message, Bead: bead}
+	w := events.Warning{Meta: p.meta(), Source: SourceGates, Message: message, Bead: bead}
 	if err != nil {
 		w.Err = err.Error()
 	}
-	p.log.Warn(message, slog.String("source", GateWarningSource), slog.String("bead", string(bead)), slog.Any("err", err))
+	p.log.Warn(message, slog.String("source", SourceGates), slog.String("bead", string(bead)), slog.Any("err", err))
 	p.publish(w)
 }
 
@@ -896,7 +1000,7 @@ func (p *GatePoller) warnOnce(key string, bead domain.BeadID, message string, er
 	p.warned[key] = true
 	p.mu.Unlock()
 	if seen {
-		p.log.Debug(message, slog.String("source", GateWarningSource), slog.Any("err", err))
+		p.log.Debug(message, slog.String("source", SourceGates), slog.Any("err", err))
 		return
 	}
 	p.warn(bead, message, err)
@@ -961,57 +1065,4 @@ func gateEscalationReason(pr int, detail string) string {
 		reason += " (" + d + ")"
 	}
 	return reason
-}
-
-// GateResolver is what [ClearStaleGate] needs; *beads.Client satisfies it.
-type GateResolver interface {
-	// GateFor returns the open gate blocking a bead, or beads.ErrNoGate.
-	GateFor(ctx context.Context, bead domain.BeadID) (beads.Gate, error)
-	// ResolveGate closes a gate by hand.
-	ResolveGate(ctx context.Context, id domain.BeadID, reason string) error
-}
-
-// *beads.Client is the production GateResolver.
-var _ GateResolver = (*beads.Client)(nil)
-
-// ClearStaleGate resolves an open `gh:pr` gate left on a bead by an earlier
-// pull request, so a delivery retry can create the gate for the pull
-// request it is about to open without the bead ending up behind two gates
-// (P6-14). It is the call [gitx] cannot make itself: the beads client
-// belongs to the orchestrator.
-//
-// It reports the gate it cleared and true. Nothing is cleared, and false is
-// reported with a nil error, when the bead has no open gate
-// ([beads.ErrNoGate]), when its open gate is not a gh:pr gate, or when the
-// gate already waits on prNumber — that gate is the one the retry wants and
-// creating it again is unnecessary, not wrong. A non-positive prNumber
-// clears any open gh:pr gate, which is what a delivery that has lost its
-// pull request wants.
-func ClearStaleGate(ctx context.Context, r GateResolver, bead domain.BeadID, prNumber int, reason string) (beads.Gate, bool, error) {
-	if r == nil {
-		return beads.Gate{}, false, fmt.Errorf("orchestrator: clear stale gate: %w", ErrNoGateStore)
-	}
-	g, err := r.GateFor(ctx, bead)
-	if err != nil {
-		if errors.Is(err, beads.ErrNoGate) {
-			return beads.Gate{}, false, nil
-		}
-		return beads.Gate{}, false, err
-	}
-	if !g.IsPR() {
-		return beads.Gate{}, false, nil
-	}
-	if n, ok := g.PRNumber(); ok && prNumber > 0 && n == prNumber {
-		return g, false, nil
-	}
-	if strings.TrimSpace(reason) == "" {
-		reason = "superseded by a new delivery"
-		if prNumber > 0 {
-			reason = fmt.Sprintf("superseded by pull request #%d", prNumber)
-		}
-	}
-	if err := r.ResolveGate(ctx, g.ID, reason); err != nil {
-		return g, false, err
-	}
-	return g, true, nil
 }

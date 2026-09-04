@@ -40,6 +40,11 @@ const (
 	// DefaultIdleReplanInterval is how long an idle autopilot waits before the
 	// PO plans again (D-18).
 	DefaultIdleReplanInterval = 10 * time.Minute
+	// DefaultGatePollInterval is how often the run asks bd whether the pull
+	// request behind a `gh:pr` gate has merged (P6-10). Every poll shells
+	// out to `gh` once per open gate and a human merge is never urgent, so
+	// the default is a minute.
+	DefaultGatePollInterval = 60 * time.Second
 	// DefaultMaxBeadsPerPlan is how many beads one planning firing may
 	// propose before the plan is rejected outright (P5-02, P1-16). Dropping
 	// the surplus is not an option: it would break the dependencies of the
@@ -185,6 +190,8 @@ type File struct {
 	CheckCommand *string `toml:"check_command,omitempty"`
 	// IdleReplanInterval is the autopilot re-plan delay when idle (D-18).
 	IdleReplanInterval *Duration `toml:"idle_replan_interval,omitempty"`
+	// GatePollInterval is how often the gh:pr gates are checked (P6-10).
+	GatePollInterval *Duration `toml:"gate_poll_interval,omitempty"`
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02).
 	MaxBeadsPerPlan *int `toml:"max_beads_per_plan,omitempty"`
 	// Limits holds the feedback-loop and budget limits (D-08, D-18).
@@ -240,6 +247,9 @@ type Config struct {
 	CheckCommand string `json:"check_command"`
 	// IdleReplanInterval is the autopilot re-plan delay when idle.
 	IdleReplanInterval Duration `json:"idle_replan_interval"`
+	// GatePollInterval is how often a delivered bead's gh:pr gate is
+	// checked for the merge that closes it (P6-10).
+	GatePollInterval Duration `json:"gate_poll_interval"`
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02);
 	// always at least 1.
 	MaxBeadsPerPlan int `json:"max_beads_per_plan"`
@@ -259,6 +269,7 @@ func Defaults() Config {
 		Vibes:              []string{},
 		Rules:              []string{},
 		IdleReplanInterval: NewDuration(DefaultIdleReplanInterval),
+		GatePollInterval:   NewDuration(DefaultGatePollInterval),
 		MaxBeadsPerPlan:    DefaultMaxBeadsPerPlan,
 		Limits: Limits{
 			MaxReviewRounds:   DefaultMaxReviewRounds,

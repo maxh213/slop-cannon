@@ -7,6 +7,7 @@ vibes                       []          default
 rules                       []          default
 check_command               make check  repo
 idle_replan_interval        10m         default
+gate_poll_interval          1m          default
 max_beads_per_plan          8           default
 limits.max_review_rounds    3           repo
 limits.max_pushback_rounds  2           default

@@ -271,13 +271,17 @@ type deliveryGitFake struct {
 	branch    string
 	rebase    []RebaseState
 	rebaseErr error
-	leftovers *gitx.Leftovers
-	leftErr   error
-	diffs     []*gitx.Diff
-	diffErr   error
-	ratio     gitx.ChangeRatio
-	ratioErr  error
-	branchErr error
+	// rebasePartial is what RebaseState reports alongside rebaseErr, the
+	// way managerGit does when git says a rebase is in progress but
+	// listing the unmerged paths fails.
+	rebasePartial RebaseState
+	leftovers     *gitx.Leftovers
+	leftErr       error
+	diffs         []*gitx.Diff
+	diffErr       error
+	ratio         gitx.ChangeRatio
+	ratioErr      error
+	branchErr     error
 
 	mu         sync.Mutex
 	rebaseN    int
@@ -298,7 +302,7 @@ func (g *deliveryGitFake) DefaultBranch(context.Context) (string, error) {
 
 func (g *deliveryGitFake) RebaseState(context.Context, domain.BeadID) (RebaseState, error) {
 	if g.rebaseErr != nil {
-		return RebaseState{}, g.rebaseErr
+		return g.rebasePartial, g.rebaseErr
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -885,6 +889,214 @@ func TestDelivererHandsOffAfterTooManyConflictRounds(t *testing.T) {
 	}
 	if _, ok := h.PendingFor("sc-68s"); ok {
 		t.Error("a conflict round is still pending after the hand-off")
+	}
+}
+
+// TestDelivererDoesNotSpendAConflictRoundOnABDFailure: MaxConflictRounds
+// bounds the rounds an engineer was actually given, not the times bd
+// hiccuped. A failure to write the conflict edge leaves the round unopened
+// and the outcome retryable, so it must leave the budget alone too —
+// otherwise three transient bd failures park the bead in needs_human saying
+// three conflict rounds did not resolve it when no engineer ever ran, and
+// D-10's "conflicts go back to the engineer" never happens.
+func TestDelivererDoesNotSpendAConflictRoundOnABDFailure(t *testing.T) {
+	t.Parallel()
+	bdDown := errors.New("bd: database is locked")
+	conflicts := make([]error, 8)
+	for i := range conflicts {
+		conflicts[i] = deliveryConflictErr("internal/a.go")
+	}
+	h := newDeliveryHarness(t, false, func(o *DeliveryOptions, h *deliveryHarness) {
+		o.MaxConflictRounds = 3
+		h.merge.errs = conflicts
+	})
+	ctx := context.Background()
+	// The conflict edge claims the bead for its engineer, so "reclaim:" is
+	// the write a hiccup lands on.
+	h.store.failAfter("reclaim:", bdDown)
+	bead := deliveryBead(domain.BeadStateApproved)
+	for i := range 3 {
+		out, err := h.Deliver(ctx, DeliveryRequest{Bead: bead})
+		if !errors.Is(err, bdDown) {
+			t.Fatalf("attempt %d: err = %v, want the bd failure", i+1, err)
+		}
+		if out.Kind != DeliveryRetryable || out.State != domain.BeadStateDelivering {
+			t.Fatalf("attempt %d: outcome = %s/%s, want retryable/delivering", i+1, out.Kind, out.State)
+		}
+		if _, ok := h.PendingFor("sc-68s"); ok {
+			t.Fatalf("attempt %d: a conflict round is pending although bd refused to open it", i+1)
+		}
+		// The caller's answer to a retryable outcome is to deliver again.
+		bead.State = out.State
+	}
+	h.store.failAfter("", nil)
+
+	// bd is back: all three rounds must still be there. Each resolution is
+	// re-delivered by Resolved itself (D-09 asks for no re-review here) and
+	// conflicts again, which is what opens the next round.
+	out, err := h.Deliver(ctx, DeliveryRequest{Bead: bead})
+	if err != nil {
+		t.Fatalf("the first round: %v", err)
+	}
+	for round := 1; round <= 3; round++ {
+		if out.Kind != DeliveryConflict || out.State != domain.BeadStateInProgress {
+			t.Fatalf("round %d: outcome = %s/%s, want conflict/in_progress (%s)", round, out.Kind, out.State, out.Summary())
+		}
+		p, ok := h.PendingFor("sc-68s")
+		if !ok {
+			t.Fatalf("round %d: no conflict round is pending", round)
+		}
+		if p.Attempt != round {
+			t.Fatalf("round %d: attempt = %d, want %d (a bd hiccup burnt a conflict round)", round, p.Attempt, round)
+		}
+		if out, err = h.Resolved(ctx, "sc-68s"); err != nil {
+			t.Fatalf("round %d: Resolved: %v", round, err)
+		}
+	}
+	// Only now, after three rounds an engineer really was given, is the
+	// bead a person's problem.
+	if out.Kind != DeliveryHandedOff || out.State != domain.BeadStateNeedsHuman {
+		t.Fatalf("the fourth round: outcome = %s/%s, want handed_off/needs_human (%s)", out.Kind, out.State, out.Summary())
+	}
+}
+
+// TestDelivererConflictRoundIsNeverEmpty: agents refuses a resolve_conflict
+// request whose conflict is empty, so a round built from one could be
+// offered for ever and never fire. Every path that opens a round therefore
+// fills in what it does know, even when git named neither the target branch
+// nor a single conflicted file.
+func TestDelivererConflictRoundIsNeverEmpty(t *testing.T) {
+	t.Parallel()
+	t.Run("the mid-rebase probe with no files and no default branch", func(t *testing.T) {
+		t.Parallel()
+		h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+			h.git.rebase = []RebaseState{{InProgress: true}}
+			h.git.branchErr = errors.New("git: no default branch")
+		})
+		out, err := h.Deliver(context.Background(), DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
+		if err != nil {
+			t.Fatalf("Deliver: %v", err)
+		}
+		if out.Kind != DeliveryConflict {
+			t.Fatalf("outcome = %s, want conflict (%s)", out.Kind, out.Summary())
+		}
+		if out.Conflict.Empty() {
+			t.Fatal("the conflict is empty, so agents would refuse the round the deliverer keeps offering")
+		}
+		p, ok := h.PendingFor("sc-68s")
+		if !ok {
+			t.Fatal("no conflict round is pending")
+		}
+		if p.Conflict.Empty() {
+			t.Fatal("the pending round's conflict is empty")
+		}
+		req := agents.EngineerRequest{
+			Mode:     agents.EngineerResolveConflict,
+			RunID:    h.host.ID(),
+			AgentID:  p.Agent,
+			Bead:     prompt.BeadContext{Bead: p.Bead, Worktree: t.TempDir(), Round: p.Round},
+			Conflict: p.Conflict,
+		}
+		if err := req.Validate(); err != nil {
+			t.Fatalf("the conflict round does not make a valid engineer request: %v", err)
+		}
+		if _, err := req.Firing(); err != nil {
+			t.Fatalf("Firing: %v", err)
+		}
+	})
+	t.Run("the mid-rebase probe names the branch it found", func(t *testing.T) {
+		t.Parallel()
+		h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+			h.git.rebase = []RebaseState{{InProgress: true, Branch: "sc/sc-68s-add-retry"}}
+		})
+		out, err := h.Deliver(context.Background(), DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
+		if err != nil {
+			t.Fatalf("Deliver: %v", err)
+		}
+		if !strings.Contains(out.Conflict.Output, "sc/sc-68s-add-retry") {
+			t.Errorf("conflict output = %q, want the rebasing branch named", out.Conflict.Output)
+		}
+	})
+	t.Run("a resume that found a rebase and nothing else", func(t *testing.T) {
+		t.Parallel()
+		h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+			h.git.branchErr = errors.New("git: no default branch")
+		})
+		bead := deliveryBead(domain.BeadStateDelivering)
+		if err := h.ConflictRound(context.Background(), gitx.ResumeEntry{
+			Bead: bead, State: domain.BeadStateDelivering, Conflict: true,
+		}); err != nil {
+			t.Fatalf("ConflictRound: %v", err)
+		}
+		p, ok := h.PendingFor(bead.ID)
+		if !ok {
+			t.Fatal("no conflict round is pending")
+		}
+		if p.Conflict.Empty() {
+			t.Fatal("the resumed round's conflict is empty, so its engineer could never be fired")
+		}
+	})
+}
+
+// TestDelivererOpensAConflictRoundWhenTheConflictedPathsCannotBeListed:
+// managerGit.RebaseState reports InProgress with the branch even when
+// "git diff --diff-filter=U" failed, and that fact outranks the error — a
+// worktree full of conflict markers belongs to its engineer, with or without
+// a file list. Retrying the probe instead would leave the bead in delivering
+// for ever with nobody working on it.
+func TestDelivererOpensAConflictRoundWhenTheConflictedPathsCannotBeListed(t *testing.T) {
+	t.Parallel()
+	listFailed := errors.New("git: diff --diff-filter=U failed")
+	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+		h.git.rebaseErr = listFailed
+		h.git.rebasePartial = RebaseState{InProgress: true, Branch: "sc/sc-68s-add-retry"}
+	})
+	out, err := h.Deliver(context.Background(), DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if out.Kind != DeliveryConflict || out.State != domain.BeadStateInProgress {
+		t.Fatalf("outcome = %s/%s, want conflict/in_progress (%s)", out.Kind, out.State, out.Summary())
+	}
+	if out.Conflict.Empty() {
+		t.Error("the conflict is empty, so agents would refuse the round")
+	}
+	if len(out.Conflict.Files) != 0 {
+		t.Errorf("conflict files = %v, want none (git could not list them)", out.Conflict.Files)
+	}
+	if n := h.git.leftoverCalls(); n != 0 {
+		t.Errorf("CommitLeftovers ran %d times, want 0 in a worktree mid-rebase", n)
+	}
+	if len(h.merge.calls) != 0 {
+		t.Errorf("the merge path ran %d times, want 0", len(h.merge.calls))
+	}
+	if !deliveryContains(h.host.warnings(), "conflicted paths could not be listed") {
+		t.Errorf("warnings = %v, want one about the unlistable paths", h.host.warnings())
+	}
+	if got, want := h.host.states(), []string{"approved→delivering", "delivering→in_progress"}; !deliveryEqualStrings(got, want) {
+		t.Errorf("state changes = %v, want %v", got, want)
+	}
+}
+
+// TestDelivererProbeFailureWithNoRebaseIsRetryable is the other half of the
+// ordering above: an inspection that failed and reported no rebase says
+// nothing about the worktree, so it stays a retryable failure with the bead
+// in delivering rather than becoming a conflict round out of nothing.
+func TestDelivererProbeFailureWithNoRebaseIsRetryable(t *testing.T) {
+	t.Parallel()
+	probeFailed := errors.New("git: rev-parse failed")
+	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+		h.git.rebaseErr = probeFailed
+	})
+	out, err := h.Deliver(context.Background(), DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
+	if !errors.Is(err, probeFailed) {
+		t.Fatalf("err = %v, want the probe failure", err)
+	}
+	if out.Kind != DeliveryRetryable || out.State != domain.BeadStateDelivering {
+		t.Fatalf("outcome = %s/%s, want retryable/delivering", out.Kind, out.State)
+	}
+	if _, ok := h.PendingFor("sc-68s"); ok {
+		t.Error("a conflict round is pending although nothing said the worktree is mid-rebase")
 	}
 }
 

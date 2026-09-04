@@ -838,7 +838,15 @@ func (r *Run) reconcileResume(ctx context.Context) error {
 		if e.Err != nil {
 			r.Warn(SourceRun, fmt.Sprintf("resume: %s could not be reattached", e.Bead.ID), e.Err)
 		}
-		if e.Changed() {
+		// Only a transition gitx actually wrote to bd is announced. An entry
+		// that reconciled to a new state but could not persist it (Applied
+		// is false, and gitx.ResumeResult.Summary prints "(not applied)") is
+		// a bd failure: publishing it would leave Summarise, state.json, the
+		// run log, `sc status` and the TUI showing a state bd disagrees
+		// with, for ever, since nothing re-reads. It is the same invariant
+		// the state machine holds (P6-03): a bd write that failed is a
+		// warning and no event.
+		if e.Changed() && e.Applied {
 			r.Publish(events.BeadStateChanged{
 				Meta: r.Meta(), Bead: e.Bead.ID, From: e.Bead.State, To: e.State,
 				Reason: e.Reason,

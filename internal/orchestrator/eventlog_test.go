@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 
@@ -119,6 +121,36 @@ func TestEventLogAppendsAcrossReopen(t *testing.T) {
 		[]events.Kind{got[0].Kind(), got[1].Kind()})
 }
 
+// TestEventLogTerminatesATornLineOnReopen is the writing half of surviving
+// a short write: a resumed run re-opens the log with O_APPEND, and if the
+// last record was cut short (ENOSPC, or a kill between the record and its
+// newline) the next event must not be glued onto the wreck. One newline
+// keeps the damage to the one line that was already lost.
+func TestEventLogTerminatesATornLineOnReopen(t *testing.T) {
+	dir := t.TempDir()
+	first, err := OpenEventLog(dir, nil)
+	require.NoError(t, err)
+	first.Publish(events.RunStarted{Meta: elogAt(0)})
+	require.NoError(t, first.Close())
+	f, err := os.OpenFile(EventLogPath(dir), os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = f.WriteString(`{"kind":"run_fin`) // the write that ran out of disk
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	second, err := OpenEventLog(dir, nil)
+	require.NoError(t, err)
+	second.Publish(events.RunResumed{Meta: elogAt(1), Reason: "user"})
+	require.NoError(t, second.Close())
+
+	got, err := ReadEventLog(dir)
+	require.Error(t, err, "the torn record is gone and is reported")
+	require.Equal(t, []events.Kind{events.KindRunStarted, events.KindRunResumed},
+		[]events.Kind{got[0].Kind(), got[1].Kind()},
+		"the event written after the tear survives it")
+	require.Len(t, got, 2)
+}
+
 func TestEventLogWriteFailureIsStickyAndSilent(t *testing.T) {
 	dir := t.TempDir()
 	log, err := OpenEventLog(dir, nil)
@@ -162,6 +194,28 @@ func TestTee(t *testing.T) {
 	tee.Publish(ev)
 	require.Equal(t, []events.Event{ev}, a.got)
 	require.Equal(t, []events.Event{ev}, b.got)
+}
+
+// elogOrder is a Publisher that appends its name to a shared list, so the
+// order Tee forwards in can be asserted rather than assumed.
+type elogOrder struct {
+	name string
+	seen *[]string
+}
+
+// Publish implements Publisher.
+func (r *elogOrder) Publish(events.Event) { *r.seen = append(*r.seen, r.name) }
+
+// TestTeeForwardsInArgumentOrder pins the invariant the run's wiring rests
+// on: Options.Bus = Tee(log, bus) writes the file before any subscriber is
+// told, so anything the TUI or the headless renderer shows is already
+// durable. Reverse the arguments and this fails.
+func TestTeeForwardsInArgumentOrder(t *testing.T) {
+	var seen []string
+	tee := Tee(&elogOrder{name: "log", seen: &seen}, nil, &elogOrder{name: "bus", seen: &seen})
+	tee.Publish(events.RunStarted{Meta: elogAt(0)})
+	tee.Publish(events.RunFinished{Meta: elogAt(1)})
+	require.Equal(t, []string{"log", "bus", "log", "bus"}, seen)
 }
 
 func TestSummariseScriptedRun(t *testing.T) {
@@ -337,8 +391,10 @@ func TestSummariseLogTruncatedTail(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	s, err := SummariseLog(dir, 0)
-	require.Error(t, err, "the caller is told the log is damaged")
-	require.Equal(t, 3, s.Events, "everything before the damage is still reported")
+	require.NoError(t, err, "an unfinished last line is a note, not a failure")
+	require.Equal(t, 3, s.Events, "everything before the unfinished record is reported")
+	require.Equal(t, []string{logPartialTailNote}, s.Notes,
+		"a log that stops mid-record is a run still writing, not damage")
 }
 
 func TestWriteEventLogMatchesTheReader(t *testing.T) {
@@ -350,9 +406,34 @@ func TestWriteEventLogMatchesTheReader(t *testing.T) {
 	require.Equal(t, len(want), len(got))
 }
 
+// elogAfterLog stands where a subscriber stands in Tee(log, bus): it
+// records how many events the run log already held when it was told, which
+// is the ordering guarantee Tee's argument order exists to give.
+type elogAfterLog struct {
+	log *EventLog
+	mu  sync.Mutex
+	at  []uint64
+}
+
+// Publish implements Publisher. It runs on whichever goroutine published,
+// so it records rather than asserts.
+func (p *elogAfterLog) Publish(events.Event) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.at = append(p.at, p.log.Written())
+}
+
+// written returns the recorded counts.
+func (p *elogAfterLog) written() []uint64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]uint64(nil), p.at...)
+}
+
 // TestRunPublishesEveryTransitionToTheLog is the P6-08 acceptance for the
-// writing half: wire the log into the run through Tee and every lifecycle
-// transition ends up on disk, in order, without the run knowing.
+// writing half: wire the log into the run through Tee, in the documented
+// order, and every lifecycle transition ends up on disk — before any
+// subscriber hears about it — without the run knowing.
 func TestRunPublishesEveryTransitionToTheLog(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -378,9 +459,13 @@ func TestRunPublishesEveryTransitionToTheLog(t *testing.T) {
 	bus := events.NewBus()
 	t.Cleanup(bus.Close)
 
+	// The log comes first in the tee, so every event is on disk before the
+	// live bus is told. after records what the log held at each hand-off.
+	after := &elogAfterLog{log: log}
+
 	release := make(chan struct{})
 	run, err := New(rc, Options{
-		Bus: Tee(bus, log),
+		Bus: Tee(log, after, bus),
 		Now: func() time.Time { return elogEpoch },
 		Loop: LoopFunc(func(_ context.Context, _ *Run) (Outcome, error) {
 			<-release
@@ -396,6 +481,9 @@ func TestRunPublishesEveryTransitionToTheLog(t *testing.T) {
 	_, err = run.Wait()
 	require.NoError(t, err)
 	require.NoError(t, log.Close())
+
+	require.Equal(t, []uint64{1, 2, 3, 4}, after.written(),
+		"Tee(log, bus): each event is durable before a subscriber is told")
 
 	got, err := ReadEventLog(rc.Run.StateDir)
 	require.NoError(t, err)
@@ -581,8 +669,188 @@ func TestSummariseReaderReportsADamagedLine(t *testing.T) {
 	require.NoError(t, WriteEventLog(&buf, elogRun()[:3]))
 	buf.WriteString(`{"kind":"run_fin`)
 	s, err := SummariseReader(bytes.NewReader(buf.Bytes()), 0)
-	require.Error(t, err)
-	require.Equal(t, 3, s.Events, "everything before the damage is still reported")
+	require.NoError(t, err)
+	require.Equal(t, 3, s.Events, "everything before the unfinished record is reported")
+	require.Equal(t, []string{logPartialTailNote}, s.Notes)
+
+	// The same half-record with a newline after it is not a run mid-write:
+	// it is a line that will never parse, and it is reported as damage.
+	buf.WriteString("\n")
+	s, err = SummariseReader(bytes.NewReader(buf.Bytes()), 0)
+	require.NoError(t, err)
+	require.Equal(t, 3, s.Events)
+	require.Len(t, s.Notes, 1)
+	require.Contains(t, s.Notes[0], "1 line of the run log did not parse")
+	require.Contains(t, s.Notes[0], "line 4")
+}
+
+// elogDamaged writes the run log a torn write leaves behind: the events up
+// to k, then a record cut short with no newline (the ENOSPC or crash the
+// EventLog is built to survive), then — because OpenEventLog re-opens an
+// existing log with O_APPEND — every later event of the run appended
+// straight onto it. The half-record swallows the line that follows it, so
+// exactly one event is lost and everything after it is intact.
+func elogDamaged(t *testing.T, evs []events.Event, k int) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, WriteEventLog(&buf, evs[:k]))
+	buf.WriteString(`{"kind":"bead_state_chan`)
+	require.NoError(t, WriteEventLog(&buf, evs[k:]))
+	return &buf
+}
+
+// TestSummariseReaderKeepsFoldingPastADamagedLine is the P6-08 regression
+// for a fold that used to stop at the first unreadable line: a run log
+// damaged in the middle made `sc status` describe the run as it stood at
+// the damage — a bead still in_progress that had long since closed — and
+// say nothing about it. Everything after a bad line is folded, and the bad
+// line becomes a note.
+func TestSummariseReaderKeepsFoldingPastADamagedLine(t *testing.T) {
+	evs := elogRun()
+	const torn = 8 // BeadStateChanged sc-1 open -> in_progress
+
+	t.Run("torn write", func(t *testing.T) {
+		s, err := SummariseReader(elogDamaged(t, evs, torn), 0)
+		require.NoError(t, err, "a damaged line is a note, not a failure")
+
+		survived := append(append([]events.Event{}, evs[:torn]...), evs[torn+1:]...)
+		want := Summarise(survived, 0)
+		require.Equal(t, want.Events, s.Events, "every event after the damage is folded")
+		require.Equal(t, want.Counts, s.Counts)
+		require.Equal(t, want.LastAt, s.LastAt)
+		require.Equal(t, want.Beads, s.Beads)
+
+		sc1, ok := s.Bead("sc-1")
+		require.True(t, ok)
+		require.Equal(t, domain.BeadStateClosed, sc1.State, "the closure after the damage still counts")
+		sc2, ok := s.Bead("sc-2")
+		require.True(t, ok)
+		require.Equal(t, domain.BeadStateInReview, sc2.State)
+
+		require.Len(t, s.Notes, 1)
+		require.Contains(t, s.Notes[0], "1 line of the run log did not parse and was skipped")
+		require.Contains(t, s.Notes[0], "everything after it was still read")
+	})
+
+	// A log written by a newer sc carries kinds this binary has no type
+	// for. One unknown line must cost one line, not the rest of the run.
+	t.Run("kind from a newer sc", func(t *testing.T) {
+		var buf bytes.Buffer
+		require.NoError(t, WriteEventLog(&buf, evs[:torn]))
+		buf.WriteString(`{"kind":"credits_paused","run_id":"20260903-120000-abcd","at":"2026-09-03T12:00:30Z"}` + "\n")
+		require.NoError(t, WriteEventLog(&buf, evs[torn:]))
+
+		s, err := SummariseReader(&buf, 0)
+		require.NoError(t, err)
+		want := Summarise(evs, 0)
+		require.Equal(t, want.Events, s.Events, "only the unknown line is lost")
+		require.Equal(t, want.Counts, s.Counts)
+		require.Len(t, s.Notes, 1)
+		require.Contains(t, s.Notes[0], "credits_paused")
+	})
+
+	// Several bad lines are counted, and the first is quoted.
+	t.Run("several", func(t *testing.T) {
+		var buf bytes.Buffer
+		require.NoError(t, WriteEventLog(&buf, evs[:2]))
+		buf.WriteString("{\n{\n")
+		require.NoError(t, WriteEventLog(&buf, evs[2:]))
+		s, err := SummariseReader(&buf, 0)
+		require.NoError(t, err)
+		require.Equal(t, len(evs), s.Events)
+		require.Len(t, s.Notes, 1)
+		require.Contains(t, s.Notes[0], "2 lines of the run log did not parse")
+		require.Contains(t, s.Notes[0], "line 3")
+	})
+}
+
+// elogBroken is a reader that fails part way through, the way a truncated
+// file or a bad sector does.
+type elogBroken struct {
+	data []byte
+	err  error
+}
+
+// Read implements io.Reader.
+func (r *elogBroken) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+// TestSummariseReaderStopsOnAStreamThatCannotBeRead pins the other half of
+// skipping bad lines: a failure that consumes no line (an I/O error, or a
+// line past the reader's size limit) must end the fold rather than be
+// retried for ever.
+func TestSummariseReaderStopsOnAStreamThatCannotBeRead(t *testing.T) {
+	var buf bytes.Buffer
+	require.NoError(t, WriteEventLog(&buf, elogRun()[:3]))
+	boom := errors.New("i/o error")
+
+	done := make(chan struct{})
+	var s RunSummary
+	var err error
+	go func() {
+		defer close(done)
+		s, err = SummariseReader(&elogBroken{data: buf.Bytes(), err: boom}, 0)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("SummariseReader did not return: a read failure must not be retried")
+	}
+	require.ErrorIs(t, err, boom)
+	require.Equal(t, 3, s.Events, "everything read before the failure is reported")
+}
+
+// TestReadEventLogSkipsDamagedLines: the slice-returning reader follows the
+// same rule as the fold — every event that parses comes back, and the lines
+// that did not are described by the error rather than hiding the rest.
+func TestReadEventLogSkipsDamagedLines(t *testing.T) {
+	evs := elogRun()
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(EventLogPath(dir), elogDamaged(t, evs, 8).Bytes(), 0o600))
+
+	got, err := ReadEventLog(dir)
+	require.Error(t, err, "the caller is told the log is damaged")
+	require.Contains(t, err.Error(), "1 line of the run log did not parse")
+	require.Len(t, got, len(evs)-1, "only the torn record is lost")
+	require.Equal(t, events.KindBeadStateChanged, got[len(got)-1].Kind())
+
+	// An unfinished last line is a run still writing, not an error.
+	var buf bytes.Buffer
+	require.NoError(t, WriteEventLog(&buf, evs[:3]))
+	buf.WriteString(`{"kind":"run_fin`)
+	live := t.TempDir()
+	require.NoError(t, os.WriteFile(EventLogPath(live), buf.Bytes(), 0o600))
+	got, err = ReadEventLog(live)
+	require.NoError(t, err)
+	require.Len(t, got, 3)
+}
+
+// TestSummariseCountsABeadWithNoState: every bead in Beads is counted, so
+// the total `sc status` prints and the per-state rows under it agree even
+// for a bead the log has named but never given a state.
+func TestSummariseCountsABeadWithNoState(t *testing.T) {
+	s := Summarise([]events.Event{
+		events.RunStarted{Meta: elogAt(0)},
+		events.AgentSpawned{Meta: elogAt(1), BeadTitle: "Add retry", Agent: domain.Agent{
+			ID: "eng-sc-1-r1", Role: domain.RoleEngineer, Bead: "sc-1",
+		}},
+	}, 0)
+	require.Len(t, s.Beads, 1)
+	require.Equal(t, "Add retry", s.Beads[0].Title)
+	require.Empty(t, s.Beads[0].State)
+	require.Equal(t, map[domain.BeadState]int{BeadStateUnrecorded: 1}, s.Counts)
+
+	total := 0
+	for _, n := range s.Counts {
+		total += n
+	}
+	require.Equal(t, len(s.Beads), total, "the breakdown must add up to the total")
 }
 
 // elogRepeat is an io.Reader that serves the same log line n times without

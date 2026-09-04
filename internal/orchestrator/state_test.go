@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"slop-cannon/internal/beads"
+	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
+	"slop-cannon/internal/gitx"
 )
 
 // stateClock is the fixed instant every state test stamps its events with, so
@@ -386,6 +388,84 @@ func TestStateTransitionStatusAcceptsOwnStatuses(t *testing.T) {
 	}
 }
 
+// TestStateResolveBeadStatusIsTheOneP612Guard pins ResolveBeadStatus, the
+// single implementation of the P6-12 rule that both TransitionStatus and the
+// gate poller (gates.go, which reads a bead before it knows which edge the
+// gate implies) go through, so the guard is exercised in production and is
+// not open-coded twice. It answers with SafeState's state whatever it
+// decides, so a caller can name the state in its own diagnostic.
+func TestStateResolveBeadStatusIsTheOneP612Guard(t *testing.T) {
+	t.Parallel()
+
+	m := beads.StatusMap{
+		"open":        domain.CategoryActive,
+		"in_progress": domain.CategoryWIP,
+		"in_review":   domain.CategoryWIP,
+		"blocked":     domain.CategoryWIP,
+		"shipped":     domain.CategoryDone, // the repository's own "done"
+		"reviewing":   domain.CategoryWIP,  // the repository's own WIP
+	}
+	cases := []struct {
+		name      string
+		status    string
+		wantState domain.BeadState
+		wantErr   error
+	}{
+		{"own status", "open", domain.BeadStateOpen, nil},
+		{"own wip status", "in_review", domain.BeadStateInReview, nil},
+		{"bd built-in", "blocked", domain.BeadStateBlocked, ErrNotWorkflowState},
+		{"foreign done maps onto closed", "shipped", domain.BeadStateClosed, ErrForeignStatus},
+		{"foreign wip", "reviewing", domain.BeadStateBlocked, ErrForeignStatus},
+		{"unknown to the repository too", "whatever", domain.BeadStateDeferred, ErrForeignStatus},
+		// An issue with no status at all is not the cannon's either: it
+		// takes the unknown-category mapping and is refused on origin.
+		{"no status at all", "", domain.BeadStateDeferred, ErrForeignStatus},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			state, err := ResolveBeadStatus(c.status, m)
+			if state != c.wantState {
+				t.Fatalf("ResolveBeadStatus(%q) state = %q, want %q", c.status, state, c.wantState)
+			}
+			if c.wantErr == nil {
+				if err != nil {
+					t.Fatalf("ResolveBeadStatus(%q) error = %v, want nil", c.status, err)
+				}
+			} else if !errors.Is(err, c.wantErr) {
+				t.Fatalf("ResolveBeadStatus(%q) error = %v, want %v", c.status, err, c.wantErr)
+			}
+			// TransitionStatus is exactly this guard plus Transition: it
+			// reports the same refusal, and never a state, when refused.
+			to, terr := TransitionStatus(c.status, m, BeadEventClaimed)
+			if c.wantErr != nil {
+				if !errors.Is(terr, c.wantErr) {
+					t.Fatalf("TransitionStatus(%q) error = %v, want %v", c.status, terr, c.wantErr)
+				}
+				if to != "" {
+					t.Fatalf("TransitionStatus(%q) = %q on a refusal, want the empty state", c.status, to)
+				}
+				return
+			}
+			want, wantErr := Transition(c.wantState, BeadEventClaimed)
+			if to != want {
+				t.Fatalf("TransitionStatus(%q) = %q; want Transition's %q", c.status, to, want)
+			}
+			// Both errors are freshly wrapped sentinels, so they are
+			// compared by what they say rather than by identity.
+			if fmt.Sprint(terr) != fmt.Sprint(wantErr) {
+				t.Fatalf("TransitionStatus(%q) error = %v; want Transition's %v", c.status, terr, wantErr)
+			}
+		})
+	}
+
+	// A nil map is the "no registered statuses" case: the cannon's own names
+	// still resolve, because SafeState knows them.
+	if state, err := ResolveBeadStatus("in_review", nil); err != nil || state != domain.BeadStateInReview {
+		t.Fatalf("ResolveBeadStatus(in_review, nil) = %q, %v; want in_review, nil", state, err)
+	}
+}
+
 // TestStateBeadEventVocabulary pins the event enum: the list, String, Valid
 // and the lenient parser.
 func TestStateBeadEventVocabulary(t *testing.T) {
@@ -688,8 +768,8 @@ func TestStateMachineRefusesInvalidTransitions(t *testing.T) {
 			if !ok {
 				t.Fatalf("event type %T", rec.evs[0])
 			}
-			if w.Source != StateWarningSource {
-				t.Fatalf("warning source = %q, want %q", w.Source, StateWarningSource)
+			if w.Source != SourceState {
+				t.Fatalf("warning source = %q, want %q", w.Source, SourceState)
 			}
 			if w.Bead != c.req.Bead || w.Agent != c.req.Agent {
 				t.Fatalf("warning names bead %q agent %q, want %q/%q", w.Bead, w.Agent, c.req.Bead, c.req.Agent)
@@ -1149,5 +1229,89 @@ func TestStateTransitionCountIsTheOneTheRecordClaims(t *testing.T) {
 	}
 	if spec != len(trs) {
 		t.Fatalf("the hand-written spec has %d edges, the table %d", spec, len(trs))
+	}
+}
+
+// ------------------------------------------- P6-03: no event without a write
+
+// TestStateResumeAnnouncesOnlyTheTransitionsBdAccepted is the resume half of
+// the invariant the rest of this file pins for StateMachine.Apply: a bd write
+// that failed is a warning and no event. gitx reconciles branch state into
+// bead state on --resume and writes it through its own tracker seam, marking
+// each entry Applied only when that write landed; an entry that reconciled but
+// could not be written must not publish events.BeadStateChanged, because
+// Summarise folds the event into the bead's state and nothing ever re-reads —
+// the run log, state.json, `sc status` and the TUI would show a state bd
+// disagrees with for the rest of the run.
+func TestStateResumeAnnouncesOnlyTheTransitionsBdAccepted(t *testing.T) {
+	f := lifecycleSetup(t)
+	landed := domain.Bead{ID: "sc-1", State: domain.BeadStateDelivering}
+	refused := domain.Bead{ID: "sc-3", State: domain.BeadStateInReview}
+	list := []domain.Bead{landed, refused}
+
+	opts := f.options()
+	opts.Resumer = &lifecycleResumer{res: &gitx.ResumeResult{
+		Default: "main",
+		Entries: []gitx.ResumeEntry{
+			// bd took the close.
+			{Bead: landed, State: domain.BeadStateClosed, Applied: true,
+				Reason: "the branch landed on main"},
+			// bd refused it: Summary() prints "(not applied)".
+			{Bead: refused, State: domain.BeadStateClosed,
+				Err:    fmt.Errorf("applying closed: bd is busy"),
+				Reason: "the branch landed on main"},
+		},
+	}}
+	opts.Beads = func(context.Context) ([]domain.Bead, error) { return list, nil }
+
+	rc := f.runConfig(t, config.RunSettings{})
+	rc.Resume = true
+	r, err := New(rc, opts)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := r.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	all := f.drain()
+	var changed []events.BeadStateChanged
+	var warned bool
+	for _, ev := range all {
+		switch e := ev.(type) {
+		case events.BeadStateChanged:
+			changed = append(changed, e)
+		case events.Warning:
+			if strings.Contains(e.Message, string(refused.ID)) {
+				warned = true
+			}
+		}
+	}
+	if len(changed) != 1 {
+		t.Fatalf("BeadStateChanged events = %d (%+v), want only the applied one", len(changed), changed)
+	}
+	if changed[0].Bead != landed.ID || changed[0].From != domain.BeadStateDelivering || changed[0].To != domain.BeadStateClosed {
+		t.Fatalf("announced %+v, want sc-1 delivering -> closed", changed[0])
+	}
+	if !warned {
+		t.Fatalf("the entry bd refused was not warned about")
+	}
+
+	// And the fold `sc status`, state.json's view and the TUI all read is
+	// left saying nothing about the bead bd refused, rather than saying
+	// closed (P6-08).
+	sum := Summarise(all, -1)
+	for _, b := range sum.Beads {
+		if b.ID == refused.ID && b.State != "" {
+			t.Fatalf("the folded view has %s as %q; bd still has it %s",
+				b.ID, b.State, refused.State)
+		}
+	}
+
+	if err := r.Stop("done"); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	if _, err := r.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
 	}
 }

@@ -175,6 +175,10 @@ type fbRig struct {
 	// second loop a resumed run would build ([Feedback.Restore]).
 	Opts FeedbackOptions
 
+	// Reverse fires each step's demands in the opposite order, which is
+	// what one tester finishing before another looks like to the loop.
+	Reverse bool
+
 	mu       sync.Mutex
 	diff     *gitx.Diff
 	ratio    float64
@@ -337,6 +341,11 @@ func (r *fbRig) step(t *testing.T) int {
 	ds, err := r.Loop.Demands(ctx)
 	require.NoError(t, err)
 	sortDemands(ds)
+	if r.Reverse {
+		for i, j := 0, len(ds)-1; i < j; i, j = i+1, j-1 {
+			ds[i], ds[j] = ds[j], ds[i]
+		}
+	}
 	for _, d := range ds {
 		agent := d.Agent
 		if agent == "" {
@@ -1380,7 +1389,7 @@ func TestFeedbackWarnsWhenItCannotRecordAMessage(t *testing.T) {
 	rig.pump(t, 8)
 
 	w := fbWarning(t, rig, "could not record the message")
-	assert.Equal(t, FeedbackWarningSource, w.Source)
+	assert.Equal(t, SourceFeedback, w.Source)
 	assert.Equal(t, fbBead, w.Bead)
 	assert.Contains(t, w.Err, "bd is not answering")
 	assert.Equal(t, domain.BeadStateApproved, rig.Thread().State,
@@ -1409,7 +1418,7 @@ func TestFeedbackUnmeasurableRoundSendsEveryTesterBack(t *testing.T) {
 	rig.pump(t, 12)
 
 	w := fbWarning(t, rig, "could not measure how far the round moved")
-	assert.Equal(t, FeedbackWarningSource, w.Source)
+	assert.Equal(t, SourceFeedback, w.Source)
 	th := rig.Thread()
 	assert.True(t, th.FullReview, "an unmeasurable round reads as everything changed (D-09)")
 	for _, l := range domain.Lenses() {
@@ -1423,7 +1432,7 @@ func fbWarning(t *testing.T, rig *fbRig, want string) events.Warning {
 	t.Helper()
 	for _, ev := range rig.Events(events.KindWarning) {
 		w, ok := ev.(events.Warning)
-		if ok && w.Source == FeedbackWarningSource && strings.Contains(w.Message, want) {
+		if ok && w.Source == SourceFeedback && strings.Contains(w.Message, want) {
 			return w
 		}
 	}
@@ -1452,4 +1461,231 @@ func TestFeedbackThreadsSnapshotsEveryTrackedBead(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, ths[1], one, "Threads and Thread render the same snapshot")
 	assert.Equal(t, 2, rig.Loop.Outstanding())
+}
+
+// --- D-09: a firing that was shown no diff has not reviewed the code ----
+
+// A round the engineer spends arguing still moves the code: D-14 commits
+// whatever the session left behind, so the head the next review must look at
+// is not the one the round started from. The tester that judges the
+// pushback is shown no diff at all (evaluate_pushback renders none), so it
+// must not be credited with having reviewed that new commit — otherwise a
+// round whose answers are all pushback approves a change set nobody looked
+// at.
+func TestFeedbackPushbackOnlyRoundStillReviewsTheNewCommit(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMinor, domain.ItemOpen)
+	sc := fbScenario("pushback-only-round")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
+	}))
+	accepted := item
+	accepted.Status = domain.ItemAccepted
+	fbSayTask(sc, "tester-qa-sc-fb1-r2", events.TaskEvaluatePushback, fbSettled("fair enough", accepted))
+	fbSayTask(sc, "tester-qa-sc-fb1-r2", events.TaskReview, fbApprove("the code the round left behind is fine"))
+
+	rig := fbSetup(t, sc, nil)
+	require.Equal(t, 1, rig.step(t), "the engineer implements")
+	require.Equal(t, 3, rig.step(t), "three lenses review head1")
+
+	// The engineer only argues, but its session still committed (D-14).
+	rig.setDiff("head2", 22, 0.1)
+	require.Equal(t, 1, rig.step(t), "the engineer pushes back")
+	assert.Equal(t, FeedbackEvaluating, rig.Thread().Phase)
+
+	require.Equal(t, 1, rig.step(t), "qa judges the argument")
+	th := rig.Thread()
+	require.Len(t, th.Items, 1)
+	assert.Equal(t, domain.ItemAccepted, th.Items[0].Status, "qa accepted the argument")
+	assert.NotEqual(t, domain.BeadStateApproved, th.State,
+		"an accepted argument is not a review of the code the round left behind (D-09)")
+	assert.Equal(t, FeedbackReviewing, th.Phase)
+	assert.Equal(t, []domain.Lens{domain.LensQA}, th.Reviewers,
+		"qa did not approve round one and the code moved, so it reviews again; ux and test approved, and an approval stands")
+
+	require.Equal(t, 1, rig.step(t), "qa re-reviews head2")
+	assert.Equal(t, domain.BeadStateApproved, rig.Thread().State)
+
+	assert.Equal(t, []string{
+		"eng-sc-fb1-r1", "tester-ux-sc-fb1-r1", "tester-qa-sc-fb1-r1", "tester-test-sc-fb1-r1",
+		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2", "tester-qa-sc-fb1-r2",
+	}, rig.Fired())
+
+	// The firing that settled the bead is the one that was shown head2.
+	assert.NotContains(t, rig.PromptFor("tester-qa-sc-fb1-r2", events.TaskEvaluatePushback),
+		"## The change under review")
+	assert.Contains(t, rig.PromptFor("tester-qa-sc-fb1-r2", events.TaskReview), "## The change under review")
+	rounds := rig.Events(events.KindRoundStarted)
+	require.Len(t, rounds, 2, "the evaluation opens no review round; the re-review does")
+	second, ok := rounds[1].(events.RoundStarted)
+	require.True(t, ok)
+	assert.Equal(t, 2, second.Round)
+	assert.Equal(t, []domain.Lens{domain.LensQA}, second.Lenses)
+	assert.Equal(t, "head2", second.Commit, "the round that settles the bead looks at the new commit")
+}
+
+// --- D-08: the product owner's ruling is binding ------------------------
+
+// An engineer that argues with a ruling instead of carrying it out must not
+// be able to erase it: that would restart the dispute the ruling closed —
+// the same tester judging the same argument again, the same item arbitrated
+// a second time with an empty ruling history — and burn a review round each
+// time round.
+func TestFeedbackBindingRulingCannotBeArguedWithAgain(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	sc := fbScenario("binding-ruling")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
+	}))
+	held := item
+	held.Status = domain.ItemHeld
+	held.Detail = "the caller is not the only entry point"
+	fbSay(sc, "tester-qa-sc-fb1-r2", fbChanges("still not convinced", held))
+	fbSay(sc, "po-sc-fb1-r2-qa-r1-1", domain.Arbitration{
+		ItemID: "qa-r1-1", Ruling: domain.RulingUpholdTester, Instruction: "bound the loop where it is written",
+	})
+	fbSay(sc, "eng-sc-fb1-r3", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "I still disagree with the product owner",
+	}))
+	fbSay(sc, "eng-sc-fb1-r4", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionFixed, Rationale: "bounded the loop where it is written",
+	}))
+	resolved := item
+	resolved.Status = domain.ItemResolved
+	fbSay(sc, "tester-qa-sc-fb1-r4", fbSettled("bounded now", resolved))
+
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) { o.Limits.MaxPushbackRounds = 1 })
+	rig.pump(t, 16)
+
+	th := rig.Thread()
+	assert.Equal(t, domain.BeadStateApproved, th.State)
+	require.Len(t, th.Items, 1)
+	require.NotNil(t, th.Items[0].Ruling, "the ruling survives the engineer arguing with it (D-08)")
+	assert.Equal(t, domain.RulingUpholdTester, th.Items[0].Ruling.Ruling)
+	assert.Equal(t, 1, th.Items[0].Holds, "arguing again does not spend another pushback exchange")
+
+	// The refused round judged nothing and arbitrated nothing a second time.
+	assert.Equal(t, []string{
+		"eng-sc-fb1-r1", "tester-ux-sc-fb1-r1", "tester-qa-sc-fb1-r1", "tester-test-sc-fb1-r1",
+		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2", "po-sc-fb1-r2-qa-r1-1",
+		"eng-sc-fb1-r3", "eng-sc-fb1-r4", "tester-qa-sc-fb1-r4",
+	}, rig.Fired())
+
+	w := fbWarning(t, rig, "binding ruling")
+	assert.Equal(t, fbBead, w.Bead)
+	// The ruling is still in front of the engineer in every later round.
+	assert.Contains(t, rig.Prompt("eng-sc-fb1-r4"), "bound the loop where it is written")
+}
+
+// --- D-08: a failed check at the round cap escalates --------------------
+
+func TestFeedbackCheckFailedAtTheRoundCapEscalates(t *testing.T) {
+	sc := fbScenario("check-failed-at-the-cap")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	for _, l := range domain.Lenses() {
+		fbSay(sc, "tester-"+l.String()+"-sc-fb1-r1", fbApprove("fine"))
+	}
+	fbSay(sc, "po-sc-fb1-r2-escalate", domain.Escalation{
+		Outcome: domain.EscalationBlock, Summary: "the check has failed at the last round; a human should look",
+	})
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) { o.Limits.MaxReviewRounds = 2 })
+	rig.pump(t, 8)
+	require.Equal(t, domain.BeadStateApproved, rig.Thread().State)
+
+	failed := fbItemAt("check-r2-1", "the check command failed: go test ./...", "retry.go",
+		domain.SeverityBlocker, domain.ItemOpen)
+	failed.Category = DefaultCheckItemCategory
+	// The delivery handoff reports the failure of the last round the cap
+	// allows (DeliveryOutcome.Round is the bead's own sc_round).
+	require.NoError(t, rig.Loop.CheckFailed(context.Background(),
+		domain.Bead{ID: fbBead, Title: "make the retry loop terminate"}, 2, []domain.FeedbackItem{failed}))
+
+	th := rig.Thread()
+	assert.Equal(t, FeedbackEscalating, th.Phase, "there is no review round left to answer the failure (D-08)")
+	assert.Equal(t, 2, th.Round, "a failed check at the cap buys no extra round")
+	assert.Equal(t, domain.BeadStateEscalated, th.State)
+	assert.Equal(t, domain.BeadStateEscalated, rig.Store.State())
+
+	rig.pump(t, 4)
+	assert.Equal(t, domain.BeadStateNeedsHuman, rig.Thread().State)
+	assert.Contains(t, rig.Fired(), "po-sc-fb1-r2-escalate")
+}
+
+// --- the round a conflict review-again opens is the thread's own --------
+
+func TestFeedbackReviewAgainPublishesTheThreadsRound(t *testing.T) {
+	sc := fbScenario("review-again-no-round")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	for _, l := range domain.Lenses() {
+		fbSay(sc, "tester-"+l.String()+"-sc-fb1-r1", fbApprove("fine"))
+	}
+	rig := fbSetup(t, sc, nil)
+	rig.pump(t, 8)
+	before := len(rig.Events(events.KindRoundStarted))
+
+	// A bead with no sc_round metadata reaches P6-06's review-again path
+	// with no round of its own.
+	require.NoError(t, rig.Loop.ReviewAgain(context.Background(),
+		domain.Bead{ID: fbBead}, 0, "the conflict resolution changed 90% of the diff"))
+
+	th := rig.Thread()
+	assert.Equal(t, 1, th.Round, "no round was given, so the thread keeps the one it has")
+	rounds := rig.Events(events.KindRoundStarted)
+	require.Len(t, rounds, before+1)
+	opened, ok := rounds[before].(events.RoundStarted)
+	require.True(t, ok)
+	assert.Equal(t, th.Round, opened.Round, "the event names the thread's round, not the caller's zero")
+	assert.Equal(t, domain.Lenses(), opened.Lenses)
+}
+
+// --- P6-21: the live merge is the exported one --------------------------
+
+// The scheduler fires the three lenses concurrently, so which tester's
+// wording names a shared issue must not depend on which of them finishes
+// first: the loop's live merge and ConsolidateItems have to agree.
+func TestFeedbackConsolidationDoesNotDependOnTheTesterOrder(t *testing.T) {
+	ux := fbItemAt("ux-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMinor, domain.ItemOpen)
+	qa := fbItemAt("qa-r1-1", "retry loop never terminates on error", "retry.go", domain.SeverityBlocker, domain.ItemOpen)
+	build := func() *mock.Scenario {
+		sc := fbScenario("consolidation-order")
+		fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+		fbSay(sc, "tester-ux-sc-fb1-r1", fbChanges("it spins", ux))
+		fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins on error", qa))
+		fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+		return sc
+	}
+	want := ConsolidateItems([]domain.Verdict{
+		{Lens: domain.LensQA, Outcome: domain.VerdictChanges, Items: []domain.FeedbackItem{qa}},
+		{Lens: domain.LensUX, Outcome: domain.VerdictChanges, Items: []domain.FeedbackItem{ux}},
+	}, 0)
+	require.Len(t, want, 1)
+
+	for _, reverse := range []bool{false, true} {
+		name := "ux first"
+		if reverse {
+			name = "qa first"
+		}
+		t.Run(name, func(t *testing.T) {
+			rig := fbSetup(t, build(), nil)
+			rig.Reverse = reverse
+			require.Equal(t, 1, rig.step(t), "the engineer implements")
+			require.Equal(t, 3, rig.step(t), "three lenses review")
+
+			th := rig.Thread()
+			require.Len(t, th.Items, 1, "the two testers raised one issue (P6-21)")
+			assert.Equal(t, want[0].Item.ID, th.Items[0].Item.ID,
+				"the first raiser in lens order names the merged item, whoever replied first")
+			assert.Equal(t, want[0].Item.Title, th.Items[0].Item.Title)
+			assert.Equal(t, want[0].Item.File, th.Items[0].Item.File)
+			assert.Equal(t, want[0].Item.Severity, th.Items[0].Item.Severity)
+			assert.Equal(t, want[0].Lenses, th.Items[0].Lenses)
+		})
+	}
 }

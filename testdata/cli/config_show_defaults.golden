@@ -5,6 +5,7 @@ vibes                       []    default
 rules                       []    default
 check_command                     default
 idle_replan_interval        10m   default
+gate_poll_interval          1m    default
 max_beads_per_plan          8     default
 limits.max_review_rounds    5     default
 limits.max_pushback_rounds  2     default

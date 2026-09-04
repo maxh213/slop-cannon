@@ -30,6 +30,17 @@ import (
 //     (a component asks for the slice it uses, which is what lets tests
 //     pass small fakes); it is the one place the whole surface is written
 //     down, and the compile-time assertion that *Run satisfies every slice.
+//
+// Two package-wide conventions hold everything else together. A component
+// names the events.Warning/events.Error Source it stamps in one exported
+// constant beside its own type, all spelled Source<Component>
+// ([SourceRun], [SourceScheduler], [SourcePlanning], [SourceSupervisor],
+// [SourceFeedback], [SourceDelivery], [SourceGates], [SourceState]); and a
+// component that reads or writes bd asks for the narrowest interface it
+// uses ([StateStore], [ClaimStore], [LeaseRenewer], [LeaseReleaser],
+// [GateStore], [GateBeadReader], [FeedbackMessageStore], [PlanPrioritiser]),
+// each asserted against *beads.Client where it is declared, so a test can
+// fake one method without standing in for the whole client.
 
 // Publisher is the event sink of this package: *events.Bus, [*Run],
 // [*EventLog] and [Tee] all satisfy it.
@@ -112,6 +123,15 @@ func mergeEnv(base, extra map[string]string) map[string]string {
 // escalated bead is not settled: the product owner still owes it a ruling
 // (D-08). [BeadSettled] is the same question about a whole bead, and also
 // counts the run's bookkeeping beads as settled.
+//
+// A state that is not a bd status at all — the empty string a listing bd
+// could not parse leaves behind, or a status from a newer sc — is never
+// settled (P6-36). This answer ends a brief run (planSettlement) and
+// counts the beads `sc status` says are done, so the safe reading of "I do
+// not know what this is" is "the run is not finished with it".
 func BeadStateSettled(s domain.BeadState) bool {
+	if !s.Valid() {
+		return false
+	}
 	return s.Terminal() || !s.Workflow()
 }

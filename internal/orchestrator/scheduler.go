@@ -61,9 +61,9 @@ import (
 // otherwise). The lease is renewed every [beads.DefaultRenewInterval] while
 // the agent runs.
 
-// SchedulerWarningSource is the [events.Warning] Source the scheduler
+// SourceScheduler is the [events.Warning] Source the scheduler
 // stamps on anything it had to skip.
-const SchedulerWarningSource = "scheduler"
+const SourceScheduler = "scheduler"
 
 // DefaultTickInterval is how often the loop wakes up when nothing kicks it.
 // The scheduler is event-driven — every finished agent kicks it — so the
@@ -430,6 +430,13 @@ type SchedulerStatus struct {
 	// Idle is true when nothing is running and the last dispatch found
 	// nothing to fire: the state a stop condition looks for.
 	Idle bool
+	// Quiet is true when the last dispatch fired nothing, whether or not
+	// agents are still running: the ready queue is empty (or every slot it
+	// wanted was taken). A work source that only wants to offer work when
+	// there is nothing left to dispatch — the planning loop's autopilot
+	// re-plan (P6-05) — looks at this rather than Idle, which also demands
+	// that every agent has finished.
+	Quiet bool
 }
 
 // Free is how many slots of the role are still available.
@@ -596,6 +603,7 @@ func (s *Scheduler) statusLocked() SchedulerStatus {
 		Ticks:  s.ticks,
 		Fired:  s.fired,
 		Idle:   s.idle && len(s.live) == 0,
+		Quiet:  s.idle,
 	}
 	for role, n := range s.byRole {
 		if n > 0 {
@@ -697,7 +705,7 @@ func (s *Scheduler) dispatch(ctx context.Context, r *Run) {
 	}
 	demands, err := s.opts.Work.Demands(ctx)
 	if err != nil {
-		r.Warn(SchedulerWarningSource, "could not work out what to schedule", err)
+		r.Warn(SourceScheduler, "could not work out what to schedule", err)
 	}
 	sortDemands(demands)
 
@@ -707,7 +715,7 @@ func (s *Scheduler) dispatch(ctx context.Context, r *Run) {
 			return
 		}
 		if !d.Kind.Valid() {
-			r.Warn(SchedulerWarningSource, fmt.Sprintf("ignored a demand of unknown kind %q", d.Kind), nil)
+			r.Warn(SourceScheduler, fmt.Sprintf("ignored a demand of unknown kind %q", d.Kind), nil)
 			continue
 		}
 		if !s.reserve(d) {
@@ -716,7 +724,7 @@ func (s *Scheduler) dispatch(ctx context.Context, r *Run) {
 		agentID := s.plannedAgentID(d)
 		if err := s.claim(ctx, d, agentID); err != nil {
 			s.unreserve(d)
-			r.Warn(SchedulerWarningSource, fmt.Sprintf("could not claim %s for %s", d.Bead, d.Kind), err)
+			r.Warn(SourceScheduler, fmt.Sprintf("could not claim %s for %s", d.Bead, d.Kind), err)
 			continue
 		}
 		s.announceClaim(r, d, agentID)
@@ -968,7 +976,7 @@ func (s *Scheduler) start(ctx context.Context, r *Run, d Demand) {
 	s.mu.Unlock()
 
 	if err := r.AgentStarted(agent); err != nil {
-		r.Warn(SchedulerWarningSource, "could not record agent "+string(id), err)
+		r.Warn(SourceScheduler, "could not record agent "+string(id), err)
 	}
 	if !s.opts.SuppressAgentEvents {
 		r.Publish(events.AgentSpawned{
@@ -1019,7 +1027,7 @@ func (s *Scheduler) fire(ctx context.Context, r *Run, l *liveAgent, startedAt ti
 	s.mu.Unlock()
 
 	if stopErr := r.AgentStopped(agent.ID); stopErr != nil {
-		r.Warn(SchedulerWarningSource, "could not clear agent "+string(agent.ID), stopErr)
+		r.Warn(SourceScheduler, "could not clear agent "+string(agent.ID), stopErr)
 	}
 	if s.opts.SuppressAgentEvents {
 		return
@@ -1078,7 +1086,7 @@ func (s *Scheduler) update(l *liveAgent, r *Run, a domain.Agent) {
 	l.agent = a
 	s.mu.Unlock()
 	if err := r.AgentUpdated(a); err != nil {
-		r.Warn(SchedulerWarningSource, "could not record agent "+string(a.ID), err)
+		r.Warn(SourceScheduler, "could not record agent "+string(a.ID), err)
 	}
 }
 
@@ -1114,7 +1122,7 @@ func (s *Scheduler) renewLease(ctx context.Context, r *Run, bead domain.BeadID, 
 			if ctx.Err() != nil {
 				return
 			}
-			r.Warn(SchedulerWarningSource, fmt.Sprintf("stopped renewing the lease %s holds on %s", agent, bead), err)
+			r.Warn(SourceScheduler, fmt.Sprintf("stopped renewing the lease %s holds on %s", agent, bead), err)
 			return
 		}
 	}
@@ -1140,7 +1148,7 @@ func (s *Scheduler) drainAgents(r *Run) {
 	select {
 	case <-done:
 	case <-s.clock.After(s.drain):
-		r.Warn(SchedulerWarningSource,
+		r.Warn(SourceScheduler,
 			fmt.Sprintf("%d agents were still running after %s; leaving them to the supervisor", s.Live(), s.drain), nil)
 	}
 }

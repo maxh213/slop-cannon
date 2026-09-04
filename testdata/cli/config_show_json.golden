@@ -17,6 +17,7 @@
     ],
     "check_command": "make check",
     "idle_replan_interval": "10m",
+    "gate_poll_interval": "1m",
     "max_beads_per_plan": 8,
     "limits": {
       "max_review_rounds": 3,
@@ -33,6 +34,7 @@
     "cartridges": "global",
     "cartridges.claude": "global",
     "check_command": "repo",
+    "gate_poll_interval": "default",
     "idle_replan_interval": "default",
     "limits.agent_timeout": "default",
     "limits.max_cost_usd": "default",
@@ -97,6 +99,11 @@
     {
       "key": "idle_replan_interval",
       "value": "10m",
+      "source": "default"
+    },
+    {
+      "key": "gate_poll_interval",
+      "value": "1m",
       "source": "default"
     },
     {

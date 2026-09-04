@@ -42,6 +42,7 @@ const (
 	KeyRules              = "rules"
 	KeyCheckCommand       = "check_command"
 	KeyIdleReplanInterval = "idle_replan_interval"
+	KeyGatePollInterval   = "gate_poll_interval"
 	KeyMaxBeadsPerPlan    = "max_beads_per_plan"
 	KeyMaxReviewRounds    = "limits.max_review_rounds"
 	KeyMaxPushbackRounds  = "limits.max_pushback_rounds"
@@ -177,7 +178,7 @@ func load(globalPath, repoRoot string) (*Effective, error) {
 // scalarKeys are the keys whose source is tracked one by one.
 var scalarKeys = []string{
 	KeyActiveCartridge, KeyAmmo, KeySafety, KeyVibes, KeyRules, KeyCheckCommand, KeyIdleReplanInterval,
-	KeyMaxBeadsPerPlan,
+	KeyGatePollInterval, KeyMaxBeadsPerPlan,
 	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyAgentTimeout, KeyMaxTokens, KeyMaxCostUSD,
 }
 
@@ -334,6 +335,10 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 		e.IdleReplanInterval = *f.IdleReplanInterval
 		e.Sources[KeyIdleReplanInterval] = src
 	}
+	if f.GatePollInterval != nil {
+		e.GatePollInterval = *f.GatePollInterval
+		e.Sources[KeyGatePollInterval] = src
+	}
 	if f.MaxBeadsPerPlan != nil {
 		e.MaxBeadsPerPlan = *f.MaxBeadsPerPlan
 		e.Sources[KeyMaxBeadsPerPlan] = src
@@ -461,6 +466,9 @@ func (e *Effective) validate() error {
 	if e.IdleReplanInterval.Duration() <= 0 {
 		return &ValidationError{Path: e.pathOf(KeyIdleReplanInterval), Key: KeyIdleReplanInterval, Msg: "must be a positive duration"}
 	}
+	if e.GatePollInterval.Duration() <= 0 {
+		return &ValidationError{Path: e.pathOf(KeyGatePollInterval), Key: KeyGatePollInterval, Msg: "must be a positive duration"}
+	}
 	if e.MaxBeadsPerPlan < 1 {
 		return &ValidationError{Path: e.pathOf(KeyMaxBeadsPerPlan), Key: KeyMaxBeadsPerPlan, Msg: "must be at least 1"}
 	}
@@ -565,6 +573,7 @@ func (e *Effective) Entries() []Entry {
 	add(KeyRules, formatList(e.Rules), e.Sources[KeyRules])
 	add(KeyCheckCommand, e.CheckCommand, e.Sources[KeyCheckCommand])
 	add(KeyIdleReplanInterval, e.IdleReplanInterval.String(), e.Sources[KeyIdleReplanInterval])
+	add(KeyGatePollInterval, e.GatePollInterval.String(), e.Sources[KeyGatePollInterval])
 	add(KeyMaxBeadsPerPlan, strconv.Itoa(e.MaxBeadsPerPlan), e.Sources[KeyMaxBeadsPerPlan])
 	add(KeyMaxReviewRounds, strconv.Itoa(e.Limits.MaxReviewRounds), e.Sources[KeyMaxReviewRounds])
 	add(KeyMaxPushbackRounds, strconv.Itoa(e.Limits.MaxPushbackRounds), e.Sources[KeyMaxPushbackRounds])

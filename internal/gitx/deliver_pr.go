@@ -82,6 +82,10 @@ type PRTracker interface {
 	CreatePRGate(ctx context.Context, bead domain.BeadID, prNumber int, reason string) (beads.Gate, error)
 	// GateFor returns the open gate blocking the bead, or beads.ErrNoGate.
 	GateFor(ctx context.Context, bead domain.BeadID) (beads.Gate, error)
+	// ResolveGate closes a gate by hand. Delivery needs it for the gate an
+	// abandoned pull request left behind (P6-14, P6-22): a bead behind two
+	// open gh:pr gates can never close.
+	ResolveGate(ctx context.Context, id domain.BeadID, reason string) error
 }
 
 var _ PRTracker = (*beads.Client)(nil)
@@ -335,8 +339,18 @@ func (d *PRDeliverer) handOff(ctx context.Context, res *PRResult, log *slog.Logg
 }
 
 // ensureGate returns the gh:pr gate for pr, creating it unless an open one
-// for the same number already blocks the bead. A gate for another PR is
-// left alone and reported as a warning.
+// for the same number already blocks the bead.
+//
+// A leftover gh:pr gate for *another* pull request — a delivery retry after
+// the first attempt's pull request was abandoned, or after a kill between
+// the gate and the merge — is resolved first (P6-14, P6-22). Under D-20 a
+// bead cannot close while any gate blocks it, so leaving the old gate in
+// place and creating a second one would leave the bead behind two gates,
+// only one of which anything will ever clear: the merge of this pull
+// request would close its own gate and the bead would still be stuck. The
+// clearing is reported as a warning, because a human's abandoned pull
+// request has stopped being tracked. A gate of any other type is not
+// delivery's to clear, so it is left alone and only warned about.
 func (d *PRDeliverer) ensureGate(ctx context.Context, bead domain.Bead, pr *PullRequest) (domain.BeadID, string, error) {
 	warn := ""
 	existing, err := d.tracker.GateFor(ctx, bead.ID)
@@ -345,7 +359,16 @@ func (d *PRDeliverer) ensureGate(ctx context.Context, bead domain.Bead, pr *Pull
 		if n, ok := existing.PRNumber(); ok && n == pr.Number {
 			return existing.ID, "", nil
 		}
-		warn = fmt.Sprintf("bead %s is already blocked by gate %s (%s %s), which is not for PR #%d", bead.ID, existing.ID, existing.AwaitType, existing.AwaitID, pr.Number)
+		switch {
+		case existing.IsPR():
+			reason := fmt.Sprintf("superseded by pull request #%d", pr.Number)
+			if rerr := d.tracker.ResolveGate(ctx, existing.ID, reason); rerr != nil {
+				return "", "", fmt.Errorf("gitx: clearing the stale gh:pr gate %s on %s: %w", existing.ID, bead.ID, rerr)
+			}
+			warn = fmt.Sprintf("bead %s was still blocked by gate %s (%s %s), which is not for PR #%d; it was resolved so this delivery does not leave the bead behind two gates", bead.ID, existing.ID, existing.AwaitType, existing.AwaitID, pr.Number)
+		default:
+			warn = fmt.Sprintf("bead %s is already blocked by gate %s (%s %s), which is not for PR #%d", bead.ID, existing.ID, existing.AwaitType, existing.AwaitID, pr.Number)
+		}
 	case errors.Is(err, beads.ErrNoGate):
 	default:
 		return "", "", fmt.Errorf("gitx: looking up the gate of %s: %w", bead.ID, err)

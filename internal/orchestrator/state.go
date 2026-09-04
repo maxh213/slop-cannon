@@ -36,7 +36,9 @@ import (
 // through [beads.SafeState]; none of them may be transitioned (P3-14, P6-12).
 // Use [TransitionStatus] when the state came off a listing rather than out of
 // the cannon's own bookkeeping, so a foreign status that happens to map onto a
-// workflow state is still refused.
+// workflow state is still refused, or [ResolveBeadStatus] — the same guard
+// without the edge — when the caller reads the bead before it knows which
+// event it will raise, as the gate poller does.
 //
 // [StateMachine.ReleaseHeld] is the same rule applied to a shutting-down run:
 // the beads its live agents hold go back to the ready set through the table
@@ -302,11 +304,37 @@ func CanTransition(from domain.BeadState, ev BeadEvent) bool {
 // Otherwise it returns the same answer [Transition] would for the resolved
 // state.
 func TransitionStatus(status string, m beads.StatusMap, ev BeadEvent) (domain.BeadState, error) {
-	state, origin := beads.SafeState(status, m[status])
-	if origin == beads.OriginForeign {
-		return "", fmt.Errorf("%w: %q (mapped to %s by category %q)", ErrForeignStatus, status, string(state), string(m[status]))
+	state, err := ResolveBeadStatus(status, m)
+	if err != nil {
+		return "", err
 	}
 	return Transition(state, ev)
+}
+
+// ResolveBeadStatus is the P6-12 guard on its own, for a caller that has a
+// raw bd status and wants to know which workflow state it may act on before
+// it knows which event it will raise (the gate poller reads a bead first and
+// picks the edge from what the gate said). It is the one implementation of
+// the rule; [TransitionStatus] is this plus [Transition].
+//
+// The returned state is always [beads.SafeState]'s answer, error or not, so a
+// caller can name the state in its own diagnostic. The error is:
+//
+//   - [ErrForeignStatus] when the status is the repository's own, even where
+//     SafeState maps it onto a workflow state (a foreign "done" maps to
+//     closed, and closing it again is not the cannon's business);
+//   - [ErrNotWorkflowState] when the status is one of bd's read-only
+//     built-ins, blocked, hooked, deferred or pinned;
+//   - nil when the cannon registered the status and owns the bead.
+func ResolveBeadStatus(status string, m beads.StatusMap) (domain.BeadState, error) {
+	state, origin := beads.SafeState(status, m[status])
+	if origin == beads.OriginForeign {
+		return state, fmt.Errorf("%w: %q (mapped to %s by category %q)", ErrForeignStatus, status, string(state), string(m[status]))
+	}
+	if !state.Workflow() {
+		return state, fmt.Errorf("%w: %q (want one of %s)", ErrNotWorkflowState, string(state), joinBeadStates(domain.WorkflowBeadStates()))
+	}
+	return state, nil
 }
 
 // EventsFrom returns the events the given state accepts, in [BeadEvents]
@@ -371,9 +399,9 @@ type StateStore interface {
 // *beads.Client is the production StateStore.
 var _ StateStore = (*beads.Client)(nil)
 
-// StateWarningSource is the events.Warning Source the state machine stamps on
+// SourceState is the events.Warning Source the state machine stamps on
 // a refused transition.
-const StateWarningSource = "state"
+const SourceState = "state"
 
 // StateMachine applies [Transition] and persists the answer through
 // internal/beads. It holds no bead state of its own: the caller says where
@@ -480,7 +508,7 @@ func (m *StateMachine) Next(req StateRequest) (domain.BeadState, error) {
 //
 // A refused transition (an unknown or non-workflow state, an unknown event,
 // no edge, a missing bead id or a claim with no agent) returns the error and
-// publishes an [events.Warning] with Source [StateWarningSource]; nothing is
+// publishes an [events.Warning] with Source [SourceState]; nothing is
 // written and nothing panics. That is the contract P6-03 asks for: the
 // orchestrator can drive the machine from whatever it believes about a bead
 // and find out it was wrong without taking the run down.
@@ -722,7 +750,7 @@ func (s ReleaseOnlyStore) Close(_ context.Context, id domain.BeadID, _ string) (
 func (m *StateMachine) warn(req StateRequest, err error) {
 	m.publish(events.Warning{
 		Meta:    m.meta(),
-		Source:  StateWarningSource,
+		Source:  SourceState,
 		Message: fmt.Sprintf("ignored %q on a bead in state %q", string(req.Event), string(req.From)),
 		Err:     err.Error(),
 		Bead:    req.Bead,

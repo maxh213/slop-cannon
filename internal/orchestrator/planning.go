@@ -18,9 +18,13 @@ package orchestrator
 //
 // [Planner.Fire] is the [Firer] for those plan demands: it fires the
 // product owner through a [PlanRunner], turns the plan into beads with
-// `bd create --graph` (D-22) and, when the validator rejects the plan a
-// second time, drops it rather than letting a stubborn product owner spin
-// (P6-19).
+// `bd create --graph` (D-22) and drops the round rather than letting a
+// stubborn product owner spin (P6-19) — either because the validator
+// rejected the plan twice in a row, or because planning itself kept failing
+// for a reason that is not the plan's fault (a cartridge that crashes, an
+// agent that times out, a rules file that cannot be read). Both roads lead
+// to the same place: a brief run finishes with [events.FinishFailed] and an
+// autopilot run cools off and comes back (D-18).
 //
 // Two smaller policies live here too. An autopilot product owner may make
 // its own earlier proposals less urgent (Q-04): a plan has no field for an
@@ -68,6 +72,20 @@ const (
 	// so the first rejection that reaches the planner is already the second
 	// plan the product owner got wrong.
 	DefaultPlanRejectionLimit = 2
+	// DefaultPlanFailureLimit is how many planning firings in a row may
+	// fail for a reason that is not the plan's fault — a cartridge crash,
+	// an agent timeout, a rules file that cannot be read, a repository scan
+	// that fails, a read-only bd shim that will not install — before the
+	// planner drops the round the same way it drops a plan the validator
+	// keeps rejecting (P6-19).
+	//
+	// It is deliberately looser than [DefaultPlanRejectionLimit]: the
+	// supervisor has already spent its own crash retries by the time the
+	// error reaches the planner (P6-07), but these failures are the
+	// transient kind, and a brief run whose product owner cannot be fired
+	// at all still has to end rather than fire every idle interval for
+	// ever.
+	DefaultPlanFailureLimit = 5
 	// DefaultMaxPlanBackoff caps the wait an autopilot planner imposes on
 	// itself after it gave up on a round of planning. Autopilot never stops
 	// (D-18), so it must always come back — just not in a hot loop.
@@ -280,9 +298,15 @@ type PlannerOptions struct {
 	Now func() time.Time
 	// IdleReplanInterval overrides the configured `idle_replan_interval`.
 	IdleReplanInterval time.Duration
-	// RejectionLimit is the P6-19 cap; zero means
-	// [DefaultPlanRejectionLimit], negative means "never give up".
+	// RejectionLimit is the P6-19 cap on consecutive rejected plans; zero
+	// means [DefaultPlanRejectionLimit], negative means "never give up".
 	RejectionLimit int
+	// FailureLimit is the same cap for consecutive planning failures that
+	// are not a rejected plan (a crash, a timeout, an unreadable rules
+	// file); zero means [DefaultPlanFailureLimit], negative means "never
+	// give up", which is what a caller that wants the pre-P6-19 behaviour
+	// of an unbounded retry loop asks for.
+	FailureLimit int
 	// MaxBackoff caps the autopilot cool-off; zero means
 	// [DefaultMaxPlanBackoff].
 	MaxBackoff time.Duration
@@ -312,6 +336,9 @@ type PlanningStatus struct {
 	Empty int
 	// Rejections is how many plans in a row the validator refused.
 	Rejections int
+	// Failures is how many planning firings in a row failed for a reason
+	// that was not a rejected plan.
+	Failures int
 	// GaveUp counts the times the planner dropped a round of planning under
 	// the P6-19 policy.
 	GaveUp int
@@ -342,11 +369,12 @@ type Planner struct {
 	cfg  *config.RunConfig
 	log  *slog.Logger
 
-	idle     time.Duration
-	maxBeads int
-	limit    int
-	maxBack  time.Duration
-	settle   time.Duration
+	idle      time.Duration
+	maxBeads  int
+	limit     int
+	failLimit int
+	maxBack   time.Duration
+	settle    time.Duration
 
 	mu            sync.Mutex
 	run           *Run
@@ -355,6 +383,7 @@ type Planner struct {
 	beads         int
 	empty         int
 	rejections    int
+	failures      int
 	gaveUp        int
 	deprioritised int
 	running       bool
@@ -368,6 +397,7 @@ type Planner struct {
 	lastSettle    time.Time
 	settled       bool
 	settleSum     string
+	settleWarn    string
 
 	// docsMu and shimMu guard the two "once, on first use" loads. Neither
 	// caches a failure: a full disk, an unreadable rules file or a bd
@@ -407,14 +437,15 @@ func NewPlanner(opts PlannerOptions) (*Planner, error) {
 		opts.Shim = InstallPlanShim
 	}
 	p := &Planner{
-		opts:     opts,
-		cfg:      opts.Config,
-		log:      opts.Logger,
-		idle:     opts.IdleReplanInterval,
-		maxBeads: opts.MaxBeads,
-		limit:    opts.RejectionLimit,
-		maxBack:  opts.MaxBackoff,
-		settle:   opts.SettleInterval,
+		opts:      opts,
+		cfg:       opts.Config,
+		log:       opts.Logger,
+		idle:      opts.IdleReplanInterval,
+		maxBeads:  opts.MaxBeads,
+		limit:     opts.RejectionLimit,
+		failLimit: opts.FailureLimit,
+		maxBack:   opts.MaxBackoff,
+		settle:    opts.SettleInterval,
 	}
 	if p.idle <= 0 {
 		p.idle = config.DefaultIdleReplanInterval
@@ -430,6 +461,9 @@ func NewPlanner(opts PlannerOptions) (*Planner, error) {
 	}
 	if p.limit == 0 {
 		p.limit = DefaultPlanRejectionLimit
+	}
+	if p.failLimit == 0 {
+		p.failLimit = DefaultPlanFailureLimit
 	}
 	if p.maxBack <= 0 {
 		p.maxBack = DefaultMaxPlanBackoff
@@ -478,7 +512,7 @@ func (p *Planner) Status() PlanningStatus {
 	defer p.mu.Unlock()
 	st := PlanningStatus{
 		Mode: p.cfg.Run.Mode, Attempts: p.attempts, Plans: p.plans, Beads: p.beads,
-		Empty: p.empty, Rejections: p.rejections, GaveUp: p.gaveUp,
+		Empty: p.empty, Rejections: p.rejections, Failures: p.failures, GaveUp: p.gaveUp,
 		Deprioritised: p.deprioritised,
 		Running:       p.running, Finished: p.finished, NextAt: p.nextAt,
 		ResumedPlan: p.resumedPlan,
@@ -494,8 +528,19 @@ func (p *Planner) Status() PlanningStatus {
 //
 // Both modes plan once at the start. Brief mode never plans again (its
 // scope is the human's -m text). Autopilot plans again whenever the ready
-// queue is empty and nothing is running, and, after a plan that proposed
-// nothing, not before `idle_replan_interval` has passed (D-18).
+// queue is empty and no engineer is running, and, after a plan that
+// proposed nothing, not before `idle_replan_interval` has passed (D-18).
+//
+// "The ready queue is empty" is [SchedulerStatus.Quiet]: the last dispatch
+// fired nothing, so everything the run's work sources offered has either
+// been served or has nowhere to go. A live tester or lens does not hold
+// planning up — a review of one bead is no reason to leave the other slots
+// empty — and neither does a live product owner, because the planning
+// demand's key is stable and the scheduler never runs two of them at once.
+// Only an engineer does: while one is implementing, the plan it is working
+// from is still being carried out. The demand is the lowest-priority kind
+// (D-05), so offering it never takes a slot an engineer, tester or
+// arbitration wanted.
 func (p *Planner) Demands(_ context.Context) ([]Demand, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -521,8 +566,11 @@ func (p *Planner) Demands(_ context.Context) ([]Demand, error) {
 		return []Demand{planDemand()}, nil // ... and retries until it has one
 	}
 	st := p.statusLocked()
-	if st.Live > 0 || !st.Idle {
-		return nil, nil // there is still work in flight
+	if st.ByRole[domain.RoleEngineer] > 0 {
+		return nil, nil // an engineer is still carrying out the last plan
+	}
+	if !st.Quiet && !st.Idle {
+		return nil, nil // the last dispatch still found work to fire
 	}
 	return []Demand{planDemand()}, nil
 }
@@ -557,7 +605,7 @@ func (p *Planner) Done(ctx context.Context, r *Run, st SchedulerStatus) (Outcome
 	if r != nil && p.run == nil {
 		p.run = r
 	}
-	failed, gaveUp, plans, attempts := p.failed, p.gaveUp, p.plans, p.attempts
+	failed, gaveUp, plans, attempts, lastErr := p.failed, p.gaveUp, p.plans, p.attempts, p.lastErr
 	p.mu.Unlock()
 
 	if p.opts.Credits != nil && p.opts.Credits.Exhausted() {
@@ -567,11 +615,15 @@ func (p *Planner) Done(ctx context.Context, r *Run, st SchedulerStatus) (Outcome
 		}, true, nil
 	}
 	if failed {
+		err := fmt.Errorf("%w after %s (%s dropped)",
+			ErrPlanningGaveUp, planCount(attempts, "attempt"), planCount(gaveUp, "round"))
+		if lastErr != nil {
+			err = fmt.Errorf("%w: %v", err, lastErr)
+		}
 		return Outcome{
 			Reason:  events.FinishFailed,
 			Summary: p.summary(fmt.Sprintf("the product owner could not produce a usable plan in %s", planCount(attempts, "attempt"))),
-		}, true, fmt.Errorf("%w after %s (%s rejected)",
-			ErrPlanningGaveUp, planCount(attempts, "attempt"), planCount(gaveUp, "round"))
+		}, true, err
 	}
 	if p.cfg.Run.Mode != domain.RunModeBrief {
 		return Outcome{}, false, nil // autopilot never stops on its own (D-18)
@@ -581,7 +633,7 @@ func (p *Planner) Done(ctx context.Context, r *Run, st SchedulerStatus) (Outcome
 	}
 	settled, summary, err := p.beadsSettled(ctx)
 	if err != nil {
-		p.warn("could not tell whether the run's beads have settled", err)
+		p.warnSettleFailure(err)
 		return Outcome{}, false, nil
 	}
 	if !settled {
@@ -592,7 +644,14 @@ func (p *Planner) Done(ctx context.Context, r *Run, st SchedulerStatus) (Outcome
 
 // beadsSettled reports whether every bead of the run needs nothing more
 // from the cannon, with a one-line account of them. The listing is
-// debounced: the scheduler consults the stop condition on every tick.
+// debounced: the scheduler consults the stop condition on every tick, and
+// asking bd for a listing that often — down the one serialised queue every
+// other component shares (D-21) — would be rude at the best of times and
+// actively harmful when bd is the thing that is failing. A listing that
+// fails therefore starts the debounce like one that succeeds, so a broken
+// bd is asked once per [PlannerOptions.SettleInterval] rather than once per
+// tick, and [Planner.warnSettleFailure] warns once per distinct failure
+// rather than once per call.
 func (p *Planner) beadsSettled(ctx context.Context) (bool, string, error) {
 	if p.opts.Beads == nil {
 		return false, "", nil
@@ -608,6 +667,9 @@ func (p *Planner) beadsSettled(ctx context.Context) (bool, string, error) {
 
 	list, err := p.opts.Beads(ctx)
 	if err != nil {
+		p.mu.Lock()
+		p.lastSettle, p.settled = now, false
+		p.mu.Unlock()
 		return false, "", err
 	}
 	settled, total, summary := planSettlement(list)
@@ -623,9 +685,32 @@ func (p *Planner) beadsSettled(ctx context.Context) (bool, string, error) {
 	}
 
 	p.mu.Lock()
-	p.lastSettle, p.settled, p.settleSum = now, settled, summary
+	p.lastSettle, p.settled, p.settleSum, p.settleWarn = now, settled, summary, ""
 	p.mu.Unlock()
 	return settled, summary, nil
+}
+
+// warnSettleFailure publishes one warning per distinct listing failure
+// rather than one per call. The stop condition runs after every dispatch,
+// so a bd that is down for an hour would otherwise write thousands of
+// identical events.Warning records into a run log that has no cap (P6-33)
+// and scroll everything else off the TUI. A different error warns again,
+// and so does the same error after a listing that worked.
+func (p *Planner) warnSettleFailure(err error) {
+	if err == nil {
+		return
+	}
+	msg := err.Error()
+	p.mu.Lock()
+	repeat := p.settleWarn == msg
+	p.settleWarn = msg
+	p.mu.Unlock()
+	if repeat {
+		p.logger().Debug("still cannot tell whether the run's beads have settled",
+			slog.String("error", msg), slog.String("source", SourcePlanning))
+		return
+	}
+	p.warn("could not tell whether the run's beads have settled; trying again on the next poll", err)
 }
 
 // planSettlement decides whether every work bead has settled, counts the
@@ -891,13 +976,24 @@ func planDependedOn(plan domain.Plan) map[string]bool {
 // applyDemotions lowers the priority of each bead the product owner asked
 // to deprioritise (Q-04). A refusal from bd is a warning, never a failed
 // plan: the beads that were created are real and the run goes on.
+//
+// Every write bd accepts is announced with an [events.BeadUpdated] naming
+// the priority field, because this is a change the cannon made to a bead
+// that already existed: without the event the only record of it would be a
+// counter in [PlanningStatus], and the run log, `sc status`, the TUI and a
+// resumed run would all show the bead silently sitting at a priority
+// nobody wrote. The plan [Planner.publishPlan] announces is the one that
+// was applied, with the restated bead taken out of it, so the events.jsonl
+// record of a Q-04 round is the PlanProduced plus one BeadUpdated per
+// deprioritised bead.
 func (p *Planner) applyDemotions(ctx context.Context, ds []planDemotion) {
 	if len(ds) == 0 || p.opts.Prioritiser == nil {
 		return
 	}
 	for _, d := range ds {
 		to := d.To
-		if _, err := p.opts.Prioritiser.Update(ctx, d.Bead, beads.Patch{Priority: &to}); err != nil {
+		issue, err := p.opts.Prioritiser.Update(ctx, d.Bead, beads.Patch{Priority: &to})
+		if err != nil {
 			p.warn(fmt.Sprintf("could not deprioritise %s (%q) from priority %d to %d",
 				d.Bead, d.Title, int(d.From), int(d.To)), err)
 			continue
@@ -908,7 +1004,29 @@ func (p *Planner) applyDemotions(ctx context.Context, ds []planDemotion) {
 		p.logger().Info("the product owner deprioritised one of its own open beads",
 			slog.String("bead", d.Bead.String()),
 			slog.Int("from", int(d.From)), slog.Int("to", int(d.To)))
+		p.publishDemotion(d, issue)
 	}
+}
+
+// publishDemotion announces one carried-out Q-04 deprioritisation. The bead
+// is the one bd returned; when the update returned nothing useful (a client
+// that does not echo the issue back), the fields the planner does know are
+// published instead, so the event is never a blank record of a real write.
+func (p *Planner) publishDemotion(d planDemotion, issue beads.Issue) {
+	r := p.host()
+	if r == nil {
+		return
+	}
+	bead := domain.Bead{ID: d.Bead, Title: d.Title, Type: domain.BeadTypeTask, Priority: d.To}
+	if issue.ID != "" {
+		if b, _ := issue.SafeBead(nil); b.ID != "" {
+			if b.Title == "" {
+				b.Title = d.Title
+			}
+			bead = b
+		}
+	}
+	r.Publish(events.BeadUpdated{Meta: r.Meta(), Bead: bead, Fields: []string{"priority"}})
 }
 
 // adoptResumedPlan closes the window between bd committing a plan and the
@@ -965,7 +1083,11 @@ func (p *Planner) adoptResumedPlan(ctx context.Context) bool {
 	return true
 }
 
-// publishPlan announces a plan that was validated and applied (D-22).
+// publishPlan announces a plan that was validated and applied (D-22): the
+// plan as it reached bd, which is the plan the product owner wrote minus
+// any Q-04 restatement [Planner.splitDemotions] turned into a priority
+// update. Those are announced separately by [Planner.publishDemotion], so
+// nothing the cannon did goes unrecorded and nothing is counted twice.
 func (p *Planner) publishPlan(f Firing, plan domain.Plan, created map[string]domain.BeadID, epic domain.BeadID) {
 	r := p.host()
 	if r == nil {
@@ -984,7 +1106,26 @@ func (p *Planner) publishPlan(f Firing, plan domain.Plan, created map[string]dom
 }
 
 // record applies the outcome of one planning firing to the planner's state,
-// including the P6-19 policy for a plan the validator rejected.
+// including the P6-19 policy for planning that keeps going wrong.
+//
+// Two runs of consecutive bad outcomes are counted, and a plan that lands
+// (or an honest "nothing worth adding right now") resets both:
+//
+//   - plans the validator rejected, capped at [PlannerOptions.RejectionLimit]
+//     — the product owner is producing plans, they are just not usable;
+//   - firings that failed for any other reason, capped at
+//     [PlannerOptions.FailureLimit] — a cartridge crash, an agent timeout,
+//     an unreadable rules file, a shim that will not install. The
+//     supervisor has already spent its own retries on these (P6-07), so a
+//     run of them is a condition that is not clearing.
+//
+// Either run reaching its cap gives up on the round, and giving up means
+// the same thing in both cases: a brief run, whose scope cannot be planned
+// any other way, finishes with events.FinishFailed, and an autopilot run
+// cools off and comes back, because autopilot ends only on a stop or on
+// credits (D-18). Without the second counter a brief run whose planning
+// firing always crashed would fire every idle interval for the rest of
+// time, which is exactly the spin P6-19 exists to stop.
 func (p *Planner) record(f Firing, created map[string]domain.BeadID, err error) {
 	now := p.opts.Now()
 	p.mu.Lock()
@@ -1010,16 +1151,21 @@ func (p *Planner) record(f Firing, created map[string]domain.BeadID, err error) 
 		}
 	case errors.Is(err, agents.ErrPlanRejected):
 		p.rejections++
+		p.failures = 0
 	default:
 		// A crash, a timeout, an unreadable rules file: not the plan's
-		// fault, so it does not count towards the P6-19 cap, but the loop
-		// still waits rather than firing again at once.
+		// fault, so it does not count towards the rejection cap — and it
+		// breaks a run of rejections, which the P6-19 contract calls
+		// consecutive. It has a cap of its own, and the loop waits rather
+		// than firing again at once.
+		p.failures++
+		p.rejections = 0
 		p.nextAt = now.Add(p.idle)
 	}
-	rejections, giveUp := p.rejections, false
-	if p.limit > 0 && p.rejections >= p.limit {
+	rejections, failures, giveUp := p.rejections, p.failures, false
+	if (p.limit > 0 && p.rejections >= p.limit) || (p.failLimit > 0 && p.failures >= p.failLimit) {
 		giveUp = true
-		p.rejections = 0
+		p.rejections, p.failures = 0, 0
 		p.gaveUp++
 		if p.cfg.Run.Mode == domain.RunModeBrief {
 			p.finished, p.failed = true, true
@@ -1042,15 +1188,16 @@ func (p *Planner) record(f Firing, created map[string]domain.BeadID, err error) 
 		p.warn(fmt.Sprintf("the product owner's plan broke a planning rule and was dropped (%s in a row)",
 			planCount(rejections, "rejection")), err)
 	default:
-		p.warn("the planning product owner failed", err)
+		p.warn(fmt.Sprintf("the planning product owner failed (%s in a row)",
+			planCount(failures, "failure")), err)
 	}
 	if !giveUp {
 		return
 	}
-	// P6-19: the validator has now rejected this product owner's plan twice
-	// in a row, once inside the firing (P5-08) and once here. Dropping the
-	// plan is the whole policy: nothing was created, so nothing has to be
-	// undone.
+	// P6-19: either the validator has rejected this product owner's plan
+	// twice in a row — once inside the firing (P5-08) and once here — or
+	// planning has failed outright once too often. Dropping the round is
+	// the whole policy: nothing was created, so nothing has to be undone.
 	if mode == domain.RunModeBrief {
 		p.warn(fmt.Sprintf("giving up on planning after %s; the brief could not be turned into beads",
 			planCount(attempts, "attempt")), err)

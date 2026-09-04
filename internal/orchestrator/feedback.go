@@ -51,11 +51,14 @@ import (
 //     may be settled that nobody looked at. A tester that holds its ground
 //     limits.max_pushback_rounds exchanges hands the item to the product
 //     owner, whose ruling either overrules the item or sends it back to the
-//     engineer.
+//     engineer, and that ruling is binding: an answer that argues with it
+//     again is refused rather than applied.
 //   - D-09 only testers that did not approve the previous round review
 //     again, unless the engineer's round moved more than
 //     [gitx.DefaultReReviewThreshold] of the change set, which sends every
-//     lens back.
+//     lens back. A tester is credited with having reviewed the commit it
+//     was actually shown, so a round the engineer spent arguing still
+//     sends it back to the code the round left behind.
 //   - D-06/D-25 every verdict, response, ruling and report is written to the
 //     bead as a structured comment, so a resumed run can read the thread
 //     back ([Feedback.Restore]).
@@ -73,7 +76,8 @@ import (
 // the round that answers them; [Feedback.ReviewAgain] runs the full round a
 // large conflict resolution owes (D-09); and [Feedback.Observe] keeps the
 // loop's view of a bead honest when somebody else moved it. None of those
-// writes a status: the delivery already did.
+// writes a status — the delivery already did — bar the one escalation a
+// check that failed at the D-08 round cap owes.
 //
 // The loop never leases a bead either: the scheduler claims it before the
 // firing and renews it while the agent runs (P6-13), and [Supervisor.Fire]
@@ -85,9 +89,9 @@ import (
 // comments through a [FeedbackMessageStore], so the whole loop is
 // deterministic under a fake clock and a mock cartridge.
 
-// FeedbackWarningSource is the [events.Warning] Source the feedback loop
+// SourceFeedback is the [events.Warning] Source the feedback loop
 // stamps on work it had to skip.
-const FeedbackWarningSource = "feedback"
+const SourceFeedback = "feedback"
 
 // DefaultTitleSimilarity is how alike two feedback item titles about the
 // same file must be before [ConsolidateItems] treats them as one issue: the
@@ -1535,24 +1539,53 @@ func (f *Feedback) submitted(ctx context.Context, t *fbThread, agent domain.Agen
 	return f.plan(ctx, t)
 }
 
+// refuses reports whether an engineer's answer must not be applied: D-08
+// says the product owner's ruling is binding, so an item that carries one
+// may only be fixed. Letting a second pushback through would drop the
+// ruling, re-open the dispute it closed, fire the tester that raised the
+// item to judge the same argument again and the product owner to rule on
+// the same item a second time — with an empty Rulings list, so it would be
+// asked as if it had never ruled — and burn a review round each time round.
+// The refused item keeps its ruling and stays owed, so the next round asks
+// the engineer again with the ruling still in front of it.
+func (f *Feedback) refuses(i *fbItem, r domain.Response) bool {
+	return i.ruling != nil && r.Action != domain.ActionFixed
+}
+
 // answered records the engineer's answers to a round of feedback.
+//
+// D-08 makes the product owner's ruling binding, so an answer that argues
+// with one is refused rather than applied ([Feedback.refuses]): the item
+// keeps its ruling and stays owed.
 func (f *Feedback) answered(ctx context.Context, t *fbThread, agent domain.AgentID, responses []domain.Response) error {
 	f.mu.Lock()
+	var refused []string
 	for _, r := range responses {
 		i := fbFind(t, r.ItemID)
 		if i == nil {
 			continue
 		}
+		if f.refuses(i, r) {
+			refused = append(refused, r.ItemID)
+			continue
+		}
 		i.response = r
-		i.ruling = nil
 		for _, l := range i.con.Lenses {
 			i.per[l] = domain.ItemOpen
 		}
+	}
+	if len(refused) > 0 {
+		t.notes = append(t.notes, "the product owner has already ruled on "+strings.Join(refused, ", ")+
+			": that ruling is binding (D-08), so carry it out rather than argue with it again")
 	}
 	t.responses = append(t.responses, responses...)
 	round := t.round
 	f.mu.Unlock()
 
+	for _, id := range refused {
+		f.warn(t.id, fmt.Sprintf("the engineer argued with the product owner's binding ruling on item %q, "+
+			"so the answer was not applied and the item is still owed", id), nil)
+	}
 	f.post(ctx, t.id, agent, responses)
 	f.publish(events.ResponseReceived{
 		Meta: f.meta(), Bead: t.id, Round: round, Agent: agent, Responses: responses,
@@ -1598,9 +1631,19 @@ func (f *Feedback) applyVerdict(t *fbThread, lens domain.Lens, mode agents.Teste
 		lens = v.Lens
 	}
 	t.verdicts[lens] = v
-	t.approved[lens] = v.Outcome == domain.VerdictApprove
-	t.looked[lens] = t.round
-	t.lookedAt[lens] = fbHead(t.diff)
+	// D-09 credit is for a firing that was shown the code, and an
+	// evaluate-pushback firing is not: its prompt renders no diff
+	// ([Feedback.planTester] clears req.Diff), so it judges an argument
+	// alone. Stamping it as this lens's look at the current commit would
+	// let a round whose answers were all pushback settle a change set
+	// nobody reviewed — the engineer's session still moves the code in
+	// such a round, because D-14 commits its leftovers — and a tester that
+	// did not approve the previous round has to see that code.
+	if mode != agents.TesterModeEvaluatePushback {
+		t.approved[lens] = v.Outcome == domain.VerdictApprove
+		t.looked[lens] = t.round
+		t.lookedAt[lens] = fbHead(t.diff)
+	}
 	t.reviewers = fbWithout(t.reviewers, lens)
 	t.evaluating = fbWithout(t.evaluating, lens)
 
@@ -1679,7 +1722,7 @@ func (f *Feedback) addItem(t *fbThread, lens domain.Lens, it domain.FeedbackItem
 		if i.settled() || !fbSameIssue(i.con.Item, it, f.similar) {
 			continue
 		}
-		i.con = fbMergeItem(i.con, lens, it)
+		f.mergeInto(i, lens, it)
 		i.per[lens] = fbOr(it.Status, domain.ItemOpen)
 		return
 	}
@@ -1692,6 +1735,40 @@ func (f *Feedback) addItem(t *fbThread, lens domain.Lens, it domain.FeedbackItem
 		round: t.round,
 		per:   map[domain.Lens]domain.ItemStatus{lens: fbOr(it.Status, domain.ItemOpen)},
 	})
+}
+
+// mergeInto folds another tester's version of an issue into one the loop is
+// already tracking (P6-21).
+//
+// While nobody has answered the issue it goes through the exported
+// [ConsolidateItems] over every version raised so far, so the item the
+// engineer is asked about — its id, title and file — is the one
+// ConsolidateItems would name however the testers' verdicts happen to be
+// interleaved. The scheduler fires the three lenses concurrently, so the
+// arrival order is not the loop's to choose, and the live merge must not
+// disagree with the batch one about which tester's wording is canonical.
+//
+// Once there is an answer or a ruling the item's id is what they name, so
+// the merge is pairwise from then on and cannot rename it.
+func (f *Feedback) mergeInto(i *fbItem, lens domain.Lens, it domain.FeedbackItem) {
+	if i.response.Action != "" || i.ruling != nil {
+		i.con = fbMergeItem(i.con, lens, it)
+		return
+	}
+	vs := make([]domain.Verdict, 0, len(i.con.Raised)+1)
+	for l, raised := range i.con.Raised {
+		vs = append(vs, domain.Verdict{Lens: l, Items: []domain.FeedbackItem{raised}})
+	}
+	vs = append(vs, domain.Verdict{Lens: lens, Items: []domain.FeedbackItem{it}})
+	if merged := ConsolidateItems(vs, f.similar); len(merged) == 1 {
+		i.con = merged[0]
+		return
+	}
+	// The versions no longer read as one issue against the wording
+	// ConsolidateItems would make canonical (a tester restated its item).
+	// The match that got here has already decided they are one, so keep
+	// the pairwise merge rather than splitting a tracked issue in two.
+	i.con = fbMergeItem(i.con, lens, it)
 }
 
 // poRuled folds an arbitration or an escalation ruling into the thread.
@@ -1893,11 +1970,26 @@ func (f *Feedback) reviewersFor(t *fbThread) []domain.Lens {
 	head := fbHead(t.diff)
 	var out []domain.Lens
 	for _, l := range f.lenses {
-		moved := t.looked[l] < t.round || (head != "" && t.lookedAt[l] != head)
+		// "The code moved" is a change of commit wherever there is one to
+		// compare: a lens that has already reviewed this very commit has
+		// nothing new to look at whatever the round number now is, and a
+		// lens that has never looked, or looked at another commit, has.
+		// Only where there is no change set at all does the round number
+		// stand in for it.
+		moved := t.looked[l] < t.round
+		if head != "" {
+			moved = t.lookedAt[l] != head
+		}
 		switch {
 		case len(f.itemsFor(t, l)) > 0:
 			out = append(out, l)
-		case moved && (t.fullReview || !t.approved[l]):
+		case t.fullReview && t.looked[l] < t.round:
+			// D-09: a round that moved more of the change set than the
+			// re-review threshold sends every lens back whether it
+			// approved or not — once per round, so a lens that has already
+			// answered this round is not asked again.
+			out = append(out, l)
+		case moved && !t.approved[l]:
 			out = append(out, l)
 		}
 	}
@@ -2046,6 +2138,10 @@ func (f *Feedback) Observe(bead domain.BeadID, state domain.BeadState) {
 // handoff has already moved the bead to changes_requested and published the
 // RoundStarted, so the loop writes no status here: it takes the items
 // (DeliveryOutcome.Items) and puts the bead back in front of an engineer.
+//
+// The one status it does write is the escalation a check that failed at the
+// D-08 round cap owes: there is no round left for the engineer to answer
+// in, so the product owner rules on the bead instead.
 func (f *Feedback) CheckFailed(ctx context.Context, bead domain.Bead, round int, items []domain.FeedbackItem) error {
 	if len(items) == 0 {
 		return fmt.Errorf("orchestrator: a failed check on %s raised no items to answer", bead.ID)
@@ -2067,14 +2163,30 @@ func (f *Feedback) CheckFailed(ctx context.Context, bead domain.Bead, round int,
 		Summary: "the repository's check command failed at delivery time", Items: items,
 	}
 	f.applyVerdict(t, domain.LensQA, agents.TesterModeReview, v)
-	f.closeRound(t)
-	t.round++
-	t.phase = FeedbackAddressing
-	round = t.round
+	// D-08 caps the review rounds, and this is a round: a check that fails
+	// at the cap has none left to answer it, so the product owner rules on
+	// the bead instead of the engineer buying one more round. The round is
+	// left open in that case, exactly as [Feedback.nextRound] leaves it, so
+	// the escalation prompt still carries the verdict that failed.
+	capped := t.round >= f.rounds
+	if capped {
+		t.phase = FeedbackEscalating
+	} else {
+		f.closeRound(t)
+		t.round++
+		t.phase = FeedbackAddressing
+	}
+	round, limit := t.round, f.rounds
 	f.mu.Unlock()
 
 	f.post(ctx, bead.ID, "", v)
 	f.publish(events.VerdictReceived{Meta: f.meta(), Bead: bead.ID, Round: v.Round, Verdict: v})
+	if capped {
+		f.log.Info("a failed check at the review-round cap escalated the bead",
+			slog.String("bead", bead.ID.String()), slog.Int("round", round), slog.Int("max_rounds", limit))
+		return f.move(ctx, t, BeadEventEscalated, "",
+			fmt.Sprintf("round %d of %d ended with a failing check", round, limit))
+	}
 	f.log.Info("a failed check reopened a bead as a qa change request",
 		slog.String("bead", bead.ID.String()), slog.Int("round", round))
 	return nil
@@ -2106,6 +2218,11 @@ func (f *Feedback) ReviewAgain(_ context.Context, bead domain.Bead, round int, r
 	t.phase = FeedbackReviewing
 	t.reviewers = f.reviewersFor(t)
 	lenses, kind, at := append([]domain.Lens(nil), t.reviewers...), t.kind, fbHead(t.diff)
+	// The round the event names is the thread's, not the caller's: a
+	// conflict round whose bead carries no sc_round metadata reaches here
+	// with round 0, and publishing that would put a round number in the
+	// stream that no other event on the bead uses.
+	round = t.round
 	f.mu.Unlock()
 
 	f.publish(events.RoundStarted{
@@ -2212,7 +2329,7 @@ func (f *Feedback) publish(ev events.Event) {
 
 // warn publishes an events.Warning and logs it.
 func (f *Feedback) warn(bead domain.BeadID, message string, err error) {
-	w := events.Warning{Meta: f.meta(), Source: FeedbackWarningSource, Message: message, Bead: bead}
+	w := events.Warning{Meta: f.meta(), Source: SourceFeedback, Message: message, Bead: bead}
 	if err != nil {
 		w.Err = err.Error()
 	}

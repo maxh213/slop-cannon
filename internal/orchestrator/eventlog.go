@@ -40,6 +40,13 @@ const EventLogName = "events.jsonl"
 // number `sc status` prints.
 const DefaultRecentEvents = 10
 
+// BeadStateUnrecorded is the placeholder [RunSummary.Counts] uses for a
+// bead the run log names without ever giving it a state — an AgentSpawned
+// carrying a bead title before the scheduler's claim, say. Every bead in
+// [RunSummary.Beads] is counted, so the total and the per-state breakdown
+// under it always agree. It is not a bd status and never reaches bd.
+const BeadStateUnrecorded domain.BeadState = "unrecorded"
+
 // ErrNoEventLog is returned by [ReadEventLog] and [SummariseLog] when the
 // run directory has no events.jsonl: a run that was never started, or one
 // whose directory was pruned.
@@ -88,10 +95,46 @@ func OpenEventLog(runDir string, logger *slog.Logger) (*EventLog, error) {
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: open %s: %w", path, err)
 	}
+	if err := terminateLastLine(path, f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &EventLog{path: path, log: logger, f: f, w: events.NewJSONLWriter(f)}, nil
+}
+
+// terminateLastLine closes off a record the previous run was cut short in
+// the middle of. A short write (the ENOSPC this log is built to survive) or
+// a kill between a record and its newline leaves the file without a final
+// newline; appending straight onto it would glue the next event to the
+// wreck and lose that one too. One newline turns the damage into exactly
+// one unreadable line, which the reader skips.
+func terminateLastLine(path string, f *os.File) error {
+	info, err := f.Stat()
+	if err != nil {
+		return fmt.Errorf("orchestrator: stat %s: %w", path, err)
+	}
+	if info.Size() == 0 {
+		return nil
+	}
+	r, err := os.Open(path) //nolint:gosec // the run directory sc owns (D-23).
+	if err != nil {
+		return fmt.Errorf("orchestrator: read %s: %w", path, err)
+	}
+	defer func() { _ = r.Close() }()
+	var last [1]byte
+	if _, err := r.ReadAt(last[:], info.Size()-1); err != nil {
+		return fmt.Errorf("orchestrator: read %s: %w", path, err)
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	if _, err := f.Write([]byte{'\n'}); err != nil {
+		return fmt.Errorf("orchestrator: terminate %s: %w", path, err)
+	}
+	return nil
 }
 
 // Path returns the file the log writes to.
@@ -212,8 +255,16 @@ func (m multiPublisher) Publish(ev events.Event) {
 }
 
 // ReadEventLog reads every event of <runDir>/events.jsonl. A missing file
-// is [ErrNoEventLog]; a corrupt line returns the events read before it
-// along with the error, so `sc status` can still report what it has.
+// is [ErrNoEventLog].
+//
+// A line that does not parse is skipped rather than ending the read: the
+// events after a damaged line are as real as the ones before it, and a log
+// written by a newer sc (one carrying an event kind this binary does not
+// know) must not blank out everything that follows. The damaged lines are
+// described in the returned error, which comes back alongside every event
+// that did parse, so a caller that wants the wreckage can ignore it. A log
+// whose last line was cut short mid-write is a run still writing, not
+// damage, and is not an error.
 func ReadEventLog(runDir string) ([]events.Event, error) {
 	path := EventLogPath(runDir)
 	f, err := os.Open(path) //nolint:gosec // the run directory sc owns (D-23).
@@ -224,11 +275,127 @@ func ReadEventLog(runDir string) ([]events.Event, error) {
 		return nil, fmt.Errorf("orchestrator: read %s: %w", path, err)
 	}
 	defer func() { _ = f.Close() }()
-	evs, err := events.ReadAll(f)
+	var evs []events.Event
+	d, err := scanLog(f, func(ev events.Event) { evs = append(evs, ev) })
 	if err != nil {
 		return evs, fmt.Errorf("orchestrator: read %s: %w", path, err)
 	}
+	if note := d.Note(); note != "" {
+		return evs, fmt.Errorf("orchestrator: read %s: %s", path, note)
+	}
 	return evs, nil
+}
+
+// logDamage is what a run log turned out to be missing: lines that did not
+// parse, and whether its last line was cut short. It is a report, never a
+// reason to stop reading — `sc status` exists to read the wreckage.
+type logDamage struct {
+	// Lines is how many lines did not parse and were skipped. The
+	// incomplete last line of a run still being written is not counted.
+	Lines int
+	// First is the parse error of the first of them, which names the line.
+	First string
+	// PartialTail is true when the log does not end in a newline and its
+	// last line did not parse: a run mid-write, or one killed between a
+	// record and its newline.
+	PartialTail bool
+}
+
+// Any reports whether the log was anything but clean.
+func (d logDamage) Any() bool { return d.Lines > 0 || d.PartialTail }
+
+// Note describes the skipped lines for [RunSummary.Notes], or "" when none
+// were skipped. The incomplete last line has its own note ([logPartialTailNote]).
+func (d logDamage) Note() string {
+	switch {
+	case d.Lines == 1:
+		return fmt.Sprintf("1 line of the run log did not parse and was skipped; "+
+			"everything after it was still read (%s)", d.First)
+	case d.Lines > 1:
+		return fmt.Sprintf("%d lines of the run log did not parse and were skipped; "+
+			"everything after them was still read (first: %s)", d.Lines, d.First)
+	}
+	return ""
+}
+
+// logPartialTailNote is what an unterminated last line means: not damage,
+// but a record that was still being written when the log was read.
+const logPartialTailNote = "the last line of the run log is incomplete: " +
+	"the run was still writing it, or was killed mid-write"
+
+// logTailReader passes a stream through while remembering its last byte, so
+// [scanLog] can tell a log that stops mid-record from one whose final line
+// is terminated and merely unreadable.
+type logTailReader struct {
+	r    io.Reader
+	last byte
+	read bool
+}
+
+// Read implements [io.Reader].
+func (t *logTailReader) Read(p []byte) (int, error) {
+	n, err := t.r.Read(p)
+	if n > 0 {
+		t.last = p[n-1]
+		t.read = true
+	}
+	return n, err
+}
+
+// endsWithNewline reports whether the stream ended on a complete line. An
+// empty stream counts as complete.
+func (t *logTailReader) endsWithNewline() bool { return !t.read || t.last == '\n' }
+
+// scanLog reads a run log from r and calls fn for every event that parses,
+// skipping the lines that do not. [events.JSONLReader] is resumable by
+// design, and this is where that matters: a torn write (the ENOSPC the
+// EventLog is built to survive, or a crash between a record and its
+// newline) leaves one bad line with good lines appended after it on the
+// next run, and an event kind written by a newer sc is a bad line in the
+// middle of a perfectly good log. Stopping at the first one would report a
+// stale run as if it were current.
+//
+// The returned error is reserved for a stream that cannot be read on: an
+// I/O failure, or a line past the reader's size limit. Those stop the scan
+// because the reader makes no further progress; every per-line failure is
+// counted in the returned [logDamage] instead.
+func scanLog(r io.Reader, fn func(events.Event)) (logDamage, error) {
+	var d logDamage
+	tail := &logTailReader{r: r}
+	jr := events.NewJSONLReader(tail)
+	line, bad := 0, 0
+	for {
+		ev, err := jr.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			if jr.Line() <= line {
+				// No line was consumed, so retrying would spin: the
+				// stream itself failed rather than one record in it.
+				return d, err
+			}
+			line = jr.Line()
+			bad = line
+			d.Lines++
+			if d.First == "" {
+				d.First = err.Error()
+			}
+			continue
+		}
+		line = jr.Line()
+		fn(ev)
+	}
+	if d.Lines > 0 && bad == jr.Line() && !tail.endsWithNewline() {
+		// The only unreadable line is the last one, and the log does not
+		// end in a newline: a record still being written, not damage.
+		d.Lines--
+		d.PartialTail = true
+		if d.Lines == 0 {
+			d.First = ""
+		}
+	}
+	return d, nil
 }
 
 // BeadSummary is what the run log says about one bead: the last state it
@@ -306,9 +473,12 @@ type RunSummary struct {
 	// Agents are the agents still live at the end of the log, in the order
 	// they were fired.
 	Agents []domain.Agent `json:"live_agents,omitempty"`
-	// Notes report what the fold could not use: a record that parses as an
-	// event but carries no bead id, for instance. A damaged run log is
-	// reported, never fatal — `sc status` exists to read the wreckage.
+	// Notes report what the fold could not use: a line that did not parse,
+	// a last line cut short mid-write, a record that parses as an event but
+	// carries no bead id. Each one costs itself and nothing after it — a
+	// damaged run log is reported, never fatal, and never truncates the
+	// report to the events before the damage. `sc status` exists to read
+	// the wreckage.
 	Notes []string `json:"notes,omitempty"`
 	// Recent are the last events, AgentOutput excluded, oldest first. They
 	// are not marshalled: an events.Event is an interface, so a caller that
@@ -344,8 +514,10 @@ func (s RunSummary) Settled() int {
 }
 
 // SummariseLog folds <runDir>/events.jsonl as it reads it. A truncated last
-// line (a run killed mid-write) still yields a summary of everything before
-// it, together with the parse error.
+// line (a run mid-write, or one killed) and a line that does not parse at
+// all are skipped and reported in [RunSummary.Notes]; neither ends the fold,
+// so the summary always describes the whole log rather than its first
+// undamaged stretch.
 //
 // The file is streamed rather than slurped: a run log grows for the life of
 // the run — one line per cartridge output line (P5-08), and under D-18 an
@@ -372,22 +544,19 @@ func SummariseLog(runDir string, recent int) (RunSummary, error) {
 
 // SummariseReader folds a run log read from r, following [Summarise] for
 // recent. It holds the summary and at most recent events, never the log, so
-// the cost of a status report does not grow with the run's output. A line
-// that does not parse stops the read and is returned along with the summary
-// of everything before it.
+// the cost of a status report does not grow with the run's output.
+//
+// A line that does not parse is skipped, counted in [RunSummary.Notes] and
+// the fold carries on: a damaged line costs itself and nothing after it, so
+// a run whose log was torn hours ago is still reported as it stands now
+// rather than as it was at the tear. An unterminated last line is a run
+// still writing, and says so. The error is returned only when the stream
+// itself cannot be read on.
 func SummariseReader(r io.Reader, recent int) (RunSummary, error) {
 	f := newLogFold(recent)
-	jr := events.NewJSONLReader(r)
-	for {
-		ev, err := jr.Next()
-		if errors.Is(err, io.EOF) {
-			return f.done(), nil
-		}
-		if err != nil {
-			return f.done(), err
-		}
-		f.add(ev)
-	}
+	d, err := scanLog(r, f.add)
+	f.damage = d
+	return f.done(), err
 }
 
 // Summarise folds a run's events into a [RunSummary]. recent is how many
@@ -415,6 +584,10 @@ type logFold struct {
 	// kind. They are skipped and reported in [RunSummary.Notes] rather than
 	// dereferenced (a nil bead used to crash `sc status`).
 	noBead map[events.Kind]int
+	// damage is what the log itself turned out to be missing, when the fold
+	// read one ([SummariseReader] sets it; [Summarise] folds events that
+	// have already parsed, so it never has any).
+	damage logDamage
 }
 
 // newLogFold starts a fold. recent follows [Summarise].
@@ -696,13 +869,25 @@ func (f *logFold) done() RunSummary {
 	if len(s.Beads) > 0 {
 		s.Counts = make(map[domain.BeadState]int, len(s.Beads))
 		for _, b := range s.Beads {
-			if b.State != "" {
-				s.Counts[b.State]++
+			state := b.State
+			if state == "" {
+				// A bead only ever named by an event that carried no state
+				// (an AgentSpawned with a bead title, say) still has to be
+				// somewhere, or the total above the breakdown would not
+				// match the rows under it.
+				state = BeadStateUnrecorded
 			}
+			s.Counts[state]++
 		}
 	}
 	if len(s.Agents) == 0 {
 		s.Agents = nil
+	}
+	if note := f.damage.Note(); note != "" {
+		s.Notes = append(s.Notes, note)
+	}
+	if f.damage.PartialTail {
+		s.Notes = append(s.Notes, logPartialTailNote)
 	}
 	if note := f.noBeadNote(); note != "" {
 		s.Notes = append(s.Notes, note)

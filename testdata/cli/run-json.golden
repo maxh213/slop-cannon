@@ -41,6 +41,7 @@
       "rules": [],
       "check_command": "",
       "idle_replan_interval": "10m",
+      "gate_poll_interval": "1m",
       "max_beads_per_plan": 8,
       "limits": {
         "max_review_rounds": 5,
@@ -55,6 +56,7 @@
       "cartridges": "global",
       "cartridges.claude": "global",
       "check_command": "default",
+      "gate_poll_interval": "default",
       "idle_replan_interval": "default",
       "limits.agent_timeout": "default",
       "limits.max_cost_usd": "default",

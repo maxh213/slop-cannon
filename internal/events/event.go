@@ -168,6 +168,12 @@ const (
 	// FailureKilled means the orchestrator killed it deliberately (stop,
 	// pause, or zombie reaping).
 	FailureKilled Failure = "killed"
+	// FailureInternal means the session itself succeeded — the agent
+	// answered and its reply was accepted — but the orchestrator could not
+	// use the result afterwards: a bead comment, a state transition or
+	// another bookkeeping step failed. It is never the cartridge's fault,
+	// so the session is not fired again (P6-07).
+	FailureInternal Failure = "internal"
 )
 
 // String returns the canonical name.
