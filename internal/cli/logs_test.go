@@ -137,12 +137,105 @@ func TestLogsTailsEveryAgentOfABead(t *testing.T) {
 	require.Contains(t, out, "qa line 2")
 	require.NotContains(t, out, "other line", "sc-12 is a different bead")
 	require.Less(t, strings.Index(out, "eng-sc-1-r1"), strings.Index(out, "tester-qa-sc-1-r1"),
-		"logs are printed in agent-id order, so a bead's rounds read in order")
+		"the engineer wrote first, so it prints first")
 
 	out, err = rootRun(t, "--repo", repo, "logs", "sc-12")
 	require.NoError(t, err)
 	require.Contains(t, out, "other line 2")
 	require.NotContains(t, out, "eng line")
+}
+
+// logsEpoch is the fixed time the ordering fixtures are stamped from.
+var logsEpoch = time.Date(2026, 9, 3, 21, 41, 0, 0, time.UTC)
+
+// logsWriteAgentAt writes one agent log whose first line is a real log
+// record — one JSON object with a "time" key, which is what
+// [logging.NewFileHandler] writes — stamped at first, and then backdates
+// the file's modification time to mtime.
+//
+// The two are set apart on purpose: the modification time is only the
+// fallback, so a fixture whose mtimes disagree with its records proves
+// which of the two the command actually orders by.
+func logsWriteAgentAt(t *testing.T, runDir, agent string, first, mtime time.Time, lines []string) string {
+	t.Helper()
+	rec := fmt.Sprintf(`{"time":%q,"level":"INFO","msg":"agent spawned","agent":%q}`,
+		first.Format(time.RFC3339Nano), agent)
+	path := logsWriteAgent(t, runDir, agent, append([]string{rec}, lines...))
+	require.NoError(t, os.Chtimes(path, mtime, mtime))
+	return path
+}
+
+// TestLogsPrintsABeadsAgentsOldestFirst is the ordering `sc logs --help`
+// promises. The ids are minted from the bead, the lens and the round, so
+// name order puts the engineer's second round ahead of the testers that
+// judged the first — which is what a real run printed before this was
+// fixed (P8-05). The fixture's modification times run the other way, so
+// only the records' own timestamps can produce the order asserted here.
+func TestLogsPrintsABeadsAgentsOldestFirst(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := config.RunDir(repo, logsRunID)
+	_, err := orchestrator.EnsureRunDir(dir)
+	require.NoError(t, err)
+	logsWriteLog(t, logging.PathsFor(dir).Log, logsLines("sc", 1))
+
+	// Written in name order, stamped in the order the agents really ran,
+	// and given modification times in the reverse of that order.
+	at := func(sec int) time.Time { return logsEpoch.Add(time.Duration(sec) * time.Second) }
+	logsWriteAgentAt(t, dir, "eng-sc-1-r1", at(31), at(90), logsLines("eng r1", 1))
+	logsWriteAgentAt(t, dir, "eng-sc-1-r2", at(35), at(80), logsLines("eng r2", 1))
+	logsWriteAgentAt(t, dir, "tester-qa-sc-1-r1", at(32), at(70), logsLines("qa", 1))
+	logsWriteAgentAt(t, dir, "tester-test-sc-1-r1", at(33), at(60), logsLines("test", 1))
+
+	out, err := rootRun(t, "--repo", repo, "logs", "sc-1")
+	require.NoError(t, err)
+	require.Equal(t,
+		[]string{"eng-sc-1-r1", "tester-qa-sc-1-r1", "tester-test-sc-1-r1", "eng-sc-1-r2"},
+		logsHeaders(out), "oldest agent first, whatever the ids sort like")
+
+	// --json prints the same order, because it prints the same list.
+	out, err = rootRun(t, "--repo", repo, "--json", "logs", "sc-1")
+	require.NoError(t, err)
+	var rep LogsReport
+	require.NoError(t, json.Unmarshal([]byte(out), &rep))
+	names := make([]string, 0, len(rep.Logs))
+	for _, l := range rep.Logs {
+		names = append(names, l.Name)
+	}
+	require.Equal(t,
+		[]string{"eng-sc-1-r1", "tester-qa-sc-1-r1", "tester-test-sc-1-r1", "eng-sc-1-r2"}, names)
+}
+
+// TestLogsOrdersByModificationTimeWhenARecordCannotBeRead: a log whose
+// first line is not a record the command can read — an agent that has
+// written nothing yet, or a format that changes one day — falls back to the
+// file's own time rather than to an arbitrary order.
+func TestLogsOrdersByModificationTimeWhenARecordCannotBeRead(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := config.RunDir(repo, logsRunID)
+	_, err := orchestrator.EnsureRunDir(dir)
+	require.NoError(t, err)
+	logsWriteLog(t, logging.PathsFor(dir).Log, logsLines("sc", 1))
+
+	// Plain lines, no records: only the modification times can order these.
+	early := logsWriteAgent(t, dir, "tester-qa-sc-1-r1", logsLines("qa", 1))
+	late := logsWriteAgent(t, dir, "eng-sc-1-r1", logsLines("eng", 1))
+	require.NoError(t, os.Chtimes(early, logsEpoch, logsEpoch))
+	require.NoError(t, os.Chtimes(late, logsEpoch.Add(time.Minute), logsEpoch.Add(time.Minute)))
+
+	out, err := rootRun(t, "--repo", repo, "logs", "sc-1")
+	require.NoError(t, err)
+	require.Equal(t, []string{"tester-qa-sc-1-r1", "eng-sc-1-r1"}, logsHeaders(out))
+}
+
+// logsHeaders is the agent names the output announced, in print order.
+func logsHeaders(out string) []string {
+	var names []string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.HasPrefix(line, "==> ") && strings.HasSuffix(line, " <==") {
+			names = append(names, strings.TrimSuffix(strings.TrimPrefix(line, "==> "), " <=="))
+		}
+	}
+	return names
 }
 
 // TestLogsUnknownTargetListsWhatThereIs: the error a mistyped id gets is

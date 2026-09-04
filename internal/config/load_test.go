@@ -45,6 +45,7 @@ exclude = ["secrets/*.key"]
 check_command = "make check"
 idle_replan_interval = "5m"
 gate_poll_interval = "30s"
+pr_poll_interval = "45s"
 max_beads_per_plan = 6
 
 [limits]
@@ -75,6 +76,7 @@ exclude = ["private/**", "secrets/*.key"]
 check_command = "go test ./..."
 idle_replan_interval = "1h"
 gate_poll_interval = "2m"
+pr_poll_interval = "3m"
 max_beads_per_plan = 4
 
 [limits]
@@ -159,6 +161,7 @@ func TestLoadGlobalOnly(t *testing.T) {
 	assert.Equal(t, "make check", eff.CheckCommand)
 	assert.Equal(t, 5*time.Minute, eff.IdleReplanInterval.Duration())
 	assert.Equal(t, 30*time.Second, eff.GatePollInterval.Duration())
+	assert.Equal(t, 45*time.Second, eff.PRPollInterval.Duration())
 	assert.Equal(t, 6, eff.MaxBeadsPerPlan)
 	assert.Equal(t, Limits{MaxReviewRounds: 4, MaxPushbackRounds: 1, AgentTimeout: NewDuration(20 * time.Minute),
 		MaxTokens: 1000, MaxCostUSD: 2.5, MaxPlanRejections: 3, MaxPlanFailures: 7}, eff.Limits)
@@ -186,6 +189,7 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 	assert.Equal(t, "go test ./...", eff.CheckCommand)
 	assert.Equal(t, time.Hour, eff.IdleReplanInterval.Duration())
 	assert.Equal(t, 2*time.Minute, eff.GatePollInterval.Duration(), "the repo's gate poll interval wins")
+	assert.Equal(t, 3*time.Minute, eff.PRPollInterval.Duration(), "the repo's pull request poll interval wins")
 	assert.Equal(t, Limits{MaxReviewRounds: 6, MaxPushbackRounds: 3, AgentTimeout: NewDuration(45 * time.Minute),
 		MaxTokens: 2000, MaxCostUSD: 9, MaxPlanRejections: 4, MaxPlanFailures: 9}, eff.Limits)
 	// Lists union across layers, global first, deduplicated by absolute path.
@@ -209,6 +213,7 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 		KeyActiveCartridge: SourceGlobal, KeyCartridges: SourceGlobal,
 		KeyAmmo: SourceRepo, KeySafety: SourceRepo, KeyVibes: SourceMerged, KeyRules: SourceMerged, KeyExclude: SourceMerged,
 		KeyCheckCommand: SourceRepo, KeyIdleReplanInterval: SourceRepo, KeyGatePollInterval: SourceRepo,
+		KeyPRPollInterval:  SourceRepo,
 		KeyMaxReviewRounds: SourceRepo, KeyMaxPushbackRounds: SourceRepo, KeyAgentTimeout: SourceRepo,
 		KeyMaxTokens: SourceRepo, KeyMaxCostUSD: SourceRepo,
 		KeyRoles + ".tester": SourceGlobal, KeyRoles + ".engineer": SourceRepo,
@@ -338,6 +343,7 @@ func TestLoadValidation(t *testing.T) {
 		{"bad role cartridge", "", "[roles.tester]\ncartridge = \"kimi\"\n", "roles.tester.cartridge", `cartridge "kimi" is not supported yet (only "claude" for now)`},
 		{"zero interval", "idle_replan_interval = \"0s\"\n", "", KeyIdleReplanInterval, "must be a positive duration"},
 		{"zero gate poll interval", "gate_poll_interval = \"0s\"\n", "", KeyGatePollInterval, "must be a positive duration"},
+		{"zero pr poll interval", "pr_poll_interval = \"0s\"\n", "", KeyPRPollInterval, "must be a positive duration"},
 		{"zero beads per plan", "max_beads_per_plan = 0\n", "", KeyMaxBeadsPerPlan, "must be at least 1"},
 		{"negative beads per plan", "", "max_beads_per_plan = -3\n", KeyMaxBeadsPerPlan, "must be at least 1"},
 		{"zero rounds", "", "[limits]\nmax_review_rounds = 0\n", KeyMaxReviewRounds, "must be at least 1"},
@@ -491,6 +497,7 @@ func TestEntries(t *testing.T) {
 	assert.Equal(t, "[FOO=bar]", byKey["cartridges.claude.env"].Value)
 	assert.Equal(t, "5m", byKey[KeyIdleReplanInterval].Value)
 	assert.Equal(t, "30s", byKey[KeyGatePollInterval].Value)
+	assert.Equal(t, "45s", byKey[KeyPRPollInterval].Value)
 	assert.Equal(t, Entry{Key: KeyMaxBeadsPerPlan, Value: "6", Source: SourceGlobal}, byKey[KeyMaxBeadsPerPlan])
 	assert.Equal(t, "20m", byKey[KeyAgentTimeout].Value)
 	assert.Equal(t, "2.5", byKey[KeyMaxCostUSD].Value)

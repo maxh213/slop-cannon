@@ -67,8 +67,11 @@
 // inventory and the graph the TUI relays out of (P6-32), offers the
 // `bd ready` set to [Feedback.Track], rebuilds a resumed run's threads from
 // the beads' own comments on its first pass ([Feedback.Restore], P8-16),
-// starts the delivery of every approved bead in the background and routes
-// each [DeliveryOutcome] back through [Conductor.ApplyOutcome]. It is also
+// queues the delivery of every approved bead — one at a time, so two
+// deliveries never rebase and fast-forward the same repository at once —
+// and routes each [DeliveryOutcome] back through [Conductor.ApplyOutcome],
+// retrying a delivery the deliverer left in delivering and handing it to a
+// person when the attempts are spent. It is also
 // where the prompt context comes from ([Conductor.BeadContext], the
 // [FeedbackOptions.Context] of the loop), which is why the D-14 leftovers
 // commit and the P9-05 secret filter both sit there: it is the only

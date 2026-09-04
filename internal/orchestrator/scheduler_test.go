@@ -2169,3 +2169,35 @@ func TestSchedulerTellsTwoHeldItemsOfOneRoundApart(t *testing.T) {
 	defer mu.Unlock()
 	assert.ElementsMatch(t, []domain.AgentID{"po-sc-1-r2-i1", "po-sc-1-r2-i2"}, ids)
 }
+
+// TestDispatchDeduplicatesOneBatch is the deterministic half of the test
+// above. A source that has not yet seen a firing goes on offering the
+// demand, so one batch can hold the same job twice; the in-flight check in
+// reserve only catches that while the first firing is still live, and a
+// firing that finishes mid-batch reopens the window. dedupeDemands closes
+// it before the loop starts, keeping the first offer of each key — which,
+// after sortDemands, is the highest-priority one — and leaving the caller's
+// slice alone, because a work source may hand out the same backing array on
+// every tick.
+func TestDispatchDeduplicatesOneBatch(t *testing.T) {
+	t.Parallel()
+
+	first := Demand{
+		Kind: DemandArbitrate, Bead: "sc-1", Round: 2, Agent: "po-sc-1-r2-i1",
+		Payload: FeedbackWork{Bead: "sc-1", Round: 2, Item: "i1"},
+	}
+	second := first
+	second.Agent = "po-sc-1-r2-i2"
+	second.Payload = FeedbackWork{Bead: "sc-1", Round: 2, Item: "i2"}
+
+	in := []Demand{first, second, first}
+	got := dedupeDemands(in)
+	require.Len(t, got, 2, "the repeated dispute is offered once")
+	assert.Equal(t, domain.AgentID("po-sc-1-r2-i1"), got[0].Agent)
+	assert.Equal(t, domain.AgentID("po-sc-1-r2-i2"), got[1].Agent)
+	assert.Equal(t, []Demand{first, second, first}, in, "the source's own slice is untouched")
+
+	clean := []Demand{first, second}
+	assert.Equal(t, clean, dedupeDemands(clean))
+	assert.Nil(t, dedupeDemands(nil))
+}

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"slop-cannon/internal/agents"
+	"slop-cannon/internal/beads"
 	"slop-cannon/internal/cartridge"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
@@ -735,5 +736,324 @@ func TestRunBudgetSurvivesAPauseItCannotMake(t *testing.T) {
 	ds, err := b.Work(limWork{{Kind: DemandImplement, Bead: "b-1"}}).Demands(t.Context())
 	if err != nil || len(ds) != 0 {
 		t.Errorf("Demands = (%d, %v), want none", len(ds), err)
+	}
+}
+
+// --- P9-01 round 4: the budget is a cap on the run, not on one `sc run` ---
+
+// TestRunBudgetCarriesTheSpendOfAResumedRun is the review gap that made
+// `limits.max_tokens` multipliable by restarting: state.json carried no
+// spend, so every invocation of the same run started at zero and a 4000
+// token cap produced 18854 tokens over two invocations of one run id.
+func TestRunBudgetCarriesTheSpendOfAResumedRun(t *testing.T) {
+	t.Parallel()
+	p, h := &limPhasedPauser{}, &limHost{}
+	p.phase = PhaseRunning
+	b := NewRunBudget(RunBudgetOptions{
+		Limits: config.Limits{MaxTokens: 500},
+		Mode:   domain.RunModeBrief,
+		Run:    p,
+		Host:   h,
+		Restore: BudgetState{
+			Spend:  Spend{Tokens: 900, Firings: 6},
+			Grants: 1,
+		},
+	})
+
+	if got := b.Spent(); got.Tokens != 900 || got.Firings != 6 {
+		t.Fatalf("Spent = %+v, want the 900 tokens over 6 sessions the earlier invocation spent", got)
+	}
+	// A resume is the user saying "carry on", so the run gets one more
+	// budget's worth — and no more. Counting from zero would have given it
+	// a whole fresh 500 on top of a spend it never sees again.
+	if got := b.Grants(); got != 2 {
+		t.Errorf("Grants = %d, want 2: one more budget's worth over the 900 already spent", got)
+	}
+	if b.Tripped() {
+		t.Error("a resumed run under its widened ceiling is holding work back")
+	}
+
+	gated := b.Work(limWork{{Kind: DemandImplement, Bead: "b-1"}})
+	if ds, err := gated.Demands(t.Context()); err != nil || len(ds) != 1 {
+		t.Fatalf("a resumed run was offered %d demands (err=%v), want its work", len(ds), err)
+	}
+	warned := h.warnings()
+	if len(warned) != 1 || !strings.Contains(warned[0], "900 tokens") || !strings.Contains(warned[0], "1000") {
+		t.Fatalf("warnings = %v, want one notice naming the carried spend and the new ceiling", warned)
+	}
+	if got := h.warnings(); len(got) != 1 {
+		t.Errorf("the resume notice was published %d times, want once", len(got))
+	}
+
+	// The next budget's worth stops it again, at the run's total rather
+	// than at this invocation's.
+	b.Record(cartridge.Usage{InputTokens: 100})
+	if !b.Tripped() {
+		t.Fatal("a resumed run never stopped: the carried spend was not counted")
+	}
+	if got := b.Summary(); !strings.Contains(got, "1000 tokens of its 1000 budget") ||
+		!strings.Contains(got, "over 7 agent sessions") {
+		t.Errorf("summary = %q, want the whole run's spend and session count", got)
+	}
+}
+
+// TestRunBudgetSnapshotIsWhatARestoreCarries pins the round trip the run
+// state file makes: what [RunBudget.Snapshot] hands the run is what
+// [RunBudgetOptions.Restore] takes back.
+func TestRunBudgetSnapshotIsWhatARestoreCarries(t *testing.T) {
+	t.Parallel()
+	b, _, _ := limBudget(t, domain.RunModeAutopilot, 1000, 0)
+	b.Record(cartridge.Usage{InputTokens: 300, OutputTokens: 100, CostUSD: 0.25, HasCost: true})
+	snap := b.Snapshot()
+	if snap.Spend.Tokens != 400 || snap.Spend.Firings != 1 || !snap.Spend.HasCost || snap.Grants != 1 {
+		t.Fatalf("Snapshot = %+v, want the metered spend and one grant", snap)
+	}
+
+	next := NewRunBudget(RunBudgetOptions{
+		Limits: config.Limits{MaxTokens: 1000}, Mode: domain.RunModeBrief, Restore: snap,
+	})
+	if got := next.Snapshot(); got != snap {
+		t.Errorf("a restored budget snapshots %+v, want the %+v it was given", got, snap)
+	}
+	next.Record(cartridge.Usage{InputTokens: 600})
+	if !next.Tripped() {
+		t.Error("the restored spend was not counted towards the cap")
+	}
+}
+
+// TestRunBudgetSurvivesTheStateFile is the same claim end to end: a run
+// writes its budget into state.json on every transition, and the run
+// `--resume` builds reads it back.
+func TestRunBudgetSurvivesTheStateFile(t *testing.T) {
+	t.Parallel()
+	cfg := limRunConfig(t, domain.RunModeBrief, config.Limits{MaxTokens: 500})
+	first, err := New(cfg, Options{SkipLock: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := first.Start(t.Context()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	t.Cleanup(func() { _ = first.Close() })
+
+	b := NewRunBudget(RunBudgetOptions{
+		Limits: config.Limits{MaxTokens: 500}, Mode: domain.RunModeBrief, Run: first, Host: first,
+		Restore: first.State().Spent(),
+	})
+	first.UseBudget(b.Snapshot)
+	b.Record(cartridge.Usage{InputTokens: 700})
+	// Any transition persists; an agent starting is the one that happens
+	// after every session in a real run.
+	if err := first.AgentStarted(domain.Agent{ID: "eng-b-1-r1", Role: domain.RoleEngineer}); err != nil {
+		t.Fatalf("AgentStarted: %v", err)
+	}
+
+	st, err := LoadState(cfg.Run.StateDir)
+	if err != nil {
+		t.Fatalf("LoadState: %v", err)
+	}
+	if got := st.Spent(); got.Spend.Tokens != 700 || got.Spend.Firings != 1 {
+		t.Fatalf("state.json carries %+v, want the run's 700 tokens over 1 session", got)
+	}
+
+	// The resumed run picks it up.
+	resumed := *cfg
+	resumed.Resume = true
+	next, err := New(&resumed, Options{SkipLock: true})
+	if err != nil {
+		t.Fatalf("New (resume): %v", err)
+	}
+	if got := next.State().Spent().Spend; got.Tokens != 700 || got.Firings != 1 {
+		t.Fatalf("the resumed run carries %+v, want the 700 tokens of the first invocation", got)
+	}
+	if got := NewRunBudget(RunBudgetOptions{
+		Limits: config.Limits{MaxTokens: 500}, Mode: domain.RunModeBrief,
+		Restore: next.State().Spent(),
+	}).Spent().Tokens; got != 700 {
+		t.Errorf("the resumed run's budget starts at %d tokens, want the 700 already spent", got)
+	}
+}
+
+// TestRunBudgetStopsAnExternalPullRequestReviewItCouldNotHaveStarted is the
+// other half of "a crossed cap stops new work": [PRReview] adopts pull
+// requests on its own goroutine (D-11), so a review demand of its is a
+// round the watcher opened rather than one the run had under way. Keeping
+// them spent three fresh tester sessions per pull request over a blown
+// budget and, because the scheduler was never idle, stopped the brief run
+// from ever finishing.
+func TestRunBudgetStopsAnExternalPullRequestReviewItCouldNotHaveStarted(t *testing.T) {
+	t.Parallel()
+	b, _, _ := limBudget(t, domain.RunModeBrief, 100, 0)
+	own := Demand{Kind: DemandReview, Bead: "b-2", Lens: domain.LensQA, Round: 1,
+		Payload: FeedbackWork{Bead: "b-2", Round: 1, Lens: domain.LensQA}}
+	external := Demand{Kind: DemandReview, Bead: "pr-7", Lens: domain.LensQA, Round: PRReviewRound,
+		Task: events.TaskReview, Claim: ClaimNone,
+		Payload: PRReviewWork{Bead: "pr-7", Lens: domain.LensQA, Round: PRReviewRound}}
+	gated := b.Work(limWork{own, external})
+
+	if ds, err := gated.Demands(t.Context()); err != nil || len(ds) != 2 {
+		t.Fatalf("an untripped budget offered %d of 2 demands (err=%v)", len(ds), err)
+	}
+	b.Record(cartridge.Usage{InputTokens: 200})
+	after, err := gated.Demands(t.Context())
+	if err != nil {
+		t.Fatalf("Demands: %v", err)
+	}
+	if len(after) != 1 || after[0].Bead != "b-2" {
+		t.Fatalf("a tripped budget offered %+v, want only the run's own round", after)
+	}
+}
+
+// TestAgentTimeoutLimitFallsBackToTheDefaultOnAHandBuiltConfig pins
+// [Supervisor.Attach] to [EffectiveLimits]: a run whose config leaves
+// agent_timeout unset must get the documented 30-minute default, not no
+// timeout at all.
+func TestAgentTimeoutLimitFallsBackToTheDefaultOnAHandBuiltConfig(t *testing.T) {
+	t.Parallel()
+	cfg := limRunConfig(t, domain.RunModeBrief, config.Limits{})
+	run, err := New(cfg, Options{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	sup, err := NewSupervisor(SupervisorOptions{})
+	if err != nil {
+		t.Fatalf("NewSupervisor: %v", err)
+	}
+	sup.Attach(run)
+	if got, want := sup.Timeout(), config.Defaults().Limits.AgentTimeout.Duration(); got != want {
+		t.Errorf("supervisor timeout = %s, want the limits.agent_timeout default %s", got, want)
+	}
+}
+
+// --- P9-01/P9-21: a verdict being folded in is not a round to re-fire ---
+
+// limReentrantMessages is a [FeedbackMessageStore] that dispatches while it
+// writes: [Feedback.testerReplied] empties the round's reviewer list under
+// the loop's lock and then, *outside* it, posts the comment to bd before
+// planning what happens next. PostMessage is therefore exactly the window a
+// scheduler tick can land in, and calling Demands from here reproduces it
+// with no goroutines and no timing.
+type limReentrantMessages struct {
+	loop *Feedback
+	seen [][]Demand
+}
+
+func (m *limReentrantMessages) PostMessage(ctx context.Context, id domain.BeadID, _ string, _ any) (beads.Message, error) {
+	ds, err := m.loop.Demands(ctx)
+	if err != nil {
+		return beads.Message{}, err
+	}
+	m.seen = append(m.seen, ds)
+	return beads.Message{IssueID: id}, nil
+}
+
+// TestABudgetHeldRoundIsNotRefiredWhileItsVerdictIsWrittenToTheBead is the
+// blocker P9-01's own wiring test tripped over: a dispatch landing between
+// the last verdict of a round and the bead moving to changes_requested saw
+// "reviewing, nobody owes a verdict", re-derived the reviewers from the
+// still-open item and fired the lens again, for ever — a livelock, because
+// the engineer firing that closes the round is exactly the new work a
+// crossed budget holds back.
+//
+// It lives beside the budget tests because the budget is what turns the
+// re-fire into an unbounded spend: with the [RunBudget.Work] gate on, the
+// re-fired review is the only demand left in the run.
+func TestABudgetHeldRoundIsNotRefiredWhileItsVerdictIsWrittenToTheBead(t *testing.T) {
+	t.Parallel()
+	msgs := &limReentrantMessages{}
+	loop, err := NewFeedback(FeedbackOptions{
+		Context: func(context.Context, domain.BeadID) (FeedbackBeadContext, error) {
+			return FeedbackBeadContext{}, nil
+		},
+		Messages: msgs,
+		Lenses:   []domain.Lens{domain.LensQA},
+		Limits:   config.Limits{MaxReviewRounds: 5, MaxPushbackRounds: 2},
+		Now:      func() time.Time { return time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC) },
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewFeedback: %v", err)
+	}
+	msgs.loop = loop
+
+	const bead domain.BeadID = "sc-b1"
+	loop.Track(domain.Bead{ID: bead, Title: "make the retry loop terminate", State: domain.BeadStateInReview, Round: 1})
+
+	// The tick that fires the round's one tester.
+	ds, err := loop.Demands(t.Context())
+	if err != nil {
+		t.Fatalf("Demands: %v", err)
+	}
+	if len(ds) != 1 || ds[0].Kind != DemandReview || ds[0].Lens != domain.LensQA {
+		t.Fatalf("the adopted bead wanted %+v, want one qa review", ds)
+	}
+
+	// The verdict lands, asking for a change: the item stays open, which is
+	// what made reviewersFor offer the lens its own review again.
+	work := FeedbackWork{Bead: bead, Round: 1, Phase: FeedbackReviewing, Tester: agents.TesterModeReview, Lens: domain.LensQA}
+	verdict := domain.Verdict{
+		Lens: domain.LensQA, Round: 1, Outcome: domain.VerdictChanges, Summary: "the note has no title",
+		Items: []domain.FeedbackItem{{
+			ID: "qa-1", Severity: domain.SeverityMajor, Status: domain.ItemOpen,
+			Title: "the note needs a title", Detail: "add a heading", File: "note.md",
+		}},
+	}
+	if err := loop.testerReplied(t.Context(), work, "tester-qa-sc-b1-r1", verdict); err != nil {
+		t.Fatalf("testerReplied: %v", err)
+	}
+
+	if len(msgs.seen) != 1 {
+		t.Fatalf("the verdict was written to the bead %d times, want once", len(msgs.seen))
+	}
+	for _, d := range msgs.seen[0] {
+		if d.Kind == DemandReview {
+			t.Fatalf("the round was re-offered to %s while its verdict was being written: %+v", d.Lens, d)
+		}
+	}
+
+	// And the round did close: the bead owes the engineer an answer.
+	after, err := loop.Demands(t.Context())
+	if err != nil {
+		t.Fatalf("Demands: %v", err)
+	}
+	if len(after) != 1 || after[0].Kind != DemandImplement || after[0].FiringTask() != events.TaskAddressFeedback {
+		t.Fatalf("after the verdict the loop wants %+v, want the engineer to answer the feedback", after)
+	}
+	th, ok := loop.Thread(bead)
+	if !ok {
+		t.Fatal("the thread vanished")
+	}
+	if th.Phase != FeedbackAddressing || th.State != domain.BeadStateChangesRequested {
+		t.Errorf("thread is %s/%s, want addressing/changes_requested", th.Phase, th.State)
+	}
+}
+
+// TestAnAdoptedBeadStillWorksOutItsOwnReviewers is the behaviour the fix
+// above must not cost: a run that resumes a bead bd already holds in
+// in_review has never been through [Feedback.plan], so the reviewer list is
+// worked out on the first dispatch.
+func TestAnAdoptedBeadStillWorksOutItsOwnReviewers(t *testing.T) {
+	t.Parallel()
+	loop, err := NewFeedback(FeedbackOptions{
+		Context: func(context.Context, domain.BeadID) (FeedbackBeadContext, error) {
+			return FeedbackBeadContext{}, nil
+		},
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewFeedback: %v", err)
+	}
+	loop.Track(domain.Bead{ID: "sc-b2", Title: "adopted", State: domain.BeadStateInReview, Round: 1})
+	ds, err := loop.Demands(t.Context())
+	if err != nil {
+		t.Fatalf("Demands: %v", err)
+	}
+	if len(ds) != len(domain.Lenses()) {
+		t.Fatalf("an adopted bead wanted %d reviews, want one per lens (%d)", len(ds), len(domain.Lenses()))
+	}
+	// And again on the next tick: the demand is stateless until it lands.
+	again, err := loop.Demands(t.Context())
+	if err != nil || len(again) != len(ds) {
+		t.Fatalf("the second tick wanted %d demands (err=%v), want the same %d", len(again), err, len(ds))
 	}
 }

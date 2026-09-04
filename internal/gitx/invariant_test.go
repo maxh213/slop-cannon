@@ -42,12 +42,19 @@ import (
 // TaskAddressFeedback and TaskResolveConflict to cartridge.ToolReadWrite,
 // which the Claude cartridge enforces with Bash allowed and no deny list),
 // so the only production guard on what an engineer does with git is a
-// sentence in its prompt. What is not watched: the production run path
-// around delivery — branch cleanup, resume, the delivery settler and the
-// external pull request reviewer — which is covered from the other side by
-// internal/orchestrator's end-to-end tests asserting that neither default
-// branch tip moves; running that path under this shim is a discovered task
-// rather than part of P9-02.
+// sentence in its prompt. The resume ([Resumer.Resume]) is watched too: it
+// is the one extra git-invoking component a crash adds — a fetch, ancestry
+// checks, worktree add and prune — and it runs on every `sc --resume`, so
+// P9-03 put it under the same checker in a scenario of its own
+// ([TestAResumeNeverTouchesTheDefaultBranch]), where it runs over a
+// repository a crash left mid-rebase, twice. It is deliberately not one of
+// the randomised events below: a resume fetches, which changes what a
+// later delivery in the same sequence has to rebase onto, and the seeds
+// here are chosen so that the sequences really deliver and really
+// conflict. What is still not watched: branch cleanup, the
+// delivery settler and the external pull request reviewer, which are
+// covered from the other side by internal/orchestrator's end-to-end tests
+// asserting that neither default branch tip moves.
 //
 // Two invariants are asserted, one per safety mode:
 //
@@ -900,6 +907,46 @@ func (f *ivFixture) ivDeliver(t *testing.T, bead domain.Bead) error {
 	return err
 }
 
+// ivResume runs the crash recovery over both beads and judges what it did
+// with everything else (P9-03). It is a dry run — the resumer is given no
+// tracker, so nothing is written to bd — because what is being judged is
+// the git it issues, not the bead states it would reconcile, which
+// cleanup_test.go covers.
+//
+// With safety on the fixture's fetch URL is the GitHub one gh needs, and
+// the resume is the one part of the product that fetches, so it is pointed
+// back at the bare remote for the duration: nothing in these tests may
+// reach the network. The pull request lookup still goes to the gh shim,
+// which is judged as well.
+func (f *ivFixture) ivResume(t *testing.T, beadList []domain.Bead) *ResumeResult {
+	t.Helper()
+	if f.env.safety == ivSafetyOn {
+		f.r.Git(t, "remote", "set-url", "origin", f.r.RemoteDir)
+		defer f.r.Git(t, "remote", "set-url", "origin", "https://github.com/acme/widgets.git")
+	}
+	opts := []ResumeOption{}
+	if f.env.safety == ivSafetyOff {
+		// A run with safety off never opens a pull request, and `sc run`
+		// gives its resumer no gh for that reason.
+		opts = append(opts, WithoutGH())
+	}
+	res, err := cuResumer(t, f.m, nil, opts...).Resume(context.Background(), beadList)
+	require.NoError(t, err)
+	return res
+}
+
+// ivDelivering returns the fixture's beads as a crash left them: claimed by
+// a delivery that never finished, which is the state the resume has the
+// most to do about.
+func (f *ivFixture) ivDelivering() []domain.Bead {
+	out := make([]domain.Bead, 0, len(f.beads))
+	for _, b := range f.beads {
+		b.State = domain.BeadStateDelivering
+		out = append(out, b)
+	}
+	return out
+}
+
 // ivResolveConflict finishes what an engineer's conflict round does (D-10):
 // it writes a resolution for every conflicted path and stages it, leaving
 // the rebase for the next delivery attempt to continue.
@@ -1060,6 +1107,69 @@ func TestSafetyOffOnlyFastForwardsTheDefaultBranch(t *testing.T) {
 	subjects := ivMustRun(t, f.r, f.r.Dir, "log", "--format=%s", "refs/heads/"+f.env.def)
 	for _, bead := range f.beads {
 		assert.Contains(t, subjects, "work on "+string(bead.ID), "%s's work is on %s", bead.ID, f.env.def)
+	}
+}
+
+// TestAResumeNeverTouchesTheDefaultBranch is the crash-recovery half of the
+// invariant (P9-03). A resume is the one extra git-invoking component a
+// crash adds — it fetches, resolves branches, asks whether each branch has
+// landed, recreates the worktrees whose directories are gone and prunes the
+// registrations that are stale — and it runs on every `sc --resume`, over a
+// repository nobody has tidied up. Everything it issues is judged by argv
+// here, exactly as a delivery's is, in both safety modes.
+func TestAResumeNeverTouchesTheDefaultBranch(t *testing.T) {
+	for _, safety := range []ivSafety{ivSafetyOn, ivSafetyOff} {
+		t.Run(string(safety), func(t *testing.T) {
+			f := ivSetup(t, safety)
+
+			// The mess a crash leaves: both beads have work committed, one
+			// of them on the file the upstream commit also touches, so its
+			// delivery stopped mid-rebase and its worktree is still in that
+			// state — which is what the resume has to inspect, reattach and
+			// report without touching anything of the user's. (The worktree
+			// directories are left in place: Manager.Create refuses a dirty
+			// repository, and this fixture is deliberately dirty with the
+			// user's own file, so a wiped worktree could not be recreated
+			// here whatever the resume did.)
+			for i, bead := range f.beads {
+				f.ivWork(t, bead, fmt.Sprintf("engineer round 1 on %s\n", bead.ID), i == 0)
+			}
+			f.ivUpstream(t, "landed-while-the-run-was-down", true)
+			_ = f.ivDeliver(t, f.beads[0])
+			f.ivAssertStep(t, "after the crash") // the setup's own calls
+
+			res := f.ivResume(t, f.ivDelivering())
+
+			fresh := f.ivAssertStep(t, "after the resume")
+			require.NotEmpty(t, fresh, "the resume ran git at all")
+			// Non-vacuity: the resume did the git work a resume does, so
+			// the invariant does not hold merely because nothing happened.
+			assert.Positive(t, ivCount(fresh, "fetch"), "the resume fetched: %v", fresh)
+			assert.Positive(t, ivCount(fresh, "merge-base"), "and asked what had landed")
+			assert.Positive(t, ivCount(fresh, "worktree"), "and worked on the worktrees")
+			require.Len(t, res.Entries, len(f.beads))
+			var conflicted int
+			for _, e := range res.Entries {
+				require.NoErrorf(t, e.Err, "%s: %s", e.Bead.ID, e.Reason)
+				assert.Equalf(t, WorktreeAttached, e.WorktreeStatus, "%s was reattached", e.Bead.ID)
+				if e.Conflict {
+					conflicted++
+				}
+			}
+			// Safety off rebases before it merges, so the delivery above
+			// really did stop mid-rebase; safety on pushes the branch and
+			// opens a pull request, and leaves no rebase behind.
+			want := 0
+			if safety == ivSafetyOff {
+				want = 1
+			}
+			assert.Equal(t, want, conflicted, "the worktrees were reported as they are: %s", res.Summary())
+
+			// And a second resume, which is what a second crash gives it,
+			// is judged too: nothing about the first one licenses the next.
+			f.ivResume(t, f.ivDelivering())
+			f.ivAssertStep(t, "after resuming twice")
+		})
 	}
 }
 

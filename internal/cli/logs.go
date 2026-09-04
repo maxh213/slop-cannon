@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -122,6 +123,10 @@ type logSource struct {
 	name  string
 	path  string
 	agent domain.AgentID
+	// started is when the log's first record was written, which is what
+	// orders a bead's agents ([logsByAge]). It is the zero time for the run
+	// log, which is never one of several.
+	started time.Time
 	// offset is how far the tail has already been printed, for --follow.
 	offset int64
 }
@@ -255,22 +260,75 @@ func logsResolve(runDir, arg string) ([]logSource, error) {
 	var out []logSource
 	for _, name := range names {
 		if logsMentions(name, want) {
+			path := filepath.Join(paths.AgentsDir, name+logging.AgentLogExt)
 			out = append(out, logSource{
-				name:  name,
-				path:  filepath.Join(paths.AgentsDir, name+logging.AgentLogExt),
-				agent: domain.AgentID(name),
+				name:    name,
+				path:    path,
+				agent:   domain.AgentID(name),
+				started: logsStartedAt(path),
 			})
 		}
 	}
 	if len(out) == 0 {
 		return nil, logsUnknown(runDir, arg, names)
 	}
+	logsByAge(out)
 	return out, nil
 }
 
+// logsByAge orders a bead's agent logs oldest first, which is what `sc
+// logs <bead-id>` promises: a bead is read as a story, and the agent that
+// went first should print first.
+//
+// Sorting by name is not that story. The ids are minted from the bead, the
+// lens and the round (eng-sc-1-r1, tester-qa-sc-1-r1), so name order groups
+// the engineer's rounds together ahead of the testers that judged the first
+// one — on a real run, eng-e2e-4-r2 printed before tester-qa-e2e-4-r1,
+// which ran three seconds earlier (P8-05). The tie-break is the name, so
+// two logs opened in the same instant still print in a fixed order.
+func logsByAge(srcs []logSource) {
+	sort.SliceStable(srcs, func(i, j int) bool {
+		a, b := srcs[i], srcs[j]
+		if !a.started.Equal(b.started) {
+			return a.started.Before(b.started)
+		}
+		return a.name < b.name
+	})
+}
+
+// logsStartedAt is when an agent's log was first written: the timestamp of
+// its first record, which is the moment the agent was spawned.
+//
+// A log file is one JSON object per line ([logging.NewFileHandler]) with a
+// "time" key, so the first line answers it exactly. Anything that does not
+// parse — an empty file the agent has not written to yet, a truncated first
+// line, a format that changes one day — falls back to the file's modification
+// time, and then to the zero time, which sorts first: an unreadable log is
+// never worth failing the command for.
+func logsStartedAt(path string) time.Time {
+	f, err := os.Open(path) //nolint:gosec // a path derived from the run directory
+	if err == nil {
+		defer func() { _ = f.Close() }()
+		line, rerr := bufio.NewReader(f).ReadString('\n')
+		if rerr == nil || errors.Is(rerr, io.EOF) {
+			var rec struct {
+				Time time.Time `json:"time"`
+			}
+			if json.Unmarshal([]byte(strings.TrimRight(line, "\r\n")), &rec) == nil && !rec.Time.IsZero() {
+				return rec.Time
+			}
+		}
+	}
+	if info, serr := os.Stat(path); serr == nil {
+		return info.ModTime()
+	}
+	return time.Time{}
+}
+
 // logsAgentNames lists the agent ids a run directory holds a log for, in
-// name order (which is stable, and groups an agent's rounds together). A
-// run that has not spawned an agent yet has no directory at all, which is
+// name order — which is the order the "this run has:" listing wants
+// ([logsUnknown]), the logs themselves being ordered by age ([logsByAge]).
+// A run that has not spawned an agent yet has no directory at all, which is
 // not an error: logsUnknown says so better than a stat failure would.
 func logsAgentNames(agentsDir string) ([]string, error) {
 	entries, err := os.ReadDir(agentsDir)

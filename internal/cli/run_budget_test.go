@@ -3,6 +3,7 @@ package cli
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -140,6 +141,15 @@ func TestRunChargesEveryAgentSessionAgainstTheRunBudget(t *testing.T) {
 	require.Contains(t, stdout, "says changes", "the qa lens asked for a fix")
 	require.Equal(t, 1, strings.Count(stdout, "fired engineer(mock)"),
 		"a crossed budget starts no new work: the engineer that owes the round an answer is held back")
+	// One session per lens, and no more. A verdict that has just emptied the
+	// round's reviewer list used to look, for as long as the bd comment took
+	// to write, like a round nobody owed a verdict — so a dispatch landing
+	// in that window re-derived the reviewers and fired the lens again. With
+	// the budget holding back the engineer firing that closes the round,
+	// that cycle had nothing to break it: runs were seen firing 181 tester
+	// sessions on one bead and never finishing (P9-01, P9-21).
+	require.Equal(t, len(domain.Lenses()), strings.Count(stdout, "fired tester/"),
+		"each lens reviews the round once")
 	require.Contains(t, stdout, "run finished: stopped")
 
 	sum := runBudgetSummary(t, env.Repo.Dir)
@@ -147,9 +157,10 @@ func TestRunChargesEveryAgentSessionAgainstTheRunBudget(t *testing.T) {
 	// The banner is written at the crossing: the planning session's 100 plus
 	// the engineer's 1000. Without MeterPlanner the engineer's session is
 	// never charged, the budget is never crossed, and the run carries on to
-	// deliver the bead. (How many tester sessions follow is the loop's
-	// business and is not pinned here: a lens whose demand is re-offered
-	// while the round closes can be fired more than once.)
+	// deliver the bead. The three reviews the round already owed are fired
+	// after it and add 30 more, which is why the total in the summary is
+	// larger than the cap: it is a floor on when new work stops, not a
+	// ceiling on the spend (docs/config.md).
 	require.Contains(t, sum.FinishSummary, "1100 tokens of its 500 budget (limits.max_tokens)")
 	require.Zero(t, sum.Merges, "the bead still owes a fix, so nothing landed")
 }
@@ -168,4 +179,56 @@ func TestRunRefusesAConfigThatAsksForNoPushbackRounds(t *testing.T) {
 	require.Equal(t, 1, code)
 	require.Contains(t, stderr, "limits.max_pushback_rounds")
 	require.Contains(t, stderr, "must be at least 1")
+}
+
+// TestRunResumedCarriesTheBudgetItAlreadySpent is the budget's other real
+// claim: `limits.max_tokens` caps the *run*, not one `sc run`.
+//
+// The spend used to live only in the process, so every `--resume` of the
+// same run id started counting from zero: a 4000-token cap was seen to
+// produce 18854 tokens over two invocations of one run, each of them
+// warning about "its 4000 budget" as though nothing had been spent. Now the
+// budget rides in state.json, and a resume is worth exactly one more
+// budget's worth — the same grant clearing a pause makes.
+func TestRunResumedCarriesTheBudgetItAlreadySpent(t *testing.T) {
+	env := runBudgetSetup(t, 500, runFireScenario(),
+		runBudgetSpend{"plan": 1000, "engineer": 10, "tester": 10})
+
+	stdout, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief,
+		"--headless", "--cartridge", "mock")
+	require.Equal(t, 0, code, "stdout:\n%s\nstderr:\n%s", stdout, stderr)
+	require.Contains(t, stdout, "1000 tokens of its 500 budget")
+
+	first := runLatestID(t, env.Repo.Dir)
+	st, err := orchestrator.LoadState(config.RunDir(env.Repo.Dir, string(first)))
+	require.NoError(t, err)
+	require.Equal(t, int64(1000), st.Spent().Spend.Tokens,
+		"the run's own state file must carry what it spent, or --resume cannot")
+
+	stdout, stderr, code = runFireExec(t, env.Repo.Dir, "--resume", "--headless", "--cartridge", "mock")
+	require.Equal(t, 0, code, "stdout:\n%s\nstderr:\n%s", stdout, stderr)
+	require.Equal(t, first, runLatestID(t, env.Repo.Dir), "the resume must be of the same run")
+
+	// The notice goes into the run's event log — what `sc logs` prints and
+	// `sc status` folds — rather than being asserted on the screen: it is
+	// published as the resumed run takes its first tick, which is before
+	// the headless renderer has subscribed to the bus.
+	log, err := os.ReadFile(filepath.Join(config.RunDir(env.Repo.Dir, string(first)), orchestrator.EventLogName))
+	require.NoError(t, err)
+	require.Contains(t, string(log), "the run was resumed over its budget: it carries the 1000 tokens",
+		"a resumed run says what it inherited rather than starting again at zero")
+	require.Contains(t, string(log), "will stop again at 1500 tokens",
+		"a resume is worth one more budget's worth, not a whole fresh budget")
+
+	// And the spend the summary reports is the run's, not this process's.
+	out := stdout + stderr
+	require.Regexp(t, `spend +1[0-9]{3} tokens`, out,
+		"the summary counts the tokens of the earlier invocation too")
+
+	st, err = orchestrator.LoadState(config.RunDir(env.Repo.Dir, string(first)))
+	require.NoError(t, err)
+	require.Greater(t, st.Spent().Spend.Tokens, int64(1000),
+		"the resumed run wrote its own spend back on top of what it inherited")
+	require.Equal(t, 3, st.Spent().Grants,
+		"one grant to start with, and the two it took to put 1000 tokens under a 500 ceiling")
 }

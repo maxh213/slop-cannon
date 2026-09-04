@@ -409,14 +409,22 @@ func TestStatusReportsWhoIsRunningIt(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, rep.Running())
 	require.True(t, rep.Crashed())
-	require.Contains(t, rep.Notes, "the run lock is held by run 20260904-000000-ffff (pid "+strconv.Itoa(os.Getpid())+")")
+	require.Equal(t, domain.RunID("20260904-000000-ffff"), rep.Liveness.Holder.Run)
+	// The phase is still a live one, so the process row says whose lock it
+	// is — and the note must not say it a second time (P8-05).
+	held := "the run lock is held by run 20260904-000000-ffff (pid " + strconv.Itoa(os.Getpid()) + ")"
+	require.NotContains(t, rep.Notes, held, "the process row already says this")
+	out, err := rootRun(t, "--repo", repo, "status", "--events", "0")
+	require.NoError(t, err)
+	require.Contains(t, out, "process    none; "+held)
+	require.Equal(t, 1, strings.Count(out, held), "the report must say it once")
 
 	// The lock is this run's, but the process that took it is gone: what a
 	// SIGKILL leaves behind.
 	dead := exec.Command("/bin/sh", "-c", "exit 0")
 	require.NoError(t, dead.Run())
 	statusLock(t, dir, dead.Process.Pid)
-	out, err := rootRun(t, "--repo", repo, "status", "--events", "0")
+	out, err = rootRun(t, "--repo", repo, "status", "--events", "0")
 	require.NoError(t, err)
 	require.Contains(t, out, fmt.Sprintf("process    none; pid %d took the run lock and is gone", dead.Process.Pid))
 	require.Contains(t, out, "phase      running (no live process: the run was killed or crashed)")
@@ -430,6 +438,40 @@ func TestStatusReportsWhoIsRunningIt(t *testing.T) {
 	out, err = rootRun(t, "--repo", repo, "status", "--events", "0")
 	require.NoError(t, err)
 	require.Contains(t, out, "process    none; nothing holds the run lock")
+}
+
+// TestStatusNotesAnotherRunsLockOnlyWhenTheProcessRowIsSilent is the other
+// half of P8-05's no-repetition rule. A run that has *finished* releases
+// its lock, so its process row says nothing at all — and a lock file left
+// naming another run is then news the report would otherwise lose. Here the
+// note is the only place it can be said, and it is said exactly once.
+func TestStatusNotesAnotherRunsLockOnlyWhenTheProcessRowIsSilent(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := statusRecord(t, repo, true)
+	st, err := orchestrator.LoadState(dir)
+	require.NoError(t, err)
+	st.Phase = orchestrator.PhaseFinished
+	st.Finish = events.FinishCompleted
+	require.NoError(t, orchestrator.WriteState(dir, st))
+
+	// A later run of the same repository is firing while this one is read.
+	data, err := json.Marshal(orchestrator.LockHolder{
+		Run: "20260904-000000-ffff", PID: os.Getpid(), TakenAt: statusEpoch,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(orchestrator.LockPath(dir), data, 0o600))
+
+	held := "the run lock is held by run 20260904-000000-ffff (pid " + strconv.Itoa(os.Getpid()) + ")"
+	rep, err := RunStatus(repo, statusRunID, 0)
+	require.NoError(t, err)
+	require.False(t, rep.Phase().Live())
+	require.Equal(t, held, rep.Notes[0], "the lock outranks the other notes")
+
+	out, err := rootRun(t, "--repo", repo, "status", "--events", "0")
+	require.NoError(t, err)
+	require.Contains(t, out, "note: "+held)
+	require.NotContains(t, out, "process    ", "a finished run owes no process row")
+	require.Equal(t, 1, strings.Count(out, held), "the report must say it once")
 }
 
 // TestStatusAgentsFallBackToTheStateFile: a run directory whose log is gone

@@ -289,14 +289,24 @@ func e2eScenario(brief string) *mock.Scenario {
 				},
 			},
 		})
-	sc.Rule("first engineer", mock.Match{Role: string(domain.RoleEngineer)}).Once().
+	// The two engineers are told apart by the bead in front of them, not by
+	// the order they fire in: a resumed run may implement only the second
+	// bead (the first was already delivered when the process died), and a
+	// rule that fired Once() per process would then write the first bead's
+	// file onto the second bead's branch, where the rebase drops it as an
+	// empty commit (P9-03).
+	sc.Rule("first engineer", mock.Match{
+		Role: string(domain.RoleEngineer), PromptContains: "Add a notes file",
+	}).
 		Say("Adding the first note.").
 		Write(e2eWorkFiles[0], "the first note\n").
 		Structured(domain.ImplReport{
 			Summary: "Added " + e2eWorkFiles[0] + ".", FilesChanged: []string{e2eWorkFiles[0]},
 			HowToVerify: "ls " + e2eWorkFiles[0],
 		})
-	sc.Rule("second engineer", mock.Match{Role: string(domain.RoleEngineer)}).
+	sc.Rule("second engineer", mock.Match{
+		Role: string(domain.RoleEngineer), PromptContains: "Extend the notes",
+	}).
 		Say("Adding the second note.").
 		Write(e2eWorkFiles[1], "the second note\n").
 		Structured(domain.ImplReport{
@@ -441,8 +451,14 @@ func e2eBuild(t *testing.T, env *e2eEnv, safety, resume bool) *e2eRig {
 	cfg.Safety = safety
 	// A trivial check command: the fixture repository ships two planted
 	// bugs on purpose (testutil.PlantedBugTests), so `go test ./...` would
-	// fail the safety-off delivery for reasons this test is not about.
+	// fail the safety-off delivery for reasons this test is not about. The
+	// crash-recovery child replaces it with one that blocks, which is how a
+	// kill point lands inside a delivery (P9-03, recModeMerging); nothing
+	// but that child sets the variable.
 	cfg.CheckCommand = "true"
+	if hold := os.Getenv(recCheckEnv); hold != "" {
+		cfg.CheckCommand = hold
+	}
 	cfg.ActiveCartridge = mock.Name
 	cfg.Cartridges = map[string]config.Cartridge{mock.Name: {}}
 	eff := &config.Effective{Config: cfg, Sources: map[string]config.Source{}}
@@ -582,10 +598,22 @@ func e2eBuild(t *testing.T, env *e2eEnv, safety, resume bool) *e2eRig {
 		rec, rerr := client.RecoverStale(ctx, beads.RecoverOptions{Run: rc.Run.ID, Now: rig.now})
 		require.NoError(t, rerr)
 		rig.Recovered = rec
-		resumer, rerr := gitx.NewResumer(manager, client, gitx.WithResumeLogger(logger))
+		// The tracker gitx writes the reconciled states through is the
+		// production P6-37 guard, not the raw client: `sc run` wraps one
+		// around it (cli.runResumer) and every bead-status write of a
+		// resume is checked against the D-07 table before it reaches bd.
+		// Without it these tests would prove a resume path the shipped
+		// binary does not have.
+		tracker, rerr := NewResumeTracker(ResumeTrackerOptions{
+			Store: client, Beads: client, Statuses: rig.Statuses, Logger: logger,
+		})
+		require.NoError(t, rerr)
+		resumer, rerr := gitx.NewResumer(manager, tracker, gitx.WithResumeLogger(logger))
 		require.NoError(t, rerr)
 		runOpts.Resumer = resumer
-		runOpts.OnResume = e2eResumeHandler{rig: rig}
+		// The production hand-off type as well (P9-03): `sc run` gives the
+		// run exactly this, with exactly this late binding.
+		runOpts.OnResume = DeliveryResumeHandler{Deliverer: rig.deliverer}
 	}
 	run, err := New(rc, runOpts)
 	require.NoError(t, err)
@@ -656,19 +684,6 @@ func (r *e2eRig) record(id domain.BeadID, out *DeliveryOutcome, err error) {
 	r.mu.Lock()
 	r.delivered[id] = out
 	r.mu.Unlock()
-}
-
-// e2eResumeHandler is the run's [ResumeHandler]: it forwards to the
-// deliverer, which is built after the run and so cannot be named in the
-// options.
-type e2eResumeHandler struct{ rig *e2eRig }
-
-func (h e2eResumeHandler) RedeliverPR(ctx context.Context, e gitx.ResumeEntry) error {
-	return h.rig.deliverer().RedeliverPR(ctx, e)
-}
-
-func (h e2eResumeHandler) ConflictRound(ctx context.Context, e gitx.ResumeEntry) error {
-	return h.rig.deliverer().ConflictRound(ctx, e)
 }
 
 // deliverer reads the rig's deliverer under the lock.
@@ -1418,8 +1433,11 @@ func TestE2EFakeBDBehavesLikeBD(t *testing.T) {
 // no worktree cleanup — and a second invocation of the same stack picks the
 // same run up and finishes it.
 //
-// It exercises, against real bd (the fixture tracker), real git and the
-// mock cartridge: RestoreRunConfig putting the frozen snapshot back
+// It exercises, against the real beads.Client driving the fixture tracker
+// (testdata/orchestrator/fakebd, the stand-in this file's header
+// describes; the real bd 1.2.2 is covered by the tagged integration
+// suite), real git and the mock cartridge: RestoreRunConfig putting the
+// frozen snapshot back
 // (P6-11); beads.RecoverStale returning the killed process's claims to the
 // ready set (P3-05); gitx.Resumer reattaching the worktrees and
 // reconciling branch state into bead state, with the run acting on what it

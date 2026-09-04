@@ -287,6 +287,9 @@ func TestSecretFilterTextMasksValues(t *testing.T) {
 	for _, tc := range []struct{ name, in string }{
 		{"api token", "run with " + plantedToken},
 		{"assignment", plantedPassword},
+		{"assignment behind a log prefix", "2026-01-01 INFO  " + plantedPassword},
+		{"assignment inside a sentence", "the check printed " + plantedPassword + " again"},
+		{"assignment after an export", "export " + plantedPassword},
 		{"pem body", plantedKey},
 		{"aws key", "id AKIAIOSFODNN7EXAMPLE"},
 		{"bearer", "Authorization: Bearer abcdefghijklmnop"},
@@ -298,6 +301,22 @@ func TestSecretFilterTextMasksValues(t *testing.T) {
 	}
 	assert.Contains(t, f.Text(plantedPassword), "DATABASE_PASSWORD=", "the name survives so the line still reads")
 	assert.Contains(t, f.Text("+API_TOKEN=abcdefghijkl"), "+API_TOKEN=", "a diff line is masked, prefix and all")
+
+	// The rule is not anchored to the start of a line: a credential
+	// assignment reaches a transcript, a bd comment and a pull request body
+	// far more often inside a line a check or an agent printed than at the
+	// start of one, and every one of those sinks is fed by this rule
+	// (P9-05, P9-09).
+	for _, line := range []string{
+		"2026-01-01 INFO  MY_API_TOKEN=prefixedsecretvalue2",
+		"failed: MY_API_TOKEN=prefixedsecretvalue2 was rejected",
+		"  - env: MY_API_TOKEN=prefixedsecretvalue2",
+	} {
+		got := f.Text(line)
+		assert.NotContains(t, got, "prefixedsecretvalue2", "the value survived in %q", line)
+		assert.Contains(t, got, "MY_API_TOKEN=", "the name survives so the line still reads")
+		assert.Equal(t, got, f.Text(got), "redaction must be idempotent")
+	}
 
 	// The rule must not fire inside an expression: a reviewed diff of code
 	// that reads a credential from the environment is not itself a leak.
@@ -513,4 +532,99 @@ func secretsProductionSources(t *testing.T) map[string]string {
 	}
 	require.NotEmpty(t, out)
 	return out
+}
+
+// TestSecretFilterWithholdsThePathsAnAgentNames is the path half applied to
+// a *reply* rather than to something git or the scan produced.
+//
+// It is P9-05's second wiring failure, and the mirror of
+// TestTheDiffHalfOfTheFilterHasAProductionCaller: the tree was filtered and
+// the diff was filtered, but an engineer that wrote ".env" and then listed
+// it in `files_changed` put the path back into the tester's prompt, into the
+// bd comment and into the pull request body — the three sinks
+// [agents.SecretFilter.Message] feeds. Masking cannot help there, because a
+// path is not a secret value, so the entry is replaced by a placeholder that
+// names neither it nor the pattern that hid it.
+func TestSecretFilterWithholdsThePathsAnAgentNames(t *testing.T) {
+	t.Parallel()
+	f := mustFilter(t, "secrets/*")
+
+	rep := domain.ImplReport{
+		Summary:      "Wired the deploy step.",
+		FilesChanged: []string{"main.go", ".env", "certs/server.pem", "secrets/deploy.txt", "docs/readme.md"},
+		HowToVerify:  "go test ./...",
+	}
+	out := f.Report(&rep)
+	require.NotNil(t, out)
+	assert.Equal(t, []string{
+		"main.go", agents.SecretPathPlaceholder, agents.SecretPathPlaceholder,
+		agents.SecretPathPlaceholder, "docs/readme.md",
+	}, out.FilesChanged, "every excluded path is withheld, in place, and the visible ones survive")
+	assert.Equal(t, []string{"main.go", ".env", "certs/server.pem", "secrets/deploy.txt", "docs/readme.md"},
+		rep.FilesChanged, "the caller's report is not written through")
+
+	// The placeholder is the point: it says a file was touched without
+	// saying which, because the path is all an agent with a read tool needs.
+	assert.NotContains(t, agents.SecretPathPlaceholder, ".env")
+	assert.NotContains(t, agents.SecretPathPlaceholder, "secrets/")
+
+	// Idempotent: a payload replayed from bd passes through twice.
+	assert.Equal(t, out.FilesChanged, f.Report(out).FilesChanged)
+}
+
+// TestSecretFilterWithholdsAnItemsFile is the same for the way back: the
+// tester names the file it is unhappy about, and that file lands in the
+// engineer's next prompt.
+func TestSecretFilterWithholdsAnItemsFile(t *testing.T) {
+	t.Parallel()
+	f := mustFilter(t, "secrets/*")
+
+	v := domain.Verdict{
+		Outcome: domain.VerdictChanges,
+		Summary: "The credentials are committed.",
+		Items: []domain.FeedbackItem{
+			{ID: "1", Severity: domain.SeverityBlocker, Title: "committed key", File: "certs/server.pem", Line: 3},
+			{ID: "2", Severity: domain.SeverityMinor, Title: "typo", File: "docs/readme.md"},
+			{ID: "3", Severity: domain.SeverityNit, Title: "no file"},
+		},
+	}
+	got := f.Verdicts([]domain.Verdict{v})
+	require.Len(t, got, 1)
+	assert.Equal(t, agents.SecretPathPlaceholder, got[0].Items[0].File)
+	assert.Equal(t, 3, got[0].Items[0].Line, "the line number names nothing on its own")
+	assert.Equal(t, "docs/readme.md", got[0].Items[1].File)
+	assert.Empty(t, got[0].Items[2].File)
+	assert.Equal(t, "certs/server.pem", v.Items[0].File, "the caller's verdict is not written through")
+
+	// The same list arriving as items — what a failed check raises (P6-06).
+	items := f.Items([]domain.FeedbackItem{{ID: "1", File: "secrets/deploy.txt"}})
+	require.Len(t, items, 1)
+	assert.Equal(t, agents.SecretPathPlaceholder, items[0].File)
+
+	// And the value half still runs beside it.
+	masked := f.Items([]domain.FeedbackItem{{ID: "1", File: "main.go", Detail: plantedPassword}})
+	require.Len(t, masked, 1)
+	assert.NotContains(t, masked[0].Detail, "hunter2")
+}
+
+// TestSecretFilterMessageLeavesTheRestAlone pins the boundary of the path
+// half: it rewrites the two fields that name a file and nothing else, so a
+// plan, a response, an arbitration and an escalation come back as they were
+// but for the value redaction.
+func TestSecretFilterMessageLeavesTheRestAlone(t *testing.T) {
+	t.Parallel()
+	f := mustFilter(t)
+
+	resp, ok := f.Message([]domain.Response{{ItemID: "1", Action: domain.ActionFixed, Rationale: "done"}}).([]domain.Response)
+	require.True(t, ok)
+	assert.Equal(t, "done", resp[0].Rationale)
+
+	bead, ok := f.Message(domain.Bead{ID: "sc-1", Title: "Add .env support"}).(domain.Bead)
+	require.True(t, ok)
+	assert.Equal(t, "Add .env support", bead.Title, "prose that mentions a path is prose, not a path field")
+
+	assert.Nil(t, f.Report(nil))
+	assert.Nil(t, f.Verdicts(nil))
+	assert.Nil(t, f.Items(nil))
+	assert.Equal(t, 7, f.Message(7), "a payload the walk does not know comes back as it was")
 }

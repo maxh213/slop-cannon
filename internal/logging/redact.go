@@ -153,18 +153,29 @@ func SafeText(s string) string {
 	return Redact(textsafe.ScrubBlock(s, textsafe.DisplayPolicy()))
 }
 
-// SafeEvent is the publication-time hook (P7-17, P9-09): it returns ev with
-// every untrusted field — an agent's output line, a warning's message, a
-// verdict's prose, a bead title a model wrote — put through [SafeText].
+// SafeEvent is the default-rules form of the publication-time hook (P7-17,
+// P9-09): it returns ev with every untrusted field — an agent's output
+// line, a warning's message, a verdict's prose, a bead title a model wrote
+// — put through [SafeText].
 //
 // [events.Bus] never transforms what it carries, on purpose: one subscriber
 // must not be able to change what another sees, and the JSONL run log has to
-// be a faithful record of what was published. So the orchestrator, the
-// supervisor and the cartridge adapters call this where they build the
-// event, once, and every consumer — the run log, the headless renderer, the
-// TUI and `sc status` — is then reading text that is already safe. The views
-// keep their own scrubbing as a second line of defence for events built
+// be a faithful record of what was published. The hook therefore belongs to
+// whoever publishes, and a run has exactly one publication point: the
+// publisher `sc run` assembles (internal/cli, runPublisher.Publish), which
+// puts every event through [Redactor.SafeEvent] before the agent
+// transcripts, the run log, the bus and the delivery settler ever see it.
+// Nothing in the orchestrator, the supervisor or a cartridge adapter calls
+// this itself — they publish through that one publisher, so a new event
+// kind is covered the moment it is published, and it is a *new publisher*
+// outside that path, not a new field, that would not be. The views keep
+// their own scrubbing as a second line of defence for events built
 // elsewhere; it is idempotent, so it costs a scan and changes nothing.
+//
+// Production uses [Redactor.SafeEvent] rather than this one, because a run
+// carries the extra rules its `exclude` list built (agents.SecretFilter,
+// P9-05). This form and the two below are the default-rules equivalents,
+// for a caller with no run-scoped redactor to hand.
 func SafeEvent(ev events.Event) events.Event { return events.Redacted(ev, SafeText) }
 
 // RedactEvent is [SafeEvent] without the escape scrubbing: the secret rules
@@ -177,9 +188,11 @@ func (r *Redactor) Event(ev events.Event) events.Event { return events.Redacted(
 
 // SafeEvent is [SafeEvent] for a redactor with extra rules of its own: the
 // escape scrub first — so a token split by an escape sequence is still
-// masked — then this redactor's rules. It is what a run wires in front of
-// its event log and its bus, with the redactor the run's `exclude` list
-// built ([agents.SecretFilter.Redactor], P9-05).
+// masked — then this redactor's rules. It is the hook a run actually
+// applies: `sc run` wires it into the publisher every event goes through,
+// with the redactor the run's `exclude` list built
+// ([agents.SecretFilter.Redactor], P9-05), so the agent transcripts, the
+// run log, the bus and everything reading them carry masked text.
 func (r *Redactor) SafeEvent(ev events.Event) events.Event {
 	return events.Redacted(ev, func(s string) string {
 		return r.Redact(textsafe.ScrubBlock(s, textsafe.DisplayPolicy()))

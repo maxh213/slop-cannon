@@ -25,28 +25,52 @@ package orchestrator
 //   - agents that were mid-flight re-fired — the resumed process fires an
 //     engineer for the bead the killed process was holding, and the run
 //     finishes both beads;
-//   - delivered beads not re-delivered — a bead whose pull request was
-//     opened and whose gate closed before the crash gets no second pull
-//     request and no second delivery, checked against the branch and pull
-//     request state the gh shim recorded across both processes.
+//   - delivered beads not re-delivered — with safety on, a bead whose pull
+//     request was opened and whose gate closed before the crash gets no
+//     second pull request and no second delivery, checked against the
+//     branch and pull request state the gh shim recorded across both
+//     processes; with safety off, a bead whose fast-forward landed on the
+//     default branch before the crash is closed from the branch state
+//     alone, and no second delivery touches the default branch.
 //
-// Two of the four kill points are the hard ones, and they are what the two
-// P6-15 hand-offs exist for (P9-03 review):
+// Three of the kill points are the hard ones, and they are what the three
+// resume hand-offs exist for (P6-15, P9-03):
 //
 //   - killed *inside* a pull request delivery, between `gh pr create` and
 //     `bd gate create`: the bead is left `delivering` with its pull request
 //     recorded and no gh:pr gate, which nothing polls and nothing can ever
 //     close, so its dependents can never become ready (D-20). Only
 //     Deliverer.RedeliverPR gets that bead moving again;
+//   - killed *before* the delivery had anything to point at — safety off,
+//     inside the repository's own check command, which the delivering
+//     status is written well before: no pull request, no conflict, nothing
+//     landed. Nothing else in the run ships a delivering bead (the
+//     conductor offers only approved ones, the gate poller watches only
+//     gh:pr gates), so without Deliverer.Redeliver that bead and its
+//     dependents hang for as long as the run lives;
 //   - killed with a worktree left mid-rebase: the bead owes its engineer a
 //     conflict round before anything may be delivered from that worktree
 //     (D-10), which is Deliverer.ConflictRound.
 //
-// Both hand-offs reach the deliverer through orchestrator.Options.OnResume,
-// which `sc run` fills in [cli.assembleRun]; that wiring is pinned in
-// internal/cli (TestRunWiresTheResumeHandoffsToTheDeliverer), because a run
-// assembled without it reconciles the worktrees and then does nothing about
-// what it found — which is what this file's rig would otherwise hide.
+// All three hand-offs reach the deliverer through
+// orchestrator.Options.OnResume, and through the very type `sc run` puts
+// there: [DeliveryResumeHandler], built by [e2eBuild] exactly as
+// [cli.assembleRun] builds it, over the P6-37 [ResumeTracker] guard that
+// checks every bead-status write of a resume against the D-07 table. The
+// wiring itself is pinned in internal/cli
+// (TestRunWiresTheResumeHandoffsToTheDeliverer), because a run assembled
+// without it reconciles the worktrees and then does nothing about what it
+// found — which is what this file's rig would otherwise hide.
+//
+// Two things this file deliberately does not prove, so that its claims
+// match what runs. The "pull request opened before the crash" subtest runs
+// against recFakeGH, which reports every pull request MERGED — the state
+// the gate poller needs to close a safety-on bead — so the resume's OPEN
+// branch is not taken here; it is covered by unit tests in
+// internal/gitx/cleanup_test.go. And the "delivered" pair covers a crash
+// after the pull request (safety on) and after the fast-forward (safety
+// off), but a delivered bead whose branch was deleted, or whose pull
+// request was closed without merging, is again gitx's own test's.
 //
 // Every helper here is prefixed "rec" so it cannot collide with e2e_test.go
 // (whose rig it reuses) or with any other file in the package.
@@ -59,6 +83,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -97,10 +122,23 @@ const (
 	// child knows the delivery has reached the exact instant the crash must
 	// land on.
 	recGateHitEnv = "SC_RECOVERY_GATE_HIT"
+	// recCloseHitEnv names the file the bd wrapper writes when it has
+	// swallowed a `bd close` (recModeLanded only): the merge and the push
+	// happened, and the close that would have ended the delivery never
+	// reached the tracker.
+	recCloseHitEnv = "SC_RECOVERY_CLOSE_HIT"
+	// recCheckEnv replaces the rig's trivial check command with one that
+	// blocks (recModeMerging only), so the crash lands inside a delivery
+	// that has written `delivering` and has nothing to show for it yet.
+	recCheckEnv = "SC_RECOVERY_CHECK"
+	// recCheckHitEnv names the file that blocking check command creates the
+	// moment it starts, which is how the child knows the delivery has
+	// reached the kill point.
+	recCheckHitEnv = "SC_RECOVERY_CHECK_HIT"
 )
 
-// The kill points. Both are states of the *run*, not of the child process,
-// so the parent never has to guess how far the child got.
+// The kill points. Every one of them is a state of the *run*, not of the
+// child process, so the parent never has to guess how far the child got.
 const (
 	// recModeInFlight kills the run while an engineer holds a bead: the
 	// bead is in_progress with a lease and its worktree exists.
@@ -109,6 +147,22 @@ const (
 	// pull request was opened and its gate closed, so the bead is closed
 	// and must never be delivered again.
 	recModeDelivered = "delivered"
+	// recModeMerging kills the run in the middle of a safety-off delivery,
+	// before it has anything to point at: the bead is `delivering`, its
+	// check command is blocking, and there is no pull request, no conflict
+	// and nothing on the default branch. It is the widest crash window in
+	// the product — the delivering status is written before the rebase, so
+	// it covers the check command, which is minutes long in a real
+	// repository — and the only thing that can end it is
+	// Deliverer.Redeliver (P9-03).
+	recModeMerging = "merging"
+	// recModeLanded kills a safety-off run between the fast-forward and the
+	// `bd close` that ends the delivery: the work is on the default branch
+	// (locally and on the remote) and the bead is still `delivering`. The
+	// resume must close it from the branch state alone and must not deliver
+	// it again, because a second delivery of a landed branch is a git
+	// operation on the default branch.
+	recModeLanded = "landed"
 	// recModeDelivering kills the run in the middle of the pull request
 	// delivery: the pull request has been opened and recorded on the bead
 	// and the gh:pr gate that watches it does not exist, because the bd
@@ -304,6 +358,153 @@ func TestRecoveryKillNineAndResume(t *testing.T) {
 		}
 		assert.Equal(t, mainBefore, rig.Repo.Head(t), "the local default branch never moved (D-10)")
 		assert.Equal(t, mainBefore, e2eRemoteHead(t, rig), "nor did the remote one (D-10)")
+		assert.Zero(t, rig.Adapter.Uses("plan"), "the resumed run fired no product owner")
+		recAssertResumedRun(t, rig, crash)
+	})
+
+	t.Run("a delivery interrupted before it had anything to show is finished", func(t *testing.T) {
+		ctx := context.Background()
+		crash := recCrash(t, recModeMerging, false)
+		stuck := crash.Sig.Bead
+		mainBefore := crash.Env.Repo.Head(t)
+
+		// What the crash left behind is the state that hangs for ever with
+		// safety off: the bead is `delivering` — written before the rebase,
+		// the check and the merge — with no pull request to re-open, no
+		// conflict to resolve and nothing on the default branch. Nothing
+		// else in the run ships a delivering bead, and `delivering` is
+		// neither terminal nor settled, so the run cannot finish and the
+		// dependent can never become ready (D-20).
+		assert.Equal(t, PhaseRunning, crash.State.Phase, "the killed run never reached a finished state")
+		assert.Equal(t, domain.BeadStateDelivering, crash.Killed[stuck], "%s was mid-delivery", stuck)
+		assert.Zero(t, crash.Sig.PRNumber, "safety off records no pull request")
+		assert.Empty(t, crash.Sig.PRURL)
+		assert.Empty(t, crash.Sig.Gate, "and no gate blocks it")
+		assert.Zero(t, crash.Sig.PRCreates, "gh was never asked to open one")
+		assert.DirExists(t, crash.Sig.Worktree, "the killed run's worktree is still there")
+		require.NotNil(t, crash.Hold)
+		assert.FileExists(t, crash.Hold.Hit, "the delivery really was inside the check command")
+
+		// --- the resume ---------------------------------------------------
+		rig := e2eBuild(t, crash.Env, false, true)
+		require.Equal(t, crash.Sig.Run, rig.RC.Run.ID, "the resume found the killed run")
+		require.NotNil(t, rig.Run.ResumeHandler(),
+			"a run must be assembled with a resume handler or this state is unreachable (P6-15)")
+
+		rig.start(ctx)
+		recAssertLockTakenOver(t, rig, crash)
+
+		// P9-03: gitx reconciled the bead to "the delivery did not
+		// complete; deliver again" and left it delivering, and the run
+		// handed it to Deliverer.Redeliver, which re-ran the idempotent
+		// delivery from the top.
+		entry := recResumeEntry(t, rig, stuck)
+		assert.Equal(t, gitx.WorktreeAttached, entry.WorktreeStatus)
+		assert.False(t, entry.Conflict, "the worktree is not mid-rebase: %s", entry.Reason)
+		assert.Empty(t, entry.PRState, "and there is no pull request to point at")
+		assert.False(t, entry.Landed, "nothing had landed when the process died")
+		assert.Equal(t, domain.BeadStateDelivering, entry.State,
+			"the resume leaves it delivering: %s", entry.Reason)
+		assert.False(t, entry.Changed())
+		assert.Contains(t, entry.Reason, "deliver again")
+
+		out, err := rig.wait(e2eTimeout)
+		require.NoError(t, err, "problems: %v", rig.Problems())
+		assert.Empty(t, rig.Problems(), "the conductor hit no problem")
+		assert.Equal(t, events.FinishCompleted, out.Reason,
+			"the run that could not finish before now does")
+
+		// The interrupted delivery finished as an uninterrupted one does,
+		// and the dependent — which could only become ready once the stuck
+		// bead closed (D-20) — went through behind it. Both beads are read
+		// back from bd rather than from anything the run remembers.
+		//
+		// e2eAssertBothBeadsClosed is deliberately not used here: it also
+		// asserts a review round per bead in this process, and the stuck
+		// bead was reviewed and approved by the process that died.
+		states := rig.States(ctx)
+		require.Len(t, states, 2)
+		for id, st := range states {
+			assert.Equalf(t, domain.BeadStateClosed, st, "%s is closed", id)
+		}
+		for _, o := range rig.Outcomes() {
+			assert.Equal(t, DeliveryMerged, o.Kind, "safety off merges")
+		}
+		for _, f := range e2eWorkFiles {
+			assert.FileExistsf(t, filepath.Join(rig.Repo.Dir, f), "%s landed on the default branch", f)
+			assert.Equalf(t, 1, recCommitsTouching(t, rig, f),
+				"exactly one commit on the default branch adds %s across both processes", f)
+		}
+		assert.NotEqual(t, mainBefore, rig.Repo.Head(t), "the default branch moved on, once the run could")
+		assert.True(t, recIsAncestor(t, rig, mainBefore, rig.Repo.Head(t)),
+			"and only forwards: the resumed run built on what the crash left")
+		assert.Equal(t, rig.Repo.Head(t), e2eRemoteHead(t, rig), "and was pushed")
+		assert.Zero(t, rig.Adapter.Uses("plan"), "the resumed run fired no product owner")
+		recAssertResumedRun(t, rig, crash)
+	})
+
+	t.Run("a fast forward that landed before the crash is closed not delivered again", func(t *testing.T) {
+		ctx := context.Background()
+		crash := recCrash(t, recModeLanded, false)
+		shipped := crash.Sig.Bead
+		mainAfterCrash := crash.Env.Repo.Head(t)
+
+		// The safety-off half of "delivered beads are not re-delivered":
+		// the fast-forward landed and was pushed, and the crash hit before
+		// the close, so bd still says `delivering` while git says the work
+		// is on the default branch. A second delivery here would be a git
+		// operation on the default branch (D-10's whole point), so the
+		// resume must close the bead from the branch state alone.
+		assert.Equal(t, PhaseRunning, crash.State.Phase, "the killed run never reached a finished state")
+		assert.Equal(t, shipped, crash.Gate.Swallowed(t), "the close of %s never reached bd", shipped)
+		assert.Equal(t, domain.BeadStateDelivering, crash.Killed[shipped], "so bd still has it delivering")
+		assert.Zero(t, crash.Sig.PRCreates, "safety off opens no pull request")
+		assert.Equal(t, mainAfterCrash, recRevParse(t, crash.Env.Repo, crash.Sig.Branch),
+			"the default branch was fast-forwarded to %s's tip", shipped)
+		assert.Equal(t, mainAfterCrash, recRemoteHead(t, crash.Env.Repo),
+			"and pushed, before the process died")
+
+		// --- the resume ---------------------------------------------------
+		rig := e2eBuild(t, crash.Env, false, true)
+		require.Equal(t, crash.Sig.Run, rig.RC.Run.ID, "the resume found the killed run")
+
+		rig.start(ctx)
+		recAssertLockTakenOver(t, rig, crash)
+
+		// The resume read the branch, not a guess: the bead is closed with
+		// sc_merge_sha, and no delivery ran for it in this process.
+		entry := recResumeEntry(t, rig, shipped)
+		assert.True(t, entry.Landed, "the branch is on the default branch: %s", entry.Reason)
+		assert.Equal(t, domain.BeadStateClosed, entry.State)
+		assert.True(t, entry.Changed())
+		assert.True(t, entry.Applied)
+		assert.Equal(t, mainAfterCrash, entry.MergeSHA, "recorded as the commit that landed")
+		assert.Contains(t, entry.Reason, "landed on main")
+
+		out, err := rig.wait(e2eTimeout)
+		require.NoError(t, err, "problems: %v", rig.Problems())
+		assert.Empty(t, rig.Problems(), "the conductor hit no problem")
+		assert.Equal(t, events.FinishCompleted, out.Reason)
+
+		assert.NotContains(t, rig.Outcomes(), shipped, "the resumed run did not deliver %s again", shipped)
+		// As in the subtest above, the states are read back from bd rather
+		// than through e2eAssertBothBeadsClosed, which also expects a review
+		// round per bead in this process: this bead's happened in the
+		// process that died.
+		states := rig.States(ctx)
+		require.Len(t, states, 2)
+		for id, st := range states {
+			assert.Equalf(t, domain.BeadStateClosed, st, "%s is closed", id)
+		}
+		for _, f := range e2eWorkFiles {
+			assert.Equalf(t, 1, recCommitsTouching(t, rig, f),
+				"exactly one commit on the default branch adds %s across both processes", f)
+		}
+		// The default branch only ever moved forwards: what the crash left
+		// on it is still an ancestor of where the resumed run left it.
+		assert.True(t, recIsAncestor(t, rig, mainAfterCrash, rig.Repo.Head(t)),
+			"the resumed run built on the crash's default branch instead of rewriting it")
+		assert.Equal(t, rig.Repo.Head(t), e2eRemoteHead(t, rig), "and pushed it")
 		assert.Zero(t, rig.Adapter.Uses("plan"), "the resumed run fired no product owner")
 		recAssertResumedRun(t, rig, crash)
 	})
@@ -565,6 +766,42 @@ func recWorktreeList(t *testing.T, crash *recCrashResult) []string {
 	return out
 }
 
+// recCommitsTouching counts the commits on the default branch that touch
+// path. Every bead of the scenario adds one file, so a bead delivered twice
+// — the failure both "delivered" kill points exist to catch — shows up here
+// as two commits for one file, whatever the second delivery called itself.
+func recCommitsTouching(t *testing.T, rig *e2eRig, path string) int {
+	t.Helper()
+	out := rig.Repo.Git(t, "rev-list", "--count", rig.Repo.DefaultBranch, "--", path)
+	n, err := strconv.Atoi(strings.TrimSpace(out))
+	require.NoErrorf(t, err, "unexpected rev-list output %q", out)
+	return n
+}
+
+// recIsAncestor reports whether one commit is an ancestor of another: it is
+// how a test says the default branch only moved forwards.
+func recIsAncestor(t *testing.T, rig *e2eRig, ancestor, descendant string) bool {
+	t.Helper()
+	_, err := recGitErr(rig.Repo.Env(), rig.Repo.Dir, "merge-base", "--is-ancestor", ancestor, descendant)
+	return err == nil
+}
+
+// recRevParse resolves a revision in the fixture repository.
+func recRevParse(t *testing.T, repo *testutil.FixtureRepo, rev string) string {
+	t.Helper()
+	return strings.TrimSpace(repo.Git(t, "rev-parse", rev))
+}
+
+// recRemoteHead is [e2eRemoteHead] for a repository rather than a rig, so
+// the state a crash left on the remote can be read before the resumed rig
+// exists.
+func recRemoteHead(t *testing.T, repo *testutil.FixtureRepo) string {
+	t.Helper()
+	fields := strings.Fields(repo.Git(t, "ls-remote", repo.RemoteDir, "refs/heads/"+repo.DefaultBranch))
+	require.NotEmpty(t, fields, "the remote has a default branch")
+	return fields[0]
+}
+
 // recConflictFile is the path the mid-rebase scenario conflicts on.
 const recConflictFile = "shared-note.md"
 
@@ -652,9 +889,14 @@ type recCrashResult struct {
 	// Killed is every work bead's state as read back from the tracker
 	// after the process died.
 	Killed map[domain.BeadID]domain.BeadState
-	// Gate is the gate seam of a recModeDelivering crash, disarmed by the
-	// time the crash is returned; nil at every other kill point.
+	// Gate is the bd seam of a recModeDelivering (`bd gate create`) or
+	// recModeLanded (`bd close`) crash, disarmed by the time the crash is
+	// returned; nil at every other kill point.
 	Gate *recGateBlock
+	// Hold is the blocking check command of a recModeMerging crash,
+	// released by the time the crash is returned; nil at every other kill
+	// point.
+	Hold *recCheckHold
 }
 
 // recCrash sets up a machine, runs the first invocation of the run as a real
@@ -665,17 +907,34 @@ func recCrash(t *testing.T, mode string, safety bool) *recCrashResult {
 	t.Helper()
 	env := e2eNewEnv(t)
 
-	// The crash inside a delivery needs two things the plain rig cannot
-	// give it, both installed in front of the rig's own shims (FakeBin
-	// prepends to PATH, so the last one installed wins): a `gh` that
-	// remembers the pull requests it opened, because a resumed run must be
-	// able to find the one the dead process opened the way the real gh
-	// would; and a `bd` whose `gate create` never reaches the tracker,
-	// which is what the dead process's own gate creation did.
-	var block *recGateBlock
-	if mode == recModeDelivering {
+	// A crash inside a delivery needs a seam the plain rig does not have,
+	// installed in front of the rig's own shims (FakeBin prepends to PATH,
+	// so the last one installed wins). Which seam depends on the window the
+	// kill point is aimed at: a `gh` that remembers the pull requests it
+	// opened, because a resumed run must be able to find the one the dead
+	// process opened the way the real gh would, and a `bd` whose
+	// `gate create` never reaches the tracker, which is what the dead
+	// process's own gate creation did; a `bd` whose `close` never reaches
+	// it, which is where a crash right after the fast-forward leaves
+	// things; or a check command that blocks, which holds the delivery open
+	// where a real repository's checks hold it.
+	var (
+		block *recGateBlock
+		hold  *recCheckHold
+	)
+	switch mode {
+	case recModeDelivering:
 		env.GH = recFakeGH(t)
 		block = recSwallowGateCreate(t, env.BD)
+	case recModeLanded:
+		// The fast-forward and the push happen; the close that would end
+		// the delivery never reaches the tracker, which is what a crash in
+		// that window leaves behind.
+		block = recSwallowClose(t, env.BD)
+	case recModeMerging:
+		// A check command that blocks holds the delivery open at the point
+		// a real repository's check (a test suite, minutes long) holds it.
+		hold = recHoldingCheck(t)
 	}
 
 	sigPath := filepath.Join(t.TempDir(), "kill-point.json")
@@ -699,7 +958,15 @@ func recCrash(t *testing.T, mode string, safety bool) *recCrashResult {
 		recSignalEnv: sigPath,
 	}
 	if block != nil {
-		childEnv[recGateHitEnv] = block.Hit
+		switch mode {
+		case recModeLanded:
+			childEnv[recCloseHitEnv] = block.Hit
+		default:
+			childEnv[recGateHitEnv] = block.Hit
+		}
+	}
+	if hold != nil {
+		childEnv[recCheckEnv], childEnv[recCheckHitEnv] = hold.Command, hold.Hit
 	}
 	cmd.Env = recEnviron(childEnv, env.Repo.Env())
 	cmd.Stdout, cmd.Stderr = logFile, logFile
@@ -733,14 +1000,21 @@ func recCrash(t *testing.T, mode string, safety bool) *recCrashResult {
 	require.ErrorAsf(t, waitErr, &exit, "the child was killed, not exited (%v)\n%s", waitErr, recTail(t, logPath))
 	assert.Equal(t, -1, exit.ExitCode(), "an exit code of -1 means a signal ended it")
 	assert.Contains(t, exit.String(), "killed", "the child died of SIGKILL")
-	// The gate the dead process meant to create is gone with it; the
-	// resumed run's own gate creations must reach the tracker.
+	// The bd call the dead process meant to make is gone with it; the
+	// resumed run's own calls must reach the tracker.
 	if block != nil {
 		block.disarm(t)
 	}
+	// And the check command the dead process left blocking is released, so
+	// the orphaned shell it spawned exits instead of idling for the rest of
+	// the package's run. The resumed rig has the rig's own trivial check
+	// again: recCheckEnv is set on the child's environment alone.
+	if hold != nil {
+		hold.release(t)
+	}
 	recAwaitQuiet(t, env)
 
-	out := &recCrashResult{Env: env, Sig: sig, Gate: block}
+	out := &recCrashResult{Env: env, Sig: sig, Gate: block, Hold: hold}
 	out.State, err = LoadState(sig.RunDir)
 	require.NoError(t, err, "the killed process left a state file to resume from (P6-11)")
 	out.Lock, err = readLock(LockPath(sig.RunDir))
@@ -949,6 +1223,99 @@ func (b *recGateBlock) disarm(t *testing.T) {
 func (b *recGateBlock) Swallowed(t *testing.T) domain.BeadID {
 	t.Helper()
 	return recBlockedGateBead(b.Hit)
+}
+
+// recSwallowClose installs a bd wrapper that answers `bd close <id>`
+// itself instead of letting it reach the tracker, and records the bead it
+// swallowed. It is the seam of a safety-off crash between the fast-forward
+// and the close (recModeLanded): the work is on the default branch and the
+// bead is still `delivering`, which is exactly what the window between
+// gitx's merge stage and its close leaves behind.
+//
+// Every close goes through this one call — the state machine's own
+// transition to closed is [beads.Client.Close] as well — so nothing writes
+// the status behind the wrapper's back. Like [recSwallowGateCreate] it
+// swallows rather than holds: beads.Client serialises every call through
+// one mutex, and a held close would freeze the child's own view of the
+// tracker, including the kill-point poll.
+func recSwallowClose(t *testing.T, inner *testutil.Shim) *recGateBlock {
+	t.Helper()
+	dir := t.TempDir()
+	b := &recGateBlock{
+		Arm: filepath.Join(dir, "armed"),
+		Hit: filepath.Join(dir, "swallowed-close"),
+	}
+	require.NoError(t, os.WriteFile(b.Arm, nil, 0o600))
+	// The command word is not $1: every call carries beads' `-C <repo>` in
+	// front of it (D-21), so the bead id is the word after the first
+	// "close" anywhere in the arguments.
+	script := fmt.Sprintf(`_id=''
+_prev=''
+for _a in "$@"; do
+  if [ -z "$_id" ] && [ "$_prev" = "close" ]; then _id=$_a; fi
+  _prev=$_a
+done
+if [ -n "$_id" ] && [ -f %[1]s ]; then
+  printf '%%s
+' "$_id" > %[2]s.tmp
+  mv %[2]s.tmp %[2]s
+  printf '{"schema_version":1,"data":[{"id":"%%s","title":"the close the crash swallowed","status":"closed","issue_type":"task"}]}
+' "$_id"
+  exit 0
+fi
+exec %[3]s "$@"
+`, e2eShellQuote(b.Arm), e2eShellQuote(b.Hit), e2eShellQuote(inner.Path))
+	b.Shim = testutil.FakeBin(t, "bd", script)
+	return b
+}
+
+// recCheckHold is the seam of a crash inside a safety-off delivery
+// (recModeMerging): a check command that reports it has started and then
+// blocks until it is released, holding the delivery open at the point a
+// real repository's check holds it. The bead is `delivering` throughout,
+// with no pull request, no conflict and nothing landed.
+//
+// The rig runs `true` as its check command, so this is passed to the child
+// alone (recCheckEnv), and released after the kill so the shell the dead
+// process spawned does not idle for the rest of the package's run.
+type recCheckHold struct {
+	// Command is the check command itself.
+	Command string
+	// Hit is the file it creates the moment it starts, and Arm the file it
+	// waits for the disappearance of.
+	Hit, Arm string
+}
+
+// recHoldingCheck builds that check command.
+func recHoldingCheck(t *testing.T) *recCheckHold {
+	t.Helper()
+	dir := t.TempDir()
+	h := &recCheckHold{
+		Arm: filepath.Join(dir, "armed"),
+		Hit: filepath.Join(dir, "check-started"),
+	}
+	require.NoError(t, os.WriteFile(h.Arm, nil, 0o600))
+	// gitx runs the check with `sh -c` in the worktree, so both paths are
+	// absolute and the command touches nothing of the repository's.
+	h.Command = fmt.Sprintf(`: > %s; while [ -f %s ]; do sleep 0.02; done`,
+		e2eShellQuote(h.Hit), e2eShellQuote(h.Arm))
+	return h
+}
+
+// release lets the held check command finish.
+func (h *recCheckHold) release(t *testing.T) {
+	t.Helper()
+	require.NoError(t, os.Remove(h.Arm))
+}
+
+// recFileExists reports whether path is there, treating an empty path (a
+// seam this kill point does not use) as absent.
+func recFileExists(path string) bool {
+	if path == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 // recBlockedGateBead reads the bead id out of a [recGateBlock] hit file,
@@ -1171,6 +1538,8 @@ func recKillPoint(t *testing.T, rig *e2eRig, mode string) (recSignal, bool) {
 		sig.PRCreates += n
 	}
 	blocked := recBlockedGateBead(os.Getenv(recGateHitEnv))
+	closeSwallowed := recBlockedGateBead(os.Getenv(recCloseHitEnv))
+	checking := recFileExists(os.Getenv(recCheckHitEnv))
 
 	for _, b := range list {
 		if b.Type == domain.BeadTypeEpic {
@@ -1201,6 +1570,30 @@ func recKillPoint(t *testing.T, rig *e2eRig, mode string) (recSignal, bool) {
 			sig.Branch = gitx.BranchName(b)
 			sig.Worktree = rig.Manager.PathFor(b.ID)
 			recDescribePR(t, rig, b, &sig)
+			return sig, true
+		case recModeMerging:
+			// The delivery has written `delivering` and is inside the
+			// repository's check command, which is blocking: there is no
+			// pull request, no conflict and nothing on the default branch,
+			// so nothing but the P9-03 re-delivery can move this bead.
+			if b.State != domain.BeadStateDelivering || !checking {
+				continue
+			}
+			sig.Bead, sig.State, sig.Assignee = b.ID, b.State, b.Assignee
+			sig.Branch = gitx.BranchName(b)
+			sig.Worktree = rig.Manager.PathFor(b.ID)
+			recDescribePR(t, rig, b, &sig)
+			return sig, true
+		case recModeLanded:
+			// The fast-forward landed and was pushed, and the close that
+			// would have ended the delivery was swallowed: the work is on
+			// the default branch and the bead is still `delivering`.
+			if b.ID != closeSwallowed || b.State != domain.BeadStateDelivering {
+				continue
+			}
+			sig.Bead, sig.State, sig.Assignee = b.ID, b.State, b.Assignee
+			sig.Branch = gitx.BranchName(b)
+			sig.Worktree = rig.Manager.PathFor(b.ID)
 			return sig, true
 		case recModeDelivering:
 			// The delivery has opened the pull request, recorded it on the

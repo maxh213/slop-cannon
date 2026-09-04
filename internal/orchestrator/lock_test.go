@@ -1096,3 +1096,139 @@ func TestRunRefusesToStartBesideAHalfWrittenLock(t *testing.T) {
 	require.Equal(t, events.FinishFailed, out.Reason)
 	require.FileExists(t, path, "the refused run leaves the other one's lock alone")
 }
+
+// TestStartTimeRefusalIsTheSameSentenceAsThePreflight: the interlock has
+// two halves — the [ClaimRunLock] preflight, and [acquireLock] inside
+// [Run.Start] for the sc that passed the preflight and then lost the race —
+// and P9-04's Do text is about the sentence a user reads, not about which
+// half produced it. The Start-time half used to say "stop it first, or
+// resume it", which named no way to see the run and advised a `sc resume`
+// the same live lock would refuse.
+func TestStartTimeRefusalIsTheSameSentenceAsThePreflight(t *testing.T) {
+	f := lockSetup(t)
+	writeLock(t, f.State, liveRecord())
+	opts := lockOpts()
+	opts.Alive = func(int) bool { return true }
+	policy := NewLockPolicy(opts)
+
+	_, preflight := policy.Check(f.State)
+	require.ErrorIs(t, preflight, ErrLocked)
+
+	_, start := acquireLock(lockRunDir(t, f, "20260904-100000-0100"), "20260904-100000-0100", policy, lockEpoch)
+	require.ErrorIs(t, start, ErrLocked)
+
+	var locked *LockedError
+	require.ErrorAs(t, start, &locked, "Run.Start refuses with the preflight's own error type")
+	require.Equal(t, LockLive, locked.State)
+	require.Equal(t, liveRecord().Run, locked.Record.Run)
+	require.Equal(t, RepoLockPath(f.State), locked.Path)
+	require.Equal(t, time.Hour, locked.Age)
+
+	require.Equal(t, preflight.Error(), start.Error(), "one refusal, whichever half raises it")
+	require.Contains(t, start.Error(), "sc status")
+	require.NotContains(t, start.Error(), "resume it",
+		"`sc resume` runs the same preflight, so the same lock would refuse it")
+}
+
+// TestStartTimeRefusalNamesTheOtherMachine: a lock written on another host
+// gets the preflight's foreign-host sentence at Start time too — this
+// machine cannot probe that pid, so the remedy is --force, not Ctrl-C.
+func TestStartTimeRefusalNamesTheOtherMachine(t *testing.T) {
+	f := lockSetup(t)
+	rec := liveRecord()
+	rec.Host = "other-host"
+	writeLock(t, f.State, rec)
+	opts := lockOpts()
+	opts.Alive = func(int) bool { return true }
+
+	_, err := acquireLock(lockRunDir(t, f, "20260904-100000-0101"), "20260904-100000-0101",
+		NewLockPolicy(opts), lockEpoch)
+	require.ErrorIs(t, err, ErrLocked)
+	var locked *LockedError
+	require.ErrorAs(t, err, &locked)
+	require.Equal(t, LockElsewhere, locked.State)
+	require.Contains(t, err.Error(), "other-host")
+	require.Contains(t, err.Error(), "--force")
+}
+
+// TestAcquireLockPublishesTheStartStamp: pid and incarnation are written
+// together, in the one atomic publish that takes the lock, so there is no
+// window in which the lock names a pid without saying which incarnation of
+// it — and no read-modify-write for a takeover to clobber. StampRunLock is
+// then only the compatibility path for a lock somebody else published.
+func TestAcquireLockPublishesTheStartStamp(t *testing.T) {
+	f := lockSetup(t)
+	path := RepoLockPath(f.State)
+	lock, err := acquireLock(lockRunDir(t, f, "20260904-100000-0102"), "20260904-100000-0102",
+		NewLockPolicy(LockOptions{}), lockEpoch)
+	require.NoError(t, err)
+
+	rec, err := readLockRecord(path)
+	require.NoError(t, err)
+	require.Equal(t, os.Getpid(), rec.PID)
+	require.Equal(t, ProcessStart(os.Getpid()), rec.Started)
+	if runtime.GOOS == "linux" {
+		require.NotEmpty(t, rec.Started, "the stamp is read from /proc")
+	}
+	// A probe from another process therefore sees a live, identified run
+	// without anybody having had to stamp the lock afterwards.
+	require.Equal(t, LockLive, InspectLock(f.State, LockOptions{Self: -1}).State)
+
+	before, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.NoError(t, StampRunLock(f.State, LockOptions{}))
+	after, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "the lock is stamped already; stamping it again changes nothing")
+
+	require.NoError(t, lock.release())
+	require.NoFileExists(t, path)
+}
+
+// TestStampDoesNotClobberATakeover is the `--force` race StampRunLock's
+// read-modify-write used to lose: the forcing run removes the lock and
+// publishes its own record between the read and the write. Putting the old
+// record back would make the forcing run decline to release a lock that no
+// longer named it, and would leave a third sc reading a pid that may by
+// then be dead — a lock it would call stale and start beside a live run.
+//
+// The two halves are called by hand, which is the takeover happening in
+// exactly the wrong instant; StampRunLock itself runs them back to back.
+func TestStampDoesNotClobberATakeover(t *testing.T) {
+	f := lockSetup(t)
+	path := writeLock(t, f.State, LockRecord{LockHolder: LockHolder{
+		Run: "20260904-100000-0103", PID: 4242, Host: "sc-host", TakenAt: lockEpoch,
+	}})
+
+	rec, seen, err := readLockToStamp(path, 4242, "5150")
+	require.NoError(t, err)
+	require.NotNil(t, seen, "an unstamped lock of ours wants stamping")
+	require.Equal(t, "5150", rec.Started)
+
+	// The takeover: `--force` removes the lock and publishes its own.
+	require.NoError(t, os.Remove(path))
+	forced := LockRecord{LockHolder: LockHolder{
+		Run: "20260904-100500-0104", PID: 4343, Host: "sc-host", TakenAt: lockEpoch.Add(time.Minute),
+	}, Started: "9999"}
+	writeLock(t, f.State, forced)
+
+	require.NoError(t, stampLockRecord(path, seen, rec), "abandoning the stamp is not a failure")
+	got, err := readLockRecord(path)
+	require.NoError(t, err)
+	require.Equal(t, forced, got, "the record the takeover published stands")
+
+	// And the whole call is still a no-op against somebody else's lock.
+	require.NoError(t, StampRunLock(f.State, LockOptions{Self: 4242, StartOf: func(int) string { return "5150" }}))
+	got, err = readLockRecord(path)
+	require.NoError(t, err)
+	require.Equal(t, forced, got)
+
+	// A lock that is still the same file is stamped as before.
+	rec, seen, err = readLockToStamp(path, 4343, "9998")
+	require.NoError(t, err)
+	require.NotNil(t, seen)
+	require.NoError(t, stampLockRecord(path, seen, rec))
+	got, err = readLockRecord(path)
+	require.NoError(t, err)
+	require.Equal(t, "9998", got.Started)
+}

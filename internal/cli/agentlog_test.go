@@ -17,7 +17,7 @@ import (
 	"slop-cannon/internal/logging"
 )
 
-// Tests for the per-agent log files (P8-07). The read side (`sc logs`,
+// Tests for the per-agent log files (P9-18). The read side (`sc logs`,
 // P8-05) and the first-run notice (P8-06) both point at
 // <run-dir>/agents/<agent-id>.log; these are the tests that the run writes
 // them. Every helper is prefixed "agentLog" so it cannot collide with
@@ -49,7 +49,7 @@ func agentLogEvents() []events.Event {
 	}
 }
 
-// TestAgentLogSinkWritesOneFilePerAgent is the unit half of P8-07's log
+// TestAgentLogSinkWritesOneFilePerAgent is the unit half of P9-18's log
 // gap: the sink opens <run-dir>/agents/<id>.log on first use and appends
 // every agent-scoped event to the right file.
 func TestAgentLogSinkWritesOneFilePerAgent(t *testing.T) {

@@ -54,16 +54,17 @@ pass silently. Durations are Go duration strings (`"10m"`, `"1h30m"`,
 | `safety` | bool | `true` | both | `true`: finished work is pushed as a branch and opened as a PR for a human to merge. `false`: rebased and fast-forward merged straight into the default branch (D-10). |
 | `vibes` | string array | `[]` | both | Style preference files appended to every agent prompt as soft guidance. Paths are relative to the config file's directory (a file at the repo root is stored as `../vibes.md`) or absolute. Each file must exist, be UTF-8 text, and be at most 64 KiB. |
 | `rules` | string array | `[]` | both | Hard constraint files appended to every agent prompt as MUST / MUST NOT. Same path and size rules as `vibes`. |
-| `exclude` | string array | `[]` | both | Extra path globs an agent must never be shown, on top of the always-on `.env`, `.env.*`, `*.env`, `*.pem` and `id_*` patterns (P9-05). A pattern is matched against a path's base name, its whole repository-relative path and every parent directory, so `certs` hides `certs/server.key`. Lists union global-then-repo, and the entries are globs rather than paths, so they are never resolved against the config file's directory. A withheld file is left out of the tree an agent sees and its diff is replaced by a placeholder that names neither the path nor the pattern. |
+| `exclude` | string array | `[]` | both | Extra path globs an agent must never be shown, on top of the always-on `.env`, `.env.*`, `*.env`, `*.pem` and `id_*` patterns (P9-05). A pattern is matched against a path's base name, its whole repository-relative path and every parent directory, so `certs` hides `certs/server.key`. Lists union global-then-repo, and the entries are globs rather than paths, so they are never resolved against the config file's directory. A withheld file is left out of the tree an agent sees and its diff is replaced by a placeholder that names neither the path nor the pattern. This key is the path half of secrets hygiene; the value half masks credentials wherever they are printed — see [Secrets: withheld files and masked values](#secrets-withheld-files-and-masked-values). |
 | `check_command` | string | `""` | both | Command run in the worktree before a safety-off merge. Empty or blank means autodetect in this order: `make test` (a Makefile with a `test` target), `npm test` (a `package.json` with a `test` script), `go test ./...`, `pytest`, `cargo test`, by the files present. Nothing detected means no check runs. |
 | `idle_replan_interval` | duration > 0 | `"10m"` | both | Autopilot only: when the PO has nothing to add, the run idles this long before planning again (D-18). |
 | `gate_poll_interval` | duration > 0 | `"1m"` | both | Safety on only: how often the run asks bd whether the pull request behind a `gh:pr` gate has merged, so the bead closes (P6-10, D-20). Each poll runs `gh pr view` once per open gate. |
+| `pr_poll_interval` | duration > 0 | `"1m"` | both | How often the run asks GitHub for open pull requests it did not open, so it can review them (D-11, P8-04). Each poll runs `gh pr list` once. It also bounds how quickly a review bead is settled when its pull request is merged or closed while the review is still in flight (P8-11), so a run shorter than one interval polls exactly once, at the start. Only used when external review is on — see `--review-prs`. |
 | `max_beads_per_plan` | integer ≥ 1 | `8` | both | How many beads one PO planning firing may propose. A plan with more is rejected outright and the PO is asked to redo it — the surplus is never trimmed, because dropping beads would break the dependencies of the ones that stayed (P5-02). |
 | `limits.max_review_rounds` | integer ≥ 1 | `5` | both | Review rounds per bead before the PO escalates (D-08). |
 | `limits.max_pushback_rounds` | integer ≥ 1 | `2` | both | Pushback exchanges per feedback item before PO arbitration (D-08). At least one: the loop always lets the engineer answer an issue once before the PO rules on it, and `0` is refused rather than silently read as the default (P9-01). |
 | `limits.agent_timeout` | duration > 0 | `"30m"` | both | Maximum wall-clock time for one agent session. |
-| `limits.max_tokens` | integer ≥ 0 | `0` (unlimited) | both | Opt-in token budget for a run: input plus output tokens (cache tokens excluded), summed over every agent session that finished. Crossing it stops new work — no fresh bead is implemented and no plan is made, while the work that finishes what is in flight (a round's reviews and arbitrations, and a delivery conflict round over a bead already taken) still gets its agents. An autopilot run then **pauses** at once with a banner and waits for you: the pause stops the whole dispatch loop, so only the agents already running finish and everything queued waits with it. Resuming grants another budget's worth, so it pauses again rather than carrying on unwatched (D-18). A brief run has no pause: it keeps offering the finishing work and ends when that drains, with the budget in its summary. Enforced only as far as the cartridge reports usage: a CLI that counts nothing spends nothing. |
-| `limits.max_cost_usd` | number ≥ 0 | `0` (unlimited) | both | Opt-in cost budget, same semantics as `max_tokens`. It waits for a cartridge that reports a price: an adapter whose CLI prints tokens but no cost never trips it, however long the run goes on. |
+| `limits.max_tokens` | integer ≥ 0 | `0` (unlimited) | both | Opt-in token budget for a run: input plus output tokens (cache tokens excluded), summed over every agent session that finished. Crossing it stops new work — no fresh bead is implemented and no plan is made, while the work that finishes what is in flight (a round's reviews and arbitrations, and a delivery conflict round over a bead already taken) still gets its agents. An autopilot run then **pauses** at once with a banner and waits for you: the pause stops the whole dispatch loop, so only the agents already running finish and everything queued waits with it. Resuming grants another budget's worth, so it pauses again rather than carrying on unwatched (D-18). A brief run has no pause: it keeps offering the finishing work and ends when that drains, with the budget in its summary. Enforced only as far as the cartridge reports usage: a CLI that counts nothing spends nothing. **The cap is a floor on when new work stops, not a ceiling on what the run spends**: the session that crosses it has already been paid for, and every review the round already owes is still fired, so the total can land at several times the cap — a 4000-token cap over a three-lens round has been seen to finish at 13000. Set it as "stop starting things after roughly this much", not as "never spend more than this". The budget belongs to the run, not to one `sc run`: it is written into the run's `state.json` and read back by `--resume`, so a resumed run carries the earlier invocations' spend instead of starting again at zero. A resume over a crossed cap is you saying carry on, so it grants one more budget's worth — the same grant that clearing a pause makes, and no more. Reviewing somebody else's pull request (D-11) is new work too: once the cap is crossed no further tester is fired for one, including for a review already open, because the watcher adopts pull requests on its own and a run held at its cap must not keep taking them on. |
+| `limits.max_cost_usd` | number ≥ 0 | `0` (unlimited) | both | Opt-in cost budget, same semantics as `max_tokens` — including the overshoot, and including the fact that the budget survives `--resume`. It waits for a cartridge that reports a price: an adapter whose CLI prints tokens but no cost never trips it, however long the run goes on. |
 | `limits.max_plan_rejections` | integer ≥ 1 | `2` | both | How many plans in a row the planning validator may reject before the run gives up on that round of planning (P6-19). One rejection has already cost two plans: a rule failure is retried once inside the firing itself. A brief run that gives up finishes and says so; an autopilot run cools off and plans again (D-18). |
 | `limits.max_plan_failures` | integer ≥ 1 | `5` | both | How many planning firings in a row may fail for a reason that is not the plan's fault — a cartridge crash, an agent timeout, an unreadable rules file — before the run gives up on that round the same way. Looser than `max_plan_rejections` because the supervisor has already spent its own retries on those failures. |
 | `cartridges.<name>.model` | string | `""` | global | Model passed to the CLI, e.g. `fable` for Claude Code. |
@@ -84,6 +85,62 @@ at, or run it in the TUI (P9-01, P9-14).
 Only `claude` is a valid cartridge name for now (D-19). Any other name, in a
 file or on the command line, fails with
 `cartridge "<name>" is not supported yet (only "claude" for now)`.
+
+## Secrets: withheld files and masked values
+
+Two different leaks need two different tools, and `sc` applies both (P9-05,
+P9-09).
+
+**Paths are withheld.** A file matching `exclude` or one of the always-on
+patterns is left out of the repository tree an agent is shown, and its diff
+is replaced by a placeholder that names neither the path nor the pattern.
+See the `exclude` row above.
+
+**Values are masked.** A credential that reaches text anyway — pasted into a
+bead, printed by a failing check, echoed by an agent — is rewritten to
+`[REDACTED]`, with the hint before it kept so the line still reads:
+
+```
+2026-01-01 INFO  MY_API_TOKEN=[REDACTED]
+export ANTHROPIC_API_KEY=[REDACTED]
+$ curl -H 'Authorization: Bearer [REDACTED]'
+the key sk-[REDACTED] was rejected
+```
+
+The masking happens once, where a run publishes, so every sink carries the
+masked text: the terminal and the TUI, `<run>/sc.log`, `<run>/events.jsonl`,
+the agent transcripts under `<run>/agents/` (which `sc logs` reads back),
+the prompts of every later agent, the comment the run writes on a bead, and
+the body of the pull request it opens — the only one of those that leaves
+your machine.
+
+The rules are deliberately few, so that ordinary prose and reviewed code
+survive intact. What is masked:
+
+| Rule | Matches | Example |
+|---|---|---|
+| `sk` | `sk-…` and `sk-ant-…` keys, 8+ characters after the prefix | `sk-ant-api03-…` |
+| `github` | `ghp_`, `gho_`, `ghu_`, `ghs_`, `ghr_`, `github_pat_` tokens | `ghp_…` |
+| `bearer` | an `Authorization: Bearer <token>` value, any case | `Bearer eyJhbGci…` |
+| `assignment` | an assignment whose **upper-case** name contains `TOKEN`, `SECRET`, `PASSWD`, `PASSWORD`, `KEY` or `CREDENTIAL`, with a value of 6+ characters — anywhere in a line, including behind a log prefix or a diff's `+` | `MY_API_TOKEN=hunter2…` |
+| `pem` | the body of a `-----BEGIN … PRIVATE KEY-----` block | a `.pem` pasted into a comment |
+| `aws` | an `AKIA…` or `ASIA…` access key id | `AKIAIOSFODNN7EXAMPLE` |
+
+What is **not** masked, on purpose:
+
+- a lower-case or mixed-case assignment (`apiKey := os.Getenv("API_KEY")`
+  in a reviewed diff is code, not a leak), and prose that merely names a
+  variable (`set DATABASE_PASSWORD before running`);
+- a bare secret with no recognisable shape — a random password on a line of
+  its own matches no rule;
+- anything in the repository itself. Masking is about what `sc` prints and
+  publishes; keeping a credential out of the repository is still your job,
+  and `sc doctor` checks that your `.gitignore` covers the usual files.
+
+The escape sequences a cartridge prints are stripped by the same hook, in
+front of the masking, so a token cut in half by a colour code is still
+masked. Both halves are idempotent: text that has already been through them
+is unchanged by a second pass.
 
 ## Ammo allocation (D-05)
 

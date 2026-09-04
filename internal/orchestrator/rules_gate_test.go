@@ -261,7 +261,7 @@ func TestRulesGateRefusesApproveWithNotesWhileAViolationIsOpen(t *testing.T) {
 }
 
 func TestRulesGateNarrowScopeClearsTheSlate(t *testing.T) {
-	g, _ := rgGate(t)
+	g, warnings := rgGate(t)
 	g.ObserveVerdict(fbBead, rgVerdict(domain.LensQA, 1, domain.VerdictChanges,
 		rgItem("qa-r1-1", "widens the public API", domain.ItemOpen)))
 	require.True(t, g.Blocked(fbBead))
@@ -270,6 +270,26 @@ func TestRulesGateNarrowScopeClearsTheSlate(t *testing.T) {
 	// (D-08), so the loop drops them and so does the gate.
 	g.Observe(fbBead, domain.Escalation{Outcome: domain.EscalationNarrowScope, NewAcceptance: "the error path only"})
 	assert.False(t, g.Blocked(fbBead))
+
+	// P9-06 review, round 4: this is the one thing that clears the gate's
+	// memory without the code being fixed, and agents.ValidateEscalation
+	// only asks such a ruling for a non-empty new_acceptance — so the drop
+	// is counted and announced rather than quietly taken.
+	assert.Equal(t, 1, g.Stats().Narrowed)
+	require.Len(t, warnings.Warnings(), 1)
+	w := warnings.Warnings()[0]
+	assert.Equal(t, SourceRules, w.Source)
+	assert.Equal(t, fbBead, w.Bead)
+	assert.Contains(t, w.Message, "narrow_scope")
+	assert.Contains(t, w.Err, "qa-r1-1", "the warning names what was dropped")
+	assert.Equal(t, "rules: 1 violation dropped by narrow_scope",
+		RunVitals{}.WithRules(g).RulesLine(), "and `sc status` says so too")
+
+	// A ruling that had nothing to drop says nothing.
+	before := len(warnings.Warnings())
+	g.Observe(domain.BeadID("sc-none"), domain.Escalation{Outcome: domain.EscalationNarrowScope, NewAcceptance: "x"})
+	assert.Len(t, warnings.Warnings(), before)
+	assert.Equal(t, 1, g.Stats().Narrowed)
 
 	// Blocking the bead does not: the violation goes to the human with it.
 	g.ObserveVerdict(fbBead, rgVerdict(domain.LensQA, 1, domain.VerdictChanges,
@@ -788,6 +808,33 @@ const rgResumeBead = domain.BeadID("sc-1")
 // two tests below: everything else is what `sc run --resume` assembles.
 func rgResume(t *testing.T, wire bool) (*RulesGate, *rgStore, *rgSink, error) {
 	t.Helper()
+	r := rgResumeSetup(t, wire)
+	return r.Gate, r.Store, r.Sink, r.sync(t)
+}
+
+// rgResumeRig is what [rgResumeSetup] built, for a test that needs more
+// than one pass.
+type rgResumeRig struct {
+	Gate  *RulesGate
+	Store *rgStore
+	Sink  *rgSink
+	Rig   *glueRig
+	Loop  *Feedback
+}
+
+// sync runs one conductor pass, exactly as the run's own ticker does.
+func (r *rgResumeRig) sync(t *testing.T) error {
+	t.Helper()
+	return r.Rig.Cond.Sync(context.Background())
+}
+
+// rgResumeSetup assembles the production glue over a killed run whose bead
+// carries the thread of [rgSettled]. Everything but `wire` is what
+// `sc run --resume` builds: the conductor is given the state machine it
+// parks a refused bead with ([ConductorOptions.States]) whether or not the
+// gate is wired, because that is what production does.
+func rgResumeSetup(t *testing.T, wire bool) *rgResumeRig {
+	t.Helper()
 	bd := newGlueBD(
 		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "make the retry loop terminate"),
 		glueIssue(rgResumeBead, domain.BeadTypeTask, "in_review", "make the retry loop terminate"),
@@ -796,17 +843,21 @@ func rgResume(t *testing.T, wire bool) (*RulesGate, *rgStore, *rgSink, error) {
 
 	gate, sink := rgGate(t)
 	store := &rgStore{state: domain.BeadStateInReview}
-	opts := ConductorOptions{Restore: glueYes()}
+	// The machine has to exist before the conductor does, so it is stamped
+	// with the gate's own run id and clock rather than the rig's; nothing
+	// here reads either.
+	states := NewStateMachine(gate.GuardStore(store),
+		WithStatePublisher(sink), WithStateRun(rgRun), WithStateClock(func() time.Time { return fbEpoch }))
+	opts := ConductorOptions{Restore: glueYes(), States: states}
 	if wire {
 		opts.RulesGate = gate
 	}
 	rig := glueSetup(t, bd, opts, config.RunSettings{})
 	loop, err := NewFeedback(FeedbackOptions{
 		Context: rig.Cond.BeadContext,
-		States: NewStateMachine(gate.GuardStore(store),
-			WithStateRun(rig.Config.Run.ID), WithStateClock(rig.Fixture.Clock.Now)),
-		Run: rig.Config.Run.ID,
-		Now: rig.Fixture.Clock.Now,
+		States:  states,
+		Run:     rig.Config.Run.ID,
+		Now:     rig.Fixture.Clock.Now,
 	})
 	require.NoError(t, err)
 	rig.Cond.Attach(ConductorParts{Feedback: loop})
@@ -817,7 +868,7 @@ func rgResume(t *testing.T, wire bool) (*RulesGate, *rgStore, *rgSink, error) {
 		_ = rig.Run.Stop("test over")
 		_, _ = rig.Run.Wait()
 	})
-	return gate, store, sink, rig.Cond.Sync(context.Background())
+	return &rgResumeRig{Gate: gate, Store: store, Sink: sink, Rig: rig, Loop: loop}
 }
 
 // TestRulesGateUnwiredAResumeShipsTheViolation is the regression this
@@ -847,7 +898,8 @@ func TestRulesGateWiredAResumeCannotShipTheViolation(t *testing.T) {
 	assert.ErrorIs(t, err, ErrRulesBlocker)
 
 	assert.NotContains(t, store.Moves(), "status:approved")
-	assert.Equal(t, domain.BeadStateInReview, store.State(), "the bead stayed where the killed run left it")
+	assert.Equal(t, domain.BeadStateNeedsHuman, store.State(),
+		"and a person owns it: needs_human, not the in_review the killed run left")
 	assert.True(t, gate.Blocked(rgResumeBead))
 	open := gate.Open(rgResumeBead)
 	require.Len(t, open, 1)
@@ -861,6 +913,64 @@ func TestRulesGateWiredAResumeCannotShipTheViolation(t *testing.T) {
 	assert.Equal(t, SourceRules, warnings[0].Source)
 	assert.Equal(t, rgResumeBead, warnings[0].Bead)
 	assert.ErrorContains(t, err, "qa-r1-1")
+}
+
+// TestRulesGateARefusedResumeEndsWithAPersonOwningTheBead is the other half
+// of the refusal, and the gap round 4 found: refusing the replay is not
+// enough on its own.
+//
+// [Feedback.Restore] registers the thread before it tries the transition,
+// so the failed first pass leaves a live thread the loop believes is
+// settled. Every later pass then took the "a live thread is the true one"
+// branch, dropped the bead from what the resume owed and said nothing —
+// leaving bd holding it in in_review for the rest of the run, no agent ever
+// offered, nothing owed and nobody told. It was not a livelock (one
+// refusal, one warning, ten passes), which is precisely why nothing caught
+// it.
+//
+// So the refusal now parks the bead: needs_human, through the same guarded
+// store, with the loop told where it went.
+func TestRulesGateARefusedResumeEndsWithAPersonOwningTheBead(t *testing.T) {
+	r := rgResumeSetup(t, true)
+
+	err := r.sync(t)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrRulesBlocker)
+	require.Equal(t, []string{"status:needs_human"}, r.Store.Moves(),
+		"nothing shipped, and the bead did not stay in in_review either")
+	require.Equal(t, domain.BeadStateNeedsHuman, r.Store.State())
+
+	// The run said so, naming the bead: the person who has to act finds it
+	// on the event stream and in `sc status`, not only in a returned error.
+	var parked int
+	for _, ev := range r.Rig.Fixture.drain() {
+		if w, ok := ev.(events.Warning); ok && w.Source == SourceRules {
+			parked++
+			assert.Contains(t, w.Message, "needs_human")
+			assert.Equal(t, rgResumeBead, w.Bead, "the warning names the bead a person now owns")
+			assert.Contains(t, w.Err, "qa-r1-1", "and what is open on it")
+		}
+	}
+	assert.Equal(t, 1, parked, "one warning, once")
+
+	// And it settles there. Nine more passes change nothing: no retry of a
+	// refusal that can never succeed, no second warning, no unbounded
+	// growth, and the loop is not waiting on the bead any more.
+	for i := 0; i < 9; i++ {
+		require.NoErrorf(t, r.sync(t), "pass %d", i+2)
+	}
+	assert.Equal(t, 1, r.Gate.Stats().Refused, "the refusal happened once")
+	assert.Equal(t, []string{"status:needs_human"}, r.Store.Moves())
+	assert.Len(t, r.Sink.Warnings(), 1)
+	assert.Zero(t, r.Loop.Outstanding(), "the loop knows a person owns the bead")
+
+	demands, err := r.Loop.Demands(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, demands, "and offers nobody work on it")
+
+	// The gate still remembers, so anything that tries to ship the bead
+	// afterwards is refused the same way.
+	assert.True(t, r.Gate.Blocked(rgResumeBead))
 }
 
 // --- what a person sees ------------------------------------------------
@@ -905,6 +1015,36 @@ func TestRulesGateStatsReachTheRunVitals(t *testing.T) {
 		rgItem("qa-r1-1", "widens the public API", domain.ItemResolved)))
 	assert.Equal(t, "rules: 1 bead with a rules item · none blocked · 1 refusal",
 		RunVitals{}.WithRules(g).RulesLine())
+}
+
+// TestRulesGateDecodesOnlyWhatItChecks pins the two halves of the decoder
+// against each other: [rulesChecks] admits exactly the message types
+// [rulesDecode] handles, and a type it does not handle decodes to nothing
+// rather than to a message of its own.
+//
+// P9-06 review, round 4: the old default branch built
+// "the rules gate does not decode %q", which no path could reach and which
+// P9-08's grep cannot see either — it scans internal/cli and internal/config
+// for user-facing text and sentinel declarations elsewhere, so an inline
+// orchestrator message was neither documented in docs/troubleshooting.md nor
+// listed as an exemption.
+func TestRulesGateDecodesOnlyWhatItChecks(t *testing.T) {
+	for _, msg := range domain.MessageTypes() {
+		payload, err := rulesDecode(msg, json.RawMessage(`{}`))
+		if !rulesChecks(msg) {
+			assert.NoErrorf(t, err, "%s decodes to nothing, not to a complaint", msg)
+			assert.Nilf(t, payload, "%s decodes to nothing", msg)
+			// And an undecoded payload is what CheckPayload passes.
+			assert.NoError(t, (&RulesGate{}).CheckPayload(fbBead, payload))
+			continue
+		}
+		require.NoErrorf(t, err, "%s is one of the three the gate judges", msg)
+		require.NotNilf(t, payload, "%s decodes to a payload", msg)
+	}
+	// The three it does judge are exactly these.
+	assert.True(t, rulesChecks(domain.MessageVerdict))
+	assert.True(t, rulesChecks(domain.MessageArbitration))
+	assert.True(t, rulesChecks(domain.MessageEscalation))
 }
 
 // --- fixtures ----------------------------------------------------------

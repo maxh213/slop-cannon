@@ -57,18 +57,26 @@ import (
 //     gate poller. The two status writes that do not go through that store
 //     are named, and are not the run's own work, in [RulesGate.GuardStore].
 //
-// Wiring is three lines and nothing else, so nothing has to know the gate
+// Wiring is four lines and nothing else, so nothing has to know the gate
 // exists:
 //
 //	gate := orchestrator.NewRulesGate(orchestrator.RulesGateOptions{Run: run.ID(), Bus: run, Now: run.Now})
 //	states := orchestrator.NewStateMachine(gate.GuardStore(client), …)
 //	sup, _ := orchestrator.NewSupervisor(orchestrator.SupervisorOptions{Planner: gate.GuardPlanner(loop), …})
-//	cond, _ := orchestrator.NewConductor(orchestrator.ConductorOptions{RulesGate: gate, …})
+//	cond, _ := orchestrator.NewConductor(orchestrator.ConductorOptions{RulesGate: gate, States: states, …})
 //
 // The third is the resume: [ConductorOptions.RulesGate] is what makes the
 // conductor tell the gate about a thread ([RulesGate.RestoreMessages])
 // before [Feedback.Restore] replays it, which is what closes the hole the
-// replay leaves — bd comments applied with no role check at all.
+// replay leaves — bd comments applied with no role check at all. The
+// [ConductorOptions.States] beside it is what the conductor parks such a
+// bead with when the replay is refused: a refusal there is permanent, so
+// the bead goes to needs_human rather than sitting in in_review with a
+// thread the loop believes is settled ([Conductor.restoreThreads]).
+//
+// `sc run` is the production assembly, and internal/cli's own tests pin
+// each of those four wire points, so removing one fails a test rather than
+// only a review.
 
 // SourceRules is the [events.Warning] Source the rules compliance gate
 // stamps on a message or a transition it refused.
@@ -152,6 +160,11 @@ type RulesGateStats struct {
 	Violations int `json:"violations,omitempty"`
 	// Refused counts every message and transition the gate refused.
 	Refused int `json:"refused,omitempty"`
+	// Narrowed counts the open violations a narrow_scope ruling dropped:
+	// the one thing that clears the gate's memory without the code being
+	// fixed, and the reason it is counted rather than forgotten quietly
+	// ([RulesGate.ObserveEscalation]).
+	Narrowed int `json:"narrowed,omitempty"`
 }
 
 // Zero reports whether the gate has seen nothing and refused nothing, which
@@ -184,6 +197,7 @@ type RulesGate struct {
 	mu       sync.Mutex
 	tracked  map[domain.BeadID]*rulesBead
 	refusals int
+	narrowed int
 }
 
 // rulesBead is one bead's rules items, in the order they were raised.
@@ -291,10 +305,52 @@ func (g *RulesGate) ObserveVerdict(bead domain.BeadID, v domain.Verdict) {
 // approve_with_notes is refused while a violation is open
 // ([RulesGate.CheckEscalation]) and settles nothing if it arrives anyway;
 // block leaves the bead with a human, violation and all.
+//
+// This is the gate's one deliberate exception, and it is deliberate in both
+// directions:
+//
+//   - It has to clear them. The narrowed rounds review a different bead:
+//     the items raised against the old criteria no longer exist, so no
+//     tester will ever mark one resolved, and a violation the gate kept
+//     would block that bead's every shipping transition for the rest of the
+//     run with nothing anyone could do about it. That is a worse failure
+//     than the one below, and it is not the kind [Conductor.restoreThreads]
+//     can hand to a person either, because the bead is live work.
+//   - It is not free. [agents.ValidateEscalation] only asks a narrow_scope
+//     ruling for a non-empty new_acceptance, so a product owner that
+//     answers the round cap with narrow_scope plus restated criteria does
+//     clear the gate's memory of a violation no tester ever resolved. So
+//     the drop is counted ([RulesGateStats.Narrowed], which reaches
+//     state.json and the `sc status` rules line) and announced as a warning
+//     naming every violation it dropped. Nothing is silently laundered:
+//     the narrowed bead still has to earn its approvals again, and the
+//     record says what the ruling wrote off.
 func (g *RulesGate) ObserveEscalation(bead domain.BeadID, e domain.Escalation) {
-	if e.Outcome == domain.EscalationNarrowScope {
-		g.Forget(bead)
+	if e.Outcome != domain.EscalationNarrowScope {
+		return
 	}
+	g.mu.Lock()
+	dropped := g.openLocked(bead)
+	g.narrowed += len(dropped)
+	n := g.narrowed
+	delete(g.tracked, bead)
+	g.mu.Unlock()
+	if len(dropped) == 0 {
+		return
+	}
+	g.log.Warn("a narrow_scope ruling dropped open rules-file violations with the criteria that raised them",
+		slog.String("bead", bead.String()), slog.Int("dropped", len(dropped)),
+		slog.Int("narrowed", n), slog.String("violations", rulesList(dropped)))
+	if g.bus == nil {
+		return
+	}
+	g.bus.Publish(events.Warning{
+		Meta:    events.MetaAt(g.run, g.now()),
+		Source:  SourceRules,
+		Message: "a narrow_scope ruling dropped open rules-file violations along with the criteria that raised them",
+		Err:     fmt.Sprintf("the gate no longer holds %s; the narrowed rounds start clean and have to earn their approvals again", rulesList(dropped)),
+		Bead:    bead,
+	})
 }
 
 // Observe folds whichever of the loop's structured messages the payload is
@@ -374,7 +430,7 @@ func (g *RulesGate) Forget(bead domain.BeadID) {
 func (g *RulesGate) Stats() RulesGateStats {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	st := RulesGateStats{Beads: len(g.tracked), Refused: g.refusals}
+	st := RulesGateStats{Beads: len(g.tracked), Refused: g.refusals, Narrowed: g.narrowed}
 	for bead := range g.tracked {
 		if open := g.openLocked(bead); len(open) > 0 {
 			st.Blocked++
@@ -459,16 +515,24 @@ func (v RunVitals) RulesLine() string {
 	if r.Zero() {
 		return ""
 	}
-	parts := []string{rulesPlural(r.Beads, "bead", "beads") + " with a rules item"}
-	if r.Blocked > 0 {
-		parts = append(parts, fmt.Sprintf("%s blocked by %s",
-			rulesPlural(r.Blocked, "bead", "beads"),
-			rulesPlural(r.Violations, "open violation", "open violations")))
-	} else {
-		parts = append(parts, "none blocked")
+	var parts []string
+	// A gate whose only entry was dropped by a narrow_scope ruling has no
+	// bead left to count, so it says what happened rather than "0 beads".
+	if r.Beads > 0 {
+		parts = append(parts, rulesPlural(r.Beads, "bead", "beads")+" with a rules item")
+		if r.Blocked > 0 {
+			parts = append(parts, fmt.Sprintf("%s blocked by %s",
+				rulesPlural(r.Blocked, "bead", "beads"),
+				rulesPlural(r.Violations, "open violation", "open violations")))
+		} else {
+			parts = append(parts, "none blocked")
+		}
 	}
 	if r.Refused > 0 {
 		parts = append(parts, rulesPlural(r.Refused, "refusal", "refusals"))
+	}
+	if r.Narrowed > 0 {
+		parts = append(parts, rulesPlural(r.Narrowed, "violation", "violations")+" dropped by narrow_scope")
 	}
 	return "rules: " + strings.Join(parts, " · ")
 }
@@ -673,6 +737,15 @@ func rulesChecks(msg domain.MessageType) bool {
 // schema has already accepted the JSON, so a failure here means the block
 // is not what the firing said it was, and the caller lets the role's own
 // check produce the complaint.
+//
+// Anything else decodes to nil rather than to a complaint of its own: the
+// only caller checks [rulesChecks] first, which admits exactly the three
+// types below, so the last branch is reachable only if the two ever
+// disagree — and the honest answer then is the one
+// [RulesGate.CheckPayload] gives an unknown payload anyway, which is to
+// leave it alone. Building a message here would put a sentence in front of
+// a user that no path produces and that P9-08's grep cannot see (it scans
+// internal/cli and internal/config, and sentinels elsewhere).
 func rulesDecode(msg domain.MessageType, raw json.RawMessage) (any, error) {
 	switch msg {
 	case domain.MessageVerdict:
@@ -685,7 +758,7 @@ func rulesDecode(msg domain.MessageType, raw json.RawMessage) (any, error) {
 		var e domain.Escalation
 		return e, json.Unmarshal(raw, &e)
 	default:
-		return nil, fmt.Errorf("orchestrator: the rules gate does not decode %q", string(msg))
+		return nil, nil
 	}
 }
 

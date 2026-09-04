@@ -38,12 +38,17 @@ func Chain(fs ...TextFunc) TextFunc {
 //
 // [Bus] deliberately never transforms what it carries: one subscriber must
 // not be able to change what another sees, and the JSONL run log has to be a
-// faithful record of what was published. Redaction therefore belongs at the
-// construction site, where the orchestrator, the supervisor and the
-// cartridge adapters build an event out of a subprocess's bytes, and this is
-// the one helper they all call — see logging.SafeEvent for the composed hook
-// (P9-09, P7-17). Applying it twice is harmless as long as f is idempotent,
-// which both the secret redactor and the escape scrubber are.
+// faithful record of what was published. Redaction therefore belongs to
+// whoever publishes, and a run has exactly one publication point — the
+// publisher `sc run` assembles (internal/cli, runPublisher.Publish) — which
+// applies this through logging.(*Redactor).SafeEvent, once, before the
+// agent transcripts, the run log, the bus and the delivery settler see the
+// event (P9-09, P7-17). The orchestrator, the supervisor and the cartridge
+// adapters build events out of a subprocess's bytes and hand them to that
+// publisher; they do not redact themselves, so a component that grows a new
+// publication path of its own has to apply the hook there. Applying it
+// twice is harmless as long as f is idempotent, which both the secret
+// redactor and the escape scrubber are.
 //
 // The fields it rewrites are the free text a model, a cartridge, bd, git or
 // gh wrote:

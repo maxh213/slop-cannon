@@ -655,6 +655,21 @@ type fbThread struct {
 	lookedAt map[domain.Lens]string
 	// reviewers are the lenses owed a verdict this round.
 	reviewers []domain.Lens
+	// adopted marks a thread the loop first met already in review — a
+	// resumed run, or a bead something outside the loop moved there — whose
+	// reviewers [Feedback.plan] has therefore never worked out. It is the
+	// only state in which [Feedback.demandsFor] may work them out itself.
+	//
+	// Without it, "reviewing with nobody owed a verdict" was also what the
+	// last verdict of a round looks like for as long as it takes
+	// [Feedback.testerReplied] to write its bead comment: it empties
+	// t.reviewers under the lock and only then, outside it, posts to bd and
+	// calls plan. A dispatch landing in that window re-derived the
+	// reviewers, re-fired the lens that raised the still-open item, and
+	// plan then bailed because somebody owed the round a verdict again —
+	// for ever, with a crossed budget holding back the engineer firing that
+	// would otherwise have closed the round (P9-01, P9-21).
+	adopted bool
 	// evaluating are the lenses owed a pushback evaluation this round.
 	evaluating []domain.Lens
 
@@ -695,6 +710,14 @@ type fbThread struct {
 	// ([Feedback.Restore]): the replay publishes nothing, and the one
 	// transition it concludes is written only when bd is not already there.
 	restoring bool
+}
+
+// setReviewers records who owes this round a verdict. It is the only way
+// t.reviewers is written, because every write also settles the question the
+// list on its own cannot answer: whether an empty one means "nobody has
+// worked them out yet" or "the round is finishing" (fbThread.adopted).
+func (t *fbThread) setReviewers(ls []domain.Lens) {
+	t.reviewers, t.adopted = ls, false
 }
 
 // Feedback is the D-08/D-09 feedback loop engine (P6-04). It is safe for
@@ -876,7 +899,9 @@ func (f *Feedback) newThread(b domain.Bead) *fbThread {
 	case domain.BeadStateChangesRequested:
 		t.phase = FeedbackAddressing
 	case domain.BeadStateInReview:
-		t.phase = FeedbackReviewing
+		// The one thread that reaches Demands owing verdicts nobody has
+		// worked out yet; see fbThread.adopted.
+		t.phase, t.adopted = FeedbackReviewing, true
 	case domain.BeadStateEscalated:
 		t.phase = FeedbackEscalating
 	default:
@@ -1064,10 +1089,14 @@ func (f *Feedback) demandsFor(t *fbThread, order int) []Demand {
 		return out
 
 	case FeedbackReviewing:
-		if len(t.reviewers) == 0 {
+		if t.adopted && len(t.reviewers) == 0 {
 			// A bead adopted straight into review (a resume) has not been
-			// through plan yet, so work out who owes a verdict now.
-			t.reviewers = f.reviewersFor(t)
+			// through plan yet, so work out who owes a verdict now. Only
+			// then: an empty list on a thread plan has already reviewed is
+			// a round whose last verdict is being folded in, and re-deriving
+			// it there re-fires a lens that has already answered
+			// (fbThread.adopted, P9-01).
+			t.setReviewers(f.reviewersFor(t))
 		}
 		var out []Demand
 		for _, l := range t.reviewers {
@@ -1822,7 +1851,7 @@ func (f *Feedback) applyVerdict(t *fbThread, lens domain.Lens, mode agents.Teste
 		t.looked[lens] = round
 		t.lookedAt[lens] = fbHead(t.diff)
 	}
-	t.reviewers = fbWithout(t.reviewers, lens)
+	t.setReviewers(fbWithout(t.reviewers, lens))
 	t.evaluating = fbWithout(t.evaluating, lens)
 
 	// Items the tester restated: update this lens's occurrence.
@@ -2199,7 +2228,8 @@ func (f *Feedback) plan(ctx context.Context, t *fbThread) error {
 	}
 	reviewers := f.reviewersFor(t)
 	if len(reviewers) > 0 {
-		t.phase, t.reviewers = FeedbackReviewing, reviewers
+		t.phase = FeedbackReviewing
+		t.setReviewers(reviewers)
 		commit, kind, round, lenses := fbHead(t.diff), t.kind, t.round, append([]domain.Lens(nil), reviewers...)
 		restoring := t.restoring
 		f.mu.Unlock()
@@ -2488,7 +2518,7 @@ func (f *Feedback) ReviewAgain(_ context.Context, bead domain.Bead, round int, r
 		t.notes = append(t.notes, fbOneLine(s))
 	}
 	t.phase = FeedbackReviewing
-	t.reviewers = f.reviewersFor(t)
+	t.setReviewers(f.reviewersFor(t))
 	lenses, kind, at := append([]domain.Lens(nil), t.reviewers...), t.kind, fbHead(t.diff)
 	// The round the event names is the thread's, not the caller's: a
 	// conflict round whose bead carries no sc_round metadata reaches here

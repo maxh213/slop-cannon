@@ -280,6 +280,13 @@ type PlannerOptions struct {
 	Repo prompt.RepoContext
 	// Scan tunes that scan (tree depth, README bytes).
 	Scan prompt.ScanOptions
+	// Filter is the run's secrets filter (P9-05). Whatever Repo holds and
+	// whatever a scan finds goes through it before the product owner sees
+	// it, so a planning prompt lists no .env, no key and nothing the
+	// `exclude` config key hides. Nil means the built-in patterns only,
+	// which is the safe default rather than "no filtering": a Planner built
+	// without one must not be the hole the rest of the run has closed.
+	Filter *agents.SecretFilter
 	// Rules and Vibes are the constraint and style documents. Each is
 	// independent: a nil field means "load that one from the effective
 	// configuration", once, on first use, and a non-nil field (an empty
@@ -1359,15 +1366,21 @@ func planPriorities(open []domain.Bead) string {
 // repoContext returns the repository context for a planning prompt: the
 // pre-scanned one when the caller supplied it, else a fresh scan, so the
 // product owner sees the tree as it is now.
+//
+// Both roads go through [PlannerOptions.Filter] (P9-05), which is why the
+// scan is agents.SecretFilter.Scan rather than prompt.ScanRepo: the fallback
+// is the one the caller did not prepare, so it is the one that would list
+// .env and every configured exclude. Filtering the supplied context again
+// costs a walk of a list sc already filtered and is idempotent.
 func (p *Planner) repoContext() (prompt.RepoContext, error) {
 	if p.opts.Repo.Root != "" {
-		return p.opts.Repo, nil
+		return p.opts.Filter.RepoContext(p.opts.Repo), nil
 	}
 	opts := p.opts.Scan
 	if opts.CheckCommand == "" && p.cfg.Effective != nil {
 		opts.CheckCommand = p.cfg.Effective.CheckCommand
 	}
-	rc, err := prompt.ScanRepo(p.cfg.Run.RepoPath, opts)
+	rc, err := p.opts.Filter.Scan(p.cfg.Run.RepoPath, opts)
 	if err != nil {
 		return prompt.RepoContext{}, fmt.Errorf("orchestrator: planning: %w", err)
 	}

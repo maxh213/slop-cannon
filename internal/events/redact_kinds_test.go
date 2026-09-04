@@ -27,8 +27,16 @@ import (
 //     in the fixture or named in [redactNoText] with the reason it carries no
 //     untrusted text.
 //   - [TestRedactedRewritesEveryFreeTextField] — every `string` field of
-//     every kind, reached through pointers and slices, is rewritten unless it
-//     is listed in [redactKeeps] as something sc, bd or git minted.
+//     every kind, reached through pointers, slices and both halves of a map,
+//     is rewritten unless it is listed in [redactKeeps] as something sc, bd
+//     or git minted.
+//
+// The walk covers maps as well as slices because a map is the shape a
+// free-text field is likeliest to slip in through unnoticed: neither its
+// keys nor its values are addressable, so a rewriter has to rebuild it on
+// purpose, and until this walk planted a marker in both halves a
+// `map[string]string` of annotations would have carried raw agent text into
+// events.jsonl with every test still green (P9-09 review, round 4).
 //
 // Only fields of the unnamed type `string` are considered untrusted text.
 // The named string types (domain.BeadID, domain.Lens, events.Kind, …) are
@@ -87,6 +95,13 @@ var redactKeeps = map[string]string{
 	"bead_updated.Bead.Labels[]":     "the same",
 	"graph_changed.Beads[].Labels[]": "the same",
 	"bead_updated.Fields[]":          "the names of the bead fields sc saw change",
+
+	// The plan-key half of the map from plan key to minted bead id. It is
+	// the same correlation key as plan_produced.Plan.Beads[].Key above, on
+	// the other side of the arrow: `sc status`, the graph and the delivery
+	// all match one against the other, and a map key cannot be rewritten in
+	// place anyway. The prose the key names is rewritten in the plan.
+	"plan_produced.Created{key}": "the plan key the created bead answers to",
 }
 
 // TestRedactionTableCoversEveryKind: the fixture must name every kind that
@@ -207,8 +222,21 @@ func redactPlant(t *testing.T, v reflect.Value, path string) []string {
 	case reflect.Slice:
 		v.Set(reflect.MakeSlice(v.Type(), 1, 1))
 		planted = append(planted, redactPlant(t, v.Index(0), path+"[]")...)
+	case reflect.Map:
+		// A map carries text in both halves, and neither is addressable, so
+		// each is built on the side and put back. A key is the awkward one:
+		// events.Redacted cannot rewrite a key in place either, so a map
+		// keyed by free text has to be rebuilt by the rewriter or named in
+		// redactKeeps — which is exactly the decision this walk forces.
+		m := reflect.MakeMap(v.Type())
+		key := reflect.New(v.Type().Key()).Elem()
+		planted = append(planted, redactPlant(t, key, path+"{key}")...)
+		val := reflect.New(v.Type().Elem()).Elem()
+		planted = append(planted, redactPlant(t, val, path+"{}")...)
+		m.SetMapIndex(key, val)
+		v.Set(m)
 	default:
-		// Numbers, booleans, maps, times: nothing a rewriter would touch.
+		// Numbers, booleans, times: nothing a rewriter would touch.
 	}
 	return planted
 }
@@ -244,6 +272,11 @@ func redactSurvivors(v reflect.Value, path string) []string {
 	case reflect.Slice:
 		for i := 0; i < v.Len(); i++ {
 			left = append(left, redactSurvivors(v.Index(i), path+"[]")...)
+		}
+	case reflect.Map:
+		for _, k := range v.MapKeys() {
+			left = append(left, redactSurvivors(k, path+"{key}")...)
+			left = append(left, redactSurvivors(v.MapIndex(k), path+"{}")...)
 		}
 	default:
 	}

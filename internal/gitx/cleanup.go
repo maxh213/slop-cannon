@@ -567,6 +567,11 @@ type ResumeEntry struct {
 	// default branch because the bead had no branch yet, rather than
 	// checked out from one that already held work.
 	recreatedFresh bool
+	// emptyBranch is true when the branch is an ancestor of the default
+	// branch only because it never received a commit (P4-13): it was cut
+	// and never moved, so nothing of the bead's landed and Landed is left
+	// false.
+	emptyBranch bool
 }
 
 // Changed reports whether reconciliation moved the bead to another state.
@@ -731,7 +736,9 @@ func activeOnResume(state domain.BeadState) bool {
 //
 //   - A delivering bead whose branch tip has landed on the default branch
 //     (locally or on the remote) is closed with sc_merge_sha set: the
-//     crash hit after the fast-forward (D-20).
+//     crash hit after the fast-forward (D-20). A branch that is an
+//     ancestor only because it never received a commit does not count as
+//     landed (P4-13); that bead stays delivering, to be delivered again.
 //   - A bead with a pull request, open or merged, stays delivering: the
 //     caller re-runs the PR delivery (idempotent) so the gh:pr gate exists,
 //     and the gate poller closes the bead once the merge is seen. bd
@@ -949,6 +956,26 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 			e.Err = fmt.Errorf("gitx: unexpected rev-list output %q", out)
 			return e
 		}
+		// P4-13: ancestry alone is not proof that anything landed. An
+		// empty sc/ branch — the worktree was created and the crash came
+		// before the first commit — is trivially an ancestor of the
+		// default branch, and Ahead cannot tell the two apart (a branch
+		// that landed is reachable from the default branch, so it is 0 in
+		// both cases). What separates them is whether the ref ever moved
+		// after it was cut, which git's own reflog records and a crash
+		// cannot erase. A branch that never moved did not land, however
+		// the ancestry reads: closing that bead would record work as
+		// delivered when none exists, and unblock its dependents (D-20).
+		if e.Landed {
+			moved, known, merr := repo.branchMoved(ctx, e.Branch)
+			switch {
+			case merr != nil:
+				e.Err = merr
+				return e
+			case known && !moved:
+				e.Landed, e.emptyBranch = false, true
+			}
+		}
 	}
 
 	// Pull request, for beads that went through the PR path. The local
@@ -1023,6 +1050,32 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 	return e
 }
 
+// branchMoved reports whether a branch has moved since it was created,
+// read from the reflog git keeps for the ref itself.
+//
+// known is false when the repository keeps no reflog for the branch
+// (core.logAllRefUpdates off, or a ref written before it was turned on):
+// nothing can then be said either way, and the caller must not read the
+// silence as an answer. A branch with exactly one entry — the "branch:
+// Created from ..." git writes when the worktree is cut — has never moved;
+// two or more mean a commit, a rebase or a reset advanced it.
+func (r *Repo) branchMoved(ctx context.Context, branch string) (moved, known bool, err error) {
+	out, err := r.Git(ctx, "reflog", "show", "--format=%H", "refs/heads/"+branch)
+	if err != nil {
+		return false, false, fmt.Errorf("gitx: reading the reflog of %s: %w", branch, err)
+	}
+	entries := 0
+	for _, line := range strings.Split(out, "\n") {
+		if strings.TrimSpace(line) != "" {
+			entries++
+		}
+	}
+	if entries == 0 {
+		return false, false, nil
+	}
+	return entries > 1, true, nil
+}
+
 // reconcile decides the bead's state from the facts inspect gathered.
 func (r *Resumer) reconcile(e *ResumeEntry, def string) {
 	bead := e.Bead
@@ -1045,6 +1098,12 @@ func (r *Resumer) reconcile(e *ResumeEntry, def string) {
 	case (bead.PRURL != "" || bead.PRNumber != 0) && e.PR == nil && e.prLookedUp:
 		e.State = domain.BeadStateNeedsHuman
 		e.Reason = fmt.Sprintf("the recorded pull request %s is no longer open or merged", bead.PRURL)
+	case bead.State == domain.BeadStateDelivering && e.emptyBranch:
+		// P4-13: the branch is an ancestor of the default branch only
+		// because it is empty. The bead is left delivering, exactly where
+		// the uninterrupted path leaves it (ErrNothingToDeliver), for the
+		// caller to deliver again.
+		e.Reason = fmt.Sprintf("branch %s never received a commit, so nothing landed on %s; deliver again", e.Branch, def)
 	case bead.State == domain.BeadStateDelivering && !e.BranchExists:
 		e.State = domain.BeadStateNeedsHuman
 		e.Reason = fmt.Sprintf("branch %s is gone and nothing landed on %s", e.Branch, def)

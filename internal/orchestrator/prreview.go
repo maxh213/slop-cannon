@@ -65,10 +65,11 @@ import (
 //     are how the watcher recognises the cannon's own work (D-11), and a
 //     pull request carrying either is skipped rather than reviewed.
 //  3. Fire the cannon at the clone with `--review-prs` (its default) and a
-//     brief of your own. Within one poll interval (60 s by default) `sc
-//     status` shows a new review bead, the TUI's PRs tab shows the pull
-//     request as "external … reviewing", and one tester per lens is fired
-//     at a worktree holding the pull request's head.
+//     brief of your own. Within one poll interval — the `pr_poll_interval`
+//     configuration key, 60 s by default, and worth turning down to a few
+//     seconds for this — `sc status` shows a new review bead, the TUI's PRs
+//     tab shows the pull request as "external … reviewing", and one tester
+//     per lens is fired at a worktree holding the pull request's head.
 //  4. When the last lens answers, exactly one review appears on the pull
 //     request on GitHub — approved, or requesting changes with the items —
 //     and the review bead closes. Check `gh pr view --json state`: the pull
@@ -81,7 +82,11 @@ import (
 //  5. Merge or close the pull request yourself while a review is still in
 //     flight and watch P8-11: the next poll settles the review bead
 //     (closed, or needs_human under [StaleReviewNeedsHuman]) and no review
-//     is posted on a pull request that is no longer open.
+//     is posted on a pull request that is no longer open. The reason bd
+//     records is the watcher's own ([gitx.StaleReview.Explain]), so add the
+//     "slop-cannon" label to the pull request instead of closing it and the
+//     bead is settled saying the pull request is now one of the cannon's
+//     own rather than claiming it has gone.
 
 // SourcePRReview is the [events.Warning] Source the external pull request
 // reviewer stamps on its own notices, following host.go's
@@ -1226,12 +1231,20 @@ func (r *PRReview) retryPosts(ctx context.Context) {
 	}
 }
 
-// settleStale is P8-11: a review bead whose pull request is no longer open
-// on GitHub is settled by the configured [StaleReviewPolicy] and never
-// offered to a tester again. The watcher only reports such beads; deciding
-// what happens to them is this component's job.
-func (r *PRReview) settleStale(ctx context.Context, stale []beads.Issue) {
-	for _, is := range stale {
+// settleStale is P8-11: a review bead the poll could not match to an open
+// external pull request is settled by the configured [StaleReviewPolicy]
+// and never offered to a tester again. The watcher only reports such beads;
+// deciding what happens to them is this component's job.
+//
+// The reason written into bd and into the run log is the watcher's own
+// ([gitx.StaleReview.Explain]) rather than a fixed sentence, because
+// "stale" is three different conditions: the pull request was merged or
+// closed, it is still open but has become one of the cannon's own (D-11),
+// or the bead names no pull request at all. A bead an earlier run left open
+// is settled too — the dedupe listing spans every run — and says so.
+func (r *PRReview) settleStale(ctx context.Context, stale []gitx.StaleReview) {
+	for _, st := range stale {
+		is := st.Issue
 		bead, _ := is.SafeBead(r.opts.Statuses)
 		if bead.ID == "" || BeadStateSettled(bead.State) {
 			r.forget(bead.ID)
@@ -1252,7 +1265,11 @@ func (r *PRReview) settleStale(ctx context.Context, stale []beads.Issue) {
 		r.stats.Stale++
 		r.mu.Unlock()
 
-		msg := fmt.Sprintf("pull request #%d is no longer open on GitHub", prNumberOf(is, bead))
+		// The number comes from bd's metadata, from the still-open pull
+		// request the bead was matched to, or from what the reviewer
+		// remembers adopting — in that order — so a bead whose metadata
+		// has lost it is still named in the reason.
+		msg := gitx.StaleSentence(st.Reason, prNumberOf(st, bead), st.ForeignRun)
 		switch r.stale {
 		case StaleReviewIgnore:
 			r.warn(bead.ID, msg+"; leaving its review bead where it is", nil)
@@ -1266,10 +1283,10 @@ func (r *PRReview) settleStale(ctx context.Context, stale []beads.Issue) {
 	}
 }
 
-// prNumberOf is the pull request number of a review bead, from bd's
-// metadata or from what the reviewer remembers.
-func prNumberOf(is beads.Issue, bead domain.Bead) int {
-	if n := is.PRNumber(); n > 0 {
+// prNumberOf is the pull request number of a stale review bead: what bd
+// and the poll know, falling back to what the reviewer remembers adopting.
+func prNumberOf(st gitx.StaleReview, bead domain.Bead) int {
+	if n := st.Number(); n > 0 {
 		return n
 	}
 	return bead.PRNumber

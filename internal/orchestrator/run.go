@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -167,14 +169,21 @@ type GitResumer interface {
 }
 
 // ResumeHandler acts on what a resume found (P6-15). The delivery handoff
-// implements both halves (*Deliverer, P6-06): a pull request is re-opened
-// through the same idempotent path that opened it, and a conflict round is
-// offered to the scheduler as engineer work. The feedback loop then picks
-// the round up through [Feedback.PlanFiring].
+// implements all three halves (*Deliverer, P6-06): a pull request is
+// re-opened through the same idempotent path that opened it, an
+// interrupted delivery is run again, and a conflict round is offered to
+// the scheduler as engineer work. The feedback loop then picks the round
+// up through [Feedback.PlanFiring].
+//
+// [DeliveryResumeHandler] is the implementation every assembly uses; it
+// exists because the deliverer is built after the run.
 type ResumeHandler interface {
 	// RedeliverPR re-runs the (idempotent) pull request delivery for a bead
 	// whose PR already exists, so its gh:pr gate is recreated (D-20).
 	RedeliverPR(ctx context.Context, e gitx.ResumeEntry) error
+	// Redeliver re-runs the delivery of a bead the crash left in
+	// delivering with no pull request and no conflict to point at (P9-03).
+	Redeliver(ctx context.Context, e gitx.ResumeEntry) error
 	// ConflictRound sends a bead whose worktree was left mid-rebase back to
 	// its engineer as a conflict round (D-10).
 	ConflictRound(ctx context.Context, e gitx.ResumeEntry) error
@@ -284,6 +293,7 @@ type Run struct {
 	resumeRes  *gitx.ResumeResult
 	beadSrc    BeadSource
 	vitals     func() RunVitals
+	budget     func() BudgetState
 	agentBus   *events.Bus
 	agentDone  chan struct{}
 	outcome    Outcome
@@ -345,6 +355,10 @@ func New(cfg *config.RunConfig, opts Options) (*Run, error) {
 		case err == nil:
 			r.st.Resumes = prev.Resumes + 1
 			r.st.LastSeq = prev.LastSeq
+			// P9-01: the spend comes with it, so `limits.max_tokens` and
+			// `limits.max_cost_usd` cap the run rather than one invocation
+			// of it. [RunBudgetOptions.Restore] is where it is read back.
+			r.st.Budget = prev.Budget
 			if r.st.Run.Epic == "" {
 				r.st.Run.Epic = prev.Run.Epic
 			}
@@ -1055,6 +1069,23 @@ func (r *Run) reconcileResume(ctx context.Context) error {
 			if err := r.opts.OnResume.RedeliverPR(ctx, e); err != nil {
 				r.Warn(SourceRun, fmt.Sprintf("resume: %s: could not re-run the pull request delivery", e.Bead.ID), err)
 			}
+		case e.State == domain.BeadStateDelivering && e.Err == nil:
+			// P9-03: the crash landed inside a delivery, before there was
+			// anything to point at — the delivering status is written
+			// before any git work, so the window covers the rebase, the
+			// repository's check command and the push (safety off) or the
+			// `gh pr create` (safety on). gitx reconciles that to "the
+			// delivery did not complete; deliver again", and nothing else
+			// in the run would: the conductor ships only approved beads,
+			// the gate poller watches only gh:pr gates, and delivering is
+			// neither terminal nor settled, so the bead — and every
+			// dependent of it (D-20) — would hang for as long as the run
+			// lives. An entry gitx could not inspect is left alone: its
+			// branch state is a guess, and delivering from a guess is how
+			// work gets lost.
+			if err := r.opts.OnResume.Redeliver(ctx, e); err != nil {
+				r.Warn(SourceRun, fmt.Sprintf("resume: %s: could not finish the interrupted delivery", e.Bead.ID), err)
+			}
 		}
 	}
 	return nil
@@ -1117,6 +1148,21 @@ func (r *Run) UseVitals(f func() RunVitals) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.vitals = f
+}
+
+// UseBudget names the function that snapshots the run's spend for every
+// state.json the run writes (P9-01), which is how a resumed run picks its
+// budget up where the last invocation left it rather than counting from
+// zero. Pass [RunBudget.Snapshot]; a nil function leaves State.Budget as
+// whatever the run was resumed with.
+//
+// Like [Run.UseVitals] it is called on the run's own goroutine while the
+// run holds its lock, so it must not block or call back into the run.
+// [RunBudget.Snapshot] does neither.
+func (r *Run) UseBudget(f func() BudgetState) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.budget = f
 }
 
 // finish performs the shutdown sequence exactly once and closes Done:
@@ -1371,6 +1417,10 @@ func (r *Run) persistLocked() error {
 		v := r.vitals()
 		r.st.Vitals = &v
 	}
+	if r.budget != nil {
+		b := r.budget()
+		r.st.Budget = &b
+	}
 	if err := WriteState(r.dirs.Dir, r.st); err != nil {
 		r.log.Error("could not write the run state", slog.Any("err", err))
 		return err
@@ -1490,7 +1540,15 @@ func acquireLock(runDir string, run domain.RunID, policy LockPolicy, now time.Ti
 	}
 	host, _ := os.Hostname()
 	holder := LockHolder{Run: run, PID: os.Getpid(), Host: host, TakenAt: now.UTC()}
-	data, err := json.MarshalIndent(holder, "", "  ")
+	// P9-04: the process start stamp goes into the record the lock is
+	// published with, so pid and incarnation become visible together in the
+	// one atomic step that takes the lock. [StampRunLock] then has nothing
+	// to do: no reader ever meets a lock that names a pid without saying
+	// which incarnation of it, and nothing has to read the lock back and
+	// write it again — a read-modify-write a concurrent `--force` takeover
+	// could have clobbered.
+	opts := lockOptionsOf(policy)
+	data, err := json.MarshalIndent(LockRecord{LockHolder: holder, Started: opts.startOf(holder.PID)}, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("orchestrator: encode the run lock: %w", err)
 	}
@@ -1514,9 +1572,9 @@ func acquireLock(runDir string, run domain.RunID, policy LockPolicy, now time.Ti
 				return nil, &LockedError{Path: path, State: LockCorrupt, Age: lockFileAge(path, LockOptions{}), cause: cause}
 			}
 		} else if !policy.Stale(existing) {
-			return nil, fmt.Errorf("%w: run %s (pid %d on %s, since %s) is using %s; stop it first, or resume it",
-				ErrLocked, existing.Run, existing.PID, existing.Host,
-				existing.TakenAt.Format(time.RFC3339), filepath.Dir(path))
+			// The same *LockedError the preflight raises, so losing the
+			// race here reads exactly like losing it there (P9-04).
+			return nil, lockedBy(path, existing, policy)
 		}
 		// Stale, or debris the policy agreed to clear: take it over.
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -1813,10 +1871,26 @@ type ConductorOptions struct {
 	// Interval is how often [Conductor.Run] syncs; zero means
 	// [DefaultConductorInterval].
 	Interval time.Duration
+	// DeliveryAttempts bounds how many times one bead's delivery is tried
+	// before it is handed to a person; zero means
+	// [DefaultDeliveryAttempts]. DeliveryBackoff is the wait before the
+	// second attempt, doubled before each one after it and capped at
+	// [MaxDeliveryBackoff]; zero means [DefaultDeliveryBackoff]. Both are
+	// wall-clock: they pace subprocesses, not the run's behaviour.
+	DeliveryAttempts int
+	DeliveryBackoff  time.Duration
 	// Restore says whether the first pass rebuilds the feedback threads
 	// from the beads' comments (P8-16). The zero value follows the run:
 	// a resumed run restores, a fresh one does not.
 	Restore *bool
+	// States applies the D-07 transitions the glue itself owes, both of
+	// which park a bead in needs_human because no retry can help:
+	// [Conductor.giveUpOnDelivery]'s, and P9-06's — a bead whose replayed
+	// thread the rules gate refused to conclude, where the thread the
+	// failed replay left behind would otherwise make every later pass skip
+	// the bead in silence. Nil leaves such a bead where bd holds it and
+	// reports why, so a test that does not care may omit it.
+	States *StateMachine
 	// RulesGate is the run's rules compliance gate (P9-06). A resume replays
 	// bd's comments without re-running any role check, so the gate is told
 	// about a thread ([RulesRestorer.RestoreMessages]) before
@@ -1874,15 +1948,28 @@ type Conductor struct {
 	log      *slog.Logger
 	restore  bool
 
-	// deliveries counts the delivery goroutines in flight; a delivery is
-	// not part of a pass (P8-14 gap 5), so the pass does not wait for it.
+	// attempts is how many times one bead's delivery is tried before it is
+	// given to a person, and backoff the first wait between two of them.
+	attempts int
+	backoff  time.Duration
+
+	// deliveries counts the delivery worker; a delivery is not part of a
+	// pass (P8-14 gap 5), so the pass does not wait for it.
 	deliveries sync.WaitGroup
+	// deliver serialises the deliveries themselves: whoever asks for one,
+	// only one repository-mutating delivery runs at a time (P8-14 gap 3).
+	deliver sync.Mutex
 
 	mu       sync.Mutex
+	idle     *sync.Cond
 	feedback ConductorFeedback
 	delivery ConductorDelivery
 	gates    GateKicker
-	inflight map[domain.BeadID]bool
+	inflight map[domain.BeadID]deliveryJob
+	queue    []deliveryJob
+	pending  int
+	wake     chan struct{}
+	worker   bool
 	shipped  map[domain.BeadID]bool
 	owed     map[domain.BeadID]bool
 	frozen   bool
@@ -1915,13 +2002,23 @@ func NewConductor(opts ConductorOptions) (*Conductor, error) {
 		feedback: opts.Feedback,
 		delivery: opts.Delivery,
 		gates:    opts.Gates,
-		inflight: map[domain.BeadID]bool{},
+		attempts: opts.DeliveryAttempts,
+		backoff:  opts.DeliveryBackoff,
+		inflight: map[domain.BeadID]deliveryJob{},
+		wake:     make(chan struct{}, 1),
 		shipped:  map[domain.BeadID]bool{},
 		owed:     map[domain.BeadID]bool{},
 		seen:     map[domain.BeadID]bool{},
 	}
+	c.idle = sync.NewCond(&c.mu)
 	if c.interval <= 0 {
 		c.interval = DefaultConductorInterval
+	}
+	if c.attempts <= 0 {
+		c.attempts = DefaultDeliveryAttempts
+	}
+	if c.backoff <= 0 {
+		c.backoff = DefaultDeliveryBackoff
 	}
 	if c.log == nil {
 		c.log = opts.Run.Log()
@@ -1976,6 +2073,29 @@ func (c *Conductor) Attach(p ConductorParts) {
 	if p.Gates != nil {
 		c.gates = p.Gates
 	}
+}
+
+// RulesWiring is P9-06's half of a conductor's options, as
+// [Conductor.RulesWiring] reports it.
+type RulesWiring struct {
+	// Gate is [ConductorOptions.RulesGate]: what a resume tells about a
+	// bead's comments before [Feedback.Restore] replays them.
+	Gate RulesRestorer
+	// States is [ConductorOptions.States]: what a bead whose replay the
+	// gate refused is parked in needs_human with.
+	States *StateMachine
+}
+
+// RulesWiring reports what the conductor was given for the rules
+// compliance gate; either field is nil when the assembly wired none.
+//
+// It exists so an assembled run can be *asked* whether P9-06's resume half
+// is in place. Both fields are otherwise read only on a resume, so dropping
+// either from `sc run` broke nothing any test could see (P9-06 review,
+// round 4). The options are set once, before the conductor runs, so no lock
+// is needed.
+func (c *Conductor) RulesWiring() RulesWiring {
+	return RulesWiring{Gate: c.opts.RulesGate, States: c.opts.States}
 }
 
 // parts reads the attached components under the lock.
@@ -2223,6 +2343,10 @@ func (c *Conductor) restoreThreads(ctx context.Context, list []domain.Bead) erro
 			c.opts.RulesGate.RestoreMessages(b.ID, msgs)
 		}
 		if err := feedback.Restore(ctx, b, msgs); err != nil {
+			if errors.Is(err, ErrRulesBlocker) {
+				errs = append(errs, c.rulesBlockedRestore(ctx, b, feedback, err))
+				continue
+			}
 			errs = append(errs, fmt.Errorf("orchestrator: conductor: restoring %s's thread: %w", b.ID, err))
 			continue
 		}
@@ -2233,17 +2357,88 @@ func (c *Conductor) restoreThreads(ctx context.Context, list []domain.Bead) erro
 		c.log.Info("feedback thread restored from the bead's comments",
 			slog.String("bead", b.ID.String()), slog.String("state", string(b.State)),
 			slog.Int("messages", len(msgs)))
+		if err := c.reopenRestored(ctx, b, feedback); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }
 
-// conductorRestorable reports whether a resumed bead has a thread worth
-// rebuilding: it is in one of the states the loop reaches only after an
-// engineer has submitted something, so its comments describe a conversation
-// rather than nothing at all.
+// rulesBlockedRestore is what a resume does with a bead whose replayed
+// thread the rules compliance gate refused to conclude (P9-06).
+//
+// It cannot be retried and it must not be dropped. The refusal is the gate
+// reading the bead's own comments and finding a violation of a rules file
+// that only code can settle, so every later pass would be refused
+// identically; and [Feedback.Restore] registers the thread before it tries
+// the transition, so the "a live thread is the true one" branch above would
+// quietly stop retrying anyway and leave bd holding the bead in in_review
+// with the loop believing it settled, no agent ever offered and nobody
+// told (P9-06 review, round 4).
+//
+// So the bead is handed to a person instead: needs_human is a state
+// [BeadEventBlocked] reaches from anywhere non-terminal, it is not a
+// shipping state so the gate's own guarded store allows it, and the loop is
+// told where the bead went so [Feedback.Outstanding] stops waiting on it.
+// The refusal is still returned, so the pass reports it and `sc status`
+// keeps the gate's own warning beside it.
+func (c *Conductor) rulesBlockedRestore(ctx context.Context, b domain.Bead, feedback ConductorFeedback, cause error) error {
+	// Nothing here is retried, so the bead is settled first: a later pass
+	// must not walk into the live-thread branch and pretend all is well.
+	c.restoreSettled(b.ID)
+	c.log.Warn("the rules compliance gate refused a resumed thread; the bead needs a person",
+		slog.String("bead", b.ID.String()), slog.String("state", string(b.State)),
+		slog.String("error", cause.Error()))
+	if c.opts.States == nil {
+		return fmt.Errorf("orchestrator: conductor: restoring %s's thread: %w", b.ID, cause)
+	}
+	_, err := c.opts.States.Apply(ctx, StateRequest{
+		Bead: b.ID, From: b.State, Event: BeadEventBlocked,
+		Reason: "a resumed thread settled a rules-file violation the gate holds open",
+	})
+	if err != nil {
+		c.rulesWarn(b.ID, "a bead the rules gate refused could not be parked in needs_human; it is where bd left it", err)
+		return errors.Join(fmt.Errorf("orchestrator: conductor: restoring %s's thread: %w", b.ID, cause),
+			fmt.Errorf("orchestrator: conductor: parking %s for a person: %w", b.ID, err))
+	}
+	feedback.Observe(b.ID, domain.BeadStateNeedsHuman)
+	c.rulesWarn(b.ID, "a resumed bead was parked in needs_human: its thread settles a rules-file violation the gate holds open", cause)
+	return fmt.Errorf("orchestrator: conductor: restoring %s's thread: %w", b.ID, cause)
+}
+
+// rulesWarn publishes one of [Conductor.rulesBlockedRestore]'s warnings. It
+// is not [Run.Warn] because that one carries no bead, and the whole point
+// of these two is to name the bead a person now owns.
+func (c *Conductor) rulesWarn(bead domain.BeadID, message string, err error) {
+	w := events.Warning{Meta: c.run.Meta(), Source: SourceRules, Message: message, Bead: bead}
+	if err != nil {
+		w.Err = err.Error()
+	}
+	c.run.Publish(w)
+}
+
+// conductorRestorable reports whether a resumed bead may have a thread
+// worth rebuilding: every workflow state a run can be killed in.
+//
+// open is in the list, and it is the state most of them are in (P8-14 gap
+// 2). A bead the killed run had claimed does not come back in_progress: a
+// graceful stop takes the D-07 released edge (P6-03) and `--resume` runs
+// [beads.Client.RecoverStale] before the run starts, which releases every
+// stale in_progress bead — both of which leave it open with the previous
+// run's whole thread still on it. Leaving open out meant the commonest
+// resume of all threw away the items, the responses, the D-08 pushback
+// counts and the rulings of every bead an engineer was working on, and
+// started it again at round one.
+//
+// Nothing is restored on the strength of this alone: only the first pass's
+// listing is a candidate ([Conductor.freezeRestorable]), only a bead that
+// really carries structured comments is replayed, and a bead the loop has
+// already adopted is left alone ([Conductor.restoreThreads]). The cost of
+// the wider net is one `bd show <id> --comments` per open bead, once, on
+// the first pass of a resumed run.
 func conductorRestorable(b domain.Bead) bool {
 	switch b.State {
-	case domain.BeadStateInProgress, domain.BeadStateInReview,
+	case domain.BeadStateOpen, domain.BeadStateInProgress, domain.BeadStateInReview,
 		domain.BeadStateChangesRequested, domain.BeadStateEscalated,
 		domain.BeadStateApproved, domain.BeadStateDelivering:
 		return true
@@ -2252,12 +2447,86 @@ func conductorRestorable(b domain.Bead) bool {
 	}
 }
 
+// reopenRestoredReason is what the testers are told when a resumed bead's
+// approvals are taken again.
+const reopenRestoredReason = "this bead's previous run was killed while its engineer was still working, " +
+	"so the approvals on its comments are for code that has since moved"
+
+// reopenRestored keeps a restored open bead's thread and the state bd holds
+// it in from contradicting each other (P8-14 gap 2).
+//
+// A bead the resume found open was in_progress when the run died, so the
+// branch is whatever its engineer had reached. The replay, though, is of
+// comments alone: with no change set to compare against, [Feedback.plan]
+// decides who still owes a verdict from the round numbers, and a thread
+// whose last round was fully approved comes back settled — over a bead bd
+// holds open, which no demand will ever be made for and which
+// [BeadStateSettled] calls unsettled, so the run would idle for ever.
+//
+// The loop's own phases say what bd should be holding: an engineer's phase
+// needs nothing (the demand's claim moves the bead to in_progress and
+// [Feedback.planEngineer] syncs the thread), a settled thread means the
+// approvals are stale and the testers are sent back over the code that is
+// really there, and every other phase means the bead is being judged, which
+// is in_review — or escalated, while the product owner rules. Telling the
+// loop that is what makes its next transition one the D-07 table allows;
+// bd catches up with the write that transition performs.
+func (c *Conductor) reopenRestored(ctx context.Context, b domain.Bead, feedback ConductorFeedback) error {
+	if b.State != domain.BeadStateOpen {
+		return nil
+	}
+	th, ok := feedback.Thread(b.ID)
+	if !ok {
+		return nil
+	}
+	switch th.Phase {
+	case FeedbackImplementing, FeedbackAddressing:
+		return nil
+	case FeedbackSettled:
+		c.log.Info("a resumed bead's approvals are for code its killed engineer was still changing; reviewing it again",
+			slog.String("bead", b.ID.String()), slog.Int("round", th.Round))
+		if err := feedback.ReviewAgain(ctx, b, th.Round, reopenRestoredReason); err != nil {
+			return fmt.Errorf("orchestrator: conductor: reviewing %s again after its resume: %w", b.ID, err)
+		}
+	case FeedbackEscalating:
+		feedback.Observe(b.ID, domain.BeadStateEscalated)
+	default:
+		feedback.Observe(b.ID, domain.BeadStateInReview)
+	}
+	return nil
+}
+
 // deliveryDrain bounds how long the conductor waits for the deliveries it
 // cancelled on the way out. It is wall-clock rather than the run's clock on
 // purpose: it bounds goroutines, not the run's behaviour.
 const deliveryDrain = 30 * time.Second
 
-// deliverApproved starts the delivery of every bead the loop approved, at
+// DefaultDeliveryAttempts is how many times one bead's delivery is tried
+// before it is handed to a person. A retryable delivery failure is a `gh`
+// that could not be reached, a remote that refused the push, a default
+// branch that moved under the rebase, or a bd write that failed after the
+// merge landed — all of which usually pass. Five attempts over
+// [DefaultDeliveryBackoff]'s doubling waits is about a minute and a half of
+// trying, which outlives the ordinary hiccup without hiding a real one.
+const DefaultDeliveryAttempts = 5
+
+// DefaultDeliveryBackoff is the wait before a delivery's second attempt. It
+// doubles before each attempt after that, up to [MaxDeliveryBackoff].
+const DefaultDeliveryBackoff = 5 * time.Second
+
+// MaxDeliveryBackoff caps the doubling, so a long run's last retries are
+// still minutes rather than hours apart.
+const MaxDeliveryBackoff = 2 * time.Minute
+
+// deliveryJob is one bead's delivery: the bead as the conductor last saw
+// it, which attempt this is (1-based) and the earliest time it may run.
+type deliveryJob struct {
+	bead    domain.Bead
+	attempt int
+	at      time.Time
+}
+
+// deliverApproved queues the delivery of every bead the loop approved, at
 // most one at a time per bead, and does not wait for it: a delivery is a
 // rebase, the repository's check command, a push and a `gh pr create` —
 // minutes in a real repository — and holding the pass open for it would
@@ -2265,6 +2534,14 @@ const deliveryDrain = 30 * time.Second
 // until the delivery returned (P8-14 gap 5). The pass keeps offering work
 // while the delivery runs; [Conductor.claim] is what stops the next pass
 // shipping the same bead twice.
+//
+// The queue is drained by one worker, so two beads approved in the same
+// pass are delivered one after the other rather than at once (P8-14 gap 3).
+// They would otherwise race over the same repository: with safety off each
+// delivery fetches, rebases, fast-forwards the default branch and pushes
+// through the same [gitx.Manager], and the second of two concurrent
+// deliveries finds the branch it rebased onto already moved and fails with
+// [gitx.ErrNotFastForward] — every time, not sometimes.
 //
 // Seeing a bead anywhere but approved also clears the mark a finished
 // delivery left ([Conductor.shipped]), so a bead that comes back to
@@ -2284,20 +2561,145 @@ func (c *Conductor) deliverApproved(ctx context.Context, list []domain.Bead) {
 			c.leftApproved(b.ID)
 			continue
 		}
-		if !c.claim(b.ID) {
+		if !c.claim(b) {
 			continue
 		}
-		bead := b
-		dctx := c.deliveryContext(ctx)
+		c.enqueue(ctx, deliveryJob{bead: b, attempt: 1, at: time.Now()})
+	}
+}
+
+// enqueue puts one delivery in the queue and makes sure the worker is
+// running. The bead is already claimed ([Conductor.claim]), so nothing else
+// will queue it while it is there.
+func (c *Conductor) enqueue(ctx context.Context, job deliveryJob) {
+	dctx := c.deliveryContext(ctx)
+	c.mu.Lock()
+	c.queue = append(c.queue, job)
+	c.pending++
+	start := !c.worker
+	c.worker = true
+	c.mu.Unlock()
+	if start {
 		c.deliveries.Add(1)
 		go func() {
 			defer c.deliveries.Done()
-			if err := c.Deliver(dctx, bead); err != nil && dctx.Err() == nil {
-				c.record(false, err)
-				c.warn(err)
-			}
+			c.deliverQueued(dctx)
 		}()
 	}
+	c.nudge()
+}
+
+// nudge wakes the worker without blocking: the channel holds one wake-up,
+// which is all a worker that re-reads the whole queue needs.
+func (c *Conductor) nudge() {
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+}
+
+// deliverQueued is the delivery worker: it runs the queued deliveries one
+// at a time, oldest due first, until the context is cancelled. Serialising
+// them is the point ([Conductor.deliverApproved]); the wait between a
+// failed attempt and its retry is [Conductor.retryDelivery]'s.
+//
+// On the way out it drops whatever is still queued and wakes anything
+// waiting in [Conductor.WaitDeliveries], so a cancelled run cannot leave a
+// caller blocked on work that will never run.
+func (c *Conductor) deliverQueued(ctx context.Context) {
+	defer c.dropQueued()
+	for {
+		job, wait, ok := c.nextDelivery(time.Now())
+		switch {
+		case ok && wait <= 0:
+			c.runDelivery(ctx, job)
+			continue
+		case ctx.Err() != nil:
+			return
+		}
+		var (
+			idle  <-chan time.Time
+			timer *time.Timer
+		)
+		if ok {
+			timer = time.NewTimer(wait)
+			idle = timer.C
+		}
+		select {
+		case <-ctx.Done():
+			if timer != nil {
+				timer.Stop()
+			}
+			return
+		case <-c.wake:
+		case <-idle:
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+	}
+}
+
+// nextDelivery takes the job that is due first. It returns ok false when
+// the queue is empty, and a positive wait when the head of the queue is a
+// retry that is not due yet (the job is left in the queue then).
+func (c *Conductor) nextDelivery(now time.Time) (deliveryJob, time.Duration, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.queue) == 0 {
+		return deliveryJob{}, 0, false
+	}
+	first := 0
+	for i, j := range c.queue {
+		if j.at.Before(c.queue[first].at) {
+			first = i
+		}
+	}
+	job := c.queue[first]
+	if wait := job.at.Sub(now); wait > 0 {
+		return job, wait, true
+	}
+	c.queue = append(c.queue[:first], c.queue[first+1:]...)
+	return job, 0, true
+}
+
+// runDelivery delivers one queued job and accounts for it. Whatever
+// happened, the job is finished here: a retry is a new job the outcome
+// queued ([Conductor.retryDelivery]) before this one was counted out, so
+// the pending count never dips to zero between an attempt and its retry.
+func (c *Conductor) runDelivery(ctx context.Context, job deliveryJob) {
+	defer c.finishDelivery()
+	if err := c.deliverJob(ctx, job); err != nil && ctx.Err() == nil {
+		c.record(false, err)
+		c.warn(err)
+	}
+}
+
+// finishDelivery counts one delivery out and wakes [Conductor.WaitDeliveries]
+// when nothing is left.
+func (c *Conductor) finishDelivery() {
+	c.mu.Lock()
+	if c.pending > 0 {
+		c.pending--
+	}
+	if c.pending == 0 {
+		c.idle.Broadcast()
+	}
+	c.mu.Unlock()
+}
+
+// dropQueued abandons the queue when the worker stops, so a shutdown does
+// not leave [Conductor.WaitDeliveries] waiting for work nothing will run.
+func (c *Conductor) dropQueued() {
+	c.mu.Lock()
+	for _, job := range c.queue {
+		delete(c.inflight, job.bead.ID)
+	}
+	c.queue = nil
+	c.pending = 0
+	c.worker = false
+	c.idle.Broadcast()
+	c.mu.Unlock()
 }
 
 // deliveryContext is the context a background delivery runs under: the
@@ -2322,11 +2724,22 @@ func (c *Conductor) deliveryContext(ctx context.Context) context.Context {
 	return c.dctx
 }
 
-// WaitDeliveries blocks until every delivery this conductor has started has
-// finished. [Conductor.Run] waits on the way out, and a caller driving
-// [Conductor.Sync] by hand — a test — waits when it wants the outcome of
-// the pass it just made.
-func (c *Conductor) WaitDeliveries() { c.deliveries.Wait() }
+// WaitDeliveries blocks until the delivery queue is empty and nothing is in
+// flight, retries included: a bead whose attempt failed is still owed one,
+// and a caller that wants "the delivery is finished with this bead" wants
+// to wait for that too. [Conductor.Run] waits on the way out, and a caller
+// driving [Conductor.Sync] by hand — a test — waits when it wants the
+// outcome of the pass it just made.
+//
+// A cancelled worker drops what it was holding ([Conductor.dropQueued]), so
+// this cannot outlive the conductor.
+func (c *Conductor) WaitDeliveries() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for c.pending > 0 {
+		c.idle.Wait()
+	}
+}
 
 // stopDeliveries cancels the deliveries in flight and waits for them,
 // bounded by [deliveryDrain] so a delivery that ignores its context cannot
@@ -2353,7 +2766,21 @@ func (c *Conductor) stopDeliveries() {
 // Deliver ships one bead and routes the outcome back into the loops. The
 // bead is held in flight until an outcome says it may be delivered again,
 // so a pass that overlaps the previous one never ships it twice.
+//
+// It is the synchronous form, for a caller that wants the outcome; the
+// conductor's own passes queue their deliveries instead
+// ([Conductor.deliverApproved]). Either way the bead is delivered under the
+// same lock, so two callers never rebase and fast-forward the same
+// repository at once (P8-14 gap 3).
 func (c *Conductor) Deliver(ctx context.Context, b domain.Bead) error {
+	return c.deliverJob(ctx, deliveryJob{bead: b, attempt: c.attemptFor(b.ID)})
+}
+
+// deliverJob is [Conductor.Deliver] for one attempt of one job: it knows
+// which attempt this is, so a retryable outcome can be given the next one
+// ([Conductor.retryDelivery]).
+func (c *Conductor) deliverJob(ctx context.Context, job deliveryJob) error {
+	b := job.bead
 	feedback, delivery, _ := c.parts()
 	if delivery == nil {
 		return nil
@@ -2382,12 +2809,31 @@ func (c *Conductor) Deliver(ctx context.Context, b domain.Bead) error {
 	c.mu.Lock()
 	c.stats.Delivered++
 	c.mu.Unlock()
+	c.attempted(job)
+	// One delivery at a time, whoever asked for it: everything below
+	// mutates the same repository (D-10's rebase, fast-forward and push,
+	// or a `gh pr create` against the same branch).
+	c.deliver.Lock()
 	out, err := delivery.Deliver(ctx, DeliveryRequest{Bead: b, Round: round, Report: report, Verdicts: verdicts})
-	if err != nil {
+	c.deliver.Unlock()
+	if out == nil {
+		// A refused request: the bead is not deliverable, or the run has no
+		// path for its safety setting. Neither is retryable and neither
+		// moved the bead, so the claim goes back and the next pass decides
+		// again on what bd says then.
 		c.release(b.ID)
+		if err != nil {
+			return fmt.Errorf("orchestrator: conductor: delivering %s: %w", b.ID, err)
+		}
+		return nil
+	}
+	if applyErr := c.ApplyOutcome(ctx, b.ID, out); applyErr != nil {
+		err = errors.Join(err, applyErr)
+	}
+	if err != nil {
 		return fmt.Errorf("orchestrator: conductor: delivering %s: %w", b.ID, err)
 	}
-	return c.ApplyOutcome(ctx, b.ID, out)
+	return nil
 }
 
 // ApplyOutcome is the boundary between the delivery handoff and the
@@ -2410,6 +2856,10 @@ func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *Del
 		slog.String("kind", out.Kind.String()), slog.String("state", string(out.State)),
 		slog.String("summary", out.Summary()))
 	bead := domain.Bead{ID: id, State: out.State, Round: out.Round}
+	// observed is where the loop is told the bead went, which is the
+	// outcome's state everywhere but the give-up below: that one moves the
+	// bead itself.
+	observed := out.State
 	var err error
 	switch out.Kind {
 	case DeliveryPending:
@@ -2436,9 +2886,27 @@ func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *Del
 		if feedback != nil {
 			err = feedback.ReviewAgain(ctx, bead, out.Round, out.Reason)
 		}
-	case DeliveryConflict, DeliveryRetryable:
-		// The engineer has the bead (D-10), or the attempt may be retried.
+	case DeliveryConflict:
+		// The engineer has the bead (D-10): the loop owns it again.
 		c.release(id)
+	case DeliveryRetryable:
+		switch out.State {
+		case domain.BeadStateDelivering:
+			// The bead is still in delivering and nothing else will ever
+			// pick it up: `bd ready` does not offer it, the feedback loop
+			// was not given it back, and the next pass delivers approved
+			// beads only. So the conductor owes it the retry the outcome
+			// asks for (P8-14 gap 1), and after enough of them, a person.
+			if !c.retryDelivery(ctx, id, out) {
+				observed = c.giveUpOnDelivery(ctx, id, out)
+			}
+		default:
+			// A retryable failure of something that is not a delivery —
+			// [Deliverer.Resolved] could not write the transition a
+			// finished conflict round owes — leaves the bead with the
+			// loop, and re-delivering it is not what it is asking for.
+			c.release(id)
+		}
 	case DeliveryHandedOff:
 		// A person owns it now, so the conductor does not pick it back up
 		// — until bd shows it out of approved and back in it again, which
@@ -2446,13 +2914,127 @@ func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *Del
 		c.ship(id)
 	}
 	if feedback != nil {
-		feedback.Observe(id, out.State)
+		feedback.Observe(id, observed)
 	}
 	if err != nil {
 		return fmt.Errorf("orchestrator: conductor: acting on the delivery of %s: %w", id, err)
 	}
 	return nil
 }
+
+// retryDelivery queues the next attempt of a delivery that failed in a way
+// the deliverer said may be tried again, and reports whether it did. The
+// bead stays claimed — it is in delivering, and the conductor is the only
+// thing that will ever come back to it — and the wait doubles with each
+// attempt, so a remote that is down for a minute costs a minute rather than
+// a delivery a second.
+//
+// It is false when the attempts are spent, which is
+// [Conductor.giveUpOnDelivery]'s cue.
+func (c *Conductor) retryDelivery(ctx context.Context, id domain.BeadID, out *DeliveryOutcome) bool {
+	c.mu.Lock()
+	job, ok := c.inflight[id]
+	if !ok {
+		// A delivery this conductor did not start (a resume handler's, a
+		// caller's own): it still owes the bead its retries.
+		job = deliveryJob{bead: domain.Bead{ID: id}}
+	}
+	if job.attempt >= c.attempts {
+		c.mu.Unlock()
+		return false
+	}
+	job.attempt++
+	if job.bead.ID == "" {
+		job.bead.ID = id
+	}
+	if out.State != "" {
+		// delivering, which is where startDelivering left it: the retry is
+		// a retry, not a second announcement.
+		job.bead.State = out.State
+	}
+	if out.Round > 0 {
+		job.bead.Round = out.Round
+	}
+	job.at = time.Now().Add(deliveryBackoff(c.backoff, job.attempt-1))
+	c.inflight[id] = job
+	wait := job.at
+	c.mu.Unlock()
+	c.log.Info("the delivery will be tried again",
+		slog.String("bead", id.String()), slog.Int("attempt", job.attempt),
+		slog.Int("of", c.attempts), slog.String("reason", out.Reason),
+		slog.Time("at", wait))
+	c.enqueue(ctx, job)
+	return true
+}
+
+// deliveryBackoff is the wait before attempt n+1 (n retries already made):
+// base, doubled each time, capped at [MaxDeliveryBackoff].
+func deliveryBackoff(base time.Duration, retries int) time.Duration {
+	wait := base
+	for i := 0; i < retries && wait < MaxDeliveryBackoff; i++ {
+		wait *= 2
+	}
+	if wait > MaxDeliveryBackoff {
+		return MaxDeliveryBackoff
+	}
+	return wait
+}
+
+// giveUpOnDelivery hands a bead whose delivery has spent every attempt to a
+// person, and returns the state the loop should be told about.
+//
+// Something is wrong that another attempt will not fix: `gh` cannot be
+// reached, the remote keeps refusing the push, or bd would not take the
+// close of a merge that has already landed. Leaving the bead in delivering
+// would strand it — no work source offers a delivering bead and
+// [BeadStateSettled] is false for it, so a brief run would never finish and
+// D-20's "a bead is closed only when its code has landed" would be broken
+// in the other direction: the code on the default branch with the bead
+// never closed. needs_human is terminal, [BeadEventBlocked] reaches it from
+// anywhere non-terminal, and the warning says what to look at.
+func (c *Conductor) giveUpOnDelivery(ctx context.Context, id domain.BeadID, out *DeliveryOutcome) domain.BeadState {
+	reason := strings.TrimSpace(out.Reason)
+	if reason == "" {
+		reason = "the delivery failed"
+	}
+	c.log.Warn("a delivery failed too many times; the bead needs a person",
+		slog.String("bead", id.String()), slog.Int("attempts", c.attempts),
+		slog.String("reason", reason))
+	why := fmt.Errorf("%s (%d attempts): %s", id, c.attempts, reason)
+	if c.opts.States == nil {
+		// No machine to write with: the claim goes back so a person who
+		// puts the bead back in approved still gets it delivered.
+		c.release(id)
+		c.run.Warn(SourceConductor, deliveryStrandedMessage, why)
+		return out.State
+	}
+	from := out.State
+	if from == "" {
+		from = domain.BeadStateDelivering
+	}
+	if _, err := c.opts.States.Apply(ctx, StateRequest{
+		Bead: id, From: from, Event: BeadEventBlocked, Round: out.Round,
+		Reason: "the delivery failed " + strconv.Itoa(c.attempts) + " times: " + reason,
+	}); err != nil {
+		c.release(id)
+		c.run.Warn(SourceConductor, deliveryStrandedMessage, errors.Join(why, err))
+		return out.State
+	}
+	c.ship(id)
+	c.run.Warn(SourceConductor, deliveryGaveUpMessage, why)
+	return domain.BeadStateNeedsHuman
+}
+
+// deliveryGaveUpMessage is what a run says when it stops retrying a
+// delivery, and deliveryStrandedMessage what it says when it could not move
+// the bead afterwards. Both are on the troubleshooting page, and
+// [TestGlueTheConductorsMessagesAreOnTheTroubleshootingPage] holds them
+// there.
+const (
+	deliveryGaveUpMessage   = "a delivery failed too many times; the bead was handed to a person"
+	deliveryStrandedMessage = "a delivery failed too many times and the bead could not be handed to a person; " +
+		"it is where bd left it"
+)
 
 // ConflictResolved is [FeedbackOptions.ConflictResolved]: the engineer of a
 // conflict round has finished, so the delivery handoff decides what happens
@@ -2522,6 +3104,18 @@ func (c *Conductor) BeadContext(ctx context.Context, id domain.BeadID) (Feedback
 			round = th.Round
 		}
 	}
+	// D-11's review bead is not this run's work: it belongs to somebody
+	// else's pull request, and [PRWorktreeCheckout] leaves its worktree
+	// detached at that pull request's head with the bead's own branch
+	// deleted. Committing D-14's leftovers there would `git add -A` and
+	// commit whatever a previous lens left in that directory — build
+	// output, a test cache — onto a detached HEAD under an `sc(<bead>):
+	// round N leftovers` message, and diffing it would describe the wrong
+	// change set. The reviewer supplies the worktree, the branch and the
+	// diff of the pull request itself (P8-14 gap 4).
+	if issues[0].IsExternalPR() {
+		return c.reviewBeadContext(bead, round), nil
+	}
 
 	worktree := ""
 	if c.opts.Worktrees != nil {
@@ -2589,6 +3183,32 @@ func (c *Conductor) BeadContext(ctx context.Context, id domain.BeadID) (Feedback
 	}, nil
 }
 
+// reviewBeadContext is [Conductor.BeadContext] for D-11's external pull
+// request review bead: everything the prompt needs about the repository and
+// the run, and nothing about a worktree or a change set, both of which
+// [PRReview.PlanFiring] fills in from the pull request itself. Nothing here
+// touches git.
+func (c *Conductor) reviewBeadContext(bead domain.Bead, round int) FeedbackBeadContext {
+	return FeedbackBeadContext{
+		Bead: prompt.BeadContext{
+			Bead:  bead,
+			Epic:  c.run.Epic(),
+			Round: round,
+		},
+		Repo:         c.opts.Repo,
+		Brief:        c.opts.Brief,
+		Rules:        c.opts.Rules,
+		Vibes:        c.opts.Vibes,
+		Budget:       c.opts.Budget,
+		CheckCommand: c.opts.CheckCommand,
+		Model:        c.opts.Model,
+		MaxTurns:     c.opts.MaxTurns,
+		Timeout:      c.opts.Timeout,
+		Env:          c.opts.Env,
+		InheritEnv:   c.opts.InheritEnv,
+	}
+}
+
 // announce publishes the bead inventory and the dependency graph (P6-32).
 // Both event kinds existed, round-trip through the codec and are folded by
 // [Summarise], but nothing in a real run emitted either: the run log
@@ -2644,20 +3264,45 @@ func (c *Conductor) announce(issues []beads.Issue, list []domain.Bead) {
 }
 
 // claim reserves a bead for delivery so two passes never ship one twice: a
-// delivery is in flight, or the last one ended somewhere the bead has not
-// come back from yet.
-func (c *Conductor) claim(id domain.BeadID) bool {
+// delivery is queued or in flight, or the last one ended somewhere the bead
+// has not come back from yet.
+func (c *Conductor) claim(b domain.Bead) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.inflight[id] || c.shipped[id] {
+	if _, busy := c.inflight[b.ID]; busy || c.shipped[b.ID] {
 		return false
 	}
-	c.inflight[id] = true
+	c.inflight[b.ID] = deliveryJob{bead: b}
 	return true
 }
 
-// release lets a bead be delivered again: a retryable failure, a check
-// failure or a conflict, all of which come back through the feedback loop.
+// attemptFor is which attempt a delivery of this bead would be: one more
+// than whatever the conductor last recorded for it, and 1 for a bead it is
+// not holding.
+func (c *Conductor) attemptFor(id domain.BeadID) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.inflight[id].attempt + 1
+}
+
+// attempted records the attempt about to run, so a retryable outcome knows
+// how many are left however it reaches [Conductor.ApplyOutcome] — through
+// the queue, or through a caller's own [Conductor.Deliver].
+func (c *Conductor) attempted(job deliveryJob) {
+	if job.bead.ID == "" {
+		return
+	}
+	if job.attempt < 1 {
+		job.attempt = 1
+	}
+	c.mu.Lock()
+	c.inflight[job.bead.ID] = job
+	c.mu.Unlock()
+}
+
+// release lets a bead be delivered again: a check failure or a conflict,
+// both of which come back through the feedback loop, or a request the
+// deliverer refused outright.
 func (c *Conductor) release(id domain.BeadID) {
 	c.mu.Lock()
 	delete(c.inflight, id)

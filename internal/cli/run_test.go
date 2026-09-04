@@ -920,11 +920,30 @@ func TestRunRedactsWhatAnAgentPrints(t *testing.T) {
 	require.NotContains(t, stdout, "\x1b[31m", "and its escape sequences are gone")
 
 	dir := config.RunDir(env.Repo.Dir, string(runLatestID(t, env.Repo.Dir)))
-	for _, name := range []string{"events.jsonl", "sc.log"} {
-		data, err := os.ReadFile(filepath.Join(dir, name))
-		require.NoError(t, err, name)
-		require.NotContains(t, string(data), runFireSecret, "%s must not carry the credential", name)
+	files := []string{filepath.Join(dir, "events.jsonl"), filepath.Join(dir, "sc.log")}
+	// The per-agent logs are the third file the run writes (P9-18), and the
+	// one `sc logs <agent-id>` prints (P8-05). They are written from the
+	// same publish path, so the same line covers them — but only this
+	// enumeration proves it, and it used to leave them out.
+	agentLogs, err := filepath.Glob(filepath.Join(dir, "agents", "*.log"))
+	require.NoError(t, err)
+	require.NotEmpty(t, agentLogs, "the run must write one log per agent")
+	files = append(files, agentLogs...)
+	for _, path := range files {
+		data, err := os.ReadFile(path) //nolint:gosec // a path under the run directory
+		require.NoError(t, err, path)
+		require.NotContains(t, string(data), runFireSecret, "%s must not carry the credential", path)
 	}
+	// And the agent logs really do hold the line the credential was in, so
+	// the check above is about a file with something in it.
+	var transcript string
+	for _, path := range agentLogs {
+		data, err := os.ReadFile(path) //nolint:gosec // a path under the run directory
+		require.NoError(t, err, path)
+		transcript += string(data)
+	}
+	require.Contains(t, transcript, "[REDACTED]",
+		"the redacted line reaches the log `sc logs <agent-id>` prints")
 }
 
 // TestRunPrintsTheFirstRunNotice is P8-06's second half wired into the run:

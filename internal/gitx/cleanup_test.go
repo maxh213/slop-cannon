@@ -1174,6 +1174,50 @@ func TestResumer_Resume(t *testing.T) {
 		assert.Contains(t, res.Summary(), "-> closed (not applied)")
 	})
 
+	// P4-13: the crash window this covers is the one P9-03 owns — a bead
+	// moved to delivering before any git work, killed before its first
+	// commit. Its branch is empty, and an empty branch is trivially an
+	// ancestor of the default branch, so "landed" ancestry alone would
+	// close the bead with the default branch's own tip as sc_merge_sha and
+	// unblock its dependents on work that does not exist (D-20). The
+	// uninterrupted path refuses the same bead with ErrNothingToDeliver, so
+	// a crash must not make the outcome better than no crash.
+	t.Run("a delivering bead whose branch never received a commit is not closed", func(t *testing.T) {
+		f := wtSetup(t, nil)
+		empty := cuBead("fx-e1", "delivering, killed before the first commit", domain.BeadStateDelivering)
+		landed := cuBead("fx-e2", "delivered before the crash", domain.BeadStateDelivering)
+		_, err := f.m.Create(ctx, empty)
+		require.NoError(t, err)
+		landedSHA := cuWork(t, f, landed)
+		cuLand(t, f, landed)
+
+		tracker := &cuTracker{}
+		res, err := cuResumer(t, f.wtReopen(t), tracker).Resume(ctx, []domain.Bead{empty, landed})
+		require.NoError(t, err)
+		require.NoError(t, res.Err(), res.Summary())
+
+		e := cuResumeEntry(t, res, empty.ID)
+		require.True(t, e.BranchExists, "the branch is there, it is only empty")
+		assert.Zero(t, e.Ahead, "with nothing on it that the default branch has not")
+		assert.False(t, e.Landed, "an empty branch landed nothing: %s", e.Reason)
+		assert.Equal(t, domain.BeadStateDelivering, e.State, "so the bead is left where the crash left it")
+		assert.False(t, e.Changed())
+		assert.False(t, e.Applied)
+		assert.Empty(t, e.MergeSHA)
+		assert.Contains(t, e.Reason, "never received a commit")
+		assert.Contains(t, e.Reason, "deliver again")
+		assert.NotContains(t, tracker.closed, empty.ID, "nothing was closed")
+		assert.NotContains(t, tracker.meta, empty.ID, "and no sc_merge_sha was recorded")
+
+		// The same pass still closes a bead that genuinely fast-forwarded:
+		// the guard reads the branch's reflog, not the ancestry both share.
+		e = cuResumeEntry(t, res, landed.ID)
+		assert.True(t, e.Landed)
+		assert.Equal(t, domain.BeadStateClosed, e.State)
+		assert.True(t, e.Applied)
+		assert.Equal(t, landedSHA, e.MergeSHA)
+	})
+
 	t.Run("a gate still blocking the close leaves the bead to the gate poller", func(t *testing.T) {
 		f := wtSetup(t, nil)
 		landed := cuBead("fx-d1", "merged by hand with a PR gate", domain.BeadStateDelivering)

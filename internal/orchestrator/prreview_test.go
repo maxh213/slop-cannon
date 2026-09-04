@@ -733,7 +733,7 @@ func TestPRReviewRetriesAFailedPostAndThenAsksForAHuman(t *testing.T) {
 func TestPRReviewStaleReviewBeadIsClosed(t *testing.T) {
 	t.Parallel()
 	pr := prvPR()
-	vanished := &gitx.PollResult{Stale: []beads.Issue{prvIssue(pr, domain.BeadStateOpen)}}
+	vanished := &gitx.PollResult{Stale: []gitx.StaleReview{{Issue: prvIssue(pr, domain.BeadStateOpen), Reason: gitx.StaleClosed}}}
 	rig := prvNew(t, []*gitx.PollResult{prvResult(pr), vanished}, nil)
 	ctx := context.Background()
 	if err := rig.review.Sync(ctx); err != nil {
@@ -768,11 +768,80 @@ func TestPRReviewStaleReviewBeadIsClosed(t *testing.T) {
 	}
 }
 
+// TestPRReviewStaleReasonIsTheTrueOne is the P8-04 review gap: "no longer
+// open on GitHub" is written into bd and into the run log, so it must not
+// be said of a pull request that is still open (one that acquired the
+// slop-cannon label since the bead was raised) or of a review bead an
+// earlier run left behind.
+func TestPRReviewStaleReasonIsTheTrueOne(t *testing.T) {
+	t.Parallel()
+	pr := prvPR()
+	for _, tc := range []struct {
+		name  string
+		stale gitx.StaleReview
+		want  string
+		never string
+	}{
+		{
+			name: "adopted by the cannon",
+			stale: gitx.StaleReview{
+				Issue: prvIssue(pr, domain.BeadStateOpen), Reason: gitx.StaleCannonPR, PR: pr,
+			},
+			want: fmt.Sprintf("pull request #%d is still open but is now one of slop-cannon's own", pr.Number),
+			// The pull request is open: saying it has gone would be a lie
+			// in bd's close reason for ever.
+			never: "no longer open",
+		},
+		{
+			name: "raised by an earlier run",
+			stale: gitx.StaleReview{
+				Issue: prvIssue(pr, domain.BeadStateOpen), Reason: gitx.StaleClosed, ForeignRun: true,
+			},
+			want:  "(its review bead was raised by an earlier run)",
+			never: "no such thing",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			vanished := &gitx.PollResult{Stale: []gitx.StaleReview{tc.stale}}
+			rig := prvNew(t, []*gitx.PollResult{prvResult(pr), vanished}, nil)
+			ctx := context.Background()
+			for range 2 {
+				if err := rig.review.Sync(ctx); err != nil {
+					t.Fatalf("Sync: %v", err)
+				}
+			}
+			reason, closed := rig.store.closeReason("sc-ext7")
+			if !closed {
+				t.Fatal("the stale review bead was left open")
+			}
+			if !strings.Contains(reason, tc.want) {
+				t.Errorf("close reason = %q, want it to contain %q", reason, tc.want)
+			}
+			if strings.Contains(reason, tc.never) {
+				t.Errorf("close reason = %q, must not claim %q", reason, tc.never)
+			}
+			var said bool
+			for _, w := range prvOfKind[events.Warning](rig.sink) {
+				if w.Source == SourcePRReview && strings.Contains(w.Message, tc.want) {
+					said = true
+				}
+			}
+			if !said {
+				t.Errorf("the run log never said %q", tc.want)
+			}
+			if len(rig.poster.reviews()) != 0 {
+				t.Error("a review was posted on a pull request the reviewer let go of")
+			}
+		})
+	}
+}
+
 // TestPRReviewStaleReviewBeadCanBeHandedToAHuman is P8-11's other choice.
 func TestPRReviewStaleReviewBeadCanBeHandedToAHuman(t *testing.T) {
 	t.Parallel()
 	pr := prvPR()
-	vanished := &gitx.PollResult{Stale: []beads.Issue{prvIssue(pr, domain.BeadStateOpen)}}
+	vanished := &gitx.PollResult{Stale: []gitx.StaleReview{{Issue: prvIssue(pr, domain.BeadStateOpen), Reason: gitx.StaleClosed}}}
 	rig := prvNew(t, []*gitx.PollResult{prvResult(pr), vanished},
 		func(o *PRReviewOptions) { o.Stale = StaleReviewNeedsHuman })
 	ctx := context.Background()
@@ -816,7 +885,7 @@ func TestPRReviewStaleReviewBeadCanBeHandedToAHuman(t *testing.T) {
 func TestPRReviewStaleReviewBeadCanBeLeftAlone(t *testing.T) {
 	t.Parallel()
 	pr := prvPR()
-	vanished := &gitx.PollResult{Stale: []beads.Issue{prvIssue(pr, domain.BeadStateOpen)}}
+	vanished := &gitx.PollResult{Stale: []gitx.StaleReview{{Issue: prvIssue(pr, domain.BeadStateOpen), Reason: gitx.StaleClosed}}}
 	rig := prvNew(t, []*gitx.PollResult{prvResult(pr), vanished},
 		func(o *PRReviewOptions) { o.Stale = StaleReviewIgnore })
 	ctx := context.Background()

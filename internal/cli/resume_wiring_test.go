@@ -62,13 +62,15 @@ func TestRunWiresTheResumeHandoffsToTheDeliverer(t *testing.T) {
 	handler := c.run.ResumeHandler()
 	require.NotNil(t, handler,
 		"the run must be given a resume handler, or --resume reconciles the worktrees and does nothing about what it found (P6-15)")
-	wiring, ok := handler.(runResumeHandler)
-	require.True(t, ok, "the handler is the CLI's own: %T", handler)
+	wiring, ok := handler.(orchestrator.DeliveryResumeHandler)
+	require.True(t, ok, "the handler is the shared production one: %T", handler)
 	// assembleRun builds exactly one deliverer and gives it to the
 	// scheduler, the conductor and this handler, so a non-nil one here is
 	// the very deliverer the run delivers with.
-	require.NotNil(t, wiring.deliverer(),
+	require.NotNil(t, wiring.Deliverer,
 		"the resume hands off to the deliverer the run delivers with, which is built after the run")
+	require.NotNil(t, wiring.Deliverer(),
+		"and it is there by the time the resume calls it")
 
 	// The hand-off runs the deliverer, not a stub: with safety off the
 	// re-delivery declines and says so through the run.

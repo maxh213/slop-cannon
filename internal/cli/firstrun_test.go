@@ -3,27 +3,33 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/cartridge"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
+	"slop-cannon/internal/events"
 	"slop-cannon/internal/gitx"
 	"slop-cannon/internal/orchestrator"
+	"slop-cannon/internal/testutil"
 )
 
 // frAdvise prints the advice for err through the whole first-run failure
@@ -97,6 +103,12 @@ func TestStartupNotAGitRepositoryGolden(t *testing.T) {
 	require.Contains(t, out, "1. repo: not a git repository")
 	require.Contains(t, out, "2. git: not found on PATH")
 	require.Contains(t, out, "3. bd: not found on PATH")
+	// And the missing cartridge is on the list even though nothing about
+	// this failure is about cartridges: it is a doctor warning that refuses
+	// every run (D-04), so a user who fixes the three steps above and
+	// nothing else would be turned away again on the next shot.
+	require.Contains(t, out, "4. cartridge: no cartridge configured")
+	require.Contains(t, out, CartridgeAddHint)
 }
 
 // TestStartupAdviceTextComesFromDoctorRows is P8-09: the fix list is the
@@ -147,6 +159,137 @@ func TestStartupAdviceFallsBackToTheErrorsOwnFix(t *testing.T) {
 	require.Contains(t, frRenderAdvice(t, a), "sc doctor")
 }
 
+// frFixedDoctor makes the advice use a report with nothing wrong in it, so
+// a test sees the class's own step and nothing else.
+func frFixedDoctor(t *testing.T) {
+	t.Helper()
+	prev := firstRunDoctor
+	t.Cleanup(func() { firstRunDoctor = prev })
+	firstRunDoctor = func(context.Context, string) *DoctorReport {
+		return &DoctorReport{OK: true, Checks: []DoctorCheck{{Name: "git", Status: DoctorPass, Detail: "fine"}}}
+	}
+}
+
+// frLockedError builds the refusal orchestrator.Run.Start raises when
+// another cannon holds the repository's lock.
+func frLockedError(state orchestrator.LockState) *orchestrator.LockedError {
+	return &orchestrator.LockedError{
+		Path:  "/state/run.lock",
+		State: state,
+		Record: orchestrator.LockRecord{LockHolder: orchestrator.LockHolder{
+			Run: "20260101-000000-aaaa", PID: 4242, Host: "elsewhere",
+			TakenAt: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC),
+		}},
+	}
+}
+
+// TestStartupLockAdviceAddsOnlyWhatTheErrorDidNotSay: a LockedError already
+// names the live run, points at `sc status` and says to wait for it or stop
+// it, so the step under "Fix it in this order:" must carry the one thing it
+// does not — what --force is for — and nothing else. When the error says
+// that too (the lock written on another machine), the class has nothing to
+// add and prints no step at all.
+func TestStartupLockAdviceAddsOnlyWhatTheErrorDidNotSay(t *testing.T) {
+	frFixedDoctor(t)
+
+	live := frLockedError(orchestrator.LockLive)
+	require.ErrorIs(t, live, orchestrator.ErrLocked)
+	a := AdviseStartup(context.Background(), "/repo", live)
+	require.Len(t, a.Steps, 1)
+	require.Equal(t, startupFixLock, a.Steps[0].Fix)
+	out := frRenderAdvice(t, a)
+	require.Equal(t, 1, strings.Count(out, "sc status"),
+		"the reason already sent the user to sc status; the step must not send them again:\n%s", out)
+	require.Equal(t, 1, strings.Count(out, "wait for it"), out)
+	require.Equal(t, 1, strings.Count(out, "--force"), "and --force is the step's own news:\n%s", out)
+
+	// The lock written on another machine names --force itself.
+	away := frLockedError(orchestrator.LockElsewhere)
+	require.Contains(t, away.Error(), "--force")
+	a = AdviseStartup(context.Background(), "/repo", away)
+	require.Empty(t, a.Steps, "the error said all of it; a numbered step would only repeat it")
+	out = frRenderAdvice(t, a)
+	require.NotContains(t, out, "Fix it in this order:")
+	require.Equal(t, 1, strings.Count(out, "--force"), out)
+	require.Contains(t, out, "Then check everything at once with: sc doctor")
+}
+
+// TestStartupAdviceDropsAStepTheErrorAlreadyGave is the same rule one level
+// down, and it looks at the fix rather than only at the problem: a class
+// step exists to add the remedy, so when the error's own message carries
+// that remedy word for word there is no step at all.
+func TestStartupAdviceDropsAStepTheErrorAlreadyGave(t *testing.T) {
+	class := startupClass{name: "demo", problem: "something is wrong", fix: "run: sc doctor --fix"}
+
+	_, ok := class.step(errors.New("it broke; run: sc doctor --fix and try again"))
+	require.False(t, ok, "the error already gave that instruction")
+
+	step, ok := class.step(errors.New("it broke"))
+	require.True(t, ok)
+	require.Equal(t, "run: sc doctor --fix", step.Fix)
+	require.Equal(t, "something is wrong", step.Problem)
+
+	// A problem the reason already spelled out leaves the check name to
+	// lead the step, and the fix keeps its line.
+	step, ok = class.step(errors.New("something is wrong here"))
+	require.True(t, ok)
+	require.Empty(t, step.Problem)
+	require.Equal(t, "demo", step.title())
+
+	// The real case: the refusal a user actually sees carries the add hint
+	// in its own message, so the class adds no step of its own.
+	noCart := fmt.Errorf("%w — add one with: %s", config.ErrNoCartridge, CartridgeAddHint)
+	cart := startupClassOf(noCart)
+	require.Equal(t, "cartridge", cart.name)
+	_, ok = cart.step(noCart)
+	require.False(t, ok, "the reason above the list already tells them to run it")
+
+	// The bare sentinel does not carry it, and then the step is worth its
+	// line.
+	step, ok = cart.step(config.ErrNoCartridge)
+	require.True(t, ok)
+	require.Equal(t, "add one with: "+CartridgeAddHint, step.Fix)
+}
+
+// TestStartupAdviceListsAMissingCartridgeWhateverFailedFirst is the fix
+// list's promise to the user it exists for. sc doctor warns rather than
+// fails when no cartridge is configured, but no run can fire an agent
+// without one (D-04): a brand-new user who is refused for another reason
+// must be told about it here, or they do everything the list says and are
+// refused again on the next shot.
+func TestStartupAdviceListsAMissingCartridgeWhateverFailedFirst(t *testing.T) {
+	report := &DoctorReport{
+		Repo: "/repo",
+		Checks: []DoctorCheck{
+			{Name: "repo", Status: DoctorWarn, Detail: "not a git repository: /repo", Hint: doctorHintRepo},
+			{Name: "cartridge", Status: DoctorWarn, Detail: "no cartridge configured", Hint: doctorHintNoCart},
+			{Name: "gh", Status: DoctorWarn, Detail: "not found on PATH", Hint: "install the GitHub CLI"},
+			{Name: ".beads", Status: DoctorWarn, Detail: "not initialised", Hint: "sc will run bd init"},
+		},
+	}
+	prev := firstRunDoctor
+	t.Cleanup(func() { firstRunDoctor = prev })
+	firstRunDoctor = func(context.Context, string) *DoctorReport { return report }
+
+	a := AdviseStartup(context.Background(), "/repo", fmt.Errorf("wrapped: %w", gitx.ErrNotRepository))
+	require.Equal(t, []StartupStep{
+		{Check: "repo", Problem: "not a git repository: /repo", Fix: doctorHintRepo},
+		{Check: "cartridge", Problem: "no cartridge configured", Fix: doctorHintNoCart},
+	}, a.Steps, "the failure leads and the blocker follows; the warnings that stop nothing stay out")
+
+	out := frRenderAdvice(t, a)
+	require.Contains(t, out, "2. cartridge: no cartridge configured")
+	require.Contains(t, out, CartridgeAddHint)
+	require.NotContains(t, out, "GitHub CLI", "gh stops no run: safety off still fires (D-10)")
+	require.NotContains(t, out, ".beads", "sc creates the bead tracker on the first run (D-13)")
+
+	// "no active cartridge" is the same blocker under its other spelling.
+	report.Checks[1] = DoctorCheck{Name: "cartridge", Status: DoctorWarn, Detail: "no active cartridge", Hint: doctorHintNoActive}
+	a = AdviseStartup(context.Background(), "/repo", fmt.Errorf("wrapped: %w", gitx.ErrNotRepository))
+	require.Len(t, a.Steps, 2)
+	require.Equal(t, "no active cartridge", a.Steps[1].Problem)
+}
+
 // TestStartupAdviceKnowsEveryClass pins the classification: each of these
 // errors must reach its own class, so the fix a user is given matches the
 // failure they hit.
@@ -155,21 +298,25 @@ func TestStartupAdviceKnowsEveryClass(t *testing.T) {
 		name string
 		err  error
 		want string
+		// mute is set for a sentinel that carries its own remedy, so the
+		// class deliberately adds no step of its own: the reason line above
+		// the list already told the user what to run.
+		mute bool
 	}{
-		{"lock", orchestrator.ErrLocked, "lock"},
-		{"not a repo", gitx.ErrNotRepository, "repo"},
-		{"no cartridge", config.ErrNoCartridge, "cartridge"},
-		{"cartridge not built", cartridge.ErrCartridgeNotBuilt, "cartridge"},
-		{"not authenticated", cartridge.ErrAuth, "cartridge"},
-		{"credits", cartridge.ErrCreditsExhausted, "cartridge"},
-		{"bd missing", &beads.CheckError{Command: "bd version", Reason: beads.ReasonNotFound}, "bd"},
-		{"no beads project", beads.ErrNoProject, "bd"},
-		{"gh", gitx.ErrGHUnauthenticated, "gh"},
-		{"dirty tree", gitx.ErrRepoDirty, "repo"},
-		{"bad config", &config.ParseError{Path: "/c.toml", Line: 3, Msg: "bad"}, "config"},
-		{"ammo", config.ErrAmmoTooLow, "ammo"},
-		{"terminal", errors.New("the TUI needs a terminal: stdin and stdout are not a TTY"), "terminal"},
-		{"unknown", errors.New("something else entirely"), ""},
+		{"lock", orchestrator.ErrLocked, "lock", false},
+		{"not a repo", gitx.ErrNotRepository, "repo", false},
+		{"no cartridge", config.ErrNoCartridge, "cartridge", false},
+		{"cartridge not built", cartridge.ErrCartridgeNotBuilt, "cartridge", false},
+		{"not authenticated", cartridge.ErrAuth, "cartridge", false},
+		{"credits", cartridge.ErrCreditsExhausted, "cartridge", false},
+		{"bd missing", &beads.CheckError{Command: "bd version", Reason: beads.ReasonNotFound}, "bd", false},
+		{"no beads project", beads.ErrNoProject, "bd", false},
+		{"gh", gitx.ErrGHUnauthenticated, "gh", false},
+		{"dirty tree", gitx.ErrRepoDirty, "repo", false},
+		{"bad config", &config.ParseError{Path: "/c.toml", Line: 3, Msg: "bad"}, "config", false},
+		{"ammo", config.ErrAmmoTooLow, "ammo", false},
+		{"terminal", errors.New("the TUI needs a terminal: stdin and stdout are not a TTY"), "terminal", false},
+		{"unknown", errors.New("something else entirely"), "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -179,6 +326,10 @@ func TestStartupAdviceKnowsEveryClass(t *testing.T) {
 			step, ok := class.step(wrapped)
 			if tc.want == "" {
 				require.False(t, ok, "an unrecognised failure invents no fix")
+				return
+			}
+			if tc.mute {
+				require.False(t, ok, "the error's own message is the fix; a step would repeat it")
 				return
 			}
 			require.True(t, ok, "every recognised class has something to tell the user")
@@ -250,14 +401,25 @@ func frMakeRunDir(t *testing.T, repo string, id domain.RunID) {
 	require.NoError(t, err)
 }
 
+// frWritePrompt files a debug copy of one agent's prompt under the run
+// directory, the way a firing does (prompt.Prompt.Write). EnsureRunDir does
+// not create prompts/, so this is what makes the row real.
+func frWritePrompt(t *testing.T, repo string, id domain.RunID, agent domain.AgentID) string {
+	t.Helper()
+	path, err := prompt.WriteFile(config.RunDir(repo, id.String()), agent, "# prompt\n")
+	require.NoError(t, err)
+	return path
+}
+
 func TestFirstRunNoticeGolden(t *testing.T) {
 	home := doctorEnv(t)
 	repo := doctorRepoDir(t, true, false)
 	id := domain.RunID("20260101-120000-abcd")
 	frMakeRunDir(t, repo, id)
+	frWritePrompt(t, repo, id, "po-plan-1")
 
 	var buf bytes.Buffer
-	require.NoError(t, ReportFirstRun(&buf, frRun(repo, id)))
+	require.NoError(t, ReportFirstRun(&buf, frRun(repo, id), events.FinishCompleted))
 	out := buf.String()
 	require.NotEmpty(t, out)
 
@@ -319,19 +481,75 @@ func TestFirstRunNoticeIsPrintedOnlyOnce(t *testing.T) {
 	first := domain.RunID("20260101-120000-aaaa")
 	second := domain.RunID("20260102-120000-bbbb")
 
-	// Before anything has run there is no runs directory at all.
-	require.False(t, FirstRunInRepo(repo, first))
-
 	frMakeRunDir(t, repo, first)
-	require.True(t, FirstRunInRepo(repo, first))
-
-	frMakeRunDir(t, repo, second)
-	require.False(t, FirstRunInRepo(repo, second), "the second run is not the first")
-	require.False(t, FirstRunInRepo(repo, first))
+	require.True(t, FirstRunInRepo(repo))
 
 	var buf bytes.Buffer
-	require.NoError(t, ReportFirstRun(&buf, frRun(repo, second)))
+	require.NoError(t, ReportFirstRun(&buf, frRun(repo, first), events.FinishCompleted))
+	require.Contains(t, buf.String(), "That was the first sc run in")
+
+	frMakeRunDir(t, repo, second)
+	require.False(t, FirstRunInRepo(repo), "the notice has been paid for this repository")
+
+	buf.Reset()
+	require.NoError(t, ReportFirstRun(&buf, frRun(repo, second), events.FinishCompleted))
 	require.Empty(t, buf.String())
+}
+
+// TestFirstRunNoticeSurvivesARunThatWasKilled is the crash half of the same
+// question, and the reason the marker is the only criterion. A run that is
+// killed outright (kill -9, a power cut, the OOM killer — P9-03 makes that a
+// supported path) leaves its run directory behind and no marker. Counting
+// run directories would see two from then on and stay silent for the life of
+// the repository, so the first run that actually succeeds would never be
+// told where anything lives.
+func TestFirstRunNoticeSurvivesARunThatWasKilled(t *testing.T) {
+	doctorEnv(t)
+	repo := doctorRepoDir(t, true, false)
+	killed := domain.RunID("20260101-120000-aaaa")
+	next := domain.RunID("20260102-120000-bbbb")
+
+	// The killed run: a run directory, no notice, no marker.
+	frMakeRunDir(t, repo, killed)
+	require.NoFileExists(t, firstRunNoticePath(repo))
+
+	// The next run finds two run directories and is still owed the notice.
+	frMakeRunDir(t, repo, next)
+	entries, err := os.ReadDir(filepath.Join(config.StateDir(repo), config.RunsDirName))
+	require.NoError(t, err)
+	require.Len(t, entries, 2, "the killed run left its directory behind")
+	require.True(t, FirstRunInRepo(repo), "a crashed run must not cost the repository its notice")
+
+	var buf bytes.Buffer
+	require.NoError(t, ReportFirstRun(&buf, frRun(repo, next), events.FinishCompleted))
+	require.Contains(t, buf.String(), "That was the first sc run in")
+	require.FileExists(t, firstRunNoticePath(repo))
+}
+
+// TestFirstRunNoticeWaitsForARunThatSucceeds is the task's "on first
+// successful run": a run that was stopped, failed or ran out of credits
+// prints nothing and — the point — does not spend the notice, so the run
+// that finally completes still gets it.
+func TestFirstRunNoticeWaitsForARunThatSucceeds(t *testing.T) {
+	doctorEnv(t)
+	repo := doctorRepoDir(t, true, false)
+	id := domain.RunID("20260101-120000-abcd")
+	frMakeRunDir(t, repo, id)
+
+	for _, reason := range []events.FinishReason{
+		events.FinishStopped, events.FinishFailed, events.FinishCreditsExhausted, events.FinishReason(""),
+	} {
+		var buf bytes.Buffer
+		require.NoError(t, ReportFirstRun(&buf, frRun(repo, id), reason))
+		require.Empty(t, buf.String(), "a run that finished %q is not the first successful run", reason)
+		require.NoFileExists(t, firstRunNoticePath(repo), "and it does not burn the marker")
+		require.False(t, FirstRunNoticeEarned(reason))
+	}
+
+	require.True(t, FirstRunNoticeEarned(events.FinishCompleted))
+	var buf bytes.Buffer
+	require.NoError(t, ReportFirstRun(&buf, frRun(repo, id), events.FinishCompleted))
+	require.Contains(t, buf.String(), "That was the first sc run in")
 }
 
 // TestFirstRunNoticeCoversEveryPlaceARunWrites: every path in the notice is
@@ -342,6 +560,7 @@ func TestFirstRunNoticeCoversEveryPlaceARunWrites(t *testing.T) {
 	id := domain.RunID("20260101-120000-abcd")
 	dirs, err := orchestrator.EnsureRunDir(config.RunDir(repo, id.String()))
 	require.NoError(t, err)
+	promptPath := frWritePrompt(t, repo, id, "po-plan-1")
 
 	n := NewFirstRunNotice(frRun(repo, id))
 	require.Equal(t, dirs.Dir, n.Dir)
@@ -349,10 +568,42 @@ func TestFirstRunNoticeCoversEveryPlaceARunWrites(t *testing.T) {
 	require.Equal(t, dirs.Worktrees, n.Worktrees)
 	require.Equal(t, orchestrator.EventLogPath(dirs.Dir), n.Events)
 	require.Equal(t, config.GlobalPath(), n.Config)
+	require.Equal(t, filepath.Dir(promptPath), n.Prompts, "the prompts row is the directory the firings write to")
 	for _, p := range []string{n.Log, n.Agents, n.Prompts, n.Events, n.Worktrees} {
 		require.True(t, strings.HasPrefix(p, dirs.Dir+string(filepath.Separator)), p)
 		require.False(t, strings.HasPrefix(p, repo+string(filepath.Separator)), "D-23: not inside the repository: "+p)
 	}
+	// Every directory the notice names exists: a row is an invitation to
+	// open something, and the run directory is created without prompts/.
+	for _, d := range []string{n.Agents, n.Prompts, n.Worktrees} {
+		require.DirExists(t, d)
+	}
+}
+
+// TestFirstRunNoticeLeavesOutAPromptsDirectoryThatIsNotThere is the other
+// side of it: EnsureRunDir does not create prompts/, and only a firing that
+// files its debug copy does (P5-13 is the open task that makes every firing
+// leave one). A run that ends before any firing writes one must not name a
+// directory that is not there.
+func TestFirstRunNoticeLeavesOutAPromptsDirectoryThatIsNotThere(t *testing.T) {
+	doctorEnv(t)
+	repo := doctorRepoDir(t, true, false)
+	id := domain.RunID("20260101-120000-abcd")
+	dirs, err := orchestrator.EnsureRunDir(config.RunDir(repo, id.String()))
+	require.NoError(t, err)
+	require.NoDirExists(t, prompt.Dir(dirs.Dir), "EnsureRunDir does not create prompts/")
+
+	n := NewFirstRunNotice(frRun(repo, id))
+	require.Empty(t, n.Prompts)
+	var buf bytes.Buffer
+	require.NoError(t, WriteFirstRunNotice(&buf, n))
+	require.NotContains(t, buf.String(), "prompts")
+
+	// One filed prompt is all it takes for the row to come back.
+	frWritePrompt(t, repo, id, "po-plan-1")
+	buf.Reset()
+	require.NoError(t, WriteFirstRunNotice(&buf, NewFirstRunNotice(frRun(repo, id))))
+	require.Contains(t, buf.String(), "prompts     "+prompt.Dir(dirs.Dir))
 }
 
 // TestNewFirstRunNoticeDerivesTheRunDirectory covers a run value that
@@ -385,7 +636,7 @@ func TestFirstRunNoticeIsNotRepeatedWhenTheSameRunIsResumed(t *testing.T) {
 	frMakeRunDir(t, repo, id)
 
 	var first bytes.Buffer
-	require.NoError(t, ReportFirstRun(&first, frRun(repo, id)))
+	require.NoError(t, ReportFirstRun(&first, frRun(repo, id), events.FinishCompleted))
 	require.Contains(t, first.String(), "That was the first sc run in")
 
 	// Nothing on disk tells the two apart but the marker: the state
@@ -398,9 +649,9 @@ func TestFirstRunNoticeIsNotRepeatedWhenTheSameRunIsResumed(t *testing.T) {
 
 	// The same run, resumed: same id, same directory, nothing new to say.
 	var again bytes.Buffer
-	require.NoError(t, ReportFirstRun(&again, frRun(repo, id)))
+	require.NoError(t, ReportFirstRun(&again, frRun(repo, id), events.FinishCompleted))
 	require.Empty(t, again.String(), "a resumed first run does not print the notice twice")
-	require.False(t, FirstRunInRepo(repo, id))
+	require.False(t, FirstRunInRepo(repo))
 
 	marker := firstRunNoticePath(repo)
 	require.FileExists(t, marker)
@@ -421,12 +672,12 @@ func TestFirstRunNoticeIsPrintedWhenTheMarkerCannotBeRead(t *testing.T) {
 	frMakeRunDir(t, repo, id)
 
 	var buf bytes.Buffer
-	require.NoError(t, ReportFirstRun(&buf, frRun(repo, id)))
+	require.NoError(t, ReportFirstRun(&buf, frRun(repo, id), events.FinishCompleted))
 	require.NotEmpty(t, buf.String())
 
 	require.NoError(t, os.Remove(firstRunNoticePath(repo)))
 	buf.Reset()
-	require.NoError(t, ReportFirstRun(&buf, frRun(repo, id)))
+	require.NoError(t, ReportFirstRun(&buf, frRun(repo, id), events.FinishCompleted))
 	require.NotEmpty(t, buf.String())
 }
 
@@ -444,6 +695,134 @@ func TestRunResumedDoesNotRepeatTheFirstRunNotice(t *testing.T) {
 	require.Equal(t, 0, code, stderr)
 	require.NotContains(t, stderr, "That was the first sc run in",
 		"resuming the first run reuses its directory and its id, and must not repeat the notice")
+}
+
+// frNoticeRows returns the label/path rows of the notice printed in out,
+// exactly as a reader sees them.
+func frNoticeRows(t *testing.T, out string) map[string]string {
+	t.Helper()
+	rows := map[string]string{}
+	lines := strings.Split(out, "\n")
+	start := -1
+	for i, l := range lines {
+		if strings.HasPrefix(l, "That was the first sc run in ") {
+			start = i
+			break
+		}
+	}
+	require.GreaterOrEqual(t, start, 0, "no first-run notice in:\n%s", out)
+	for _, l := range lines[start:] {
+		if !strings.HasPrefix(l, "  ") {
+			continue
+		}
+		fields := strings.Fields(l)
+		if len(fields) < 2 || !filepath.IsAbs(fields[len(fields)-1]) {
+			continue
+		}
+		label := strings.Join(fields[:len(fields)-1], " ")
+		rows[label] = fields[len(fields)-1]
+	}
+	require.NotEmpty(t, rows)
+	return rows
+}
+
+// TestRunNoticeNamesOnlyPathsTheRunReallyWrote opens everything the notice
+// tells a first-time user to look at, after a real run of the production
+// path. A row is an invitation, so a path that is not there — the prompts
+// directory EnsureRunDir never creates among them — must not be printed.
+func TestRunNoticeNamesOnlyPathsTheRunReallyWrote(t *testing.T) {
+	env := runFireSetup(t, false)
+
+	_, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief, "--headless", "--cartridge", "mock")
+	require.Equal(t, 0, code, stderr)
+
+	rows := frNoticeRows(t, stderr)
+	for label, path := range rows {
+		_, err := os.Stat(path)
+		require.NoErrorf(t, err, "the notice's %q row names %s, which nothing wrote", label, path)
+	}
+	for _, label := range []string{"run log", "agent logs", "events", "worktrees", "config"} {
+		require.Contains(t, rows, label)
+	}
+
+	// The prompts row is printed because this run filed prompts, and every
+	// file in it belongs to an agent the run fired. Only the planning
+	// firing files its copy today; P5-13 is the open task that makes every
+	// firing leave one, and this holds either way.
+	dir := config.RunDir(env.Repo.Dir, runLatestID(t, env.Repo.Dir).String())
+	require.Equal(t, prompt.Dir(dir), rows["prompts"])
+	prompts, err := os.ReadDir(rows["prompts"])
+	require.NoError(t, err)
+	require.NotEmpty(t, prompts, "a run that fired agents filed at least one prompt")
+	agents, err := os.ReadDir(rows["agent logs"])
+	require.NoError(t, err)
+	fired := map[string]bool{}
+	for _, a := range agents {
+		fired[strings.TrimSuffix(a.Name(), filepath.Ext(a.Name()))] = true
+	}
+	for _, p := range prompts {
+		name := strings.TrimSuffix(p.Name(), prompt.PromptFileExt)
+		require.Truef(t, fired[name], "prompts/%s belongs to no agent this run fired", p.Name())
+		info, err := p.Info()
+		require.NoError(t, err)
+		require.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "a prompt quotes the user's rules and vibes")
+	}
+}
+
+// TestRunLockRefusalFromStartPrintsTheFixList closes the window the
+// preflight cannot: fireCannon checks the repository's run lock before it
+// builds anything, and orchestrator.Run.Start takes that lock again when
+// the run begins, so a second sc that arrives in between is refused by
+// Start. That refusal is the startup failure P8-06 exists for, and it must
+// print the numbered advice rather than a bare error line.
+//
+// The window is opened deterministically: the `bd` the assembly runs plants
+// a live lock the first time it is called, which is after the preflight and
+// before Start.
+func TestRunLockRefusalFromStartPrintsTheFixList(t *testing.T) {
+	env := runFireSetup(t, false)
+
+	// A lock held by a live process that is not this one.
+	held := exec.Command("sleep", "60")
+	require.NoError(t, held.Start())
+	t.Cleanup(func() { _ = held.Process.Kill(); _, _ = held.Process.Wait() })
+
+	host, err := os.Hostname()
+	require.NoError(t, err)
+	rec, err := json.Marshal(orchestrator.LockHolder{
+		Run: "20260101-000000-aaaa", PID: held.Process.Pid, Host: host, TakenAt: time.Now().UTC(),
+	})
+	require.NoError(t, err)
+	record := filepath.Join(t.TempDir(), "run.lock")
+	require.NoError(t, os.WriteFile(record, rec, 0o600))
+
+	lock := orchestrator.RepoLockPath(config.StateDir(env.Repo.Dir))
+	testutil.FakeBin(t, "bd", fmt.Sprintf(`if [ ! -f %[1]q ]; then
+  mkdir -p %[2]q
+  cp %[3]q %[1]q
+fi
+exec %[4]q "$@"
+`, lock, filepath.Dir(lock), record, env.BD.Path))
+
+	_, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief, "--headless", "--cartridge", "mock")
+	require.Equal(t, 1, code, stderr)
+	require.FileExists(t, lock, "a refused run leaves the other run's lock alone")
+
+	// The lock was planted during assembly, so this refusal came out of
+	// orchestrator.Run.Start — whose own failure path logs this line —
+	// rather than out of the preflight check, which had already passed.
+	require.Contains(t, stderr, "run failed to start",
+		"the refusal came from the preflight, not from Start; this test proves nothing")
+
+	require.Contains(t, stderr, "sc could not start a run in "+env.Repo.Dir)
+	require.Contains(t, stderr, "20260101-000000-aaaa")
+	require.Contains(t, stderr, "Fix it in this order:")
+	require.Contains(t, stderr, "--force")
+	require.Contains(t, stderr, "Then check everything at once with: sc doctor")
+	require.NotContains(t, stderr, "sc: orchestrator: another run holds the lock",
+		"the bare error line is what the fix list replaces")
+	require.NotContains(t, stderr, "That was the first sc run in",
+		"a run that never started says nothing about where it would have written")
 }
 
 // TestStartupWithoutATerminalPrintsTheFixList is the "terminal" class
@@ -589,7 +968,7 @@ const tsWildcard = "\x00"
 // situation a user can be advised out of. A new sentinel must be documented
 // or listed here, and a stale entry fails too.
 var tsExempt = map[string]string{
-	"cli.ErrNotImplemented":               "dead placeholder: no released command returns it, and P9-16 decides whether it is deleted",
+	"cli.ErrNotImplemented":               "dead placeholder: root_test.go is its only reference, no released command returns it, and no user can reach it; P9-16 deletes it",
 	"agents.ErrInvalidAgentRun":           "a firing sc assembled wrongly; the user cannot cause it",
 	"agents.ErrInvalidPlanRequest":        "same: the planning request is built by sc",
 	"agents.ErrIncompleteRuling":          "same: the arbitration request is built by sc",
@@ -1079,8 +1458,11 @@ func TestTroubleshootingMessagesStillExistInTheCode(t *testing.T) {
 	// A key is usually literal source text. It may instead be text only the
 	// running command has — "--model requires --add NAME" is built from
 	// "--%s requires --%s NAME" and two flag constants — so the rendered
-	// messages count too: what matters is that a user can read it.
+	// messages, warnings and doctor details count too: what matters is that
+	// a user can read it.
 	rendered := tsCodeMessages(t, tsMessagePackages)
+	rendered = append(rendered, tsWarnings(t)...)
+	rendered = append(rendered, tsDetails(t)...)
 	seen := map[string]bool{}
 	for _, msg := range tsMessages(t) {
 		require.False(t, seen[msg], "documented twice: %q", msg)
@@ -1287,5 +1669,406 @@ func TestTroubleshootingSendsNobodyToAFileNothingWrites(t *testing.T) {
 				"nothing calls logging.RunLogger.Agent, so runs/<run-id>/agents/ stays empty (P9-18): "+
 					"this remedy must name sc.log, `sc logs` or events.jsonl instead")
 		}
+	}
+}
+
+// --- Warnings (P9-08 round 4) -------------------------------------------
+//
+// A warning is the other half of what sc prints. It is not an error — the
+// run carries on — but it is what a user reads when a bead stops being
+// worked on, when a plan is dropped, or when part of the run degrades, and
+// it reaches sc.log, events.jsonl, the TUI and `sc status` alike. Warnings
+// are built with fmt.Sprintf rather than fmt.Errorf, so the message guard
+// above cannot see them; these two helpers and their test hold them to a
+// row each, the same way.
+
+// tsWarnFuncs are the functions that raise a warning, and the index of the
+// argument that carries its message. -1 means the signature varies
+// (slog's Warn takes the message first, Run.Warn takes a source first), so
+// the message is the first argument that renders to words.
+var tsWarnFuncs = map[string]int{
+	"Warn":      -1,
+	"warn":      -1,
+	"warnOnce":  2,
+	"warnAbout": 3,
+}
+
+// tsStringy renders an expression to the text it produces, as far as the
+// source allows, and reports whether it produces text at all: a string
+// literal, a concatenation involving one, a package-level string constant,
+// or a fmt.Sprintf. Anything else — a bead id, an error, a struct field —
+// is not text, and saying so is what keeps a warning's message argument
+// from being confused with the bead it is about.
+func tsStringy(dir string, consts tsConsts, expr ast.Expr) (string, bool) {
+	switch e := expr.(type) {
+	case *ast.BasicLit:
+		return tsLiteral(e)
+	case *ast.BinaryExpr:
+		if e.Op != token.ADD {
+			return "", false
+		}
+		l, lok := tsStringy(dir, consts, e.X)
+		r, rok := tsStringy(dir, consts, e.Y)
+		if !lok && !rok {
+			return "", false
+		}
+		if !lok {
+			l = tsWildcard
+		}
+		if !rok {
+			r = tsWildcard
+		}
+		return l + r, true
+	case *ast.Ident, *ast.SelectorExpr:
+		return consts.lookup(dir, expr)
+	case *ast.CallExpr:
+		sel, ok := e.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "Sprintf" || len(e.Args) == 0 {
+			return "", false
+		}
+		if pkg, ok := sel.X.(*ast.Ident); !ok || pkg.Name != "fmt" {
+			return "", false
+		}
+		format, ok := tsLiteral(e.Args[0])
+		if !ok {
+			return "", false
+		}
+		return tsRender(format, e.Args[1:], dir, consts), true
+	default:
+		return "", false
+	}
+}
+
+// tsLocals maps each local variable of a function body to the texts it is
+// assigned, so a warning whose message is built a line above the call —
+// `msg := fmt.Sprintf(…)`, then `msg += " (…)"` — is read rather than
+// missed. Both halves count as messages: both reach the user.
+func tsLocals(dir string, consts tsConsts, fn ast.Node) map[string][]string {
+	out := map[string][]string{}
+	ast.Inspect(fn, func(n ast.Node) bool {
+		as, ok := n.(*ast.AssignStmt)
+		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+			return true
+		}
+		if as.Tok != token.ASSIGN && as.Tok != token.DEFINE && as.Tok != token.ADD_ASSIGN {
+			return true
+		}
+		name, ok := as.Lhs[0].(*ast.Ident)
+		if !ok {
+			return true
+		}
+		if text, ok := tsStringy(dir, consts, as.Rhs[0]); ok {
+			out[name.Name] = append(out[name.Name], text)
+		}
+		return true
+	})
+	return out
+}
+
+// tsWarnTexts renders one argument of a warning call to the texts it can
+// carry: its own, or those of the local it names.
+func tsWarnTexts(dir string, consts tsConsts, locals map[string][]string, arg ast.Expr) []string {
+	if id, ok := arg.(*ast.Ident); ok {
+		if texts := locals[id.Name]; len(texts) > 0 {
+			return texts
+		}
+	}
+	if text, ok := tsStringy(dir, consts, arg); ok {
+		return []string{text}
+	}
+	return nil
+}
+
+// tsIsSourceArg reports whether an argument is one of the orchestrator's
+// Source… constants, which name the component a warning came from rather
+// than saying anything to a user.
+func tsIsSourceArg(arg ast.Expr) bool {
+	switch e := arg.(type) {
+	case *ast.Ident:
+		return strings.HasPrefix(e.Name, "Source")
+	case *ast.SelectorExpr:
+		return strings.HasPrefix(e.Sel.Name, "Source")
+	default:
+		return false
+	}
+}
+
+// tsWarnings returns every warning message the non-test files of tsPackages
+// raise, rendered the way tsCodeMessages renders an error: verbs whose
+// argument sc knows at compile time are substituted, the rest become
+// tsWildcard, so a documented key can only match text a user really sees.
+func tsWarnings(t *testing.T) []tsMessage {
+	t.Helper()
+	consts := tsStringConsts(t)
+	var out []tsMessage
+	seen := map[string]bool{}
+	for _, pkg := range tsPackages {
+		for _, path := range tsGoFiles(t, pkg) {
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			require.NoError(t, err, path)
+			dir := filepath.Dir(path)
+			for _, decl := range f.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Body == nil {
+					continue
+				}
+				locals := tsLocals(dir, consts, fn.Body)
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					name := ""
+					switch fun := call.Fun.(type) {
+					case *ast.Ident:
+						name = fun.Name
+					case *ast.SelectorExpr:
+						name = fun.Sel.Name
+					}
+					idx, ok := tsWarnFuncs[name]
+					if !ok {
+						return true
+					}
+					args := call.Args
+					if idx >= 0 {
+						if idx >= len(args) {
+							return true
+						}
+						args = args[idx : idx+1]
+					}
+					for _, arg := range args {
+						if tsIsSourceArg(arg) {
+							continue
+						}
+						texts := tsWarnTexts(dir, consts, locals, arg)
+						said := false
+						for _, text := range texts {
+							if !tsSaysSomething(text) {
+								continue
+							}
+							said = true
+							out = append(out, tsMessage{
+								text: text, file: path, line: fset.Position(call.Pos()).Line,
+							})
+						}
+						if said && idx < 0 {
+							break // the first argument with words is the message
+						}
+					}
+					return true
+				})
+			}
+		}
+	}
+	require.NotEmpty(t, out, "no warnings found: the extraction is broken, not the code")
+	return out
+}
+
+// TestTroubleshootingCoversEveryWarningTheRunRaises is the guard the round-3
+// page did not have. `tsCodeMessages` skips fmt.Sprintf on purpose — it
+// builds text, not errors — and every warning is a Sprintf handed to
+// Run.Warn, so the whole warning vocabulary was outside the audit: a bead
+// that quietly stopped being worked on had no row, and nothing failed.
+// Every warning now needs a row keyed by what it prints, or an entry in
+// tsExemptWarnings with the reason a user never has to look it up.
+func TestTroubleshootingCoversEveryWarningTheRunRaises(t *testing.T) {
+	documented := tsDocumented(t)
+	var missing []string
+	for _, w := range tsWarnings(t) {
+		if tsCovered(w.text, documented) || tsExemptWarnings[w.display()] != "" {
+			continue
+		}
+		missing = append(missing, fmt.Sprintf("%s:%d %q", w.file, w.line, w.display()))
+	}
+	sort.Strings(missing)
+	require.Empty(t, missing,
+		"docs/troubleshooting.md matches no row for these warnings: add a row keyed by a phrase of one "+
+			"that no verb interrupts, or add it to tsExemptWarnings with the reason a user never has to look it up")
+}
+
+// tsExemptWarnings are the warnings docs/troubleshooting.md deliberately
+// does not document, keyed by what they print, each with the reason. Nearly
+// all of them are the run saying that a piece of bookkeeping failed after
+// the work itself was done — a bd write, a lease, a shim, a temporary
+// directory. The run carries on, nothing is lost, and the sentence a user
+// would look up is the wrapped error's, which has a row of its own. The
+// rest are prefixes and sc's own programming errors. A new warning must be
+// documented or listed here, and a stale entry fails too.
+var tsExemptWarnings = map[string]string{
+	// Bookkeeping after the work: a bd or git step that failed, reported so
+	// the log shows it. The run keeps going and re-does or skips the step.
+	"could not record agent …":                                                           "the run could not write an agent to its own state; the firing itself is unaffected",
+	"could not clear agent …":                                                            "the same, when the agent finished",
+	"could not reap agent …":                                                             "the same, for a session that had already exited",
+	"could not claim … for …":                                                            "the claim's own message is the documented `bead is already claimed by another actor`; the scheduler picks other work",
+	"could not park … as failed":                                                         "bd would not take the failed edge; the give-up warning above it is the one a user reads",
+	"could not release the lease on …":                                                   "a lease left behind at shutdown; the next run's --resume recovers it",
+	"could not renew the lease on … for …":                                               "the same, mid-firing; the documented `stopped renewing the lease` row is the user-facing half",
+	"could not read the run's beads before releasing their leases":                       "the same, for the whole set: --resume recovers them",
+	"could not list the run's beads for the worktree cleanup":                            "the documented `the worktree cleanup did not run` warning is raised beside it",
+	"could not remove the bd shim …":                                                     "a temporary file under the run directory; it is removed with the run directory",
+	"could not remove the planning bd shim at …":                                         "the same shim, on the planning side",
+	"could not delete the worktree copy …":                                               "a temporary copy under the run directory, removed with it",
+	"could not remove the directory of a run that never started":                         "an empty run directory left behind by a run that was refused; it holds nothing",
+	"could not close the review bead":                                                    "bd bookkeeping on an external pull request's review bead; the review itself was posted",
+	"could not hand the review bead to a human":                                          "the same, when the reviewer wanted a person to look at it",
+	"could not record the verdict on the review bead":                                    "the same, for the verdict comment",
+	"could not record the message on the bead":                                           "the same, for a feedback message; the round carries on",
+	"could not write the narrowed acceptance criteria to the bead":                       "the narrowing is applied in the loop either way; only the bd copy is missing",
+	"could not read the diff for the next review round":                                  "the round is fired without the diff rather than not at all",
+	"could not measure how far the round moved the change set":                           "a progress measurement (D-09), not a decision",
+	"could not record the run epic …":                                                    "the plan was applied; only the epic's id could not be stored",
+	"could not record the run epic … found in bd":                                        "the same, on resume",
+	"could not deprioritise … (…) from priority … to …":                                  "a tidy-up of the backlog's priorities; nothing about the run depends on it",
+	"could not check whether this resumed run had already planned":                       "the resumed run plans again rather than not at all",
+	"could not tell whether the run's beads have settled; trying again on the next poll": "it says so itself: the next poll retries",
+	"could not file the debug copy of the planning prompt":                               "the prompt is fired either way; only the debug copy under the run directory is missing",
+	"bd reported a warning while creating the plan: …":                                   "the documented `bd warned about the graph plan` row is the refusal a user acts on",
+	"could not resolve the escalated gate … on …":                                        "bd would not close a gate sc had settled; the gate stays open and the next poll retries",
+	"could not read gate …":                                                              "one gate could not be read this poll; the next poll reads it again",
+	"could not read …, the bead gate … blocks":                                           "the same, for the bead the gate names",
+	"could not move … on …":                                                              "a bd transition the gate poller could not apply; it is retried on the next poll",
+	"gate poller: transition refused":                                                    "the D-07 table refused the move; the documented `orchestrator: invalid bead state transition` row is the same event",
+
+	// Prefixes: the words a user reads are in the error they carry.
+	"feedback loop: …":                "a prefix on the wrapped error, which has its own row",
+	"external pull request review: …": "the same, for the reviewer's own failures",
+	"resume: …":                       "the same, for a resume step",
+	"…; … fires … instead":            "the reason is the cartridge selection failure, which is documented above; the rest names the role and the cartridge that fired in its place",
+
+	// sc's own programming errors: reaching one is a bug, not a situation.
+	"ignored a demand of unknown kind …":                               "a demand kind that does not exist: the scheduler drops it and says so",
+	"could not park …: nothing told the scheduler what state it is in": "the demand reached the give-up path with no state to move from, which sc's own wiring is supposed to prevent",
+
+	// A clause, not a message.
+	" (the last agent answered: it was the run's own bookkeeping afterwards that failed, not the cartridge)": "appended to the documented give-up warning to say the cartridge was not at fault",
+}
+
+// --- What sc doctor prints (P9-08 round 4) ------------------------------
+
+// tsDoctorFile is the file the doctor report's rows are built in. Its
+// Detail strings are neither errors nor warnings — they are the words each
+// row carries — and they are the first thing a refused run prints, because
+// the startup fix list renders them verbatim. The page tells every reader
+// to start with `sc doctor`, so its own vocabulary is the one that has to
+// be keyed.
+const tsDoctorFile = "doctor.go"
+
+// tsExemptDetails are the doctor details docs/troubleshooting.md does not
+// document, each with the reason. They are all details of a passing row:
+// a version, a path, a count. Nobody looks up the words of a row that is
+// telling them everything is fine.
+var tsExemptDetails = map[string]string{
+	"embedded database answered bd ping in … ms": "the bd row passing, with how long the embedded database took",
+	"…, authenticated":                           "the gh row passing",
+	"…, authenticated as … on …":                 "the same, when gh also named the account and the host",
+	"clean working tree at …":                    "the repository row passing",
+	"… present":                                  "the beads row passing, naming the .beads directory it found",
+	"ignores .env":                               "the .gitignore row passing",
+}
+
+// tsDetails returns the Detail of every doctor row, rendered the way
+// tsCodeMessages renders an error.
+func tsDetails(t *testing.T) []tsMessage {
+	t.Helper()
+	consts := tsStringConsts(t)
+	var out []tsMessage
+	seen := map[string]bool{}
+	for _, pkg := range tsMessagePackages {
+		for _, path := range tsGoFiles(t, pkg) {
+			if seen[path] || filepath.Base(path) != tsDoctorFile {
+				continue
+			}
+			seen[path] = true
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			require.NoError(t, err, path)
+			dir := filepath.Dir(path)
+			add := func(pos token.Pos, expr ast.Expr) {
+				text, ok := tsStringy(dir, consts, expr)
+				if !ok || !tsSaysSomething(text) {
+					return
+				}
+				out = append(out, tsMessage{text: text, file: path, line: fset.Position(pos).Line})
+			}
+			ast.Inspect(f, func(n ast.Node) bool {
+				switch e := n.(type) {
+				case *ast.AssignStmt:
+					if len(e.Lhs) != len(e.Rhs) {
+						return true
+					}
+					for i, lhs := range e.Lhs {
+						if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "Detail" {
+							add(e.Pos(), e.Rhs[i])
+						}
+					}
+				case *ast.KeyValueExpr:
+					if key, ok := e.Key.(*ast.Ident); ok && key.Name == "Detail" {
+						add(e.Pos(), e.Value)
+					}
+				}
+				return true
+			})
+		}
+	}
+	require.NotEmpty(t, out, "no doctor details found: the extraction is broken, not the code")
+	return out
+}
+
+// TestTroubleshootingCoversTheDoctorRowsOwnWords holds the doctor report to
+// the same standard as the errors and the warnings. `sc doctor` is what the
+// page tells every reader to run first, and a failing run prints its rows
+// as the numbered fix list, so `cartridge:mock: active: "mock" not found on
+// PATH` is often the very first thing a user sees. Round 3 keyed the
+// nearest row by the sentinel (`cartridge: not installed`) rather than by
+// those words.
+func TestTroubleshootingCoversTheDoctorRowsOwnWords(t *testing.T) {
+	documented := tsDocumented(t)
+	var missing []string
+	for _, d := range tsDetails(t) {
+		if tsCovered(d.text, documented) || tsExemptDetails[d.display()] != "" {
+			continue
+		}
+		missing = append(missing, fmt.Sprintf("%s:%d %q", d.file, d.line, d.display()))
+	}
+	sort.Strings(missing)
+	require.Empty(t, missing,
+		"docs/troubleshooting.md matches no row for these `sc doctor` details: add a row keyed by a phrase "+
+			"of one that no verb interrupts, or add it to tsExemptDetails with the reason a passing row needs none")
+}
+
+// TestTroubleshootingWarningAndDetailExemptionsAreReal is
+// TestTroubleshootingExemptionsAreReal for the two lists round 4 added:
+// neither may outlive the text it excuses, or quietly cover one the page
+// now documents.
+func TestTroubleshootingWarningAndDetailExemptionsAreReal(t *testing.T) {
+	documented := tsDocumented(t)
+	live := func(all []tsMessage) map[string]bool {
+		out := map[string]bool{}
+		for _, m := range all {
+			if !tsCovered(m.text, documented) {
+				out[m.display()] = true
+			}
+		}
+		return out
+	}
+	warnings := live(tsWarnings(t))
+	for text, reason := range tsExemptWarnings {
+		require.True(t, warnings[text],
+			"tsExemptWarnings names %q, which nothing warns any more, or which a row of the page now "+
+				"documents: drop the entry", text)
+		require.NotEmpty(t, reason, "%q needs a reason", text)
+	}
+	details := live(tsDetails(t))
+	for text, reason := range tsExemptDetails {
+		require.True(t, details[text],
+			"tsExemptDetails names %q, which no doctor row carries any more, or which a row of the page "+
+				"now documents: drop the entry", text)
+		require.NotEmpty(t, reason, "%q needs a reason", text)
 	}
 }

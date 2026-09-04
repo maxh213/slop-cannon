@@ -1604,6 +1604,36 @@ func (d *Deliverer) RedeliverPR(ctx context.Context, e gitx.ResumeEntry) error {
 	return err
 }
 
+// Redeliver implements [ResumeHandler]: a resumed run found a bead the
+// crash left in delivering with no pull request to point at and no
+// conflict to resolve, because the process died between the delivering
+// status and the delivery itself (P9-03). The delivery is simply run
+// again: [Deliverer.Deliver] is idempotent about the status — a bead
+// already delivering is neither re-announced nor refused (startDelivering)
+// — and every stage under it is a retry of the same attempt, so a rebase
+// that already happened, a merge that already landed and a pull request
+// that already exists are all recognised rather than repeated.
+//
+// A bead reconciliation moved somewhere else, and one whose conflict round
+// is already pending, are left alone: this is the last resort for the one
+// state nothing else in the run can move.
+func (d *Deliverer) Redeliver(ctx context.Context, e gitx.ResumeEntry) error {
+	bead := e.Bead
+	bead.State = e.State
+	if bead.State != domain.BeadStateDelivering {
+		d.host.Log().Debug("resume: nothing to redeliver",
+			slog.String("bead", string(bead.ID)), slog.String("state", string(bead.State)))
+		return nil
+	}
+	if _, ok := d.PendingFor(bead.ID); ok {
+		return nil
+	}
+	d.host.Log().Info("resume: finishing the delivery the crash interrupted",
+		slog.String("bead", string(bead.ID)), slog.String("reason", e.Reason))
+	_, err := d.Deliver(ctx, DeliveryRequest{Bead: bead, Round: bead.Round})
+	return err
+}
+
 // ConflictRound implements [ResumeHandler]: a resumed run found a worktree
 // left mid-rebase, so the bead owes its engineer a conflict round before
 // anything else can happen to it (D-10). The bead is moved to in_progress
@@ -1640,6 +1670,70 @@ func (d *Deliverer) ConflictRound(ctx context.Context, e gitx.ResumeEntry) error
 		return fmt.Errorf("orchestrator: resume: %s: %s", bead.ID, res.Reason)
 	}
 	return nil
+}
+
+// DeliveryResumeHandler is the [ResumeHandler] every assembly gives its
+// run (P6-15, P9-03). All three hand-offs belong to the delivery handoff,
+// which is built after the run and so cannot be named in the run's
+// options, hence the function: it is the same late-bound indirection the
+// supervisor and the scheduler use, and like them it is only ever called
+// once the assembly has finished — the run acts on a resume inside
+// [Run.Start].
+//
+// It lives here rather than in the command layer so that the end-to-end
+// and crash-recovery rigs act on a resume through the very type `sc run`
+// does, instead of through a look-alike of their own.
+//
+// A deliverer that is somehow still missing is an assembly bug, not a
+// resume failure, so it is reported rather than silently skipped: the run
+// turns the error into a warning naming the bead.
+type DeliveryResumeHandler struct {
+	// Deliverer returns the run's delivery handoff. Required.
+	Deliverer func() *Deliverer
+}
+
+// DeliveryResumeHandler is a ResumeHandler.
+var _ ResumeHandler = DeliveryResumeHandler{}
+
+// RedeliverPR re-runs the idempotent pull request delivery for a bead whose
+// pull request already exists, so its gh:pr gate is recreated (D-20).
+func (h DeliveryResumeHandler) RedeliverPR(ctx context.Context, e gitx.ResumeEntry) error {
+	d, err := h.deliverer("re-run the pull request delivery")
+	if err != nil {
+		return err
+	}
+	return d.RedeliverPR(ctx, e)
+}
+
+// Redeliver finishes a delivery a crash interrupted before it had a pull
+// request or a conflict to point at (P9-03).
+func (h DeliveryResumeHandler) Redeliver(ctx context.Context, e gitx.ResumeEntry) error {
+	d, err := h.deliverer("finish the interrupted delivery")
+	if err != nil {
+		return err
+	}
+	return d.Redeliver(ctx, e)
+}
+
+// ConflictRound sends a bead whose worktree was left mid-rebase back to its
+// engineer as a conflict round (D-10).
+func (h DeliveryResumeHandler) ConflictRound(ctx context.Context, e gitx.ResumeEntry) error {
+	d, err := h.deliverer("open the conflict round")
+	if err != nil {
+		return err
+	}
+	return d.ConflictRound(ctx, e)
+}
+
+// deliverer reads the late-bound handoff, or says what could not be done
+// without it.
+func (h DeliveryResumeHandler) deliverer(what string) (*Deliverer, error) {
+	if h.Deliverer != nil {
+		if d := h.Deliverer(); d != nil {
+			return d, nil
+		}
+	}
+	return nil, fmt.Errorf("the run has no delivery handoff to %s with", what)
 }
 
 // ------------------------------------------------- the resume guard (P6-37)

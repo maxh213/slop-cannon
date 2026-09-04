@@ -96,6 +96,23 @@ type State struct {
 	// off disk and has no live component to ask, so this is the only way
 	// the two numbers reach it.
 	Vitals *RunVitals `json:"vitals,omitempty"`
+	// Budget is what the run has spent and how much headroom it has been
+	// granted, as of this write (P9-01). It is what makes
+	// `limits.max_tokens` and `limits.max_cost_usd` caps on the *run*
+	// rather than on one invocation of it: a resumed run reads it back
+	// through [RunBudgetOptions.Restore] instead of counting from zero.
+	// It is absent for a run assembled without a budget and for a state
+	// file written by an older sc.
+	Budget *BudgetState `json:"budget,omitempty"`
+}
+
+// Spent is the run's budget state, or the zero value for a state file that
+// carries none.
+func (s State) Spent() BudgetState {
+	if s.Budget == nil {
+		return BudgetState{}
+	}
+	return *s.Budget
 }
 
 // clone returns a copy that shares no slice with s.

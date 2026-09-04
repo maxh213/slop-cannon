@@ -426,12 +426,18 @@ func lockRemove(p LockProbe, opts LockOptions, notice string) (LockProbe, error)
 
 // StampRunLock records this process's start stamp in the run lock it holds,
 // so a later sc can tell the lock's owner from an unrelated program that
-// has since been given the same pid. Call it once, after [Run.Start] has
-// taken the lock.
+// has since been given the same pid.
+//
+// It is the *compatibility* half of the stamp: [acquireLock] writes the
+// stamp into the record it publishes, in the one atomic step that takes the
+// lock, so a lock this sc took is already stamped and this does nothing.
+// What is left for it is a lock published by an older sc, or by a caller
+// that took one some other way.
 //
 // It is best-effort by design: a lock held by somebody else is left alone,
 // a missing lock is not an error, and a platform that cannot tell a
-// process's start time changes nothing.
+// process's start time changes nothing. It never overwrites a lock that was
+// taken over while it was being read either — see [stampLockRecord].
 func StampRunLock(stateDir string, opts LockOptions) error {
 	path := RepoLockPath(stateDir)
 	self := opts.self()
@@ -439,29 +445,103 @@ func StampRunLock(stateDir string, opts LockOptions) error {
 	if stamp == "" {
 		return nil
 	}
+	rec, seen, err := readLockToStamp(path, self, stamp)
+	if err != nil || seen == nil {
+		return err
+	}
+	return stampLockRecord(path, seen, rec)
+}
+
+// readLockToStamp is the read half of [StampRunLock]: it returns the record
+// to write back and the identity of the file it came from, or a nil
+// os.FileInfo when there is nothing to do (no lock, somebody else's lock,
+// or one this process already stamped).
+func readLockToStamp(path string, self int, stamp string) (LockRecord, os.FileInfo, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return LockRecord{}, nil, nil
+		}
+		return LockRecord{}, nil, fmt.Errorf("orchestrator: read the run lock %s: %w", path, err)
+	}
 	data, err := os.ReadFile(path) //nolint:gosec // the path is sc's own state directory (D-23).
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return LockRecord{}, nil, nil
 		}
-		return fmt.Errorf("orchestrator: read the run lock %s: %w", path, err)
+		return LockRecord{}, nil, fmt.Errorf("orchestrator: read the run lock %s: %w", path, err)
 	}
 	var rec LockRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
-		return fmt.Errorf("orchestrator: parse the run lock %s: %w", path, err)
+		return LockRecord{}, nil, fmt.Errorf("orchestrator: parse the run lock %s: %w", path, err)
 	}
 	if rec.PID != self || rec.Started == stamp {
-		return nil // somebody else's lock, or already stamped.
+		return LockRecord{}, nil, nil // somebody else's lock, or already stamped.
 	}
 	rec.Started = stamp
+	return rec, info, nil
+}
+
+// stampLockRecord writes rec back over the lock at path — but only while
+// that path is still the very file seen was read from.
+//
+// The re-check is P9-04's answer to a takeover racing the stamp (a `--force`
+// run removes the lock and publishes its own record in its place). Without
+// it this read-modify-write would put the *old* process's record back over
+// the forcing run's: the forcing run would then decline to release a lock
+// that no longer names it, and a third sc would read a record naming a
+// process that may by then be dead, call the lock stale and start alongside
+// a live run — the one thing this file exists to prevent. A replaced file
+// has a different identity, so the stamp is simply abandoned; the record
+// the takeover published stands, and it carries its own stamp already.
+func stampLockRecord(path string, seen os.FileInfo, rec LockRecord) error {
 	out, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return fmt.Errorf("orchestrator: encode the run lock: %w", err)
+	}
+	now, err := os.Stat(path)
+	if err != nil || !os.SameFile(seen, now) {
+		return nil
 	}
 	if err := config.WriteAtomic(path, append(out, '\n'), runFilePerm); err != nil {
 		return fmt.Errorf("orchestrator: write the run lock %s: %w", path, err)
 	}
 	return nil
+}
+
+// lockOptionsOf recovers the options a [LockPolicy] was built with, so that
+// [acquireLock] stamps its record and phrases its refusal with the same
+// clock, hostname and process probes the preflight used. A policy that is
+// not the run's own — P6-01's [DefaultLockPolicy], or a test's stand-in —
+// gets the production zero value.
+func lockOptionsOf(policy LockPolicy) LockOptions {
+	if p, ok := policy.(*RunLockPolicy); ok {
+		return p.Options()
+	}
+	return LockOptions{}
+}
+
+// lockedBy is the refusal [Run.Start] hands back when the repository's lock
+// is held by a run the policy will not take over.
+//
+// It is deliberately a *[LockedError], the very error the [ClaimRunLock]
+// preflight returns, so a second `sc <repo>` reads one sentence whether it
+// loses the race at the preflight or in the moment between the preflight
+// and [Run.Start]: the sentence names the live run and points at `sc
+// status`, rather than advising a `sc resume` that the same live lock would
+// refuse (P9-04).
+func lockedBy(path string, h LockHolder, policy LockPolicy) *LockedError {
+	opts := lockOptionsOf(policy)
+	e := &LockedError{Path: path, State: LockLive, Record: LockRecord{LockHolder: h}}
+	if host := opts.host(); host != "" && h.Host != "" && h.Host != host {
+		e.State = LockElsewhere
+	}
+	if h.TakenAt.IsZero() {
+		e.Age = lockFileAge(path, opts)
+	} else {
+		e.Age = opts.now().Sub(h.TakenAt)
+	}
+	return e
 }
 
 // RunLockPolicy is P9-04's [LockPolicy]: the hardened rule [Run.Start]

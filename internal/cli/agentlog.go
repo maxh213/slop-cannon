@@ -10,7 +10,7 @@ import (
 	"slop-cannon/internal/logging"
 )
 
-// The per-agent log files (P8-07). D-23 gives a run one log per agent at
+// The per-agent log files (P9-18). D-23 gives a run one log per agent at
 // <run-dir>/agents/<agent-id>.log, [logging.RunLogger.Agent] opens them and
 // `sc logs <agent-id>` (P8-05) reads them back — but nothing was writing
 // them, so the directory the first-run notice points at stayed empty and

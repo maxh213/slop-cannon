@@ -117,6 +117,27 @@ type Spend struct {
 	Firings int `json:"firings"`
 }
 
+// BudgetState is everything a run's budget has to carry from one
+// invocation of the run to the next: what has been spent and how much
+// headroom the user has already been granted. It is written into
+// state.json on every transition ([State.Budget]) and handed back to
+// [NewRunBudget] through [RunBudgetOptions.Restore] when the run is
+// resumed.
+//
+// Without it `limits.max_tokens` and `limits.max_cost_usd` were per
+// *process*, not per run: every `sc run --resume` started counting from
+// zero, so a capped run could be handed a whole fresh budget as often as
+// the user restarted it, and the summary of a resumed run reported a spend
+// smaller than the agents its own run log had fired (P9-01).
+type BudgetState struct {
+	// Spend is the metered spend of the whole run so far.
+	Spend Spend `json:"spend"`
+	// Grants is how many budgets' worth of headroom the run has been given:
+	// one to start with, and one more each time the user resumed it over a
+	// crossed cap (see [RunBudget]).
+	Grants int `json:"grants"`
+}
+
 // BudgetPauser is the slice of [*Run] a [RunBudget] uses: it pauses an
 // autopilot run that crossed its budget (D-18) and notices, on the next
 // dispatch, that the user resumed it.
@@ -166,6 +187,18 @@ type RunBudgetOptions struct {
 	Host EventHost
 	// Logger overrides the host's logger.
 	Logger *slog.Logger
+	// Restore is what an earlier invocation of the same run spent, read
+	// from state.json ([State.Budget]). The zero value is a run starting
+	// from nothing; anything else is a resume, and the budget carries that
+	// spend rather than counting from zero.
+	//
+	// A resume is the user saying "carry on", so a restored spend that is
+	// already over its ceiling earns the same grant an in-process resume
+	// earns: one more budget's worth, no more. The notice naming the new
+	// ceiling is published on the first dispatch, because at the moment the
+	// budget is built the run has not started and there is nowhere to
+	// publish it.
+	Restore BudgetState
 }
 
 // RunBudget enforces the opt-in `limits.max_tokens` and
@@ -223,6 +256,11 @@ type RunBudget struct {
 	paused bool
 	reason string
 	banner string
+	// pending is a notice the budget owes the user but had nowhere to
+	// publish: [NewRunBudget] runs while the run is still being assembled,
+	// so the headroom a resumed run is granted is announced on the first
+	// dispatch instead ([RunBudget.notice]).
+	pending string
 }
 
 // NewRunBudget builds the budget. It never fails: a configuration with no
@@ -247,7 +285,64 @@ func NewRunBudget(opts RunBudgetOptions) *RunBudget {
 		b.log = slog.Default()
 	}
 	b.log = b.log.With(slog.String("source", SourceLimits))
+	b.restore(opts.Restore)
 	return b
+}
+
+// restore carries an earlier invocation's spend into a resumed run
+// ([RunBudgetOptions.Restore]). A spend already over the restored ceiling
+// is granted one more budget's worth, exactly as clearing an in-process
+// pause is, so a resumed run has something to spend without the cap being
+// reset to zero underneath it.
+func (b *RunBudget) restore(prev BudgetState) {
+	if prev.Spend == (Spend{}) && prev.Grants <= 0 {
+		return
+	}
+	b.mu.Lock()
+	b.spend = prev.Spend
+	b.grants = max(prev.Grants, 1)
+	if !b.exceededLocked() {
+		b.mu.Unlock()
+		b.log.Info("the resumed run carries the spend of its earlier sessions",
+			slog.Int64("tokens", b.spend.Tokens), slog.Int("sessions", b.spend.Firings))
+		return
+	}
+	grants, ceiling := b.grantLocked()
+	spent := b.spend
+	b.pending = fmt.Sprintf(
+		"the run was resumed over its budget: it carries the %s of its earlier sessions, "+
+			"and will stop again at %s", budgetPlural(spent.Tokens, "token"), ceiling)
+	b.mu.Unlock()
+	b.log.Info("the resumed run carries the spend of its earlier sessions and was granted more headroom",
+		slog.Int64("tokens", spent.Tokens), slog.Int("sessions", spent.Firings), slog.Int("grants", grants))
+}
+
+// Snapshot is what the run persists so the budget survives a resume
+// ([BudgetState]). It is read on the run's own goroutine while the run
+// holds its lock, so it must not — and does not — call back into the run.
+func (b *RunBudget) Snapshot() BudgetState {
+	if b == nil {
+		return BudgetState{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return BudgetState{Spend: b.spend, Grants: b.grants}
+}
+
+// notice publishes whatever the budget owed the user from before the run
+// started, once.
+func (b *RunBudget) notice() {
+	b.mu.Lock()
+	msg := b.pending
+	b.pending = ""
+	b.mu.Unlock()
+	if msg == "" {
+		return
+	}
+	b.log.Warn(msg)
+	if b.host != nil {
+		b.host.Publish(events.Warning{Meta: b.host.Meta(), Source: SourceLimits, Message: msg})
+	}
 }
 
 // Enabled reports whether either budget is set. A disabled budget still
@@ -457,6 +552,7 @@ func (b *RunBudget) Work(inner WorkSource) WorkSource {
 		return inner
 	}
 	return WorkSourceFunc(func(ctx context.Context) ([]Demand, error) {
+		b.notice()
 		if inner == nil {
 			return nil, nil
 		}
@@ -470,10 +566,20 @@ func (b *RunBudget) Work(inner WorkSource) WorkSource {
 
 // holding reports whether new work is being held back, after giving a
 // resumed autopilot run its fresh headroom.
+//
+// It is called on the scheduler's loop goroutine, and it asks the run
+// whether it is still paused. That question is put with b.mu released: the
+// run takes its own lock to answer, and the run also reads the budget —
+// [RunBudget.Snapshot], for the state file it writes while holding that
+// lock. Holding b.mu across the call would make the two locks a cycle.
+// Nothing else can move tripped or paused meanwhile: paused is only ever
+// set by the fire a Record makes, which cannot happen while tripped is
+// already true, and tripped is only ever cleared here.
 func (b *RunBudget) holding() bool {
 	b.mu.Lock()
-	if !b.tripped {
-		b.mu.Unlock()
+	tripped, paused, pauser := b.tripped, b.paused, b.pauser
+	b.mu.Unlock()
+	if !tripped {
 		return false
 	}
 	// Only the user can clear a pause, so a run this budget paused that is
@@ -486,10 +592,10 @@ func (b *RunBudget) holding() bool {
 	// resumed it (P9-01). Granting it more headroom there would announce a
 	// resume that never happened, in the run log and in the summary's
 	// notice count, while the run was already shutting down.
-	if !b.paused || b.pauser == nil || b.pauser.Paused() || budgetEnding(b.pauser) {
-		b.mu.Unlock()
+	if !paused || pauser == nil || pauser.Paused() || budgetEnding(pauser) {
 		return true
 	}
+	b.mu.Lock()
 	grants, ceiling := b.grantLocked()
 	b.tripped, b.paused, b.reason, b.banner = false, false, "", ""
 	b.mu.Unlock()
@@ -548,9 +654,21 @@ func (b *RunBudget) grantLocked() (grants int, ceiling string) {
 // to in_progress (D-10), so holding it back strands a half-delivered bead
 // there — with no engineer offered, and, in brief mode, [RunBudget.Stop]
 // finishing the run as soon as the loop goes idle (P9-01).
+//
+// The review of an *external* pull request is the mirror image and is
+// dropped: [PRReview] adopts pull requests on its own goroutine as GitHub
+// shows them to it (D-11), so a review demand of its is a round the watcher
+// opened, quite possibly after the cap was crossed, rather than one the run
+// had under way. Keeping it let a steady arrival of pull requests spend
+// three fresh tester sessions apiece over a budget the run had already
+// blown, and — because the scheduler was never idle — stopped
+// [RunBudget.Stop] from ever finishing the brief run (P9-01).
 func budgetFinishing(ds []Demand) []Demand {
 	kept := make([]Demand, 0, len(ds))
 	for _, d := range ds {
+		if budgetExternalReview(d) {
+			continue
+		}
 		switch {
 		case d.Kind == DemandReview, d.Kind == DemandArbitrate:
 			kept = append(kept, d)
@@ -564,6 +682,15 @@ func budgetFinishing(ds []Demand) []Demand {
 	return kept
 }
 
+// budgetExternalReview reports whether a demand is [PRReview]'s: a review
+// of somebody else's pull request rather than of the run's own work. The
+// payload is the only thing that says so — the kind, the task and the round
+// all read exactly like a feedback round's.
+func budgetExternalReview(d Demand) bool {
+	_, ok := d.Payload.(PRReviewWork)
+	return ok
+}
+
 // Stop wraps a stop condition so that a brief run whose budget was crossed
 // finishes once the reviews in flight have drained, with the budget in the
 // summary (P9-01). An autopilot run is never finished here: D-18 says a cap
@@ -575,6 +702,7 @@ func (b *RunBudget) Stop(inner StopCondition) StopCondition {
 		return inner
 	}
 	return StopConditionFunc(func(ctx context.Context, r *Run, st SchedulerStatus) (Outcome, bool, error) {
+		b.notice()
 		if b.mode == domain.RunModeBrief && b.Tripped() && st.Live == 0 && st.Idle {
 			return Outcome{Reason: events.FinishStopped, Summary: b.Summary()}, true, nil
 		}

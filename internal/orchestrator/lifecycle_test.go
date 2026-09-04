@@ -232,6 +232,7 @@ func (r *lifecycleResumer) Resume(_ context.Context, beadList []domain.Bead) (*g
 type lifecycleResumeHandler struct {
 	mu        sync.Mutex
 	redeliver []domain.BeadID
+	finished  []domain.BeadID
 	conflicts []domain.BeadID
 	err       error
 }
@@ -240,6 +241,13 @@ func (h *lifecycleResumeHandler) RedeliverPR(_ context.Context, e gitx.ResumeEnt
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.redeliver = append(h.redeliver, e.Bead.ID)
+	return h.err
+}
+
+func (h *lifecycleResumeHandler) Redeliver(_ context.Context, e gitx.ResumeEntry) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.finished = append(h.finished, e.Bead.ID)
 	return h.err
 }
 
@@ -254,6 +262,13 @@ func (h *lifecycleResumeHandler) seen() ([]domain.BeadID, []domain.BeadID) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return append([]domain.BeadID(nil), h.redeliver...), append([]domain.BeadID(nil), h.conflicts...)
+}
+
+// finishedDeliveries returns the beads handed to Redeliver (P9-03).
+func (h *lifecycleResumeHandler) finishedDeliveries() []domain.BeadID {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]domain.BeadID(nil), h.finished...)
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -878,6 +893,51 @@ func TestLifecycleResumeConflictWinsOverAPullRequest(t *testing.T) {
 	redeliver, conflicts := handler.seen()
 	require.Empty(t, redeliver, "a worktree left mid-rebase cannot be delivered")
 	require.Equal(t, []domain.BeadID{"sc-9"}, conflicts)
+	require.NoError(t, r.Stop("done"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+}
+
+// TestLifecycleResumeFinishesAnInterruptedDelivery is the P9-03 dispatch:
+// a bead the crash left in delivering with nothing to point at — no pull
+// request, no conflict, nothing landed — is handed to Redeliver, because
+// nothing else in the run ships a delivering bead and the run would
+// otherwise spin until it was stopped (D-20).
+func TestLifecycleResumeFinishesAnInterruptedDelivery(t *testing.T) {
+	f := lifecycleSetup(t)
+	stuck := domain.Bead{ID: "sc-1", State: domain.BeadStateDelivering}
+	withPR := domain.Bead{ID: "sc-2", State: domain.BeadStateDelivering}
+	rebasing := domain.Bead{ID: "sc-3", State: domain.BeadStateDelivering}
+	blind := domain.Bead{ID: "sc-4", State: domain.BeadStateDelivering}
+	working := domain.Bead{ID: "sc-5", State: domain.BeadStateInProgress}
+	beadList := []domain.Bead{stuck, withPR, rebasing, blind, working}
+
+	handler := &lifecycleResumeHandler{}
+	opts := f.options()
+	opts.Resumer = &lifecycleResumer{res: &gitx.ResumeResult{Entries: []gitx.ResumeEntry{
+		{Bead: stuck, State: stuck.State, Reason: "the delivery did not complete; deliver again"},
+		{Bead: withPR, State: withPR.State, PRState: "OPEN"},
+		{Bead: rebasing, State: rebasing.State, Conflict: true},
+		// Inspection failed, so the branch state is a guess: delivering
+		// from a guess is how work gets lost.
+		{Bead: blind, State: blind.State, Err: fmt.Errorf("git is unwell")},
+		{Bead: working, State: working.State},
+	}}}
+	opts.OnResume = handler
+	opts.Beads = func(context.Context) ([]domain.Bead, error) { return beadList, nil }
+
+	rc := f.runConfig(t, config.RunSettings{})
+	rc.Resume = true
+	r, err := New(rc, opts)
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+
+	redeliver, conflicts := handler.seen()
+	require.Equal(t, []domain.BeadID{"sc-1"}, handler.finishedDeliveries(),
+		"only the bead with nothing to point at is delivered again")
+	require.Equal(t, []domain.BeadID{"sc-2"}, redeliver, "the pull request keeps its own hand-off")
+	require.Equal(t, []domain.BeadID{"sc-3"}, conflicts, "and the conflict keeps its own")
+
 	require.NoError(t, r.Stop("done"))
 	_, err = r.Wait()
 	require.NoError(t, err)

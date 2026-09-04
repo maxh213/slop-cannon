@@ -552,8 +552,56 @@ func TestPRWatcher_Poll(t *testing.T) {
 		assert.Equal(t, domain.BeadID("fx-old12"), res.Existing[0].Issue.ID)
 		assert.Equal(t, domain.BeadID("fx-old15"), res.Existing[1].Issue.ID)
 		require.Len(t, res.Stale, 1)
-		assert.Equal(t, domain.BeadID("fx-stale"), res.Stale[0].ID)
+		assert.Equal(t, domain.BeadID("fx-stale"), res.Stale[0].Issue.ID)
+		assert.Equal(t, StaleClosed, res.Stale[0].Reason)
+		assert.Equal(t, "pull request #99 is no longer open on GitHub", res.Stale[0].Explain())
 		assert.Empty(t, store.created)
+	})
+
+	// A stale review bead is not one condition, and the reason the run
+	// writes into bd has to be the true one (P8-04 review gap).
+	t.Run("says why each unmatched review bead is stale", func(t *testing.T) {
+		pwGH(t, pwShimConfig{listFile: pwTestdata(t, "pr-list.json")})
+		store := &pwStore{}
+		// #13 is still open, but it now carries the slop-cannon label, so
+		// the poll skips it rather than reviewing it.
+		store.pwSeed("fx-cannon", "in_review", map[string]any{
+			beads.MetaPRNumber: 13,
+			beads.MetaPRURL:    "https://github.com/example/fixture/pull/13",
+			beads.MetaRun:      "r1",
+		})
+		// #99 really has gone, and its bead belongs to an earlier run.
+		store.pwSeed("fx-old", "in_review", map[string]any{beads.MetaPRNumber: 99, beads.MetaRun: "r0"})
+		// A bead with no pull request at all: no listing can ever match it.
+		store.pwSeed("fx-nameless", "in_review", nil)
+
+		res, err := NewPRWatcher(NewGH(repo), store, WithRun("r1")).Poll(ctx)
+		require.NoError(t, err)
+		byID := map[domain.BeadID]StaleReview{}
+		for _, st := range res.Stale {
+			byID[st.Issue.ID] = st
+		}
+		require.Len(t, byID, 3)
+
+		cannon := byID["fx-cannon"]
+		assert.Equal(t, StaleCannonPR, cannon.Reason)
+		assert.Equal(t, 13, cannon.PR.Number)
+		assert.False(t, cannon.ForeignRun)
+		assert.Equal(t, "pull request #13 is still open but is now one of slop-cannon's own, "+
+			"so it is not reviewed as an external pull request", cannon.Explain())
+		assert.NotContains(t, cannon.Explain(), "no longer open")
+
+		old := byID["fx-old"]
+		assert.Equal(t, StaleClosed, old.Reason)
+		assert.True(t, old.ForeignRun, "a bead of an earlier run must be marked as one")
+		assert.Equal(t, "pull request #99 is no longer open on GitHub "+
+			"(its review bead was raised by an earlier run)", old.Explain())
+
+		nameless := byID["fx-nameless"]
+		assert.Equal(t, StaleUnknownPR, nameless.Reason)
+		assert.Equal(t, 0, nameless.Number())
+		assert.Equal(t, "the review bead records no pull request number or URL, "+
+			"so no pull request could be matched to it", nameless.Explain())
 	})
 
 	t.Run("one failed create does not stop the others", func(t *testing.T) {

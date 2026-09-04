@@ -45,6 +45,13 @@ const (
 	// out to `gh` once per open gate and a human merge is never urgent, so
 	// the default is a minute.
 	DefaultGatePollInterval = 60 * time.Second
+	// DefaultPRPollInterval is how often the run asks GitHub for the open
+	// pull requests it might review (D-11, P8-04). Every poll shells out to
+	// `gh pr list` once, and a pull request somebody opened while the
+	// cannon was firing can wait a minute, so the default matches
+	// DefaultGatePollInterval. It is gitx.DefaultPRPollInterval, which is
+	// an alias of this constant so there is one number.
+	DefaultPRPollInterval = 60 * time.Second
 	// DefaultMaxBeadsPerPlan is how many beads one planning firing may
 	// propose before the plan is rejected outright (P5-02, P1-16). Dropping
 	// the surplus is not an option: it would break the dependencies of the
@@ -213,6 +220,9 @@ type File struct {
 	IdleReplanInterval *Duration `toml:"idle_replan_interval,omitempty"`
 	// GatePollInterval is how often the gh:pr gates are checked (P6-10).
 	GatePollInterval *Duration `toml:"gate_poll_interval,omitempty"`
+	// PRPollInterval is how often GitHub is asked for external pull
+	// requests to review (D-11, P8-04).
+	PRPollInterval *Duration `toml:"pr_poll_interval,omitempty"`
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02).
 	MaxBeadsPerPlan *int `toml:"max_beads_per_plan,omitempty"`
 	// Limits holds the feedback-loop and budget limits (D-08, D-18).
@@ -284,6 +294,12 @@ type Config struct {
 	// GatePollInterval is how often a delivered bead's gh:pr gate is
 	// checked for the merge that closes it (P6-10).
 	GatePollInterval Duration `json:"gate_poll_interval"`
+	// PRPollInterval is how often the external pull request reviewer asks
+	// GitHub for open pull requests it has not reviewed yet (D-11, P8-04).
+	// It bounds how quickly a pull request opened during a run is picked
+	// up, and how quickly one that is merged or closed while a review is
+	// in flight settles its review bead (P8-11).
+	PRPollInterval Duration `json:"pr_poll_interval"`
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02);
 	// always at least 1.
 	MaxBeadsPerPlan int `json:"max_beads_per_plan"`
@@ -305,6 +321,7 @@ func Defaults() Config {
 		Exclude:            []string{},
 		IdleReplanInterval: NewDuration(DefaultIdleReplanInterval),
 		GatePollInterval:   NewDuration(DefaultGatePollInterval),
+		PRPollInterval:     NewDuration(DefaultPRPollInterval),
 		MaxBeadsPerPlan:    DefaultMaxBeadsPerPlan,
 		Limits: Limits{
 			MaxReviewRounds:   DefaultMaxReviewRounds,

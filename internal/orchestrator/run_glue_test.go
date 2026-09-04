@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -355,6 +356,11 @@ func glueSetup(t *testing.T, bd *glueBD, opts ConductorOptions, settings config.
 	if opts.Interval == 0 {
 		opts.Interval = 5 * time.Millisecond
 	}
+	if opts.DeliveryBackoff == 0 {
+		// The retry policy is what is under test, not the waiting: a test
+		// that wants the production wait sets it.
+		opts.DeliveryBackoff = time.Millisecond
+	}
 	c, err := NewConductor(opts)
 	require.NoError(t, err)
 
@@ -531,11 +537,6 @@ func TestGlueRoutesDeliveryOutcomesBackIntoTheLoops(t *testing.T) {
 		{
 			name:      "a conflict is the engineer's again",
 			outcome:   DeliveryOutcome{Kind: DeliveryConflict, State: domain.BeadStateInProgress, Round: 2},
-			redeliver: true,
-		},
-		{
-			name:      "a retryable failure may be delivered again",
-			outcome:   DeliveryOutcome{Kind: DeliveryRetryable, State: domain.BeadStateDelivering, Round: 2},
 			redeliver: true,
 		},
 		{
@@ -788,6 +789,102 @@ func TestGlueBeadContextRefusesABeadBDDoesNotKnow(t *testing.T) {
 	assert.Contains(t, err.Error(), "bd knows no bead sc-missing")
 }
 
+// TestGlueBeadContextCommitsNothingIntoAReviewWorktree is P8-14 gap 4. The
+// conductor's context provider is also the external pull request
+// reviewer's (D-11, internal/cli: `Context: cond.BeadContext`), and
+// PRWorktreeCheckout leaves that bead's worktree detached at somebody
+// else's pull request head with its own `sc/<bead>` branch deleted.
+// Committing D-14's leftovers there would `git add -A` whatever a previous
+// lens left behind — build output, a test cache — onto a detached HEAD, on
+// a bead that is not an engineer's work at all.
+func TestGlueBeadContextCommitsNothingIntoAReviewWorktree(t *testing.T) {
+	review := glueIssue("sc-pr-7", domain.BeadTypeTask, "open", "Review external PR #7")
+	review.Labels = []string{beads.LabelExternalPR}
+	bd := newGlueBD(review)
+	git := &glueGit{diff: &gitx.Diff{Patch: "diff --git a/retry.go b/retry.go\n"}}
+	worktrees := &glueWorktrees{}
+	rig := glueSetup(t, bd, ConductorOptions{
+		Git: git, Worktrees: worktrees, Brief: "make it retry", CheckCommand: "go test ./...",
+		Repo: prompt.RepoContext{Root: "/repo", DefaultBranch: "main"},
+	}, config.RunSettings{})
+
+	bc, err := rig.Cond.BeadContext(context.Background(), "sc-pr-7")
+	require.NoError(t, err)
+	assert.Empty(t, git.committed(), "nothing is committed into somebody else's pull request")
+	assert.Zero(t, git.diffs, "and the change set is the reviewer's, taken from the pull request")
+	assert.Empty(t, worktrees.created, "the reviewer checks the pull request out itself")
+	assert.Empty(t, bc.Bead.Worktree)
+	assert.Empty(t, bc.Bead.Branch, "the bead has no sc/ branch of its own")
+	assert.Nil(t, bc.Diff)
+
+	// Everything the prompt needs that is not about the working tree is
+	// still there.
+	assert.Equal(t, "make it retry", bc.Brief)
+	assert.Equal(t, "main", bc.Repo.DefaultBranch)
+	assert.Equal(t, domain.BeadID("sc-pr-7"), bc.Bead.Bead.ID)
+
+	// The run's own work is untouched by the exception.
+	bd.add(glueIssue("sc-1", domain.BeadTypeTask, "in_progress", "add the retry"))
+	_, err = rig.Cond.BeadContext(context.Background(), "sc-1")
+	require.NoError(t, err)
+	assert.Equal(t, []domain.BeadID{"sc-1"}, git.committed())
+}
+
+// glueWorktrees records the worktrees the context provider asked for.
+type glueWorktrees struct {
+	mu      sync.Mutex
+	created []domain.BeadID
+}
+
+func (w *glueWorktrees) PathFor(id domain.BeadID) string { return "/wt/" + string(id) }
+
+func (w *glueWorktrees) Create(_ context.Context, bead domain.Bead) (*gitx.Worktree, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.created = append(w.created, bead.ID)
+	return &gitx.Worktree{Path: "/wt/" + string(bead.ID)}, nil
+}
+
+// --- what the conductor tells a user (P9-08) -----------------------------
+
+// TestGlueTheConductorsMessagesAreOnTheTroubleshootingPage holds the
+// run-level glue to P9-08's contract from this side. The page's own guards
+// scan internal/cli and internal/config for every message they build, and
+// the deeper packages only for their exported sentinels — so the
+// conductor's messages, which reach the TUI, `sc status` and the run log
+// like any other, are outside that net by construction.
+//
+// Each entry is pinned twice: the words must still be in run.go, so a
+// reworded message fails here rather than leaving a page row nothing
+// prints, and they must be on the page, so a new one is documented.
+func TestGlueTheConductorsMessagesAreOnTheTroubleshootingPage(t *testing.T) {
+	source, err := os.ReadFile("run.go")
+	require.NoError(t, err)
+	page, err := os.ReadFile(filepath.Join("..", "..", "docs", "troubleshooting.md"))
+	require.NoError(t, err)
+
+	for _, msg := range []string{
+		// The warnings the run publishes.
+		"a run-level sync with bd failed; the run carries on and retries",
+		"a delivery is still running after the conductor stopped",
+		// The errors a failed pass reports, which reach `sc status` and
+		// the log through the same warning.
+		"orchestrator: conductor: listing the run's beads",
+		"orchestrator: conductor: listing the ready beads",
+		"orchestrator: conductor: bd knows no bead",
+		"orchestrator: conductor: worktree for",
+		"orchestrator: conductor: committing",
+	} {
+		assert.Contains(t, string(source), msg, "the message is still the one run.go builds")
+		assert.Contains(t, string(page), msg, "docs/troubleshooting.md documents it")
+	}
+	// The two the code names, so the words and the row move together
+	// whatever the source line they are written across.
+	for _, msg := range []string{deliveryGaveUpMessage, deliveryStrandedMessage} {
+		assert.Contains(t, string(page), msg, "docs/troubleshooting.md documents it")
+	}
+}
+
 // --- the bead inventory and the graph (P6-32) ----------------------------
 
 func TestGluePublishesABeadCreatedOutsideAPlan(t *testing.T) {
@@ -1007,19 +1104,147 @@ func glueThread(id domain.BeadID, round int) []beads.Message {
 // TestGlueRestoreNeverReplaysIntoALiveThread is the resume defect the brief
 // asked for: a run that can never finish.
 //
-// A graceful stop takes the D-07 `released` edge (in_progress -> open,
-// P6-03), so the most ordinary resume finds the bead *open* with the
-// previous run's whole thread still on it. The first pass tracks it, the
-// scheduler claims it (open -> in_progress), and a conductor that decided
-// what to restore from the bead's state on every pass would then read those
-// old comments and replay them into the thread the loop is holding right
-// now: the engineer it has just fired is abandoned, no tester is ever
-// fired, the bead is never delivered, and — sitting in in_progress — it is
-// not settled either, so a brief run idles for ever.
+// The first pass of a resumed run rebuilds the thread of a bead the killed
+// run had claimed (P8-14 gap 2), and the scheduler then claims it (open ->
+// in_progress) and fires the engineer the rebuilt thread owes. A conductor
+// that decided what to restore from the bead's state on every pass would
+// read those same old comments again on the next pass and replay them into
+// the thread the loop is holding right now: the engineer it has just fired
+// is abandoned, no tester is ever fired, the bead is never delivered, and
+// — sitting in in_progress — it is not settled either, so a brief run
+// idles for ever. Freezing the restore set at the first pass is what stops
+// that.
 //
 // The real *Feedback is driven here, not the recording fake: the damage is
 // what the replay does to a live thread.
 func TestGlueRestoreNeverReplaysIntoALiveThread(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "open", "add the retry"),
+	)
+	bd.msgs["sc-1"] = glueChangesThread("sc-1", 1)
+
+	rig := glueSetup(t, bd, ConductorOptions{Restore: glueYes()}, config.RunSettings{})
+	loop, err := NewFeedback(FeedbackOptions{
+		Context: rig.Cond.BeadContext,
+		Run:     rig.Config.Run.ID,
+		Now:     rig.Fixture.Clock.Now,
+	})
+	require.NoError(t, err)
+	rig.Cond.Attach(ConductorParts{Feedback: loop})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	// Pass one: the resume rebuilds the thread and the loop owes the bead
+	// the engineer that answers round 1's feedback.
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	assert.Equal(t, 1, bd.count("messages"))
+	assert.Equal(t, 1, rig.Cond.Stats().Restored)
+	demands, err := loop.Demands(context.Background())
+	require.NoError(t, err)
+	require.Len(t, demands, 1, "the loop owes the bead an engineer")
+	require.Equal(t, DemandImplement, demands[0].Kind)
+
+	// The scheduler claims it: open -> in_progress, with the engineer live.
+	bd.set("sc-1", domain.BeadStateInProgress)
+
+	// Pass two, one interval later, must leave that thread alone.
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	assert.Equal(t, 1, bd.count("messages"), "a bead the run itself moved is not read again")
+	assert.Equal(t, 1, rig.Cond.Stats().Restored)
+
+	th, ok := loop.Thread("sc-1")
+	require.True(t, ok)
+	assert.NotEqual(t, FeedbackSettled, th.Phase, "the running engineer was not settled out from under the loop")
+	assert.Equal(t, FeedbackAddressing, th.Phase)
+	require.Len(t, th.Items, 1, "and its feedback was not replayed on top of itself")
+	demands, err = loop.Demands(context.Background())
+	require.NoError(t, err)
+	require.Len(t, demands, 1, "the engineer the run fired is still owed")
+	assert.Equal(t, DemandImplement, demands[0].Kind)
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err = rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// glueChangesThread is a killed run's thread on a bead whose engineer was
+// still working: an implementation report and one lens asking for changes,
+// with an item to answer.
+func glueChangesThread(id domain.BeadID, round int) []beads.Message {
+	item := domain.FeedbackItem{ID: "qa-r" + strconv.Itoa(round) + "-1", Title: "the retry loop never terminates",
+		Severity: domain.SeverityMajor, Status: domain.ItemOpen, File: "retry.go"}
+	return []beads.Message{
+		{Type: domain.MessageImplReport, IssueID: id,
+			Payload: domain.ImplReport{Summary: "added the retry"}},
+		{Type: domain.MessageVerdict, IssueID: id, Payload: domain.Verdict{
+			Lens: domain.LensQA, Round: round, Outcome: domain.VerdictChanges,
+			Summary: "still spins", Items: []domain.FeedbackItem{item},
+		}},
+	}
+}
+
+// TestGlueResumeRestoresTheThreadOfABeadTheKilledRunHadClaimed is P8-16 for
+// the commonest resume of all (P8-14 gap 2).
+//
+// A bead the killed run had claimed does not come back in_progress:
+// `--resume` runs beads.Client.RecoverStale before the run starts, which
+// releases every stale in_progress bead, and a graceful stop takes the same
+// D-07 released edge. Both leave the bead *open* with the whole thread
+// still on its comments. A conductor that restored only the states past
+// open therefore threw away the items, the responses, the D-08 pushback
+// counts and the rulings of exactly the beads a kill interrupts, and
+// started them again at round one.
+func TestGlueResumeRestoresTheThreadOfABeadTheKilledRunHadClaimed(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "open", "add the retry"),
+	)
+	bd.msgs["sc-1"] = glueChangesThread("sc-1", 3)
+
+	rig := glueSetup(t, bd, ConductorOptions{Restore: glueYes()}, config.RunSettings{})
+	loop, err := NewFeedback(FeedbackOptions{
+		Context: rig.Cond.BeadContext,
+		Run:     rig.Config.Run.ID,
+		Now:     rig.Fixture.Clock.Now,
+	})
+	require.NoError(t, err)
+	rig.Cond.Attach(ConductorParts{Feedback: loop})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	assert.Equal(t, 1, rig.Cond.Stats().Restored, "the open bead's thread was rebuilt")
+	assert.Equal(t, 1, bd.count("messages"))
+
+	th, ok := loop.Thread("sc-1")
+	require.True(t, ok)
+	assert.Equal(t, 4, th.Round, "the thread carries on from where the killed run left it")
+	assert.Equal(t, FeedbackAddressing, th.Phase)
+	require.Len(t, th.Items, 1, "the items the testers raised survived the kill")
+	assert.Equal(t, "qa-r3-1", th.Items[0].Item.ID)
+
+	// And the engineer it fires is answering that feedback, not starting
+	// the bead again.
+	demands, err := loop.Demands(context.Background())
+	require.NoError(t, err)
+	require.Len(t, demands, 1)
+	assert.Equal(t, DemandImplement, demands[0].Kind)
+	assert.Equal(t, events.TaskAddressFeedback, demands[0].Task)
+	assert.Equal(t, 4, demands[0].Round)
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err = rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// An open bead whose comments say every lens approved is a bead whose
+// engineer was killed *after* that approval — a conflict round, D-10 — so
+// the approvals are for a commit that has since moved. Concluding the
+// replay would settle the loop's thread over a bead bd holds open: no
+// demand would ever be made for it, and `open` is not a settled state, so a
+// brief run would idle for ever. The testers are asked again instead.
+func TestGlueResumeReviewsAnOpenBeadWhoseApprovalsAreStale(t *testing.T) {
 	bd := newGlueBD(
 		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
 		glueIssue("sc-1", domain.BeadTypeTask, "open", "add the retry"),
@@ -1037,30 +1262,21 @@ func TestGlueRestoreNeverReplaysIntoALiveThread(t *testing.T) {
 	require.NoError(t, rig.Run.Start(context.Background()))
 	require.NoError(t, rig.Run.SetEpic("sc-epic"))
 
-	// Pass one: the bead is open, so it is adopted rather than restored.
 	require.NoError(t, rig.Cond.Sync(context.Background()))
-	assert.Zero(t, bd.count("messages"), "an open bead's comments are not replayed")
-	demands, err := loop.Demands(context.Background())
-	require.NoError(t, err)
-	require.Len(t, demands, 1, "the loop owes the bead an engineer")
-	require.Equal(t, DemandImplement, demands[0].Kind)
-
-	// The scheduler claims it: open -> in_progress, with the engineer live.
-	bd.set("sc-1", domain.BeadStateInProgress)
-
-	// Pass two, one interval later, must leave that thread alone.
-	require.NoError(t, rig.Cond.Sync(context.Background()))
-	assert.Zero(t, bd.count("messages"), "a bead the run itself moved is not a resume candidate")
-	assert.Zero(t, rig.Cond.Stats().Restored)
-
 	th, ok := loop.Thread("sc-1")
 	require.True(t, ok)
-	assert.NotEqual(t, FeedbackSettled, th.Phase, "the running engineer was not settled out from under the loop")
-	assert.Equal(t, FeedbackImplementing, th.Phase)
-	demands, err = loop.Demands(context.Background())
+	assert.NotEqual(t, FeedbackSettled, th.Phase, "a settled thread over an open bead is a run that cannot finish")
+	assert.Equal(t, FeedbackReviewing, th.Phase)
+	assert.Equal(t, domain.BeadStateInReview, th.State,
+		"and the loop's next transition is one the D-07 table allows")
+	assert.NotNil(t, th.Report, "the engineer's report is still the one the killed run recorded")
+
+	demands, err := loop.Demands(context.Background())
 	require.NoError(t, err)
-	require.Len(t, demands, 1, "the engineer the run fired is still owed")
-	assert.Equal(t, DemandImplement, demands[0].Kind)
+	require.NotEmpty(t, demands, "somebody is owed a firing, or the run idles for ever")
+	for _, d := range demands {
+		assert.Equal(t, DemandReview, d.Kind)
+	}
 
 	require.NoError(t, rig.Run.Stop("test"))
 	_, err = rig.Run.Wait()
@@ -1068,15 +1284,16 @@ func TestGlueRestoreNeverReplaysIntoALiveThread(t *testing.T) {
 }
 
 // The restore set is the one the first pass found, whatever the beads do
-// afterwards: a bead that becomes restorable later became so because this
-// run moved it.
+// afterwards: a bead that is not in that listing, or that grows a thread
+// later, belongs to this run rather than to the one it resumed.
 func TestGlueRestoreOnlyRebuildsWhatTheFirstPassFound(t *testing.T) {
 	bd := newGlueBD(
 		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
 		glueIssue("sc-1", domain.BeadTypeTask, "open", "add the retry"),
 		glueIssue("sc-2", domain.BeadTypeTask, "in_review", "test the retry"),
 	)
-	bd.msgs["sc-1"] = glueThread("sc-1", 1)
+	// sc-1 is a bead nothing has started: no comments, so there is no
+	// thread to replay and it is adopted the ordinary way.
 	bd.msgs["sc-2"] = glueThread("sc-2", 1)
 	feedback := newGlueFeedback()
 	rig := glueSetup(t, bd, ConductorOptions{Feedback: feedback, Restore: glueYes()}, config.RunSettings{})
@@ -1084,19 +1301,22 @@ func TestGlueRestoreOnlyRebuildsWhatTheFirstPassFound(t *testing.T) {
 	require.NoError(t, rig.Run.SetEpic("sc-epic"))
 
 	require.NoError(t, rig.Cond.Sync(context.Background()))
-	_, restored, order := feedback.snapshot()
-	assert.Equal(t, []domain.BeadID{"sc-2"}, restored, "only the bead the resume found past open")
-	assert.Equal(t, []string{"restore:sc-2", "track:sc-1"}, order)
+	_, restored, _ := feedback.snapshot()
+	assert.Equal(t, []domain.BeadID{"sc-2"}, restored, "only the bead that carried a thread")
+	assert.Equal(t, 2, bd.count("messages"), "each candidate's comments are read once")
 
-	// The loop moves sc-1 on, exactly as a claim would.
+	// The run moves sc-1 on and writes its own thread onto it, exactly as
+	// an engineer and a tester would, and a bead the run planned appears.
 	bd.set("sc-1", domain.BeadStateInReview)
+	bd.msgs["sc-1"] = glueThread("sc-1", 1)
+	bd.add(glueIssue("sc-3", domain.BeadTypeTask, "in_review", "document the retry"))
+	bd.msgs["sc-3"] = glueThread("sc-3", 1)
 	require.NoError(t, rig.Cond.Sync(context.Background()))
 	require.NoError(t, rig.Cond.Sync(context.Background()))
 
-	_, restored, order = feedback.snapshot()
-	assert.Equal(t, []domain.BeadID{"sc-2"}, restored, "sc-1 is the run's own work, not a resume's")
-	assert.Equal(t, []string{"restore:sc-2", "track:sc-1"}, order)
-	assert.Equal(t, 1, bd.count("messages"))
+	_, restored, _ = feedback.snapshot()
+	assert.Equal(t, []domain.BeadID{"sc-2"}, restored, "sc-1 and sc-3 are the run's own work, not a resume's")
+	assert.Equal(t, 2, bd.count("messages"), "and no later pass reads a comment again")
 
 	require.NoError(t, rig.Run.Stop("test"))
 	_, err := rig.Run.Wait()
@@ -1276,6 +1496,240 @@ func TestGlueDeliversABeadThatComesBackToApproved(t *testing.T) {
 	rig.Cond.WaitDeliveries()
 	assert.Len(t, delivery.sent(), 2, "the bead came back to approved, so it is delivered again")
 	assert.Equal(t, domain.BeadStateClosed, bd.state("sc-1"))
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// --- a retryable delivery is retried, and then given to a person ---------
+
+// glueStore is a StateStore over glueBD, so a test can drive the real
+// StateMachine the conductor parks a bead with.
+type glueStore struct{ bd *glueBD }
+
+func (s glueStore) SetStatus(_ context.Context, id domain.BeadID, state domain.BeadState) (beads.Issue, error) {
+	s.bd.set(id, state)
+	return beads.Issue{ID: id, Status: string(state)}, nil
+}
+
+func (s glueStore) ClaimFor(_ context.Context, id domain.BeadID, _ domain.AgentID) (beads.Issue, error) {
+	s.bd.set(id, domain.BeadStateInProgress)
+	return beads.Issue{ID: id, Status: string(domain.BeadStateInProgress)}, nil
+}
+
+func (s glueStore) Reclaim(ctx context.Context, id domain.BeadID, agent domain.AgentID) (beads.Issue, error) {
+	return s.ClaimFor(ctx, id, agent)
+}
+
+func (s glueStore) Release(_ context.Context, id domain.BeadID) (beads.Issue, error) {
+	s.bd.set(id, domain.BeadStateOpen)
+	return beads.Issue{ID: id, Status: string(domain.BeadStateOpen)}, nil
+}
+
+func (s glueStore) Close(_ context.Context, id domain.BeadID, _ string) (beads.Issue, error) {
+	s.bd.set(id, domain.BeadStateClosed)
+	return beads.Issue{ID: id, Status: string(domain.BeadStateClosed)}, nil
+}
+
+// glueDelivering is a delivery fake that behaves like the real Deliverer on
+// the way in: it writes bd's approved -> delivering before it can fail
+// (Deliverer.startDelivering), which is exactly what makes a retryable
+// failure unreachable by any later pass. answer decides what each attempt
+// returns.
+func glueDelivering(bd *glueBD, answer func(attempt int, req DeliveryRequest) (*DeliveryOutcome, error)) *glueDelivery {
+	d := &glueDelivery{}
+	attempt := 0
+	d.deliver = func(req DeliveryRequest) (*DeliveryOutcome, error) {
+		attempt++
+		bd.set(req.Bead.ID, domain.BeadStateDelivering)
+		return answer(attempt, req)
+	}
+	return d
+}
+
+// A retryable delivery leaves the bead in delivering: `bd ready` does not
+// offer it, the feedback loop was never given it back, and the conductor's
+// own pass only delivers beads bd holds in approved. Nothing but the
+// conductor's retry can ever come back to it, which is why a run used to
+// hang with the merge landed and the bead never closed.
+func TestGlueRetriesADeliveryLeftInDelivering(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "approved", "add the retry"),
+	)
+	feedback := newGlueFeedback()
+	delivery := glueDelivering(bd, func(attempt int, req DeliveryRequest) (*DeliveryOutcome, error) {
+		out := &DeliveryOutcome{Bead: req.Bead.ID, Round: req.Round, State: domain.BeadStateDelivering}
+		if attempt < 3 {
+			out.Kind, out.Reason = DeliveryRetryable, "the merge landed but the bead could not be closed"
+			return out, errors.New("bd is down")
+		}
+		bd.set(req.Bead.ID, domain.BeadStateClosed)
+		out.Kind, out.State = DeliveryMerged, domain.BeadStateClosed
+		return out, nil
+	})
+	rig := glueSetup(t, bd, ConductorOptions{Feedback: feedback, Delivery: delivery}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	// One pass is all it gets: bd never shows the bead approved again.
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+
+	sent := delivery.sent()
+	require.Len(t, sent, 3, "the retryable failures were tried again")
+	assert.Equal(t, domain.BeadStateApproved, sent[0].Bead.State)
+	assert.Equal(t, domain.BeadStateDelivering, sent[1].Bead.State,
+		"the retry delivers the bead where the last attempt left it, so startDelivering re-announces nothing")
+	assert.Equal(t, domain.BeadStateClosed, bd.state("sc-1"), "and the third attempt landed it")
+	assert.Equal(t, domain.BeadStateClosed, feedback.seen("sc-1"))
+	assert.Equal(t, 1, bd.count("list"), "one pass")
+	assert.Equal(t, 1, rig.Cond.Stats().Shipped)
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// The retries are bounded: something that fails every time is not retried
+// for the life of the run. The bead goes to a person — needs_human is
+// terminal, so a brief run can finish — and the run says so in words the
+// troubleshooting page carries.
+func TestGlueHandsOverADeliveryThatKeepsFailing(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "approved", "add the retry"),
+	)
+	feedback := newGlueFeedback()
+	delivery := glueDelivering(bd, func(_ int, req DeliveryRequest) (*DeliveryOutcome, error) {
+		return &DeliveryOutcome{Bead: req.Bead.ID, Round: req.Round, Kind: DeliveryRetryable,
+				State: domain.BeadStateDelivering, Reason: "the pull request could not be delivered"},
+			errors.New("gh is not authenticated")
+	})
+	states := NewStateMachine(glueStore{bd: bd})
+	rig := glueSetup(t, bd, ConductorOptions{
+		Feedback: feedback, Delivery: delivery, States: states, DeliveryAttempts: 3,
+	}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	assert.Len(t, delivery.sent(), 3, "three attempts and no more")
+	assert.Equal(t, domain.BeadStateNeedsHuman, bd.state("sc-1"), "the bead is a person's now")
+	assert.True(t, BeadStateSettled(bd.state("sc-1")), "so a brief run can finish")
+	assert.Equal(t, domain.BeadStateNeedsHuman, feedback.seen("sc-1"), "and the loop stops waiting on it")
+
+	// A later pass does not start it all over again.
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	assert.Len(t, delivery.sent(), 3)
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
+	require.NoError(t, rig.Log.Close())
+
+	var said []string
+	evs, err := ReadEventLog(rig.Config.Run.StateDir)
+	require.NoError(t, err)
+	for _, ev := range evs {
+		if w, ok := ev.(events.Warning); ok && w.Source == SourceConductor {
+			said = append(said, w.Message)
+		}
+	}
+	assert.Contains(t, said, deliveryGaveUpMessage, "the user is told, in the words the page documents")
+}
+
+// With no state machine to write with, the give-up still stops retrying and
+// still says so, and the claim goes back so a person who puts the bead back
+// in approved gets it delivered.
+func TestGlueADeliveryGivenUpWithNoStateMachineIsDeliveredAgainWhenItComesBack(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "approved", "add the retry"),
+	)
+	fail := true
+	delivery := glueDelivering(bd, func(_ int, req DeliveryRequest) (*DeliveryOutcome, error) {
+		if fail {
+			return &DeliveryOutcome{Bead: req.Bead.ID, Kind: DeliveryRetryable,
+				State: domain.BeadStateDelivering, Reason: "the remote is unreachable"}, errors.New("no route to host")
+		}
+		bd.set(req.Bead.ID, domain.BeadStateClosed)
+		return &DeliveryOutcome{Bead: req.Bead.ID, Kind: DeliveryMerged, State: domain.BeadStateClosed}, nil
+	})
+	rig := glueSetup(t, bd, ConductorOptions{
+		Feedback: newGlueFeedback(), Delivery: delivery, DeliveryAttempts: 2,
+	}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	require.Len(t, delivery.sent(), 2)
+	assert.Equal(t, domain.BeadStateDelivering, bd.state("sc-1"),
+		"with no machine to write with, the bead is where bd left it")
+
+	// A person looks at it and puts it back.
+	fail = false
+	bd.set("sc-1", domain.BeadStateApproved)
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	assert.Len(t, delivery.sent(), 3, "the bead was not stranded in the conductor's bookkeeping")
+	assert.Equal(t, domain.BeadStateClosed, bd.state("sc-1"))
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
+}
+
+// Two beads approved in one pass are delivered one after the other. With
+// safety off each delivery fetches, rebases, fast-forwards the default
+// branch and pushes through the same gitx.Manager: the second of two
+// concurrent ones finds the branch already moved and fails with
+// gitx.ErrNotFastForward every time, not sometimes.
+func TestGlueDeliversOneBeadAtATime(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "approved", "add the retry"),
+		glueIssue("sc-2", domain.BeadTypeTask, "approved", "test the retry"),
+		glueIssue("sc-3", domain.BeadTypeTask, "approved", "document the retry"),
+	)
+	var (
+		mu     sync.Mutex
+		live   int
+		most   int
+		merged int
+	)
+	delivery := &glueDelivery{deliver: func(req DeliveryRequest) (*DeliveryOutcome, error) {
+		mu.Lock()
+		live++
+		if live > most {
+			most = live
+		}
+		mu.Unlock()
+		// Long enough that a second delivery would overlap this one if
+		// anything let it.
+		time.Sleep(5 * time.Millisecond)
+		mu.Lock()
+		live--
+		merged++
+		mu.Unlock()
+		bd.set(req.Bead.ID, domain.BeadStateClosed)
+		return &DeliveryOutcome{Bead: req.Bead.ID, Kind: DeliveryMerged, State: domain.BeadStateClosed}, nil
+	}}
+	rig := glueSetup(t, bd, ConductorOptions{Feedback: newGlueFeedback(), Delivery: delivery}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 3, merged, "every approved bead was delivered")
+	assert.Equal(t, 1, most, "and never two at once")
 
 	require.NoError(t, rig.Run.Stop("test"))
 	_, err := rig.Run.Wait()

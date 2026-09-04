@@ -369,6 +369,10 @@ func NewSupervisor(opts SupervisorOptions) (*Supervisor, error) {
 // supervisor first (the run needs it as [Options.Agents]), then attaches
 // the run [New] returned. Attaching also adopts the run's
 // `limits.agent_timeout` unless [SupervisorOptions.Timeout] set one.
+//
+// The timeout comes through [EffectiveLimits], not from the configuration
+// directly, so a run built from a hand-made config with no agent_timeout
+// gets the documented default rather than no timeout at all (P9-01).
 func (s *Supervisor) Attach(h SupervisorHost) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -377,9 +381,7 @@ func (s *Supervisor) Attach(h SupervisorHost) {
 		return
 	}
 	if rc, ok := h.(interface{ RunConfig() *config.RunConfig }); ok {
-		if cfg := rc.RunConfig(); cfg != nil && cfg.Effective != nil {
-			s.timeout = cfg.Effective.Limits.AgentTimeout.Duration()
-		}
+		s.timeout = EffectiveLimits(rc.RunConfig()).AgentTimeout.Duration()
 	}
 }
 

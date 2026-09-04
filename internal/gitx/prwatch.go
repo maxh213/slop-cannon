@@ -12,15 +12,18 @@ import (
 	"time"
 
 	"slop-cannon/internal/beads"
+	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/logging"
 	"slop-cannon/internal/proc"
 )
 
 // DefaultPRPollInterval is how often the watcher asks GitHub for open pull
-// requests when no [WithPollInterval] option is given (the README's
-// `pr_poll_interval`, default 60 s).
-const DefaultPRPollInterval = 60 * time.Second
+// requests when no [WithPollInterval] option is given. It is an alias of
+// [config.DefaultPRPollInterval], the default of the `pr_poll_interval`
+// configuration key, so the documented number and the built-in one cannot
+// drift apart (P8-04).
+const DefaultPRPollInterval = config.DefaultPRPollInterval
 
 // CannonPRLabel is the GitHub label the cannon puts on every pull request it
 // opens (P4-05). The watcher skips pull requests carrying it, so the cannon
@@ -674,10 +677,90 @@ type PollResult struct {
 	// Existing are the review beads that already tracked an open external
 	// pull request before this poll.
 	Existing []ReviewBead
-	// Stale are the not-yet-closed review beads whose pull request is no
-	// longer open (merged or closed on GitHub). The watcher leaves them
-	// alone; P8-04 decides what to do with them.
-	Stale []beads.Issue
+	// Stale are the not-yet-closed review beads this poll could not match
+	// to an open external pull request, each with the reason why. The
+	// watcher leaves them alone; P8-04 decides what to do with them.
+	Stale []StaleReview
+}
+
+// StaleReason says why a review bead was not matched to an open external
+// pull request. It exists because "stale" is not one condition: the reason
+// is written into bd's close reason and into the run log (P8-11), so it has
+// to be the true one.
+type StaleReason string
+
+// The reasons a review bead can go stale.
+const (
+	// StaleClosed: the pull request is not in the open listing any more,
+	// so it has been merged or closed on GitHub.
+	StaleClosed StaleReason = "closed"
+	// StaleCannonPR: the pull request is still open, but it now looks like
+	// one of the cannon's own ([IsCannonPR]) — it acquired the
+	// [CannonPRLabel], or its head branch was renamed under
+	// [BranchPrefix] — so it is no longer reviewed as an external one
+	// (D-11). Nothing has happened to the pull request itself.
+	StaleCannonPR StaleReason = "cannon_pr"
+	// StaleUnknownPR: the review bead records neither a pull request
+	// number nor a URL, so no listing could ever match it.
+	StaleUnknownPR StaleReason = "unknown_pr"
+)
+
+// StaleReview is one review bead the poll could not match to an open
+// external pull request.
+type StaleReview struct {
+	// Issue is the review bead as bd returned it.
+	Issue beads.Issue
+	// Reason says which of the three conditions applies.
+	Reason StaleReason
+	// PR is the pull request the bead was matched to when it is still open
+	// and only skipped ([StaleCannonPR]); the zero value otherwise.
+	PR PullRequest
+	// ForeignRun is set when the bead carries another run's id: the
+	// dedupe listing spans every run, so a review bead an earlier run left
+	// open is reported here too, and whatever settles it should not claim
+	// this run raised it.
+	ForeignRun bool
+}
+
+// Number is the pull request the bead tracks, from bd's metadata or from
+// the still-open pull request it was matched to; zero when neither says.
+func (s StaleReview) Number() int {
+	if n := s.Issue.PRNumber(); n > 0 {
+		return n
+	}
+	return s.PR.Number
+}
+
+// Explain is the reason in one clause, for bd's close reason and for the
+// run log. It never claims a pull request has gone when it has not.
+func (s StaleReview) Explain() string {
+	return StaleSentence(s.Reason, s.Number(), s.ForeignRun)
+}
+
+// StaleSentence renders one stale reason as the clause that goes into bd's
+// close reason and the run log. A number of zero or less leaves the pull
+// request unnamed rather than writing "#0"; foreign says the review bead
+// belongs to an earlier run. It is exported so a caller that knows the
+// pull request number when the bead's metadata has lost it (the reviewer
+// remembers what it adopted) still words the reason the same way.
+func StaleSentence(reason StaleReason, number int, foreign bool) string {
+	var msg string
+	switch {
+	case reason == StaleUnknownPR:
+		msg = "the review bead records no pull request number or URL, so no pull request could be matched to it"
+	case number <= 0 && reason == StaleCannonPR:
+		msg = "the review bead's pull request is still open but is now one of slop-cannon's own, so it is not reviewed as an external pull request"
+	case reason == StaleCannonPR:
+		msg = fmt.Sprintf("pull request #%d is still open but is now one of slop-cannon's own, so it is not reviewed as an external pull request", number)
+	case number <= 0:
+		msg = "the review bead's pull request is no longer open on GitHub"
+	default:
+		msg = fmt.Sprintf("pull request #%d is no longer open on GitHub", number)
+	}
+	if foreign {
+		msg += " (its review bead was raised by an earlier run)"
+	}
+	return msg
 }
 
 // PRWatcher implements D-11's first half: it polls GitHub for open pull
@@ -799,13 +882,54 @@ func (w *PRWatcher) Poll(ctx context.Context) (*PollResult, error) {
 		w.logger.InfoContext(ctx, "review bead created for external pull request", "bead", created.ID, "pr", pr.Number, "url", pr.URL)
 	}
 
+	skipped := map[int]PullRequest{}
+	skippedURL := map[string]PullRequest{}
+	for _, pr := range res.Skipped {
+		if _, dup := skipped[pr.Number]; !dup {
+			skipped[pr.Number] = pr
+		}
+		if pr.URL != "" {
+			if _, dup := skippedURL[pr.URL]; !dup {
+				skippedURL[pr.URL] = pr
+			}
+		}
+	}
 	for _, is := range existing {
 		if open[is.ID] || is.Status == string(domain.BeadStateClosed) {
 			continue
 		}
-		res.Stale = append(res.Stale, is)
+		res.Stale = append(res.Stale, w.staleReview(is, skipped, skippedURL))
 	}
 	return res, firstErr
+}
+
+// staleReview classifies one unmatched review bead. A pull request that is
+// still open and was only skipped as the cannon's own is [StaleCannonPR],
+// not a pull request that has gone; a bead with no pull request at all is
+// [StaleUnknownPR]; everything else really is no longer in the open
+// listing. A bead carrying another run's id is marked so, because the
+// dedupe listing deliberately spans every run.
+func (w *PRWatcher) staleReview(is beads.Issue, skipped map[int]PullRequest, skippedURL map[string]PullRequest) StaleReview {
+	st := StaleReview{Issue: is, Reason: StaleClosed}
+	if w.run != "" {
+		if run := is.RunID(); run != "" && run != w.run {
+			st.ForeignRun = true
+		}
+	}
+	number, url := is.PRNumber(), is.PRURL()
+	if number <= 0 && url == "" {
+		st.Reason = StaleUnknownPR
+		return st
+	}
+	if pr, ok := skipped[number]; ok && number > 0 {
+		st.Reason, st.PR = StaleCannonPR, pr
+		return st
+	}
+	if pr, ok := skippedURL[url]; ok && url != "" {
+		st.Reason, st.PR = StaleCannonPR, pr
+		return st
+	}
+	return st
 }
 
 // Run polls immediately and then every interval until ctx is done,

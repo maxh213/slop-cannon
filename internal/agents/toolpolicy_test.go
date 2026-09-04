@@ -3,8 +3,10 @@ package agents_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -475,9 +477,24 @@ func TestToolPolicyPerAdapterMethod(t *testing.T) {
 	})
 }
 
+// toolPolicyRegSeq numbers the names this file registers. The enforcement
+// registry is package-level and deliberately has no way to unregister — a
+// cartridge's enforcement is decided once, at init — so a fixed name makes
+// the test unrepeatable: `go test -count=2` (and the flake hunts that use
+// it) would fail on the second iteration with "already registered", through
+// no fault of the code under test. A fresh name per registration keeps the
+// duplicate-registration assertion below honest, because it registers the
+// same fresh name twice on purpose.
+var toolPolicyRegSeq atomic.Int64
+
+// toolPolicyRegName returns a registry name no earlier iteration used.
+func toolPolicyRegName(stem string) string {
+	return fmt.Sprintf("mock-%s-%d", stem, toolPolicyRegSeq.Add(1))
+}
+
 func TestToolPolicyRegisterEnforcement(t *testing.T) {
 	// Not parallel: it mutates the package-level registry.
-	name := "mock-registered"
+	name := toolPolicyRegName("registered")
 	err := agents.RegisterEnforcement(name, func(n string, p cartridge.ToolPolicy) (agents.Enforcement, error) {
 		return agents.Enforcement{Cartridge: n, Policy: p, Mode: agents.EnforceNative, Detail: "scripted"}, nil
 	})
@@ -499,7 +516,7 @@ func TestToolPolicyRegisterEnforcement(t *testing.T) {
 	require.Error(t, agents.RegisterEnforcement("nil-fn", nil))
 
 	t.Run("a registered function may refuse", func(t *testing.T) {
-		refusing := "mock-refusing"
+		refusing := toolPolicyRegName("refusing")
 		require.NoError(t, agents.RegisterEnforcement(refusing, func(string, cartridge.ToolPolicy) (agents.Enforcement, error) {
 			return agents.Enforcement{}, errors.New("unsupported")
 		}))

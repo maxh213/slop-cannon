@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"slop-cannon/internal/agents"
 	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/cartridge/mock"
 	"slop-cannon/internal/config"
@@ -75,8 +76,14 @@ func runFireScenarioPlantingSecrets() *mock.Scenario {
 		Write("certs/server.pem", "-----BEGIN RSA PRIVATE KEY-----\n"+runSecretKey+"\n-----END RSA PRIVATE KEY-----\n").
 		Write("secrets/deploy.txt", runSecretConfigured+"\n").
 		Structured(domain.ImplReport{
-			Summary: "Added " + runFireWork + ".", FilesChanged: []string{runFireWork},
-			HowToVerify: "ls " + runFireWork,
+			Summary: "Added " + runFireWork + ".",
+			// The engineer names what it wrote, secrets included. This is
+			// the half of the path filter git cannot supply: the run never
+			// asked for these paths, an agent volunteered them, and every
+			// later prompt, the bd comment and the pull request body quote
+			// the report verbatim.
+			FilesChanged: []string{runFireWork, ".env", "certs/server.pem", "secrets/deploy.txt"},
+			HowToVerify:  "ls " + runFireWork,
 		})
 	sc.Rule("tester", mock.Match{Role: string(domain.RoleTester)}).
 		Say("Reading the diff.").
@@ -134,6 +141,123 @@ func TestRunNeverPutsAPlantedSecretInAPrompt(t *testing.T) {
 		}
 		assert.Contains(t, text, "main.go", "prompts/%s must still carry the repository", name)
 	}
+
+	// The reply half, which the tripwires above cover for the prompts a
+	// tester is handed but which leaves no prompt file behind (only the
+	// planning firing writes one today, P5-13): the engineer's report is
+	// filtered once, where it is stored, so the event log — and with it the
+	// bd comment and the pull request body, which are written from the same
+	// filtered copy — says a path was withheld rather than naming it.
+	data, err := os.ReadFile(filepath.Join(dir, "events.jsonl"))
+	require.NoError(t, err)
+	lists := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.Contains(line, "files_changed") {
+			continue
+		}
+		lists++
+		for _, secret := range []string{".env", "server.pem", "deploy.txt"} {
+			assert.NotContains(t, line, secret, "an event's file list names %q", secret)
+		}
+		assert.Contains(t, line, agents.SecretPathPlaceholder)
+	}
+	assert.Positive(t, lists, "no event carried the engineer's file list, so nothing was proved about it")
+}
+
+// TestRunNeverNamesAnExcludedPathToTheRemote is the same reply half at the
+// one sink that leaves the machine. `gh pr create` writes the implementation
+// report's file list into the body verbatim, so an engineer that listed
+// ".env" would publish the path to GitHub.
+func TestRunNeverNamesAnExcludedPathToTheRemote(t *testing.T) {
+	env := runFireSetup(t, true)
+	require.NoError(t, runFireScenarioPlantingSecrets().WriteFile(env.Scenario))
+	configWriteFile(t, config.RepoConfigPath(env.Repo.Dir), "exclude = [\"secrets/*\"]\n")
+	// The repo config lives inside the repository, and gitx refuses to add
+	// a worktree to a dirty one.
+	env.Repo.Commit(t, "configure the exclude list")
+
+	stdout, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief,
+		"--headless", "--cartridge", "mock")
+	require.Equal(t, 0, code, "stdout:\n%s\nstderr:\n%s", stdout, stderr)
+	assert.NotContains(t, stdout, runLeakMarker, "a prompt of the run carried a planted secret")
+	require.Contains(t, stdout, "run finished")
+
+	bodies := ghPRBodies(t, env)
+	require.NotEmpty(t, bodies, "the run opened no pull request, so nothing was sent anywhere")
+	for _, body := range bodies {
+		for _, secret := range runSecretPromptTripwires() {
+			assert.NotContains(t, body, secret, "the pull request body leaks %q", secret)
+		}
+		assert.Contains(t, body, "## Implementation report", "the body is still the real one")
+		assert.Contains(t, body, agents.SecretPathPlaceholder,
+			"the body should say a file was withheld rather than drop the list")
+		assert.Contains(t, body, runFireWork, "and the paths that are not excluded are still named")
+	}
+}
+
+// runP905Password and runP905AWS are credentials only P9-05's own rules
+// know: logging.DefaultPatterns (P0-07) matches neither, so a run that
+// masks them is a run whose redactor really is the filter's.
+const (
+	runP905PasswordName  = "DATABASE_PASSWORD"
+	runP905PasswordValue = "correct-horse-battery-staple-9"
+	runP905AWSTail       = "PLANTEDKEYID7Q"
+	runP905AWS           = "AKIA" + runP905AWSTail
+)
+
+// TestRunRedactsTheCredentialsOnlyTheP905RulesKnow is the non-vacuity guard
+// on the value half's wiring. The end-to-end redaction test plants an
+// `sk-ant-…` token, which P0-07's default rules already mask, so it passes
+// whether `sc run` installs [agents.SecretFilter.Redactor] or a plain
+// logging.NewRedactor. These two are matched only by the rules P9-05 adds —
+// the credential assignment and the AWS access key id — so the terminal, the
+// event log and the run log stay clean only if the filter's redactor is the
+// one wired in.
+func TestRunRedactsTheCredentialsOnlyTheP905RulesKnow(t *testing.T) {
+	env := runFireSetup(t, false)
+	sc := runFireScenarioSaying(runP905PasswordName + "=" + runP905PasswordValue +
+		"\nexporting AWS_ACCESS_KEY_ID=" + runP905AWS)
+	require.NoError(t, sc.WriteFile(env.Scenario))
+
+	stdout, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief,
+		"--headless", "--cartridge", "mock")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "[REDACTED]", "the lines themselves still reach the reader")
+	require.Contains(t, stdout, runP905PasswordName+"=", "and keep the shape a reader needs")
+
+	dir := config.RunDir(env.Repo.Dir, string(runLatestID(t, env.Repo.Dir)))
+	sinks := map[string]string{"stdout": stdout, "stderr": stderr}
+	for _, name := range []string{"events.jsonl", "sc.log"} {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		require.NoError(t, err, name)
+		sinks[name] = string(data)
+	}
+	for where, text := range sinks {
+		assert.NotContains(t, text, runP905PasswordValue, "%s carries the password", where)
+		assert.NotContains(t, text, runP905AWSTail, "%s carries the access key id", where)
+	}
+}
+
+// TestRunRefusesAMalformedExcludePatternWithAdvice is P9-05's refusal in the
+// shape P8-06 gives every other startup failure: the run that could not
+// start, the reason, a numbered fix and `sc doctor`. The pattern is not a
+// config *parse* error — it is a well-formed string until the filter
+// compiles it — so it needs its own class in the startup advice.
+func TestRunRefusesAMalformedExcludePatternWithAdvice(t *testing.T) {
+	env := runFireSetup(t, false)
+	configWriteFile(t, config.RepoConfigPath(env.Repo.Dir), "exclude = [\"secrets/[\"]\n")
+
+	stdout, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief,
+		"--headless", "--cartridge", "mock")
+	require.Equal(t, 1, code, "stdout:\n%s\nstderr:\n%s", stdout, stderr)
+	assert.Contains(t, stderr, "sc could not start a run in "+env.Repo.Dir)
+	// The message docs/troubleshooting.md documents, still word for word.
+	assert.Contains(t, stderr, "exclude pattern \"secrets/[\" is malformed")
+	assert.Contains(t, stderr, "Fix it in this order:")
+	assert.Contains(t, stderr, startupFixExclude)
+	assert.Contains(t, stderr, "Then check everything at once with: sc doctor")
+	assert.NoDirExists(t, filepath.Join(config.StateDir(env.Repo.Dir), "runs"),
+		"a refused run leaves no run directory behind")
 }
 
 // readPromptFiles reads every prompt the run wrote, keyed by file name.

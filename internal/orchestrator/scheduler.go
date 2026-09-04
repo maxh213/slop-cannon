@@ -812,6 +812,7 @@ func (s *Scheduler) dispatch(ctx context.Context, r *Run) {
 		r.Warn(SourceScheduler, "could not work out what to schedule", err)
 	}
 	sortDemands(demands)
+	demands = dedupeDemands(demands)
 
 	fired := 0
 	for _, d := range demands {
@@ -836,6 +837,53 @@ func (s *Scheduler) dispatch(ctx context.Context, r *Run) {
 		fired++
 	}
 	s.setIdle(fired == 0)
+}
+
+// dedupeDemands drops every demand whose [Demand.Key] an earlier one in the
+// same batch already carries, keeping the first — which, after
+// [sortDemands], is the highest-priority offer of that job.
+//
+// One job is fired once per pass even if the source offers it twice, and a
+// source that tracks what it has had fired offers a demand again until the
+// firing it has not seen yet comes back (the feedback loop does exactly
+// this, P6-25). The in-flight check in [Scheduler.reserve] is not enough on
+// its own: a firing that finishes while the dispatch loop is still walking
+// the same batch gives its slot and its byKey entry back, and the duplicate
+// further down the batch would then reserve a second product owner for one
+// disputed item — the D-05 single-PO slot and P6-25's "the same dispute
+// offered twice is still fired once" both broken, rarely and only under
+// load. Deduplicating the batch up front closes that window without any
+// extra locking.
+func dedupeDemands(ds []Demand) []Demand {
+	if len(ds) < 2 {
+		return ds
+	}
+	seen := make(map[string]bool, len(ds))
+	dup := false
+	for _, d := range ds {
+		k := d.Key()
+		if seen[k] {
+			dup = true
+			break
+		}
+		seen[k] = true
+	}
+	if !dup {
+		return ds
+	}
+	// A source may hand out the same backing array on every tick, so the
+	// copy is what keeps the batch from eating its own tail.
+	out := make([]Demand, 0, len(ds))
+	kept := make(map[string]bool, len(ds))
+	for _, d := range ds {
+		k := d.Key()
+		if kept[k] {
+			continue
+		}
+		kept[k] = true
+		out = append(out, d)
+	}
+	return out
 }
 
 func (s *Scheduler) setIdle(v bool) {

@@ -42,6 +42,7 @@
       "check_command": "",
       "idle_replan_interval": "10m",
       "gate_poll_interval": "1m",
+      "pr_poll_interval": "1m",
       "max_beads_per_plan": 8,
       "limits": {
         "max_review_rounds": 5,
@@ -69,6 +70,7 @@
       "limits.max_review_rounds": "default",
       "limits.max_tokens": "default",
       "max_beads_per_plan": "default",
+      "pr_poll_interval": "default",
       "rules": "default",
       "safety": "default",
       "vibes": "default"

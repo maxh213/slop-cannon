@@ -1,10 +1,14 @@
 # Troubleshooting
 
 Every row below is keyed by words `sc` can actually print, exactly as they
-appear in the output. Find the words you saw, read what happened, do the
-thing in the last column. A handful of tests in `internal/cli` keep the page
-honest, and they are worth knowing about, because they are what makes this
-a complete list rather than a sample:
+appear in the output — not by the name the code knows the failure under.
+Find the words you saw, read what happened, do the thing in the last
+column. Errors are the first eleven sections; the warnings a run prints
+while it carries on are under [Warnings the run prints](#warnings-the-run-prints),
+and what `sc doctor` itself says is under
+[What `sc doctor` prints](#what-sc-doctor-prints). A handful of tests in
+`internal/cli` keep the page honest, and they are worth knowing about,
+because they are what makes this a complete list rather than a sample:
 
 - `TestTroubleshootingMessagesStillExistInTheCode` — every key is still
   text the code builds, so a reworded error breaks this page instead of
@@ -22,10 +26,20 @@ a complete list rather than a sample:
   sentinel's own sentence, printed in front of the tool's own words: `bd
   show: bead not found: no issues found matching the provided IDs`. Their
   wrapped messages are not yet held to a row each — that is P9-19.
+- `TestTroubleshootingCoversEveryWarningTheRunRaises` — every warning the
+  run can raise is documented or exempted the same way. A warning is not an
+  error — the run carries on — but it is what says a bead has stopped being
+  worked on, and it was outside the audit until round 4, because warnings
+  are built with `fmt.Sprintf` rather than `fmt.Errorf`.
+- `TestTroubleshootingCoversTheDoctorRowsOwnWords` — every detail an
+  `sc doctor` row carries, which is also what a refused run prints as its
+  numbered fix list, is documented or exempted as a passing row's words.
 - `TestTroubleshootingSendsNobodyToAFileNothingWrites` — no remedy here may
   send you to a file nothing writes.
-- `TestTroubleshootingExemptionsAreReal` — an exemption cannot outlive the
-  error it excuses, or quietly cover one this page now documents.
+- `TestTroubleshootingExemptionsAreReal` and
+  `TestTroubleshootingWarningAndDetailExemptionsAreReal` — an exemption
+  cannot outlive the message it excuses, or quietly cover one this page now
+  documents.
 - `TestTroubleshootingLinksAreLocalFiles` and
   `TestTroubleshootingIsReachableFromTheReadme` — the pages this one points
   at exist, and something points at this one.
@@ -43,9 +57,9 @@ command was refused, `3` every cartridge is out of credits.
 **Where things are.** Nothing `sc` writes lives inside the target repository:
 logs, prompts, events and worktrees go under
 `$XDG_STATE_HOME/slop-cannon/<repo-id>/runs/<run-id>/` (see
-[cli.md](cli.md)), and the first run in a repository prints the paths. `sc
-status` reads the same files back, and `sc status --json` gives them to a
-script. The one thing `sc` may write inside the repository is
+[cli.md](cli.md)), and the first run that completes in a repository prints
+the paths. `sc status` reads the same files back, and `sc status --json`
+gives them to a script. The one thing `sc` may write inside the repository is
 `.slop-cannon/config.toml`, and only when a config command created it.
 
 ---
@@ -201,13 +215,13 @@ is rebased and fast-forwarded onto the default branch (D-10).
 | `orchestrator: delivery handoff has no path for this safety setting` | Safety is on but no pull-request path was built, or off with no merge path. Usually a `gh` that could not be reached at assembly time. | `sc doctor` — with safety on, delivery needs `gh` installed and authenticated. |
 | `gitx: bead branch does not exist` | The bead's branch is gone, so there is nothing to deliver. | The bead is re-fired; if it repeats, check nothing outside `sc` is pruning `sc/` branches. |
 | `gitx: branch has no commit to deliver` | The engineer's branch carries no commit past its base, so closing the bead would ship nothing (D-20). | `sc logs <bead-id>` shows the session that should have written it: it usually failed or wrote nothing. The bead goes back for another round. |
-| `gitx: push rejected by the remote` | The remote refused the push: a protected branch, or someone else pushed first. | Check branch protection rules, then let the delivery retry. |
+| `gitx: push rejected by the remote` | The remote refused the push: a protected branch, or someone else pushed first. | Check branch protection rules, then let the delivery retry: it tries five times, waiting longer each time, and hands the bead to a person if the push keeps failing (`a delivery failed too many times`). |
 | `gitx: rebase stopped on conflicts` | The bead's branch conflicts with the default branch. | Nothing by hand: `sc` fires a conflict round and the engineer resolves it in the worktree. |
 | `orchestrator: the worktree is mid-rebase` | Something was asked of a worktree that is stopped in a rebase, and doing it would have committed the conflict markers. | Let the conflict round finish; to intervene, resolve the rebase in `runs/<run-id>/wt/<bead-id>` by hand. |
 | `orchestrator: no conflict round is pending for this bead` | A conflict resolution arrived for a bead that has none outstanding. | Nothing: a duplicate answer, already logged. |
 | `gitx: check command failed` | The repository's `check_command` exited non-zero on the rebased branch, so the merge did not happen. | Run the same command yourself; the failure is real. `check_command` is configured in [config.md](config.md). |
 | `gitx: local default branch has diverged from its remote` | The local default branch and its remote each have commits the other lacks, so neither a fast-forward nor a push can work. | Reconcile them yourself (`git pull --rebase` on a clean tree), then resume. |
-| `gitx: default branch cannot be fast-forwarded` | The default branch moved while the delivery ran. | Nothing: the delivery rebases and retries. |
+| `gitx: default branch cannot be fast-forwarded` | The default branch moved while the delivery ran — something outside the run pushed to it, since `sc` never delivers two beads at once. | Nothing: the delivery rebases and retries, up to five times. |
 | `gitx: rebased branch still contains a merge commit` | Fast-forwarding would have put a merge commit on the default branch, which safety-off delivery never does. | Rebase the bead's branch to a linear history, or deliver it as a pull request with safety on. |
 | `gitx: worktree is not on the bead's branch` | The bead's worktree was switched to another branch, probably by hand. | `git switch` it back to the `sc/` branch the message names. |
 | `gitx: no verdicts to post` | A review was posted with no verdicts in it. | Nothing to do: nothing was written to the pull request. |
@@ -224,6 +238,7 @@ is rebased and fast-forwarded onto the default branch (D-10).
 | `gitx: no git remote points at a GitHub repository` | None of the remotes maps to GitHub, so no pull request can be opened. | Add a GitHub remote, or use `--safety off`. |
 | `external pull request review stopped` | The reviewer (D-11) gave up polling GitHub: `gh` is missing, not logged in, or no remote points at GitHub. Polling again cannot fix any of those, so the rest of the run carries on without it. | Fix `gh` (`sc doctor` says which of the three it is), or run with `--review-prs=false` to stop asking. |
 | `orchestrator: pr checkout: fetching #` | The pull request's head could not be fetched — neither its `pull/<n>/head` reference nor its head branch. A fork with the pull-request references disabled, or the network being down. | Check `git fetch origin pull/<n>/head` by hand. The review is retried on the next poll; if it keeps failing the review bead is marked failed and the run says so. |
+| `orchestrator: pr review context for` | The shared prompt context — the bead, the repository summary, the rules and vibes — could not be assembled for a review bead, so the lens was not fired. The rest of the line says which step failed. | Usually `bd` being unavailable for a moment (`sc doctor`). The review is retried on the next poll. |
 | `orchestrator: pr checkout: moving` | The pull request was fetched but its worktree could not be moved onto it, usually because something else is holding the worktree. | Look in `<state-dir>/runs/<run-id>/wt/<bead-id>`; deleting that directory makes the next poll check the pull request out again. |
 | `posting the review of pull request #` | `gh pr review` failed. The verdicts are safe: the review is retried on the next poll, three times in all. | Usually GitHub being unreachable — nothing to do. After the last attempt the review bead is handed to a human and the pull request is left untouched. |
 
@@ -235,6 +250,15 @@ a session printed is in its own file under `<run-dir>/agents/`, which
 `sc logs` with no argument, and every event of the run is in `events.jsonl`
 beside it.
 
+Text a session printed can come back with `[REDACTED]` in it. That is not a
+failure: `sc` masks anything shaped like a credential once, where the run
+publishes, so the terminal, the transcripts, `sc.log`, `events.jsonl`, the
+prompts of later agents, the comment on the bead and the pull request body
+all carry the masked form.
+[config.md](config.md#secrets-withheld-files-and-masked-values) lists the
+rules, what they deliberately do not catch, and the `exclude` key that hides
+whole files from an agent.
+
 | Message | What happened | What to do |
 |---|---|---|
 | `structured: no sc-result block in output` | The session ended without the result block the contract asks for — usually a model that answered in prose, or a CLI that truncated its output. | The firing is retried. If it repeats, check the cartridge's model: a smaller model follows the contract less reliably. |
@@ -242,7 +266,8 @@ beside it.
 | `structured: sc-result block is not valid JSON` | The block closed but its body is not JSON. | Nothing, usually: the firing is retried. `sc logs <bead-id>` shows the raw output the block was cut from. |
 | `structured: result does not match schema` | The JSON is well formed but breaks the contract — a missing field, a value outside its enum. | The message lists the violations, one per line, and `sc logs <bead-id>` shows the JSON they were found in. Persistent failures belong in a bug report. |
 | `structured: unknown contract` | A result was decoded against a contract name that is not registered. | An `sc` bug rather than a user problem; report it with the run id. |
-| `agents: plan rejected` | The product owner's plan was schema-valid but broke a planning rule: too many beads, a duplicate of an open bead, dangling dependencies, a cycle, or empty acceptance criteria. | `sc` asks it to re-plan. Raising `max_beads_per_plan` helps when the brief is genuinely large. |
+| `the plan breaks a planning rule` | The product owner's plan was schema-valid but broke a planning rule: too many beads, a duplicate of an open bead, dangling dependencies, a cycle, or empty acceptance criteria. These are the words a rejected plan prints, on the end of `structured: result does not match schema (plan)`, with the rules it broke listed under it, one per line. | `sc` asks it to re-plan. Raising `max_beads_per_plan` helps when the brief is genuinely large; the duplicate and cycle rules are about the beads already in `bd`, so `bd list` shows what the plan collided with. |
+| `agents: plan rejected` | The same rejection under the name the planner matches it by. It is not usually what you read — a rejected plan reaches you as the row above — but it is what a warning's `error` field carries in `sc.log` and `events.jsonl` when the plan was rejected as it was being applied. | As above. |
 | `agents: plan proposes no beads` | The plan is empty. In autopilot that is a legitimate answer — nothing worth doing right now (D-18). | In brief mode, give a more concrete brief. In autopilot, nothing. |
 | `orchestrator: planning: the product owner could not produce a usable plan` | Brief mode gave up after the configured number of rejected or failed plans. | Rewrite the brief in smaller, concrete terms, or raise `limits.max_plan_rejections` and `limits.max_plan_failures`. |
 | `agents: prompt is over its token budget` | Even after dropping everything droppable, the assembled prompt exceeds the budget. | Split the bead, or trim the vibes and rules files: they are sent to every agent. |
@@ -260,6 +285,11 @@ beside it.
 | `orchestrator: run has finished` | Something was asked of a run that has already ended: a late key press, a slow component reporting in. | Nothing. `--resume` starts the next run from where this one stopped. |
 | `orchestrator: invalid bead state transition` | An event arrived for a bead in a state that event cannot act on (D-07). It is logged as a warning, never a crash. | Usually a duplicate answer from a re-fired agent. Persistent ones are worth reporting with the bead id. |
 | `orchestrator: the bead's current state could not be read` | On `--resume`, `bd` could not say what state a bead is in, so nothing was written for it. | Check `bd` works in the repository (`sc doctor`), then resume again. |
+| `orchestrator: conductor: listing the run's beads` | The run-level reconciliation with `bd` could not list this run's beads, so that pass did nothing. | Nothing at once: the next pass, a second later, tries again, and the warning below it says the run carries on. If it repeats, `sc doctor` and `bd list` in the repository. |
+| `orchestrator: conductor: listing the ready beads` | The same pass could not ask `bd` which beads are claimable, so no new work was offered that second. Whatever was already approved was still delivered. | As above. |
+| `orchestrator: conductor: bd knows no bead` | A prompt was being built for a bead `bd` no longer has — usually one deleted by hand while the run was going. | Leave the run's beads to the run. `bd list` shows what is there; the firing is retried and the bead is dropped if it stays missing. |
+| `orchestrator: conductor: worktree for` | The bead's worktree could not be created before its agent was fired. The rest of the line is git's own message. | The `gitx:` rows above name the usual causes (an occupied path, a branch checked out elsewhere). The firing is retried. |
+| `orchestrator: conductor: committing` | D-14's leftovers commit — whatever the last engineer left uncommitted, committed before the testers read it — failed. | Look in `<state-dir>/runs/<run-id>/wt/<bead-id>`: a worktree stopped mid-rebase is handled on its own, anything else is git refusing, and the line carries its words. |
 | `orchestrator: the supervisor has stopped; no new agents are fired` | The run is shutting down: you stopped it, or a limit ended it. In-flight agents finish, nothing new starts. | Nothing. `--resume` continues the work. |
 
 ### The run paused itself and nothing is happening
@@ -278,6 +308,161 @@ Until then the run holds the repository's run lock, which is why a second
 A brief run never pauses over its budget: it stops starting new work, lets the
 reviews already in flight finish, and ends with the budget in its summary
 (see [config.md](config.md) for both keys).
+
+Restarting the same run with `--resume` does not hand it a fresh budget. The
+spend is kept in the run's `state.json`, so a resumed run carries what the
+earlier invocations already spent; a resume over a crossed cap grants one more
+budget's worth, exactly as clearing a pause in the TUI does, and then stops
+again. If a run really needs more than that, raise `limits.max_tokens` (or
+`limits.max_cost_usd`) and start a new run — a resumed run behaves by the
+configuration it was started with (P6-11).
+
+## Warnings the run prints
+
+A warning is not an error: the run carries on. It is what `sc` says when
+something degraded — a bead abandoned, a plan dropped, a step skipped — and
+it reaches `sc.log`, `events.jsonl`, the TUI's log pane and `sc status`
+alike, tagged with the component that raised it (`planning`, `scheduler`,
+`delivery`, `gates`, `pr-review`, `supervisor`, `run`, `limits`, `rules`).
+Most of them need nothing from you; the ones that do are here.
+`TestTroubleshootingCoversEveryWarningTheRunRaises` holds this list to
+every warning the code can raise, so a new one is documented here or
+exempted in the test with a written reason.
+
+### Planning
+
+| Message | What happened | What to do |
+|---|---|---|
+| `the product owner's plan broke a planning rule and was dropped` | An autopilot planning round produced a plan the validator refused, and nothing was created. The count in the message is how many in a row. The rule it broke is on the `the plan breaks a planning rule` row under [Agents and their answers](#agents-and-their-answers). | Nothing at once: the next round re-plans. If it repeats, the brief or the repository is the cause — `max_beads_per_plan`, or a backlog of open beads every plan duplicates. |
+| `the planning product owner failed` | The planning session itself failed — a crashed CLI, a timeout, no result block — rather than producing a bad plan. | `sc logs` shows the session. Repeated failures are usually the cartridge: `sc doctor`. |
+| `giving up on this round of planning; the next one is at` | Autopilot hit `limits.max_plan_rejections` or `limits.max_plan_failures` for this round, so it dropped it and backed off. The next attempt is at the time in the message. | Nothing: autopilot never stops (D-18). To make the wait shorter, lower `idle_replan_interval`. |
+| `the brief could not be turned into beads` | Brief mode gave up: every plan it got was rejected or failed. The run ends rather than idling. | Rewrite the brief in smaller, concrete terms, or raise `limits.max_plan_rejections` and `limits.max_plan_failures`. |
+| `is over its token budget` | A prompt — the planning one, a review, a feedback round — did not fit the budget even after everything droppable was dropped. Planning fires it anyway; a review round says so and carries on. | Trim the vibes and rules files (every agent is given them), or split the bead. |
+
+### Agents and the scheduler
+
+| Message | What happened | What to do |
+|---|---|---|
+| `firings failed in a row; it will not be offered an agent again` | The scheduler gave up on one bead's work after `limits.max_firing_failures` consecutive failures, moved it down the D-07 failed edge and stopped offering it. **This is why a bead stops being worked on.** The bead keeps whatever the last agent left behind. | `sc logs <bead-id>` shows the sessions that failed. Fix the cause, then `--resume`: a resumed run offers the bead again. |
+| `agent failed; retrying` | One firing failed and is being retried. | Nothing unless it repeats into the give-up above. |
+| `could not work out what to schedule` | The scheduler could not read the work queue this tick, usually because `bd` failed. | `sc doctor`. The tick is retried. |
+| `stopped renewing the lease` | An agent's claim on its bead could not be renewed, so another actor may take it. | Usually harmless. Persistent lease loss means two `sc` processes are on one repository. |
+| `leaving them to the supervisor` | The scheduler stopped while agents were still running; the supervisor is stopping them. | Nothing. |
+
+### Cartridges
+
+| Message | What happened | What to do |
+|---|---|---|
+| `is out of credits and is retired for this run (D-18)` | That cartridge is dead for the rest of the run. When the last one goes, the run ends with exit code 3. | Add another cartridge and `sc cartridge --use` it, or wait for the quota window. |
+| `is rate limited; pausing it for` | The CLI reported a temporary limit, so `sc` is holding that cartridge for the time in the message. | Nothing, unless it repeats — then lower `ammo`. |
+
+### The run and its shutdown
+
+| Message | What happened | What to do |
+|---|---|---|
+| `agent event(s) were dropped: the run log could not keep up with the agents' output` | Agents printed faster than the run could publish, so some output never reached `events.jsonl` or the TUI. The work is unaffected; the record of it has a hole. | Nothing to fix mid-run. If you need the whole transcript, the per-agent files under `<run-dir>/agents/` are written directly and are not dropped. |
+| `the agent event forwarder did not drain in time` | The same queue was still draining when the run shut down, so its last events were abandoned. | As above. |
+| `stopping immediately, agents will be killed` | A second Ctrl-C (or a second signal) arrived while the run was already stopping, so it stopped waiting for the agents. | Nothing. Worktrees and the run lock may be left behind; the next run's stale-lock notice clears the lock. |
+| `some agents could not be stopped cleanly` | One or more sessions did not exit when asked and were left to the operating system. | Check for stray cartridge processes if the machine feels busy afterwards. |
+| `a helper did not stop; ending the run without it` | A background helper (the gate poller, the pull request reviewer) outlived the shutdown deadline. | Nothing: the run has already finished. |
+| `the worktree cleanup did not run` | The run ended without removing its worktrees, usually because it could not list its beads. | Remove them by hand: `git worktree list`, then `git worktree remove <path>` for the ones under `<state-dir>/runs/<run-id>/wt/`. |
+| `some worktrees could not be cleaned up` | Cleanup ran and some worktrees survived it — usually ones with uncommitted work in them (see `gitx: worktree has uncommitted changes`). | As above; inspect before removing. |
+| `could not release the run lock` | The run finished but its `run.lock` is still on disk. | Nothing: the next run proves the process is gone and removes it. If it does not, delete `run.lock` under `<state-dir>` by hand. |
+| `could not stamp the run lock` | The lock was taken but its details (the run id, the pid) could not be written into it. | Nothing. Another `sc` will treat it as unreadable and wait out the grace period rather than take it. |
+| `a run-level sync with bd failed; the run carries on and retries` | The periodic reconciliation with `bd` failed once. | Nothing unless it repeats: then `sc doctor` and `bd list` in the repository. |
+| `a delivery failed too many times; the bead was handed to a person` | A bead's delivery was tried five times — the message names how many and why the last one failed — and every attempt failed the same way, so `sc` stopped retrying and moved the bead to `needs_human`. The usual causes are `gh` not being authenticated, a remote that keeps refusing the push, and `bd` refusing to close a bead whose merge has already landed. | Look at the reason in the message, then at the repository: with safety off the merge may already be on the default branch, in which case only the bead is behind. `sc status` shows where the bead is; fix the cause and put it back in `approved` (`bd update <id> --status approved`) and the next pass delivers it again. |
+| `a delivery failed too many times and the bead could not be handed to a person; it is where bd left it` | The same give-up, with `bd` refusing the move to `needs_human` as well. | `sc status <bead-id>` says where the bead is; check `bd` works (`sc doctor`), then move it yourself. |
+| `a delivery is still running after the conductor stopped` | The run stopped while a pull request or merge was in flight. | Check the repository: the branch is there, and the pull request may have been opened. `sc status` and `gh pr list` say which. |
+| `could not open the agent log` | A per-agent transcript under `<run-dir>/agents/` could not be written. | Check the state directory's permissions; the run's own `sc.log` still has the session's events. |
+| `and a contained session must not reach it (P6-20)` | A reviewing agent gets a copy of the engineer's worktree, and a symlink in it pointed outside the tree, so the copy left it out. The reviewer sees a tree that differs from the engineer's by that link. | Nothing, unless the review needs that file: then commit its contents rather than linking to them from outside the repository. |
+| `the run could not be paused over its budget` | The run crossed `limits.max_tokens` or `limits.max_cost_usd` but could not pause itself. | Stop it with Ctrl-C: it finishes as a user stop and the summary still reports what was spent. |
+
+### Resuming
+
+| Message | What happened | What to do |
+|---|---|---|
+| `could not be reattached` | `--resume` found a bead whose worktree or branch it could not pick up again. | The bead is re-fired from its branch; `git worktree list` shows what is left under the old run directory. |
+| `could not schedule the conflict round` | A resumed run knew a bead was mid-conflict but could not re-open the round. | `--resume` again, or resolve the rebase by hand in `runs/<run-id>/wt/<bead-id>`. |
+| `could not re-run the pull request delivery` | A resumed run could not restart a delivery the previous run had begun. | `sc status` says where the bead is; the branch still holds the work. |
+| `could not finish the interrupted delivery` | A resumed run picked up a delivery the previous run had begun and could not carry it through. | `sc status` says where the bead is; the branch still holds the work, and the next round re-delivers it. |
+| `refusing a bead-status write the D-07 table has no edge for` | On resume, `bd` reported a bead in a state the workflow has no transition out of, so nothing was written for it. | `sc status <bead>` shows the state; move the bead by hand in `bd` if it should be worked on. |
+
+### Delivery and conflicts
+
+| Message | What happened | What to do |
+|---|---|---|
+| `the check command failed at delivery; sending the bead back as a qa change request` | `check_command` failed on the rebased branch, so the bead went back for another round instead of being delivered. | Nothing: the engineer is asked to fix it. Run the same command yourself to see what broke. |
+| `delivery handed to a human` | Delivery stopped and the bead is waiting for a person. The rest of the line says why. | `sc status` lists what is waiting; the branch and any pull request are untouched. |
+| `a delivery failed too many times` | One bead's delivery was retried up to its limit and failed every time, so it stops being retried and waits for a person. | Read the failures in `sc logs`; they are usually `gh`, branch protection, or a check command. Fix the cause, then `--resume`. |
+| `a pull request exists but this run has safety off; leaving it to a human` | Safety-off delivery merges locally, and this bead already has a pull request open. `sc` will not merge behind it. | Merge or close the pull request yourself, or re-run with safety on. |
+| `the conflicted paths could not be listed; opening the conflict round without them` | The rebase conflicted and `git` would not say which files, so the engineer is asked to resolve it without that list. | Nothing; the worktree still shows the conflict markers. |
+| `could not be measured; reviewing it again` | A conflict resolution came back but the run could not diff it, so it goes round again rather than being trusted. | Nothing unless it loops: then look at `runs/<run-id>/wt/<bead-id>`, which is where the rebase is. |
+
+### Gates and merged pull requests
+
+| Message | What happened | What to do |
+|---|---|---|
+| `gate polling skipped: gh is unavailable, so merged pull requests will not close their beads` | With safety on, `sc` polls GitHub to close beads whose pull requests were merged. Without `gh` it cannot, so beads stay open after you merge them. | `sc doctor`, then `gh auth login`. Until then, close the beads yourself with `bd`. |
+| `could not check the pull request gates` | One poll of the gates failed. | Nothing: it is retried. Repeated failures are `bd` or `gh` — `sc doctor`. |
+| `until the pull request is merged or a human resolves it` | A gate stays open because its pull request is neither merged nor closed. | Merge or close the pull request; the next poll closes the bead. |
+| `not delivering; leaving it alone` | A gate resolved for a bead that is not in a deliverable state, so nothing was moved. | Nothing: `sc status <bead>` shows where the bead actually is. |
+| `names no bead it blocks; leaving it alone` | A gate in the database blocks nothing, so there is nothing for `sc` to close. | Nothing: it is someone else's gate. `bd gate list` shows them. |
+| `needs a human` | A gate was raised that only a person can clear — an escalation, or a pull request `sc` will not merge for you. | `sc status` lists what is waiting and why. |
+| `gates but printed no per-gate verdict` | `bd` checked the gates and reported no result for any of them. | Usually a `bd` older than 1.2.2: `sc doctor`. |
+
+### The review loop
+
+| Message | What happened | What to do |
+|---|---|---|
+| `so the answer was not applied and the item is still owed` | The engineer argued with a binding ruling instead of doing it, so the item stays open and the round goes again. | Nothing: the loop re-asks. Repeated arguing on one item is worth reading in `sc logs <bead-id>`. |
+| `ruling the loop cannot apply` | An arbitration or escalation ruling arrived for something the loop is no longer tracking. | Nothing: a duplicate answer from a re-fired agent. |
+| `on a bead in state` | An event arrived for a bead whose state has no edge for it (D-07), so it was ignored. | Nothing, usually. Persistent ones are worth reporting with the bead id. |
+| `refused work on a bead with an open rules violation` | The rules compliance gate stopped a firing or a transition while a `rules` verdict item is unresolved (D-08, P9-06). | Fix the code so the rule is met, or change the rules file if the rule itself is wrong. |
+| `refused a resumed thread; the bead needs a person` | On `--resume`, the rules gate found a bead whose stored thread would settle a `rules` violation, so the thread was dropped and the bead parked for a person. | Read the violation in `sc status <bead>`, fix the code or the rules file, then resume again. |
+| `its thread settles a rules-file violation the gate holds open` | The same, reported once the bead reached `needs_human`. | As above. |
+| `could not be parked in needs_human; it is where bd left it` | The rules gate refused a resumed thread but `bd` would not move the bead, so it stayed where it was. | `sc status <bead>` says where; move it in `bd` if it should be worked on. |
+| `a narrow_scope ruling dropped open rules-file violations` | A product owner narrowed a bead's acceptance criteria in a way that would have dropped open `rules` items with them. The items stay; the narrowing does not silently discard them (D-08). | Nothing: the loop keeps asking for them. The message lists which. |
+
+### Reviewing pull requests `sc` did not open
+
+| Message | What happened | What to do |
+|---|---|---|
+| `polling for external pull requests failed; retrying` | One poll of GitHub failed. Unlike `external pull request review stopped`, this one is retried. | Nothing unless it repeats: then `sc doctor` for `gh`. |
+| `no review will be posted` | The review bead of a pull request was closed or failed before its review could be posted. | Nothing: the pull request is untouched. |
+| `no gh: the review of pull request #` | A review was produced but there is no usable `gh` to post it with. | `gh auth login`, then the next poll posts it. The verdicts are in `sc logs` meanwhile. |
+| `could not build the review of pull request #` | The reviewing agents ran but their verdicts could not be assembled into a review. | Nothing: the next poll tries again, three times in all. |
+| `its review bead` | Housekeeping on a review bead: it is being left, handed to a human, or closed, and the message says which. | Nothing. `sc status` lists the review beads. |
+
+### The bead database
+
+| Message | What happened | What to do |
+|---|---|---|
+| `could not read the beads project metadata` | `.beads/metadata.json` could not be read, so `sc` used what `bd` itself reports. | Nothing: it is a notice. A missing or unreadable `metadata.json` in a working repository is worth checking into `git status`. |
+| `metadata.json says dolt_mode` | The file and `bd` disagree about the database mode; `sc` trusts `bd`. | Nothing. If it persists, `bd` and the file were written by different versions — `sc doctor` reports the one in use. |
+
+## What `sc doctor` prints
+
+`sc doctor` is the first thing to run, and when a run refuses to start it
+prints the same rows as a numbered fix list. These are the words its rows
+carry, rather than the errors above.
+
+| Message | What happened | What to do |
+|---|---|---|
+| `not found on PATH` | The tool that row names — `git`, `bd`, `gh`, or a cartridge's CLI — is not installed, or not on the `PATH` `sc` sees. | Install it, or, for a cartridge, set `command` under `[cartridges.<name>]` to its absolute path. `gh` is only needed for safety-on delivery and pull request review. |
+| `--version failed` | The tool is on `PATH` but `git --version` or `gh --version` did not run: a wrapper script, a broken install, or a binary for another architecture. | Run the command yourself; the row carries what it printed. |
+| `git status failed in` | The repository row could not read the working tree's state. | Run `git status` in the directory the row names; it is usually a permissions problem or a repository another user owns. |
+| `does not ignore .env` | The repository's `.gitignore` does not ignore dotenv files, and an engineer that commits one has leaked the credential whatever the prompts said (P9-05). | Add `.env` to `.gitignore`. It is a warning, not a refusal. |
+| `is older than` | The tool is installed but below the minimum `sc` supports (git 2.20, `bd` 1.2.2). | Upgrade it; the row names the version found and the path it was found at. |
+| `version unknown` | The tool answered `--version` with something `sc` could not parse. | Usually harmless — the row is a warning, not a failure. Check you are not shadowing the real binary with a wrapper script. |
+| `not authenticated` | `gh`, or a cartridge's CLI, is installed but not logged in. | `gh auth login`, or run the cartridge's CLI once yourself (for Claude Code: `claude`). |
+| `not logged in (run: claude auth login, or set ANTHROPIC_API_KEY)` | The Claude CLI is installed but has no credentials. | Either of the two things it names. |
+| `auth probe` | `sc` could not tell whether the cartridge is logged in: the probe did not finish, printed no JSON, or could not be run. | Run the CLI once by hand. `sc` fires it anyway; a real auth failure surfaces as `cartridge: not authenticated`. |
+| `no cartridge configured` | No cartridge at all is in the configuration. | `sc cartridge --add claude --model <model>`. |
+| `no active cartridge` | Cartridges are configured but none is selected. | `sc cartridge --use claude`. |
+| `uncommitted change` | The target repository has uncommitted work. Worktrees are made from a clean tree. | Commit or stash it. It is a warning: `sc doctor` still passes. |
+| `clean-tree check skipped: git is not usable` | The repository row could not run because the `git` row failed. | Fix `git` first; the rest of the report is still worth reading. |
+| `not initialised:` | The repository has no `.beads/` directory. | Nothing to do before a run: `sc` creates one (D-13). `bd init` does it by hand. |
+| `could not be read:` | A file `sc doctor` checks — the config, the repository's `.gitignore` — could not be opened. | The row names it; check its permissions. |
 
 ## The demo (`make demo`)
 

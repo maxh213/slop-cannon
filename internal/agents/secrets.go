@@ -25,9 +25,10 @@ import (
 // The first is a *path*: a prompt that lists ".env", "id_rsa" or
 // "deploy.pem" in the repository tree is an invitation for an agent with a
 // read tool to open them. [SecretFilter] drops those entries from the
-// repository context, from a diff, and from any other path list a prompt is
-// built from, using the built-in patterns below plus whatever the user's
-// `exclude` config key adds.
+// repository context, from a diff, from the paths an agent names in its own
+// reply, and from any other path list a prompt is built from, using the
+// built-in patterns below plus whatever the user's `exclude` config key
+// adds.
 //
 // The second is a *value*: a token pasted into a bead description, printed
 // by a failing check, or echoed by an agent. Those are masked rather than
@@ -59,13 +60,21 @@ func SecretPatterns() []logging.Pattern {
 		{
 			Name: "assignment",
 			// A dotenv, YAML or shell assignment whose name looks like a
-			// credential: anchored to the start of a line (after the "+" or
-			// "-" of a diff and an optional "export"), with an upper-case
-			// name, because that is what an environment variable looks like
-			// and it is what keeps the rule from firing inside an
-			// expression — `apiKey := os.Getenv("API_KEY")` in a reviewed
-			// diff must survive intact.
-			Regexp: regexp.MustCompile(`(?m)^[+\- ]?\s*(?:export\s+)?[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWD|PASSWORD|KEY|CREDENTIAL)[A-Z0-9_]*\s*[=:]\s*["']?([^\s"']{6,})`),
+			// credential. It fires wherever the assignment appears — at the
+			// start of a line, after the "+" or "-" of a diff, after an
+			// "export", or in the middle of a log line a check printed
+			// ("2026-01-01 INFO  MY_API_TOKEN=hunter2"), which is how a
+			// value most often reaches a transcript. All that is required
+			// in front of the name is a character that cannot be part of an
+			// identifier, so the rule cannot fire on the tail of a longer
+			// word ("NOTATOKEN=…" is matched as one name, not as "TOKEN=…").
+			//
+			// The name itself must be upper-case, because that is what an
+			// environment variable looks like and it is what keeps the rule
+			// from firing inside an expression — `apiKey :=
+			// os.Getenv("API_KEY")` in a reviewed diff must survive intact,
+			// and so must prose that merely names the variable.
+			Regexp: regexp.MustCompile(`(?m)(?:^|[^A-Za-z0-9_])(?:export\s+)?[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWD|PASSWORD|KEY|CREDENTIAL)[A-Z0-9_]*\s*[=:]\s*["']?([^\s"']{6,})`),
 		},
 		{
 			Name:   "pem",
@@ -242,20 +251,134 @@ func (f *SecretFilter) Texts(list []string) []string {
 
 // Message returns a copy of one structured agent message — a plan, an
 // implementation report, a verdict, responses, arbitrations, an escalation
-// or a bead — with the prose a model wrote masked by [SecretFilter.Text].
-// Anything else comes back unchanged. It is [events.RedactMessage] with
-// this run's rules, so the walk is the one [events.Redacted] makes rather
-// than a second copy of it.
+// or a bead — with both halves of the filter applied: the paths the message
+// *names* are withheld behind [SecretPathPlaceholder], and the prose a model
+// wrote is masked by [SecretFilter.Text]. Anything else comes back
+// unchanged. The value half is [events.RedactMessage] with this run's
+// rules, so the walk is the one [events.Redacted] makes rather than a
+// second copy of it.
 //
-// The two sinks that need it are the ones that are not events: the comment
-// the feedback loop writes on the bead, and the pull request body the
-// delivery hands to `gh`, which is the only one of the three that leaves the
-// machine.
+// Apply it where a reply is stored, because a stored reply is quoted for the
+// rest of the run: the three sinks are the prompts of every later firing,
+// the comment the feedback loop writes on the bead, and the pull request
+// body the delivery hands to `gh` — the only one of the three that leaves
+// the machine.
 func (f *SecretFilter) Message(msg any) any {
-	return events.RedactMessage(msg, f.resolve().Text)
+	f = f.resolve()
+	return events.RedactMessage(f.messagePaths(msg), f.Text)
 }
 
-// Report is [SecretFilter.Message] for an implementation report, keeping the
+// messagePaths is the path half of [SecretFilter.Message]: the fields of a
+// structured message that *name* a file rather than describe one. Masking
+// cannot help there, because a path is not a secret value — ".env" matches
+// no credential rule — and an agent that names an excluded path in its
+// reply puts it back into every prompt, bead comment and pull request body
+// the rest of the run builds, which is exactly what the path half exists to
+// stop.
+//
+// Two fields carry a path: an implementation report's FilesChanged and a
+// feedback item's File (a tester's, or one raised by a failed check). An
+// excluded entry is replaced by [SecretPathPlaceholder] rather than dropped,
+// so the reply still says a file was touched; everything else comes back
+// unchanged. Replacement is idempotent: the placeholder matches no exclude
+// pattern, so a payload that passes through twice is rewritten once.
+func (f *SecretFilter) messagePaths(msg any) any {
+	switch v := msg.(type) {
+	case domain.ImplReport:
+		return f.reportPaths(v)
+	case *domain.ImplReport:
+		if v == nil {
+			return v
+		}
+		r := f.reportPaths(*v)
+		return &r
+	case domain.Verdict:
+		return f.verdictPaths(v)
+	case *domain.Verdict:
+		if v == nil {
+			return v
+		}
+		w := f.verdictPaths(*v)
+		return &w
+	case []domain.Verdict:
+		if len(v) == 0 {
+			return v
+		}
+		out := make([]domain.Verdict, len(v))
+		for i, w := range v {
+			out[i] = f.verdictPaths(w)
+		}
+		return out
+	case domain.FeedbackItem:
+		return f.itemPaths(v)
+	case []domain.FeedbackItem:
+		if len(v) == 0 {
+			return v
+		}
+		out := make([]domain.FeedbackItem, len(v))
+		for i, it := range v {
+			out[i] = f.itemPaths(it)
+		}
+		return out
+	default:
+		return msg
+	}
+}
+
+// reportPaths withholds the excluded entries of an implementation report's
+// file list, in place and in order, so "3 files changed" stays true while
+// the excluded names go.
+func (f *SecretFilter) reportPaths(r domain.ImplReport) domain.ImplReport {
+	r.FilesChanged = f.pathList(r.FilesChanged)
+	return r
+}
+
+// verdictPaths withholds the excluded File of every item of one verdict, on
+// a copy of the item slice so the caller's verdict is untouched.
+func (f *SecretFilter) verdictPaths(v domain.Verdict) domain.Verdict {
+	if len(v.Items) == 0 {
+		return v
+	}
+	items := make([]domain.FeedbackItem, len(v.Items))
+	for i, it := range v.Items {
+		items[i] = f.itemPaths(it)
+	}
+	v.Items = items
+	return v
+}
+
+// itemPaths withholds one feedback item's File when it is excluded. The
+// line number is left as it is: it names nothing on its own.
+func (f *SecretFilter) itemPaths(it domain.FeedbackItem) domain.FeedbackItem {
+	if it.File != "" && f.Excluded(it.File) {
+		it.File = SecretPathPlaceholder
+	}
+	return it
+}
+
+// pathList returns list with every excluded entry replaced by
+// [SecretPathPlaceholder]. A list with nothing to withhold is returned as it
+// came in, without allocating; otherwise the copy is what keeps the walk
+// from writing through the caller's backing array.
+func (f *SecretFilter) pathList(list []string) []string {
+	var out []string
+	for i, p := range list {
+		if !f.Excluded(p) {
+			continue
+		}
+		if out == nil {
+			out = append([]string(nil), list...)
+		}
+		out[i] = SecretPathPlaceholder
+	}
+	if out == nil {
+		return list
+	}
+	return out
+}
+
+// Report is [SecretFilter.Message] for an implementation report — the
+// engineer's prose masked and its excluded file names withheld — keeping the
 // pointer shape the delivery request uses. A nil report returns nil.
 func (f *SecretFilter) Report(r *domain.ImplReport) *domain.ImplReport {
 	if r == nil {
@@ -283,7 +406,9 @@ func (f *SecretFilter) Verdicts(list []domain.Verdict) []domain.Verdict {
 
 // Items is [SecretFilter.Message] for a list of feedback items, on a copy;
 // nil in, nil out. The delivery raises one out of a failed check command's
-// output (P6-06), which is where a credential in the environment surfaces.
+// output (P6-06), which is where a credential in the environment surfaces —
+// and where the name of the file it failed on surfaces with it, so the path
+// half applies here too.
 func (f *SecretFilter) Items(list []domain.FeedbackItem) []domain.FeedbackItem {
 	if len(list) == 0 {
 		return nil
@@ -366,6 +491,13 @@ func (f *SecretFilter) History(rounds []prompt.Round) []prompt.Round {
 // pattern: an agent that reads the worktree would only need the path to open
 // the file the exclusion was protecting.
 const SecretPlaceholder = "[a change to an excluded path was withheld: the path matches a secrets exclude pattern]"
+
+// SecretPathPlaceholder is what an excluded path an agent *named* — in an
+// implementation report's file list, or as a feedback item's file — is
+// replaced with. Like [SecretPlaceholder] it names neither the path nor the
+// pattern, for the same reason: the path alone is what an agent with a read
+// tool would need to open the file the exclusion was protecting.
+const SecretPathPlaceholder = "[an excluded path was withheld: it matches a secrets exclude pattern]"
 
 // Diff returns a unified diff with the sections for excluded files replaced
 // by a one-line placeholder, and the remaining text redacted. A change to

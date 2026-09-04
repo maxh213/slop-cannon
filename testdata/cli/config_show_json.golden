@@ -18,6 +18,7 @@
     "check_command": "make check",
     "idle_replan_interval": "10m",
     "gate_poll_interval": "1m",
+    "pr_poll_interval": "1m",
     "max_beads_per_plan": 8,
     "limits": {
       "max_review_rounds": 3,
@@ -47,6 +48,7 @@
     "limits.max_review_rounds": "repo",
     "limits.max_tokens": "default",
     "max_beads_per_plan": "default",
+    "pr_poll_interval": "default",
     "roles.tester": "repo",
     "rules": "global+repo",
     "safety": "repo",
@@ -113,6 +115,11 @@
     },
     {
       "key": "gate_poll_interval",
+      "value": "1m",
+      "source": "default"
+    },
+    {
+      "key": "pr_poll_interval",
       "value": "1m",
       "source": "default"
     },

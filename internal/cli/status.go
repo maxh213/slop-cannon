@@ -325,10 +325,6 @@ func RunStatus(repo string, runID domain.RunID, recent int) (*StatusReport, erro
 	}
 	rep.Found = true
 	rep.Liveness = orchestrator.ProbeLiveness(rep.Dir, rep.Run)
-	if rep.Liveness.Held && !rep.Liveness.Mine {
-		rep.Notes = append(rep.Notes, fmt.Sprintf("the run lock is held by run %s (pid %d)",
-			rep.Liveness.Holder.Run, rep.Liveness.Holder.PID))
-	}
 
 	switch st, err := orchestrator.LoadState(rep.Dir); {
 	case err == nil:
@@ -364,7 +360,35 @@ func RunStatus(repo string, runID domain.RunID, recent int) (*StatusReport, erro
 		// A damaged record is a note, not a missing report.
 		rep.Notes = append(rep.Notes, rep.Summary.Notes...)
 	}
+	if note := statusLockNote(rep); note != "" {
+		// First, because whose lock it is outranks a missing file: the
+		// notes are a list, and the reader stops at the one that explains
+		// the report.
+		rep.Notes = append([]string{note}, rep.Notes...)
+	}
 	return rep, nil
+}
+
+// statusLockNote is the note a report needs when this run's lock belongs to
+// another run — and "" when the process row already says so.
+//
+// The two used to be written unconditionally, so a crashed run queried
+// while a second `sc` held the repository printed the same sentence twice:
+// `process    none; the run lock is held by run <id> (pid <n>)` in the
+// header and `note: the run lock is held by run <id> (pid <n>)` at the
+// foot (P8-05; the same repetition P8-06 took out of the startup advice).
+// [statusProcessText] speaks for every live phase, so the note is what a
+// finished or never-started run — whose process row is deliberately silent
+// — has instead.
+//
+// It is computed after the state and the log are folded in because the
+// phase is what decides, and nothing knows the phase until then.
+func statusLockNote(r *StatusReport) string {
+	if !r.Liveness.Held || r.Liveness.Mine || r.Phase().Live() {
+		return ""
+	}
+	return fmt.Sprintf("the run lock is held by run %s (pid %d)",
+		r.Liveness.Holder.Run, r.Liveness.Holder.PID)
 }
 
 // RunStatusLive is [RunStatus] followed by the P8-15 reconciliation

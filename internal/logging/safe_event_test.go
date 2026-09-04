@@ -38,8 +38,11 @@ func TestSafeTextScrubsThenRedacts(t *testing.T) {
 }
 
 // TestSafeEventCleansWhatAPublisherBuilds covers the hook P7-17 and P9-09
-// ask the orchestrator, the supervisor and the cartridge adapters to call
-// where they construct an event out of a subprocess's bytes.
+// put at a run's single publication point: `sc run` wires
+// [Redactor.SafeEvent] into the publisher every event goes through, and
+// internal/cli's TestRunPublisherRedactsBeforeEverySink pins that wiring.
+// This test is the unit half — what the hook does to one event a publisher
+// hands it.
 func TestSafeEventCleansWhatAPublisherBuilds(t *testing.T) {
 	const run domain.RunID = "run-hook"
 	dirty := events.AgentOutput{

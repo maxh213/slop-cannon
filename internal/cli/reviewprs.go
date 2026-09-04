@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"slop-cannon/internal/agents"
 	"slop-cannon/internal/beads"
@@ -54,6 +55,11 @@ type prReviewSetup struct {
 	// Context describes a bead for the prompt builders
 	// ([orchestrator.Conductor.BeadContext]).
 	Context orchestrator.FeedbackContextFunc
+	// Interval is how often GitHub is asked for open pull requests: the
+	// `pr_poll_interval` configuration key (P8-04). It is the watcher's
+	// interval and the reviewer's, so one key moves both. Zero or negative
+	// keeps [gitx.DefaultPRPollInterval], which is that key's default.
+	Interval time.Duration
 	// Filter is the run's P9-05 secrets filter. The pull request's diff is
 	// the one change set that does not come from the conductor, so it is
 	// filtered here instead ([filterPRDiffs]); nil still applies the
@@ -136,6 +142,7 @@ func newPRReviewer(ctx context.Context, s prReviewSetup) (*orchestrator.PRReview
 
 	watcher := gitx.NewPRWatcher(gh, s.Beads,
 		gitx.WithRun(s.RC.Run.ID),
+		gitx.WithPollInterval(s.Interval),
 		gitx.WithWatcherLogger(logger))
 	var checkout orchestrator.PRCheckout
 	if s.Worktrees != nil {
@@ -158,6 +165,7 @@ func newPRReviewer(ctx context.Context, s prReviewSetup) (*orchestrator.PRReview
 		Host:     s.Host,
 		Run:      s.RC.Run.ID,
 		Statuses: s.Statuses,
+		Interval: s.Interval,
 		Logger:   logger,
 	})
 	if err != nil {
