@@ -1,5 +1,6 @@
 run        20260903-120000-abcd
 phase      running
+process    pid <pid> holds the run lock
 mode       brief
 brief      add retries to the client
 epic       sc-0
@@ -11,14 +12,15 @@ cartridge  claude (model fable)
 ammo       10 → 1 PO, up to 2 engineers, up to 7 testers
 safety     on (pull requests)
 
-beads      2
+beads      3
+  open       1
   in_review  1
   closed     1
 
 agents     1 live of 10 ammo
   tester-qa-sc-2-r1  tester/qa  sc-2  running  pid 4243
 
-events     10 of 20 (1 output line, 1 warning)
+events     10 of 18 (1 output line, 1 warning)
   12:00:41 ↻ sc-1 round 1 (review): lenses qa
   12:00:42 → bead sc-1 in_progress → in_review (round 1)
   12:00:50 → bead sc-1 in_review → approved (round 1, all testers approved)

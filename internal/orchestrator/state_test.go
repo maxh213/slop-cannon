@@ -907,3 +907,247 @@ func stateLabel(s domain.BeadState) string {
 	}
 	return strings.ReplaceAll(string(s), " ", "_")
 }
+
+// ----------------------------------------------------- the shutdown release
+
+// stateReleaser is a LeaseReleaser that records the beads it released and
+// can fail on demand.
+type stateReleaser struct {
+	got []domain.BeadID
+	err error
+}
+
+func (r *stateReleaser) Release(_ context.Context, id domain.BeadID) (beads.Issue, error) {
+	r.got = append(r.got, id)
+	if r.err != nil {
+		return beads.Issue{}, r.err
+	}
+	return beads.Issue{ID: id, Status: string(domain.BeadStateOpen)}, nil
+}
+
+// TestStateHeldBeadsKeepsOnlyTheClaimHolders pins which of a shutting-down
+// run's live agents actually hold a bead: the engineer does, because the
+// scheduler claimed the bead for it; the testers reviewing it and the product
+// owner ruling on it do not (ClaimNone). One entry per bead, in agent order,
+// stamped with the state the listing has.
+func TestStateHeldBeadsKeepsOnlyTheClaimHolders(t *testing.T) {
+	t.Parallel()
+
+	for _, r := range domain.Roles() {
+		if got, want := RoleHoldsBeadClaim(r), r == domain.RoleEngineer; got != want {
+			t.Fatalf("RoleHoldsBeadClaim(%q) = %v, want %v", r, got, want)
+		}
+	}
+	if RoleHoldsBeadClaim("") {
+		t.Fatal("an agent with no role holds no claim")
+	}
+
+	agents := []domain.Agent{
+		{ID: "po-1", Role: domain.RolePO},                                        // no bead at all
+		{ID: "ux-1", Role: domain.RoleTester, Lens: domain.LensUX, Bead: "sc-1"}, // reviewing
+		{ID: "eng-1", Role: domain.RoleEngineer, Bead: "sc-1"},                   // holds sc-1
+		{ID: "eng-1b", Role: domain.RoleEngineer, Bead: "sc-1"},                  // duplicate bead
+		{ID: "eng-2", Role: domain.RoleEngineer, Bead: "sc-2"},                   // holds sc-2, state unknown
+		{ID: "po-2", Role: domain.RolePO, Bead: "sc-3"},                          // escalating
+		{ID: "nobody", Bead: "sc-4"},                                             // no role: no claim
+	}
+	states := []domain.Bead{
+		{ID: "sc-1", State: domain.BeadStateInProgress},
+		{ID: "sc-3", State: domain.BeadStateEscalated},
+		{ID: "sc-4", State: domain.BeadStateInProgress},
+	}
+	want := []HeldBead{
+		{Bead: "sc-1", Agent: "eng-1", Role: domain.RoleEngineer, From: domain.BeadStateInProgress},
+		{Bead: "sc-2", Agent: "eng-2", Role: domain.RoleEngineer},
+	}
+	if got := HeldBeads(agents, states); !reflect.DeepEqual(got, want) {
+		t.Fatalf("HeldBeads = %+v, want %+v", got, want)
+	}
+	if got := HeldBeads(agents, nil); len(got) != 2 || got[0].From != "" {
+		t.Fatalf("with no listing the states are unknown, got %+v", got)
+	}
+	if got := HeldBeads(nil, states); got != nil {
+		t.Fatalf("HeldBeads(nil, …) = %+v, want nil", got)
+	}
+}
+
+// TestStateReleaseHeldTakesOnlyTheD07Edge is the release side of "every
+// status write goes through the table": a stop hands back the beads that have
+// an in_progress --released--> open edge and publishes each one, and leaves
+// every other bead exactly where it was, writing nothing to bd.
+func TestStateReleaseHeldTakesOnlyTheD07Edge(t *testing.T) {
+	t.Parallel()
+
+	m, store, rec := newStateHarness(t)
+	held := []HeldBead{
+		{Bead: "sc-1", Agent: "eng-1", Role: domain.RoleEngineer, From: domain.BeadStateInProgress},
+		{Bead: "sc-2", Agent: "eng-2", Role: domain.RoleEngineer, From: domain.BeadStateInReview},
+		{Bead: "sc-3", Agent: "eng-3", Role: domain.RoleEngineer, From: domain.BeadStateEscalated},
+		{Bead: "sc-4", Agent: "eng-4", Role: domain.RoleEngineer, From: domain.BeadStateDelivering},
+		{Bead: "sc-5", Agent: "eng-5", Role: domain.RoleEngineer, From: domain.BeadStateBlocked},
+		{Bead: "sc-6", Agent: "eng-6", Role: domain.RoleEngineer}, // unknown: the claim's own state
+		{Bead: "sc-1", Agent: "eng-1b", Role: domain.RoleEngineer, From: domain.BeadStateInProgress},
+		{Bead: "", Agent: "eng-7", Role: domain.RoleEngineer},
+	}
+
+	out := m.ReleaseHeld(context.Background(), held, "the run stopped")
+	if len(out) != 6 {
+		t.Fatalf("got %d outcomes, want one per distinct bead: %+v", len(out), out)
+	}
+	wantReleased := map[domain.BeadID]bool{"sc-1": true, "sc-6": true}
+	for _, o := range out {
+		if o.Err != nil {
+			t.Fatalf("%s: unexpected error %v", o.Bead, o.Err)
+		}
+		if o.Released != wantReleased[o.Bead] {
+			t.Fatalf("%s: released = %v, want %v", o.Bead, o.Released, wantReleased[o.Bead])
+		}
+		if o.Released == (o.Kept != "") {
+			t.Fatalf("%s: exactly one of Released and Kept must be set: %+v", o.Bead, o)
+		}
+		if !o.Released && !strings.Contains(o.Kept, string(o.From)) {
+			t.Fatalf("%s: the reason %q should name the state", o.Bead, o.Kept)
+		}
+	}
+	if out[5].From != domain.BeadStateInProgress {
+		t.Fatalf("an unknown state falls back to in_progress, got %q", out[5].From)
+	}
+
+	wantCalls := []stateCall{
+		{Op: "Release", Bead: "sc-1", State: domain.BeadStateOpen},
+		{Op: "Release", Bead: "sc-6", State: domain.BeadStateOpen},
+	}
+	if !reflect.DeepEqual(store.calls, wantCalls) {
+		t.Fatalf("bd calls = %+v, want %+v", store.calls, wantCalls)
+	}
+
+	var moved []events.BeadStateChanged
+	for _, ev := range rec.evs {
+		switch e := ev.(type) {
+		case events.BeadStateChanged:
+			moved = append(moved, e)
+		default:
+			t.Fatalf("a kept bead published %s: %+v", ev.Kind(), ev)
+		}
+	}
+	if len(moved) != 2 {
+		t.Fatalf("published %d state changes, want 2: %+v", len(moved), moved)
+	}
+	for _, e := range moved {
+		if e.From != domain.BeadStateInProgress || e.To != domain.BeadStateOpen {
+			t.Fatalf("%s: published %s → %s", e.Bead, e.From, e.To)
+		}
+		if e.Reason != "the run stopped" || e.At() != stateClock {
+			t.Fatalf("%s: reason %q at %s", e.Bead, e.Reason, e.At())
+		}
+	}
+}
+
+// TestStateReleaseHeldReportsBDFailures checks a bd failure is reported per
+// bead and does not stop the rest of the shutdown.
+func TestStateReleaseHeldReportsBDFailures(t *testing.T) {
+	t.Parallel()
+
+	m, store, rec := newStateHarness(t)
+	store.err = fmt.Errorf("bd is busy")
+	out := m.ReleaseHeld(context.Background(), []HeldBead{
+		{Bead: "sc-1", Agent: "eng-1", Role: domain.RoleEngineer, From: domain.BeadStateInProgress},
+		{Bead: "sc-2", Agent: "eng-2", Role: domain.RoleEngineer, From: domain.BeadStateInProgress},
+	}, "the run stopped")
+	if len(out) != 2 {
+		t.Fatalf("got %d outcomes, want 2", len(out))
+	}
+	for _, o := range out {
+		if o.Released || o.Err == nil || !strings.Contains(o.Err.Error(), "bd is busy") {
+			t.Fatalf("%s: %+v", o.Bead, o)
+		}
+	}
+	if len(rec.evs) != 0 {
+		t.Fatalf("a failed release publishes nothing, got %v", rec.kinds())
+	}
+	if m.ReleaseHeld(context.Background(), nil, "") != nil {
+		t.Fatal("nothing held, nothing to do")
+	}
+}
+
+// TestStateReleaseOnlyStoreOnlyReleases pins the adapter the run lifecycle
+// wraps its lease releaser in: the release reaches bd, and every other write
+// is refused rather than silently taking an edge behind the table's back.
+func TestStateReleaseOnlyStoreOnlyReleases(t *testing.T) {
+	t.Parallel()
+
+	rel := &stateReleaser{}
+	store := ReleaseOnlyStore{Releaser: rel}
+	ctx := context.Background()
+
+	issue, err := store.Release(ctx, "sc-1")
+	if err != nil || issue.ID != "sc-1" {
+		t.Fatalf("Release = %+v, %v", issue, err)
+	}
+	if !reflect.DeepEqual(rel.got, []domain.BeadID{"sc-1"}) {
+		t.Fatalf("released %v", rel.got)
+	}
+
+	refused := map[string]error{}
+	_, refused["SetStatus"] = store.SetStatus(ctx, "sc-1", domain.BeadStateInReview)
+	_, refused["ClaimFor"] = store.ClaimFor(ctx, "sc-1", "eng-1")
+	_, refused["Reclaim"] = store.Reclaim(ctx, "sc-1", "eng-1")
+	_, refused["Close"] = store.Close(ctx, "sc-1", "done")
+	for op, err := range refused {
+		requireStateErr(t, err, ErrReleaseOnlyStore)
+		if !strings.Contains(err.Error(), "sc-1") {
+			t.Fatalf("%s: %q should name the bead", op, err)
+		}
+	}
+	if _, err := (ReleaseOnlyStore{}).Release(ctx, "sc-1"); !errors.Is(err, ErrReleaseOnlyStore) {
+		t.Fatalf("a store with no releaser = %v", err)
+	}
+
+	// The machine's own release goes through it and nothing else does.
+	m := NewStateMachine(ReleaseOnlyStore{Releaser: rel}, WithStateClock(stateNow))
+	if _, err := m.Apply(ctx, StateRequest{Bead: "sc-2", From: domain.BeadStateInProgress,
+		Event: BeadEventReleased}); err != nil {
+		t.Fatalf("release through the machine: %v", err)
+	}
+	if !reflect.DeepEqual(rel.got, []domain.BeadID{"sc-1", "sc-2"}) {
+		t.Fatalf("released %v", rel.got)
+	}
+}
+
+// TestStateTransitionCountIsTheOneTheRecordClaims pins the size of the D-07
+// table: 15 flow edges, plus a blocked and a failed exit for each of the
+// seven non-terminal workflow states, is 29. The progress note for P6-03 said
+// 24 until this test was written; a number in prose that nothing checks is a
+// number that drifts.
+func TestStateTransitionCountIsTheOneTheRecordClaims(t *testing.T) {
+	t.Parallel()
+
+	trs := BeadTransitions()
+	var flow, exits, nonTerminal int
+	for _, tr := range trs {
+		if tr.Event == BeadEventBlocked || tr.Event == BeadEventFailed {
+			exits++
+			continue
+		}
+		flow++
+	}
+	for _, s := range domain.WorkflowBeadStates() {
+		if !s.Terminal() {
+			nonTerminal++
+		}
+	}
+	if nonTerminal != 7 {
+		t.Fatalf("non-terminal workflow states = %d, want 7", nonTerminal)
+	}
+	if flow != 15 || exits != 2*nonTerminal || len(trs) != 29 {
+		t.Fatalf("table = %d edges (%d flow, %d exits), want 29 (15 flow, %d exits)",
+			len(trs), flow, exits, 2*nonTerminal)
+	}
+	var spec int
+	for _, evs := range stateWantEdges {
+		spec += len(evs)
+	}
+	if spec != len(trs) {
+		t.Fatalf("the hand-written spec has %d edges, the table %d", spec, len(trs))
+	}
+}

@@ -73,6 +73,15 @@ type Options struct {
 	// ControlKeys overrides the run-control bindings; nil means
 	// [DefaultControlsKeyMap].
 	ControlKeys *ControlsKeyMap
+	// ControlTimeout bounds one [Controller] call; zero means
+	// [ControlTimeout]. A caller whose orchestrator is slower than that
+	// raises it rather than watching every key report a timeout.
+	ControlTimeout time.Duration
+	// ControlMaxAmmo is the largest value the `a` prompt accepts; zero means
+	// [ControlMaxAmmo]. The prompt always accepts at least the run's own cap
+	// as well, so a run fired with more ammo than the ceiling can still be
+	// put back to the number it started with.
+	ControlMaxAmmo int
 	// Output is where the program draws; nil means os.Stdout.
 	Output io.Writer
 	// Input is where key presses are read from; nil means os.Stdin.
@@ -134,6 +143,8 @@ func New(ctx context.Context, opts Options) Model {
 		Theme:      theme,
 		Keys:       opts.ControlKeys,
 		Controller: opts.Controller,
+		Timeout:    opts.ControlTimeout,
+		MaxAmmo:    opts.ControlMaxAmmo,
 	})
 	m.anim = NewAnimator(AnimOptions{
 		Disabled: AnimDisabled(opts.NoAnim, nil),

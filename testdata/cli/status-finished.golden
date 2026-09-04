@@ -15,12 +15,13 @@ cartridge  claude (model fable)
 ammo       10 → 1 PO, up to 2 engineers, up to 7 testers
 safety     on (pull requests)
 
-beads      2
+beads      3
+  open    1
   closed  2
 
 agents     0 live of 10 ammo
 
-events     10 of 24 (1 output line, 1 warning)
+events     10 of 22 (1 output line, 1 warning)
   12:00:52 → bead sc-1 approved → delivering (round 1)
   12:00:55 ⤵ sc-1 merged 0123456 into main (PR #7, pushed)
   12:00:56 → bead sc-1 delivering → closed (round 1)

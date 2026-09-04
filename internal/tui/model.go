@@ -743,6 +743,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	k := m.keys
 	m.flash, m.flashErr = "", false
+	// The control layer's own flash is cleared with it, so a control's
+	// answer does not outlive the key after it and shadow the footer for the
+	// rest of the run (P7-10).
+	m.controls = m.controls.ClearFlash()
 	if key.Matches(msg, k.ForceQuit) {
 		m.quitting = true
 		return m, tea.Quit
@@ -772,7 +776,7 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// overlay of theirs is modal, and otherwise they consume only their own
 	// keys (P7-10). With no [Controller] attached the whole keymap is
 	// disabled and every key falls straight through.
-	if c, cmd, ok := m.controls.Update(msg, m.state, k, TargetFor(m.state, m.graph.SelectedID())); ok {
+	if c, cmd, ok := m.controls.Update(msg, m.state, k, m.controlTarget()); ok {
 		m.controls = c
 		return m, cmd
 	}

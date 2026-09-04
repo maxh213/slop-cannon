@@ -27,10 +27,17 @@ import (
 //   - `sc status` folds the run log at <run-dir>/events.jsonl together with
 //     <run-dir>/state.json into the state of a run: phase, per-state bead
 //     counts, live agents and the last events. It needs neither bd nor git
-//     nor the process that wrote them, so it works on a run that crashed.
+//     nor the process that wrote them, so it works on a run that crashed —
+//     and says so, by asking the run lock whether anybody is still running
+//     it ([orchestrator.ProbeLiveness]) rather than believing a `running`
+//     that nothing got the chance to overwrite.
 //   - `sc status <bead-id>` asks bd for the bead and prints
 //     [beads.FormatTimeline] over its structured messages (P6-15), rather
 //     than re-deriving a history the messages already record (D-06).
+//
+// Every line the first report prints is scrubbed before it reaches the
+// terminal ([statusScrub]): a run log quotes what a cartridge and bd
+// printed, and that text must not be able to repaint the user's screen.
 
 // Flag names of `sc status`.
 const (
@@ -125,9 +132,13 @@ type StatusReport struct {
 	// Summary is the fold of <run-dir>/events.jsonl, absent when there is
 	// no run log.
 	Summary *orchestrator.RunSummary `json:"summary,omitempty"`
+	// Liveness is what the repository's run lock says about this run:
+	// whether a process is still running it. A run directory alone cannot
+	// tell a live run from a killed one — both say "running".
+	Liveness orchestrator.Liveness `json:"liveness"`
 	// Recent are the last events as one-line text, oldest first
-	// (tui.FormatHeadless); events are an interface, so JSON gets the
-	// rendered lines rather than half-decoded objects.
+	// (tui.FormatHeadless, scrubbed); events are an interface, so JSON gets
+	// the rendered lines rather than half-decoded objects.
 	Recent []string `json:"recent_events,omitempty"`
 	// Notes explain anything missing or unreadable.
 	Notes []string `json:"notes,omitempty"`
@@ -144,6 +155,17 @@ func (r *StatusReport) Phase() orchestrator.Phase {
 	default:
 		return orchestrator.PhaseNew
 	}
+}
+
+// Running reports whether a live process still holds this run's lock.
+func (r *StatusReport) Running() bool { return r.Liveness.Running() }
+
+// Crashed reports a run whose last recorded phase is still an active one
+// but which nothing is running any more: it was killed, its machine went
+// away, or it died without writing a finish. Nothing in the run directory
+// can say this on its own, which is why the lock is probed.
+func (r *StatusReport) Crashed() bool {
+	return r.Found && r.Phase().Live() && !r.Running()
 }
 
 // statusBeadReader is the slice of the beads client `sc status <bead-id>`
@@ -225,6 +247,11 @@ func RunStatus(repo string, runID domain.RunID, recent int) (*StatusReport, erro
 		return rep, nil
 	}
 	rep.Found = true
+	rep.Liveness = orchestrator.ProbeLiveness(rep.Dir, rep.Run)
+	if rep.Liveness.Held && !rep.Liveness.Mine {
+		rep.Notes = append(rep.Notes, fmt.Sprintf("the run lock is held by run %s (pid %d)",
+			rep.Liveness.Holder.Run, rep.Liveness.Holder.PID))
+	}
 
 	switch st, err := orchestrator.LoadState(rep.Dir); {
 	case err == nil:
@@ -253,8 +280,10 @@ func RunStatus(repo string, runID domain.RunID, recent int) (*StatusReport, erro
 	if rep.Summary != nil {
 		rep.Recent = make([]string, 0, len(rep.Summary.Recent))
 		for _, ev := range rep.Summary.Recent {
-			rep.Recent = append(rep.Recent, tui.FormatHeadless(ev, time.UTC))
+			rep.Recent = append(rep.Recent, statusScrub(tui.FormatHeadless(ev, time.UTC)))
 		}
+		// A damaged record is a note, not a missing report.
+		rep.Notes = append(rep.Notes, rep.Summary.Notes...)
 	}
 	return rep, nil
 }
@@ -272,7 +301,7 @@ func WriteStatus(w io.Writer, r *StatusReport) error {
 	statusAgentsSection(&b, r)
 	statusEventsSection(&b, r)
 	for _, n := range r.Notes {
-		fmt.Fprintf(&b, "\nnote: %s\n", n)
+		fmt.Fprintf(&b, "\nnote: %s\n", statusScrub(n))
 	}
 	_, err := io.WriteString(w, b.String())
 	return err
@@ -284,10 +313,13 @@ func statusHeader(b *strings.Builder, r *StatusReport) {
 		if value == "" {
 			return
 		}
-		fmt.Fprintf(b, "%-*s%s\n", statusLabelWidth, label, value)
+		// Values quote what a run recorded, which quotes what a cartridge
+		// and bd printed: the brief, a stop reason, a finish summary.
+		fmt.Fprintf(b, "%-*s%s\n", statusLabelWidth, label, statusScrub(value))
 	}
 	row("run", string(r.Run))
 	row("phase", statusPhaseText(r))
+	row("process", statusProcessText(r))
 	if st := r.State; st != nil {
 		row("mode", st.Run.Mode.String())
 		row("brief", st.Run.Brief)
@@ -329,13 +361,40 @@ func statusSafetyGloss(on bool) string {
 }
 
 // statusPhaseText renders the phase, adding the finish reason once the run
-// has ended.
+// has ended and marking a phase no live process backs any more.
 func statusPhaseText(r *StatusReport) string {
 	phase := r.Phase().String()
 	if reason := statusFinishReason(r); reason != "" {
 		return phase + " (" + reason.String() + ")"
 	}
+	if r.Crashed() {
+		return phase + " (no live process: the run was killed or crashed)"
+	}
 	return phase
+}
+
+// statusProcessText describes the process behind the run, or "" when there
+// is nothing worth saying: a finished run releases its lock, and that is
+// not news. An active phase always gets a line, because "who is running
+// this" is the first thing a reader wants after a crash.
+func statusProcessText(r *StatusReport) string {
+	l := r.Liveness
+	switch {
+	case r.Running():
+		who := fmt.Sprintf("pid %d", l.Holder.PID)
+		if l.Holder.Host != "" {
+			who += " on " + l.Holder.Host
+		}
+		return who + " holds the run lock"
+	case !r.Phase().Live():
+		return "" // a run that ended owes no explanation for releasing it
+	case l.Held && !l.Mine:
+		return fmt.Sprintf("none; the run lock is held by run %s (pid %d)", l.Holder.Run, l.Holder.PID)
+	case l.Held:
+		return fmt.Sprintf("none; pid %d took the run lock and is gone", l.Holder.PID)
+	default:
+		return "none; nothing holds the run lock"
+	}
 }
 
 // statusFinishReason returns the run's finish reason from whichever source
@@ -421,13 +480,27 @@ func statusStateOrder(counts map[domain.BeadState]int) []domain.BeadState {
 	return out
 }
 
-// statusAgentsSection writes the agents that were live at the last event.
+// statusAgentsSection writes the agents that were live at the last event:
+// the run log's un-finished spawns, or state.json's record of them when
+// there is no run log to fold. A run nothing is running any more has no
+// live agents at all, however many the log ends on, so those are reported
+// as the last ones seen rather than as processes the reader could go and
+// look at.
 func statusAgentsSection(b *strings.Builder, r *StatusReport) {
-	if r.Summary == nil {
+	var live []domain.Agent
+	switch {
+	case r.Summary != nil:
+		live = r.Summary.Agents
+	case r.State != nil:
+		live = r.State.Agents
+	default:
 		return
 	}
-	live := r.Summary.Agents
-	head := fmt.Sprintf("%d live", len(live))
+	word := "live"
+	if r.Crashed() {
+		word = "last seen"
+	}
+	head := fmt.Sprintf("%d %s", len(live), word)
 	if r.State != nil && r.State.Run.Config.Ammo > 0 {
 		head += fmt.Sprintf(" of %d ammo", r.State.Run.Config.Ammo)
 	}
@@ -506,6 +579,78 @@ func statusTime(t time.Time) string {
 		return ""
 	}
 	return t.UTC().Format(statusTimeFormat)
+}
+
+// statusScrub makes text from a run log safe to print. Event lines quote
+// what a cartridge and bd wrote — a Warning's message, an Error's err, an
+// agent's own output — and `sc status` writes them straight to a terminal,
+// where an ANSI escape would repaint the screen, a carriage return would
+// erase the line already printed and a backspace would rewrite it. Escape
+// sequences are removed whole, a tab becomes a space, and every other
+// control character (C0, DEL and C1) is dropped. Text that carries none of
+// them is returned unchanged, so the common line pays only one scan.
+//
+// tui.FormatHeadless promises a line free of newlines but not of escapes
+// (P7-18 fixes the renderer itself); this is the same guarantee applied at
+// the one place `sc status` prints.
+func statusScrub(s string) string {
+	if !strings.ContainsFunc(s, statusIsControl) {
+		return s
+	}
+	rs := []rune(s)
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(rs); i++ {
+		switch r := rs[i]; {
+		case r == 0x1b:
+			i += statusEscapeRunes(rs[i:]) - 1
+		case r == '\t':
+			b.WriteRune(' ')
+		case statusIsControl(r):
+			// dropped: it is an instruction to the terminal, not text
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// statusIsControl reports whether r is read by a terminal as an instruction
+// rather than as text: a C0 control (ESC, CR, LF and tab included), DEL, or
+// a C1 control.
+func statusIsControl(r rune) bool {
+	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+}
+
+// statusEscapeRunes returns how many runes the escape sequence starting at
+// rs[0] (an ESC) occupies: a CSI up to its final byte, an OSC up to its
+// terminator, and otherwise the ESC and the one character after it. It is
+// never less than 1, so the caller always makes progress.
+func statusEscapeRunes(rs []rune) int {
+	if len(rs) < 2 {
+		return 1
+	}
+	switch rs[1] {
+	case '[': // CSI: parameters and intermediates, then a final byte.
+		for i := 2; i < len(rs); i++ {
+			if rs[i] >= 0x40 && rs[i] <= 0x7e {
+				return i + 1
+			}
+		}
+		return len(rs)
+	case ']': // OSC: a string terminated by BEL or ESC \.
+		for i := 2; i < len(rs); i++ {
+			if rs[i] == 0x07 {
+				return i + 1
+			}
+			if rs[i] == 0x1b && i+1 < len(rs) && rs[i+1] == '\\' {
+				return i + 2
+			}
+		}
+		return len(rs)
+	default:
+		return 2
+	}
 }
 
 // statusBead prints one bead's timeline from beads (P6-15).

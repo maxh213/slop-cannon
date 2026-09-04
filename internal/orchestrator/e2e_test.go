@@ -26,6 +26,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -696,6 +697,14 @@ func (r *e2eRig) beadSource(ctx context.Context) ([]domain.Bead, error) {
 // beadContext is the FeedbackContextFunc: it makes sure the bead has a
 // worktree, commits whatever the last engineer left uncommitted (D-14) so
 // the testers always review committed code, and describes the change set.
+//
+// The leftovers commit goes through the DeliveryGit adapter rather than
+// straight to gitx because of P6-16(b): a conflict round's prompt is built
+// while the worktree is mid-rebase by construction, and "git add -A"
+// followed by a commit there would commit the conflict markers and destroy
+// the rebase state. The adapter refuses that with ErrRebaseInProgress,
+// which is not a failure of the round — there is simply nothing to commit
+// until the engineer has resolved the conflict.
 func (r *e2eRig) beadContext(ctx context.Context, id domain.BeadID) (FeedbackBeadContext, error) {
 	issues, err := r.Beads.Show(ctx, id)
 	if err != nil {
@@ -712,7 +721,7 @@ func (r *e2eRig) beadContext(ctx context.Context, id domain.BeadID) (FeedbackBea
 			return FeedbackBeadContext{}, err
 		}
 	}
-	if _, err := r.Manager.CommitLeftovers(ctx, bead, round); err != nil {
+	if _, err := r.Git.CommitLeftovers(ctx, bead, round); err != nil && !errors.Is(err, ErrRebaseInProgress) {
 		return FeedbackBeadContext{}, err
 	}
 	diff, err := r.Manager.Diff(ctx, id)

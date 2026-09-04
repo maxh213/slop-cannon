@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/bubbles/help"
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -280,10 +281,20 @@ func TestControlRefireOnlyFiresGivenUpBeads(t *testing.T) {
 		fires bool
 	}{
 		{"failed", domain.BeadStateFailed, true},
+		// D-20 parks a bead a delivery or a gh:pr gate handed over in
+		// needs_human, and D-08 parks one that hit the review-round cap in
+		// escalated: those are the two a human most wants to put back in
+		// the queue, so `r` has to take them.
+		{"needs human", domain.BeadStateNeedsHuman, true},
+		{"escalated", domain.BeadStateEscalated, true},
+		// `sc` never writes bd's own blocked (D-07), but a bead edited
+		// outside the run can carry it in through beads.SafeState.
 		{"blocked", domain.BeadStateBlocked, true},
 		{"in review", domain.BeadStateInReview, false},
 		{"closed", domain.BeadStateClosed, false},
 		{"in progress", domain.BeadStateInProgress, false},
+		{"approved", domain.BeadStateApproved, false},
+		{"delivering", domain.BeadStateDelivering, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -299,7 +310,7 @@ func TestControlRefireOnlyFiresGivenUpBeads(t *testing.T) {
 			if !tc.fires {
 				require.Empty(t, c.Calls())
 				require.True(t, isErr)
-				require.Contains(t, flash, "only a failed or blocked bead can be re-fired")
+				require.Contains(t, flash, "only a failed, needs_human, escalated or blocked bead can be re-fired")
 				return
 			}
 			require.Equal(t, []ctlCall{{Action: ControlRefire, Bead: "sc-1a2b", Reason: ControlReason}}, c.Calls())
@@ -790,12 +801,21 @@ func TestControlKeysDoNotCollideWithTheRestOfTheTUI(t *testing.T) {
 	t.Parallel()
 
 	global := DefaultKeyMap()
+	// Every column of every view, not just the first: a binding in the
+	// second column collides just as hard, and a control key that shadowed
+	// one would be found only by a user.
 	others := [][]key.Binding{
 		{global.NextTab, global.PrevTab, global.SelectTab, global.Up, global.Down, global.Help, global.Quit, global.ForceQuit},
-		DefaultGraphKeyMap().FullHelp()[0],
-		DefaultAgentsKeyMap().FullHelp()[0],
-		DefaultFeedbackKeyMap().FullHelp()[0],
-		DefaultPRsKeyMap().FullHelp()[0],
+		global.ShortHelp(),
+	}
+	for _, km := range []help.KeyMap{
+		DefaultGraphKeyMap(), DefaultAgentsKeyMap(),
+		DefaultFeedbackKeyMap(), DefaultPRsKeyMap(),
+	} {
+		cols := km.FullHelp()
+		require.NotEmpty(t, cols)
+		others = append(others, cols...)
+		others = append(others, km.ShortHelp())
 	}
 	controls := DefaultControlsKeyMap()
 	for _, b := range []key.Binding{controls.PauseResume, controls.Stop, controls.Refire, controls.MarkDone, controls.Safety, controls.Ammo} {
@@ -968,4 +988,186 @@ type ctlDeadlineController struct {
 func (c *ctlDeadlineController) Pause(ctx context.Context, reason string) error {
 	c.seen(ctx)
 	return c.ctlController.Pause(ctx, reason)
+}
+
+// The rest of this file is the second round of P7-10: the review found that
+// `S` and `a` were one-way ratchets, that `r` was keyed on states the run
+// never writes, and that a control's footer line never expired.
+
+func TestControlSafetyCanBeToggledBackAgain(t *testing.T) {
+	t.Parallel()
+
+	c := &ctlController{}
+	st := ctlState(t, true, 4)
+	v := ctlModel(c)
+
+	// Off, then on again. Nothing publishes a configuration change, so a
+	// layer that read the run's frozen snapshot both times would ask for
+	// "off" twice and the run could never be put back under safety.
+	for i, want := range []bool{false, true} {
+		var res *ControlResultMsg
+		v, _, _ = ctlPress(t, v, st, "S", ControlTarget{})
+		req, confirming := v.Confirming()
+		require.Truef(t, confirming, "press %d raised no confirmation", i+1)
+		require.Equalf(t, want, req.Safety, "press %d asked for the wrong flag", i+1)
+
+		plain := ctlPlain(ctlOverlay(t, v, st, 70, 10))
+		require.Contains(t, plain, "Turn safety "+onOff(want)+"?")
+		if want {
+			require.Contains(t, plain, "open a pull request for a human to merge")
+		} else {
+			require.Contains(t, plain, "merge straight to the default branch")
+		}
+
+		v, res, _ = ctlPress(t, v, st, "y", ControlTarget{})
+		require.NotNil(t, res)
+		flash, isErr := v.Flash()
+		require.False(t, isErr)
+		require.Equal(t, "safety "+onOff(want)+" for future deliveries", flash)
+	}
+	require.Equal(t, []ctlCall{{Action: ControlSafety, Safety: false}, {Action: ControlSafety, Safety: true}}, c.Calls())
+	require.True(t, v.Safety(st), "the layer remembers the value the orchestrator accepted")
+}
+
+func TestControlSafetyKeepsAskingWhenTheCallFails(t *testing.T) {
+	t.Parallel()
+
+	c := &ctlController{err: errors.New("bd refused")}
+	st := ctlState(t, true, 4)
+	v, _ := ctlType(t, ctlModel(c), st, ControlTarget{}, "S", "y")
+	require.True(t, v.Safety(st), "a failed call changes nothing")
+
+	// The next press asks for the same flip, because the first never landed.
+	v, _, _ = ctlPress(t, v, st, "S", ControlTarget{})
+	req, confirming := v.Confirming()
+	require.True(t, confirming)
+	require.False(t, req.Safety)
+}
+
+func TestControlAmmoCanBeSetBackToAValueItHad(t *testing.T) {
+	t.Parallel()
+
+	c := &ctlController{}
+	st := ctlState(t, true, 4)
+	v, _ := ctlType(t, ctlModel(c), st, ControlTarget{}, "a", "backspace", "6", "enter")
+	require.Equal(t, 6, v.Ammo(st), "the layer remembers the cap the orchestrator accepted")
+
+	// Re-opening the prompt offers 6, not the run's frozen 4, and 4 is now a
+	// change again rather than a value the guard swallows.
+	v, _, _ = ctlPress(t, v, st, "a", ControlTarget{})
+	require.Equal(t, "6", v.AmmoInput())
+	require.Contains(t, ctlPlain(ctlOverlay(t, v, st, 60, 12)), "the run's cap today is 6.")
+
+	v, res := ctlType(t, v, st, ControlTarget{}, "backspace", "4", "enter")
+	require.NotNil(t, res)
+	require.Equal(t, []ctlCall{{Action: ControlAmmo, Ammo: 6}, {Action: ControlAmmo, Ammo: 4}}, c.Calls())
+	flash, isErr := v.Flash()
+	require.False(t, isErr)
+	require.Equal(t, "ammo 4 for future ticks", flash)
+	require.Equal(t, 4, v.Ammo(st))
+}
+
+func TestControlAmmoPromptTakesARunConfiguredAboveTheCeiling(t *testing.T) {
+	t.Parallel()
+
+	// The configuration enforces only a minimum, so a run can carry more
+	// ammo than the prompt's ceiling. It still has to be able to get its own
+	// number back.
+	c := &ctlController{}
+	st := ctlState(t, true, 150)
+	v, _, _ := ctlPress(t, ctlModel(c), st, "a", ControlTarget{})
+	require.Equal(t, "150", v.AmmoInput(), "the prompt starts from the run's own cap")
+	require.Contains(t, ctlPlain(ctlOverlay(t, v, st, 70, 12)),
+		fmt.Sprintf("%d–150 concurrent agents; the run's cap today is 150.", ControlMinAmmo))
+
+	v, _ = ctlType(t, v, st, ControlTarget{}, "backspace", "backspace", "backspace", "1", "2", "enter")
+	require.Equal(t, []ctlCall{{Action: ControlAmmo, Ammo: 12}}, c.Calls())
+
+	// And back up to 150, which is three digits: the field has to allow them.
+	ctlType(t, v, st, ControlTarget{}, "a", "backspace", "backspace", "1", "5", "0", "enter")
+	require.Equal(t, []ctlCall{{Action: ControlAmmo, Ammo: 12}, {Action: ControlAmmo, Ammo: 150}}, c.Calls())
+}
+
+func TestControlConfigOverridesYieldToTheRun(t *testing.T) {
+	t.Parallel()
+
+	c := &ctlController{}
+	st := ctlState(t, true, 4)
+	v, _ := ctlType(t, ctlModel(c), st, ControlTarget{}, "S", "y", "a", "backspace", "6", "enter")
+	require.False(t, v.Safety(st))
+	require.Equal(t, 6, v.Ammo(st))
+
+	// The events are the record of the run: the moment one moves the run's
+	// own configuration, the layer's memory of what it asked for is dropped
+	// rather than fighting it.
+	info := ctlRunInfo(false, 9)
+	st.Apply(events.RunStarted{Meta: events.MetaAt(ctlRunID, ctlAt(9)), Info: info})
+	require.False(t, v.Safety(st))
+	require.Equal(t, 9, v.Ammo(st))
+
+	v, _, _ = ctlPress(t, v, st, "S", ControlTarget{})
+	req, confirming := v.Confirming()
+	require.True(t, confirming)
+	require.True(t, req.Safety, "the run says safety is off, so `S` offers to turn it on")
+}
+
+func TestControlRefusalNamesExactlyTheRefirableStates(t *testing.T) {
+	t.Parallel()
+
+	states := ControlRefirableStates()
+	require.NotEmpty(t, states)
+	msg := controlRefirableList()
+	for _, s := range states {
+		require.True(t, ControlRefirable(s), "%s is listed but refused", s)
+		require.Contains(t, msg, string(s), "the refusal message does not name %s", s)
+	}
+	// D-07: `sc` never writes bd's blocked, and the states it does park
+	// abandoned work in are the ones the key has to accept.
+	for _, s := range []domain.BeadState{domain.BeadStateFailed, domain.BeadStateNeedsHuman, domain.BeadStateEscalated} {
+		require.Contains(t, states, s, "a run parks work in %s, so `r` must take it", s)
+	}
+	for _, s := range []domain.BeadState{
+		domain.BeadStateOpen, domain.BeadStateInProgress, domain.BeadStateInReview,
+		domain.BeadStateChangesRequested, domain.BeadStateApproved, domain.BeadStateDelivering,
+		domain.BeadStateClosed,
+	} {
+		require.False(t, ControlRefirable(s), "%s is in flight or finished", s)
+		require.NotContains(t, msg, string(s))
+	}
+	// The accessor hands out a copy: scribbling on it cannot re-key `r`.
+	states[0] = domain.BeadStateClosed
+	require.NotEqual(t, states, ControlRefirableStates())
+	require.False(t, ControlRefirable(domain.BeadStateClosed))
+}
+
+func TestControlFlashIsClearedOnDemand(t *testing.T) {
+	t.Parallel()
+
+	c := &ctlController{}
+	st := ctlState(t, true, 4)
+	v, _, _ := ctlPress(t, ctlModel(c), st, "p", ControlTarget{})
+	flash, _ := v.Flash()
+	require.Equal(t, "run paused", flash)
+
+	cleared := v.ClearFlash()
+	flash, isErr := cleared.Flash()
+	require.Empty(t, flash)
+	require.False(t, isErr)
+	// Clearing says nothing about the run: the keys still work afterwards.
+	next, _, ok := ctlPress(t, cleared, st, "p", ControlTarget{})
+	require.True(t, ok)
+	flash, _ = next.Flash()
+	require.Equal(t, "run paused", flash)
+}
+
+func TestControlConfigReadersSurviveNoRun(t *testing.T) {
+	t.Parallel()
+
+	// Before the first event there is no run to read: the readers answer
+	// with the zero configuration rather than panicking, which is what lets
+	// the keys refuse with "no run to control" instead of crashing.
+	v := ctlModel(&ctlController{})
+	require.False(t, v.Safety(nil))
+	require.Zero(t, v.Ammo(nil))
+	require.Equal(t, ControlMaxAmmo, v.maxAmmoFor(nil))
 }

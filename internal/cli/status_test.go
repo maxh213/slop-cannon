@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -66,9 +69,24 @@ func statusDomainRun(repo, dir string) domain.Run {
 	}
 }
 
-// statusEvents is the recorded run: a plan, two beads, one delivered and
-// merged behind a PR, one still under review by a live tester, plus a
-// warning and a line of agent output.
+// statusPlan is the plan the recorded run's PO produced: three beads, of
+// which the scheduler has reached two. It is what a real run publishes —
+// nothing in production emits BeadCreated or GraphChanged (P6-32) — so it
+// is what tells `sc status` about the bead nothing has touched yet.
+func statusPlan() domain.Plan {
+	return domain.Plan{
+		Brief: "add retries to the client",
+		Beads: []domain.PlanBead{
+			{Key: "retry", Title: "Add retry", Acceptance: "retries are bounded", Priority: domain.PriorityDefault},
+			{Key: "docs", Title: "Document retries", Acceptance: "the README says so", Priority: domain.PriorityDefault},
+			{Key: "retire", Title: "Retire the old client", Acceptance: "no caller is left", Priority: domain.PriorityDefault},
+		},
+	}
+}
+
+// statusEvents is the recorded run: a three-bead plan, one bead delivered
+// and merged behind a PR, one still under review by a live tester, one the
+// run has not started, plus a warning and a line of agent output.
 func statusEvents(repo, dir string) []events.Event {
 	po := domain.Agent{ID: "po-plan-1", Role: domain.RolePO, Cartridge: "claude", Model: "fable",
 		State: domain.AgentStateRunning, StartedAt: statusEpoch.Add(time.Second), PID: 4241}
@@ -81,12 +99,10 @@ func statusEvents(repo, dir string) []events.Event {
 		events.RunStarted{Meta: statusAt(0), Info: statusDomainRun(repo, dir)},
 		events.AgentSpawned{Meta: statusAt(1), Agent: po, Task: events.TaskPlan},
 		events.AgentOutput{Meta: statusAt(2), Agent: po.ID, Stream: events.StreamStdout, Line: "reading the repository"},
-		events.PlanProduced{Meta: statusAt(9), Agent: po.ID, Epic: "sc-0",
-			Created: map[string]domain.BeadID{"retry": "sc-1", "docs": "sc-2"}},
+		events.PlanProduced{Meta: statusAt(9), Agent: po.ID, Epic: "sc-0", Plan: statusPlan(),
+			Created: map[string]domain.BeadID{"retry": "sc-1", "docs": "sc-2", "retire": "sc-3"}},
 		events.AgentFinished{Meta: statusAt(10), Agent: po.ID, Role: domain.RolePO,
 			Duration: 9 * time.Second, Produced: domain.MessagePlan},
-		events.BeadCreated{Meta: statusAt(11), Bead: domain.Bead{ID: "sc-1", Title: "Add retry", State: domain.BeadStateOpen, Priority: domain.PriorityDefault}},
-		events.BeadCreated{Meta: statusAt(12), Bead: domain.Bead{ID: "sc-2", Title: "Document retries", State: domain.BeadStateOpen, Priority: domain.PriorityDefault}},
 		events.AgentSpawned{Meta: statusAt(20), Agent: eng, Task: events.TaskImplement, BeadTitle: "Add retry", Round: 1},
 		events.BeadStateChanged{Meta: statusAt(21), Bead: "sc-1", From: domain.BeadStateOpen, To: domain.BeadStateInProgress, Round: 1},
 		events.AgentFinished{Meta: statusAt(40), Agent: eng.ID, Role: domain.RoleEngineer, Bead: "sc-1",
@@ -122,6 +138,9 @@ func statusRecord(t *testing.T, repo string, writeState bool, extra ...events.Ev
 	require.NoError(t, log.Close())
 
 	if writeState {
+		// A live run holds the repository's run lock; `sc status` asks it
+		// whether the phase in state.json is still true.
+		statusLock(t, dir, os.Getpid())
 		st := orchestrator.State{
 			Version:       orchestrator.StateFileVersion,
 			Run:           statusDomainRun(repo, dir),
@@ -136,12 +155,36 @@ func statusRecord(t *testing.T, repo string, writeState bool, extra ...events.Ev
 	return dir
 }
 
-// statusNormalise replaces the run state directory with <state> and the
-// temp base with <tmp> so goldens are stable: the state directory embeds a
-// hash of the repository path, which changes on every run.
+// statusLock writes the repository's run lock as if pid were running the
+// recorded run. The lock lives outside the run directory (D-23), which is
+// why it is written through orchestrator.LockPath rather than by hand.
+func statusLock(t *testing.T, runDir string, pid int) {
+	t.Helper()
+	path := orchestrator.LockPath(runDir)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	data, err := json.Marshal(orchestrator.LockHolder{
+		Run: statusRunID, PID: pid, TakenAt: statusEpoch,
+	})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+}
+
+// statusUnlock drops the run lock, as the end of a run does.
+func statusUnlock(t *testing.T, runDir string) {
+	t.Helper()
+	require.NoError(t, os.Remove(orchestrator.LockPath(runDir)))
+}
+
+// statusNormalise replaces the run state directory with <state>, the temp
+// base with <tmp> and this process's id with <pid> so goldens are stable:
+// the state directory embeds a hash of the repository path and the run lock
+// names whichever process the test runs in.
 func statusNormalise(out, base, repo string) string {
 	out = strings.ReplaceAll(out, config.StateDir(repo), "<state>")
-	return strings.ReplaceAll(out, base, "<tmp>")
+	out = strings.ReplaceAll(out, base, "<tmp>")
+	// Only the lock holder's pid, never a fixture agent's: the test process
+	// could in principle be pid 4243 itself.
+	return strings.ReplaceAll(out, "pid "+strconv.Itoa(os.Getpid())+" holds", "pid <pid> holds")
 }
 
 func TestStatusHelpGolden(t *testing.T) {
@@ -168,6 +211,7 @@ func TestStatusFinishedGolden(t *testing.T) {
 		events.RunFinished{Meta: statusAt(73), Reason: events.FinishCompleted,
 			Summary: "2 beads landed; kept 1 worktree", Duration: 73 * time.Second},
 	)
+	statusUnlock(t, dir) // a run that ended released the lock
 	st, err := orchestrator.LoadState(dir)
 	require.NoError(t, err)
 	st.Phase = orchestrator.PhaseFinished
@@ -216,8 +260,10 @@ func TestStatusJSON(t *testing.T) {
 	require.Equal(t, "add retries to the client", rep.State.Run.Brief)
 	require.NotNil(t, rep.Summary)
 	require.Equal(t, map[domain.BeadState]int{
-		domain.BeadStateClosed: 1, domain.BeadStateInReview: 1,
-	}, rep.Summary.Counts)
+		domain.BeadStateClosed: 1, domain.BeadStateInReview: 1, domain.BeadStateOpen: 1,
+	}, rep.Summary.Counts, "the planned bead nothing has claimed is counted too")
+	require.True(t, rep.Running(), "the lock is held by this very process")
+	require.False(t, rep.Crashed())
 	require.Len(t, rep.Summary.Agents, 1)
 	require.Len(t, rep.Recent, orchestrator.DefaultRecentEvents)
 	require.Empty(t, rep.Notes)
@@ -230,12 +276,12 @@ func TestStatusEventsFlag(t *testing.T) {
 
 	out, err := rootRun(t, "--repo", repo, "status", "--events", "0")
 	require.NoError(t, err)
-	require.Contains(t, out, "events     0 of 20")
+	require.Contains(t, out, "events     0 of 18")
 	require.NotContains(t, out, "run started")
 
 	out, err = rootRun(t, "--repo", repo, "status", "--events", "2")
 	require.NoError(t, err)
-	require.Contains(t, out, "events     2 of 20")
+	require.Contains(t, out, "events     2 of 18")
 }
 
 func TestStatusSelectsTheLatestRunAndNamedRuns(t *testing.T) {
@@ -255,7 +301,9 @@ func TestStatusSelectsTheLatestRunAndNamedRuns(t *testing.T) {
 	require.True(t, rep.Found)
 	require.Nil(t, rep.State)
 	require.Nil(t, rep.Summary)
-	require.Len(t, rep.Notes, 2, "one note for the missing state file, one for the missing run log")
+	require.Len(t, rep.Notes, 3,
+		"the run lock (held by the newer run), the missing state file and the missing run log")
+	require.Contains(t, rep.Notes[0], "the run lock is held by run "+statusRunID)
 
 	_, err = RunStatus(repo, "20991231-235959-ffff", 0)
 	require.Error(t, err)
@@ -275,6 +323,152 @@ func TestStatusRejectsTwoArguments(t *testing.T) {
 	_, repo := statusEnv(t)
 	_, err := rootRun(t, "--repo", repo, "status", "sc-1", "sc-2")
 	require.Error(t, err)
+}
+
+// TestStatusCrashedRunGolden is the report a user gets after the cannon was
+// killed: state.json still says `running` and the run log still ends on a
+// live tester, but nothing holds the run lock any more, so neither is true.
+func TestStatusCrashedRunGolden(t *testing.T) {
+	base, repo := statusEnv(t)
+	dir := statusRecord(t, repo, true)
+	statusUnlock(t, dir) // SIGKILL leaves the state file behind, not the lock
+
+	out, err := rootRun(t, "--repo", repo, "status", "--events", "3")
+	require.NoError(t, err)
+	require.Contains(t, out, "phase      running (no live process: the run was killed or crashed)")
+	require.Contains(t, out, "agents     1 last seen of 10 ammo")
+	rootGolden(t, "status-crashed", statusNormalise(out, base, repo))
+}
+
+// TestStatusReportsWhoIsRunningIt covers the three answers the run lock can
+// give: this run, another run, and nobody.
+func TestStatusReportsWhoIsRunningIt(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := statusRecord(t, repo, true)
+
+	rep, err := RunStatus(repo, "", 0)
+	require.NoError(t, err)
+	require.True(t, rep.Running())
+	require.False(t, rep.Crashed())
+	require.Equal(t, os.Getpid(), rep.Liveness.Holder.PID)
+	require.Empty(t, rep.Notes)
+
+	// A later run of the same repository took the lock: this one is over.
+	path := orchestrator.LockPath(dir)
+	data, err := json.Marshal(orchestrator.LockHolder{Run: "20260904-000000-ffff", PID: os.Getpid(), TakenAt: statusEpoch})
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, data, 0o600))
+	rep, err = RunStatus(repo, statusRunID, 0)
+	require.NoError(t, err)
+	require.False(t, rep.Running())
+	require.True(t, rep.Crashed())
+	require.Contains(t, rep.Notes, "the run lock is held by run 20260904-000000-ffff (pid "+strconv.Itoa(os.Getpid())+")")
+
+	// The lock is this run's, but the process that took it is gone: what a
+	// SIGKILL leaves behind.
+	dead := exec.Command("/bin/sh", "-c", "exit 0")
+	require.NoError(t, dead.Run())
+	statusLock(t, dir, dead.Process.Pid)
+	out, err := rootRun(t, "--repo", repo, "status", "--events", "0")
+	require.NoError(t, err)
+	require.Contains(t, out, fmt.Sprintf("process    none; pid %d took the run lock and is gone", dead.Process.Pid))
+	require.Contains(t, out, "phase      running (no live process: the run was killed or crashed)")
+
+	// Nobody at all.
+	require.NoError(t, os.Remove(path))
+	rep, err = RunStatus(repo, statusRunID, 0)
+	require.NoError(t, err)
+	require.True(t, rep.Crashed())
+	require.False(t, rep.Liveness.Held)
+	out, err = rootRun(t, "--repo", repo, "status", "--events", "0")
+	require.NoError(t, err)
+	require.Contains(t, out, "process    none; nothing holds the run lock")
+}
+
+// TestStatusAgentsFallBackToTheStateFile: a run directory whose log is gone
+// still knows which agents were live, because state.json records them.
+func TestStatusAgentsComeFromTheStateFileWithoutARunLog(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := statusRecord(t, repo, true)
+	require.NoError(t, os.Remove(orchestrator.EventLogPath(dir)))
+	st, err := orchestrator.LoadState(dir)
+	require.NoError(t, err)
+	st.Agents = []domain.Agent{{ID: "tester-qa-sc-2-r1", Role: domain.RoleTester, Lens: domain.LensQA,
+		Bead: "sc-2", State: domain.AgentStateRunning, PID: 4243}}
+	require.NoError(t, orchestrator.WriteState(dir, st))
+
+	out, err := rootRun(t, "--repo", repo, "status")
+	require.NoError(t, err)
+	require.Contains(t, out, "agents     1 live of 10 ammo")
+	require.Contains(t, out, "tester-qa-sc-2-r1  tester/qa  sc-2  running  pid 4243")
+	require.Contains(t, out, "note: no events.jsonl")
+}
+
+// TestStatusSurvivesARecordWithoutABeadID is the regression for the crash
+// `sc status` used to take on a run log line that parses as an event but
+// names no bead: the reviewer's exact line, through the real command.
+func TestStatusSurvivesARecordWithoutABeadID(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := statusRecord(t, repo, true)
+	f, err := os.OpenFile(orchestrator.EventLogPath(dir), os.O_APPEND|os.O_WRONLY, 0o600)
+	require.NoError(t, err)
+	_, err = f.WriteString(`{"kind":"bead_state_changed","run_id":"20260903-120000-abcd","at":"2026-09-03T12:00:00Z","to":"in_review"}` + "\n")
+	require.NoError(t, err)
+	require.NoError(t, f.Close())
+
+	out, err := rootRun(t, "--repo", repo, "status")
+	require.NoError(t, err)
+	require.Contains(t, out, "beads      3", "the damaged record costs nothing but itself")
+	require.Contains(t, out, "note: 1 record in the run log names no bead and was skipped (bead_state_changed)")
+}
+
+// TestStatusScrubsUntrustedEventText: a run log quotes what a cartridge and
+// bd printed, and `sc status` writes it to a terminal. No escape, carriage
+// return or other control character may reach it (P7-18 fixes the renderer
+// itself; this is the guarantee at the printing end).
+func TestStatusScrubsUntrustedEventText(t *testing.T) {
+	_, repo := statusEnv(t)
+	statusRecord(t, repo, true,
+		events.Warning{Meta: statusAt(62), Source: "cartridge",
+			Message: "\x1b[1;41m spoofed \x1b[0m\rERASED\x07\x1b]0;title\x07 and\ttabbed"},
+		events.Error{Meta: statusAt(63), Source: "bd", Message: "\x1b[2J", Err: "\x9b31m"},
+	)
+
+	out, err := rootRun(t, "--repo", repo, "status")
+	require.NoError(t, err)
+	require.NotContains(t, out, "\x1b")
+	require.NotContains(t, out, "\x07")
+	require.NotContains(t, out, "\x9b")
+	require.NotContains(t, out, "\r")
+	require.Contains(t, out, " spoofed ERASED and tabbed", "the text itself survives")
+	for _, line := range strings.Split(out, "\n") {
+		require.False(t, strings.ContainsFunc(line, func(r rune) bool {
+			return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
+		}), "control character in %q", line)
+	}
+}
+
+// TestStatusScrub covers the scrubber directly, including the sequences a
+// line of cartridge output is most likely to carry.
+func TestStatusScrub(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"plain", "nothing to scrub", "nothing to scrub"},
+		{"csi", "\x1b[1;41mred\x1b[0m", "red"},
+		{"osc bel", "\x1b]0;window title\x07kept", "kept"},
+		{"osc st", "\x1b]8;;https://example.test\x1b\\kept", "kept"},
+		{"lone escape", "a\x1bZb", "ab"},
+		{"trailing escape", "a\x1b", "a"},
+		{"unterminated csi", "a\x1b[1;2", "a"},
+		{"carriage return", "first\rsecond", "firstsecond"},
+		{"tab", "a\tb", "a b"},
+		{"c1", "a\u009bb", "ab"},
+		{"del", "a\u007fb", "ab"},
+		{"unicode kept", "héllo → ✔", "héllo → ✔"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, statusScrub(tc.in))
+		})
+	}
 }
 
 // statusFakeBeads is a statusBeadReader that answers from a fixture.

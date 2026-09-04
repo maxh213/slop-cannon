@@ -21,6 +21,15 @@ package orchestrator
 // `bd create --graph` (D-22) and, when the validator rejects the plan a
 // second time, drops it rather than letting a stubborn product owner spin
 // (P6-19).
+//
+// Two smaller policies live here too. An autopilot product owner may make
+// its own earlier proposals less urgent (Q-04): a plan has no field for an
+// existing bead, so it restates the open bead with a larger priority number
+// and [Planner.splitDemotions] turns that into a priority update instead of
+// the duplicate [agents.ValidatePlan] would refuse. And the product owner
+// is the one agent with no throw-away worktree — it reads the user's own
+// repository — so [Planner.planShim] installs its read-only bd shim
+// (D-21) and no firing is ever made without it.
 
 import (
 	"context"
@@ -245,10 +254,20 @@ type PlannerOptions struct {
 	Repo prompt.RepoContext
 	// Scan tunes that scan (tree depth, README bytes).
 	Scan prompt.ScanOptions
-	// Rules and Vibes are the constraint and style documents. Nil means
-	// "load them from the effective configuration", once, on first use.
+	// Rules and Vibes are the constraint and style documents. Each is
+	// independent: a nil field means "load that one from the effective
+	// configuration", once, on first use, and a non-nil field (an empty
+	// slice included) means "the caller supplied it; never go to disk".
+	// Supplying one therefore never loses the other.
 	Rules []prompt.Doc
 	Vibes []prompt.Doc
+	// Prioritiser is how the planner carries out the deprioritisation an
+	// autopilot product owner asks for (Q-04): see [PlanPrioritiser] and
+	// [Planner.notes] for the convention the prompt describes. Nil means
+	// the planner never reprioritises anything and never offers to, so a
+	// plan that repeats an open bead stays the plain duplicate
+	// [agents.ValidatePlan] refuses.
+	Prioritiser PlanPrioritiser
 	// Shim installs the read-only bd shim; nil means [InstallPlanShim].
 	Shim PlanShimInstaller
 	// ShimOptions are passed to it (a pinned real bd, a skipped self-check).
@@ -296,6 +315,9 @@ type PlanningStatus struct {
 	// GaveUp counts the times the planner dropped a round of planning under
 	// the P6-19 policy.
 	GaveUp int
+	// Deprioritised counts the open beads the planner made less urgent at
+	// an autopilot product owner's request (Q-04).
+	Deprioritised int
 	// Running is true while a product owner is planning.
 	Running bool
 	// Finished is true when the planner will not fire again.
@@ -326,33 +348,43 @@ type Planner struct {
 	maxBack  time.Duration
 	settle   time.Duration
 
-	mu          sync.Mutex
-	run         *Run
-	attempts    int
-	plans       int
-	beads       int
-	empty       int
-	rejections  int
-	gaveUp      int
-	running     bool
-	finished    bool
-	resumedPlan bool
-	failed      bool
-	nextAt      time.Time
-	lastErr     error
-	lastStatus  SchedulerStatus
-	lastSettle  time.Time
-	settled     bool
-	settleSum   string
+	mu            sync.Mutex
+	run           *Run
+	attempts      int
+	plans         int
+	beads         int
+	empty         int
+	rejections    int
+	gaveUp        int
+	deprioritised int
+	running       bool
+	finished      bool
+	resumedPlan   bool
+	resumeChecked bool
+	failed        bool
+	nextAt        time.Time
+	lastErr       error
+	lastStatus    SchedulerStatus
+	lastSettle    time.Time
+	settled       bool
+	settleSum     string
 
-	docsOnce sync.Once
+	// docsMu and shimMu guard the two "once, on first use" loads. Neither
+	// caches a failure: a full disk, an unreadable rules file or a bd
+	// holding the Dolt flock while [beads.Shim.Verify] probes it must not
+	// make every later planning round fail with the same stale error, or an
+	// autopilot run that can never stop (D-18) would idle for ever without
+	// ever recovering. The lock order is docsMu/shimMu before mu; neither
+	// is ever taken while mu is held.
+	docsMu   sync.Mutex
+	docsDone bool
 	rules    []prompt.Doc
 	vibes    []prompt.Doc
-	docsErr  error
 
-	shimOnce sync.Once
-	shim     beads.Shim
-	shimErr  error
+	shimMu    sync.Mutex
+	shim      beads.Shim
+	shimReady bool
+	shimFails int
 }
 
 // Compile-time proof that a planner is all three hooks the scheduler needs.
@@ -383,8 +415,6 @@ func NewPlanner(opts PlannerOptions) (*Planner, error) {
 		limit:    opts.RejectionLimit,
 		maxBack:  opts.MaxBackoff,
 		settle:   opts.SettleInterval,
-		rules:    opts.Rules,
-		vibes:    opts.Vibes,
 	}
 	if p.idle <= 0 {
 		p.idle = config.DefaultIdleReplanInterval
@@ -406,10 +436,6 @@ func NewPlanner(opts PlannerOptions) (*Planner, error) {
 	}
 	if p.settle <= 0 {
 		p.settle = DefaultSettleInterval
-	}
-	if opts.Rules != nil || opts.Vibes != nil {
-		// The caller supplied them; never go to disk.
-		p.docsOnce.Do(func() {})
 	}
 	return p, nil
 }
@@ -453,7 +479,8 @@ func (p *Planner) Status() PlanningStatus {
 	st := PlanningStatus{
 		Mode: p.cfg.Run.Mode, Attempts: p.attempts, Plans: p.plans, Beads: p.beads,
 		Empty: p.empty, Rejections: p.rejections, GaveUp: p.gaveUp,
-		Running: p.running, Finished: p.finished, NextAt: p.nextAt,
+		Deprioritised: p.deprioritised,
+		Running:       p.running, Finished: p.finished, NextAt: p.nextAt,
 		ResumedPlan: p.resumedPlan,
 	}
 	if p.lastErr != nil {
@@ -686,6 +713,9 @@ func planCount(n int, word string) string {
 // the plan into beads and records the outcome so [Planner.Demands] knows
 // whether to ask again.
 //
+// A resumed run whose plan reached bd but never reached state.json adopts
+// that plan instead of firing (see [Planner.adoptResumedPlan]).
+//
 // A demand of any other kind is refused with [ErrNotAPlanDemand]; see
 // [PlanRouter] for the one-line split the integrator wires.
 func (p *Planner) Fire(ctx context.Context, f Firing) (FireResult, error) {
@@ -704,6 +734,10 @@ func (p *Planner) Fire(ctx context.Context, f Firing) (FireResult, error) {
 		p.running = false
 		p.mu.Unlock()
 	}()
+
+	if p.adoptResumedPlan(ctx) {
+		return FireResult{Produced: domain.MessagePlan}, nil
+	}
 
 	created, err := p.fire(ctx, f)
 	p.record(f, created, err)
@@ -738,8 +772,13 @@ func (p *Planner) fire(ctx context.Context, f Firing) (map[string]domain.BeadID,
 	if p.opts.Applier == nil {
 		return nil, ErrNoPlanApplier
 	}
+	plan, demotions := p.splitDemotions(plan, req.OpenBeads)
 	res, err := agents.CreatePlanBeads(ctx, p.opts.Applier, req, plan)
 	if errors.Is(err, agents.ErrEmptyPlan) {
+		// The product owner may have asked for nothing but a
+		// reprioritisation, which is a real answer (Q-04) even though it
+		// creates no bead.
+		p.applyDemotions(ctx, demotions)
 		p.publishPlan(f, plan, nil, req.Epic)
 		return nil, err
 	}
@@ -754,8 +793,176 @@ func (p *Planner) fire(ctx context.Context, f Firing) (map[string]domain.BeadID,
 	for _, w := range res.Warnings {
 		p.warn("bd reported a warning while creating the plan: "+w, nil)
 	}
+	p.applyDemotions(ctx, demotions)
 	p.publishPlan(f, plan, res.IDs, res.Epic)
 	return res.IDs, nil
+}
+
+// PlanPrioritiser is the slice of *beads.Client the planning loop carries
+// out a Q-04 deprioritisation with: the client's `Update` signature, so
+// *beads.Client satisfies it and tests use a fake. The planner only ever
+// sets [beads.Patch.Priority] through it — a plan may make its own earlier
+// work less urgent, never delete or close it.
+type PlanPrioritiser interface {
+	// Update applies the patch to one bead.
+	Update(ctx context.Context, id domain.BeadID, patch beads.Patch) (beads.Issue, error)
+}
+
+var _ PlanPrioritiser = (*beads.Client)(nil)
+
+// planDemotion is one open bead an autopilot product owner asked to make
+// less urgent by restating it in its plan (Q-04).
+type planDemotion struct {
+	// Bead is the existing bead, and Title its title in bd.
+	Bead  domain.BeadID
+	Title string
+	// From is the priority the bead has now, To the one the plan asks for;
+	// To is always the less urgent of the two (a larger number on bd's
+	// scale, D-22).
+	From domain.Priority
+	To   domain.Priority
+}
+
+// splitDemotions takes the Q-04 deprioritisations out of a plan and returns
+// the plan that is left. The product owner has no field for "make this
+// existing bead less urgent" — a plan proposes beads — so the convention
+// [Planner.notes] puts in the prompt is that it restates the open bead by
+// its exact title with a larger priority number, and the cannon updates
+// that bead instead of creating a duplicate.
+//
+// Only a strict demotion is taken out. A repeat at the same or a more
+// urgent priority is the accidental duplicate [agents.ValidatePlan] exists
+// to refuse, and is left in the plan to be refused; so is a repeat another
+// proposed bead depends on, which cannot be removed without dangling that
+// dependency. Brief mode never deprioritises anything (Q-04 is autopilot
+// only) and neither does a planner with no [PlannerOptions.Prioritiser].
+func (p *Planner) splitDemotions(plan domain.Plan, open []domain.Bead) (domain.Plan, []planDemotion) {
+	if p.opts.Prioritiser == nil || p.cfg.Run.Mode == domain.RunModeBrief ||
+		len(plan.Beads) == 0 || len(open) == 0 {
+		return plan, nil
+	}
+	dups := make(map[string]agents.PlanDuplicate, len(plan.Beads))
+	for _, d := range agents.DuplicateOpenBeads(plan, open) {
+		dups[d.Key] = d
+	}
+	if len(dups) == 0 {
+		return plan, nil
+	}
+	byID := make(map[domain.BeadID]domain.Bead, len(open))
+	for _, b := range open {
+		byID[b.ID] = b
+	}
+	depended := planDependedOn(plan)
+	kept := make([]domain.PlanBead, 0, len(plan.Beads))
+	var out []planDemotion
+	for _, pb := range plan.Beads {
+		d, isDup := dups[pb.Key]
+		existing, known := byID[d.Bead]
+		switch {
+		case !isDup || !known || depended[pb.Key]:
+			kept = append(kept, pb)
+		case !pb.Priority.Valid() || pb.Priority <= existing.Priority:
+			kept = append(kept, pb) // not a demotion: a plain duplicate
+		default:
+			out = append(out, planDemotion{
+				Bead: existing.ID, Title: existing.Title,
+				From: existing.Priority, To: pb.Priority,
+			})
+		}
+	}
+	if len(out) == 0 {
+		return plan, nil
+	}
+	plan.Beads = kept
+	return plan, out
+}
+
+// planDependedOn indexes the plan keys some other proposed bead depends on.
+func planDependedOn(plan domain.Plan) map[string]bool {
+	out := make(map[string]bool)
+	for _, b := range plan.Beads {
+		for _, d := range b.Deps {
+			out[d] = true
+		}
+	}
+	return out
+}
+
+// applyDemotions lowers the priority of each bead the product owner asked
+// to deprioritise (Q-04). A refusal from bd is a warning, never a failed
+// plan: the beads that were created are real and the run goes on.
+func (p *Planner) applyDemotions(ctx context.Context, ds []planDemotion) {
+	if len(ds) == 0 || p.opts.Prioritiser == nil {
+		return
+	}
+	for _, d := range ds {
+		to := d.To
+		if _, err := p.opts.Prioritiser.Update(ctx, d.Bead, beads.Patch{Priority: &to}); err != nil {
+			p.warn(fmt.Sprintf("could not deprioritise %s (%q) from priority %d to %d",
+				d.Bead, d.Title, int(d.From), int(d.To)), err)
+			continue
+		}
+		p.mu.Lock()
+		p.deprioritised++
+		p.mu.Unlock()
+		p.logger().Info("the product owner deprioritised one of its own open beads",
+			slog.String("bead", d.Bead.String()),
+			slog.Int("from", int(d.From)), slog.Int("to", int(d.To)))
+	}
+}
+
+// adoptResumedPlan closes the window between bd committing a plan and the
+// run recording its epic in state.json: a kill in between leaves bd holding
+// the epic and its beads while state.json still says the run never planned,
+// and [Planner.Attach]'s guard — which reads the recorded epic — then lets a
+// resumed brief run plan its brief all over again.
+//
+// It runs once, on the first planning firing of a resumed run that has no
+// recorded epic, and asks the [BeadSource] whether this run's beads are
+// already in bd. When they are, the epic is recorded, the round counts as
+// the plan it is, and no product owner is fired.
+func (p *Planner) adoptResumedPlan(ctx context.Context) bool {
+	p.mu.Lock()
+	skip := !p.cfg.Resume || p.resumeChecked || p.plans > 0 || p.opts.Beads == nil
+	p.resumeChecked = true
+	p.mu.Unlock()
+	if skip {
+		return false
+	}
+	r := p.host()
+	if r == nil || r.Epic() != "" {
+		return false
+	}
+	list, err := p.opts.Beads(ctx)
+	if err != nil {
+		p.warn("could not check whether this resumed run had already planned", err)
+		return false
+	}
+	var epic domain.BeadID
+	work := 0
+	for _, b := range list {
+		if b.Type == domain.BeadTypeEpic {
+			if epic == "" {
+				epic = b.ID
+			}
+			continue
+		}
+		if !planInfrastructure(b) {
+			work++
+		}
+	}
+	if epic == "" || work == 0 {
+		return false
+	}
+	if err := r.SetEpic(epic); err != nil {
+		p.warn("could not record the run epic "+string(epic)+" found in bd", err)
+	}
+	p.mu.Lock()
+	p.plans, p.resumedPlan, p.nextAt = 1, true, time.Time{}
+	p.mu.Unlock()
+	p.logger().Info("this run had already planned before it was interrupted; adopting the plan bd holds",
+		slog.String("epic", epic.String()), slog.Int("beads", work))
+	return true
 }
 
 // publishPlan announces a plan that was validated and applied (D-22).
@@ -919,6 +1126,13 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 }
 
 // notes are the orchestrator's lines in the planning prompt.
+//
+// The Q-04 line is only offered when the planner can actually carry the
+// deprioritisation out ([PlannerOptions.Prioritiser]) and there is an open
+// bead to deprioritise, and it describes the exact convention
+// [Planner.splitDemotions] implements — a plan has no field for an existing
+// bead, so the product owner restates it. An instruction the orchestrator
+// would drop on the floor is worse than no instruction at all.
 func (p *Planner) notes(open []domain.Bead) []string {
 	if p.cfg.Run.Mode == domain.RunModeBrief {
 		return nil
@@ -926,9 +1140,16 @@ func (p *Planner) notes(open []domain.Bead) []string {
 	p.mu.Lock()
 	first := p.plans == 0
 	p.mu.Unlock()
-	notes := []string{
-		"You may deprioritise open beads you proposed in an earlier plan if better work has appeared; " +
-			"say so in the plan's brief. You may not delete them.",
+	var notes []string
+	if p.opts.Prioritiser != nil && len(open) > 0 {
+		notes = append(notes,
+			"You may deprioritise an open bead you proposed in an earlier plan if better work has "+
+				"appeared: repeat it in this plan with its title unchanged and a larger `priority` "+
+				"number than it has now, and the cannon lowers that bead's priority instead of "+
+				"creating a duplicate. Repeating a bead at the same or a more urgent priority is a "+
+				"duplicate and the whole plan is rejected. You may never delete or close a bead.",
+			"The open beads' current priorities, on the tracker's scale (0 most urgent, 4 least): "+
+				planPriorities(open)+".")
 	}
 	if !first {
 		notes = append(notes,
@@ -939,6 +1160,25 @@ func (p *Planner) notes(open []domain.Bead) []string {
 		notes = append(notes, "Nothing this run planned earlier is still open.")
 	}
 	return notes
+}
+
+// planPrioritiesShown bounds the priority list [Planner.notes] renders, so a
+// run with hundreds of open beads cannot crowd the planning prompt out of
+// its budget.
+const planPrioritiesShown = 30
+
+// planPriorities renders "`sc-1` 2, `sc-2` 0" for the open beads, in the
+// order the listing gave them.
+func planPriorities(open []domain.Bead) string {
+	parts := make([]string, 0, len(open))
+	for _, b := range open {
+		if len(parts) == planPrioritiesShown {
+			parts = append(parts, "…")
+			break
+		}
+		parts = append(parts, fmt.Sprintf("`%s` %d", b.ID, int(b.Priority)))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // repoContext returns the repository context for a planning prompt: the
@@ -959,30 +1199,40 @@ func (p *Planner) repoContext() (prompt.RepoContext, error) {
 	return rc, nil
 }
 
-// docs loads the rules and vibes once. A rules file that cannot be read is
-// an error, not a warning: the rules are the user's hard constraints and a
-// plan made without them is not the plan they asked for.
+// docs loads the rules and vibes once, on the first planning firing. A file
+// that cannot be read is an error, not a warning: the rules are the user's
+// hard constraints and a plan made without them is not the plan they asked
+// for. The failure is not remembered, so a transient one (a file being
+// rewritten, a full disk) costs one planning round rather than every round
+// the run has left.
+//
+// The two documents are independent: whichever [PlannerOptions] supplied is
+// used as given — an empty non-nil slice means "the caller says there are
+// none" — and only the other is loaded from the effective configuration.
 func (p *Planner) docs() ([]prompt.Doc, []prompt.Doc, error) {
-	p.docsOnce.Do(func() {
-		eff := p.cfg.Effective
-		if eff == nil {
-			return
-		}
-		rules, err := prompt.LoadDocs(eff.Rules)
-		if err != nil {
-			p.docsErr = fmt.Errorf("orchestrator: planning: rules: %w", err)
-			return
-		}
-		vibes, err := prompt.LoadDocs(eff.Vibes)
-		if err != nil {
-			p.docsErr = fmt.Errorf("orchestrator: planning: vibes: %w", err)
-			return
-		}
-		p.rules, p.vibes = rules, vibes
-	})
-	if p.docsErr != nil {
-		return nil, nil, p.docsErr
+	p.docsMu.Lock()
+	defer p.docsMu.Unlock()
+	if p.docsDone {
+		return p.rules, p.vibes, nil
 	}
+	rules, vibes := p.opts.Rules, p.opts.Vibes
+	if eff := p.cfg.Effective; eff != nil {
+		if rules == nil {
+			loaded, err := prompt.LoadDocs(eff.Rules)
+			if err != nil {
+				return nil, nil, fmt.Errorf("orchestrator: planning: rules: %w", err)
+			}
+			rules = loaded
+		}
+		if vibes == nil {
+			loaded, err := prompt.LoadDocs(eff.Vibes)
+			if err != nil {
+				return nil, nil, fmt.Errorf("orchestrator: planning: vibes: %w", err)
+			}
+			vibes = loaded
+		}
+	}
+	p.rules, p.vibes, p.docsDone = rules, vibes, true
 	return p.rules, p.vibes, nil
 }
 
@@ -1006,22 +1256,37 @@ func (p *Planner) openBeads(ctx context.Context) ([]domain.Bead, error) {
 	return out, nil
 }
 
-// planShim installs the planning agent's read-only bd shim once, under
-// <run-dir>/bin/po-plan (D-21, D-23).
+// planShim installs the planning agent's read-only bd shim under
+// <run-dir>/bin/po-plan (D-21, D-23) and keeps it for the rest of the run.
+//
+// The install is memoised on success only. A failed install — a full disk,
+// or a [beads.Shim.Verify] probe that lost a race with bd holding the Dolt
+// flock — costs this planning round and is tried again on the next one,
+// with the run of failures counted into the message so a condition that
+// never clears is visible rather than repeating one cached error for ever.
+// A run never fires the product owner without the shim: the D-21 promise
+// the prompt makes has to be true, and this is the one agent that runs in
+// the user's own repository rather than a throw-away worktree.
 func (p *Planner) planShim(ctx context.Context) (beads.Shim, error) {
-	p.shimOnce.Do(func() {
-		r := p.host()
-		if r == nil {
-			p.shimErr = errors.New("orchestrator: planning: no run directory for the read-only bd shim")
-			return
-		}
-		dir := filepath.Join(r.Dirs().Shims, PlanShimDirName)
-		p.shim, p.shimErr = p.opts.Shim(ctx, dir, p.cfg.Run.RepoPath, p.opts.ShimOptions)
-		if p.shimErr != nil {
-			p.shimErr = fmt.Errorf("orchestrator: planning: installing the read-only bd shim: %w", p.shimErr)
-		}
-	})
-	return p.shim, p.shimErr
+	p.shimMu.Lock()
+	defer p.shimMu.Unlock()
+	if p.shimReady {
+		return p.shim, nil
+	}
+	r := p.host()
+	if r == nil {
+		return beads.Shim{}, errors.New("orchestrator: planning: no run directory for the read-only bd shim")
+	}
+	dir := filepath.Join(r.Dirs().Shims, PlanShimDirName)
+	shim, err := p.opts.Shim(ctx, dir, p.cfg.Run.RepoPath, p.opts.ShimOptions)
+	if err != nil {
+		p.shimFails++
+		return beads.Shim{}, fmt.Errorf(
+			"orchestrator: planning: installing the read-only bd shim in %s (%s in a row): %w",
+			dir, planCount(p.shimFails, "failure"), err)
+	}
+	p.shim, p.shimReady, p.shimFails = shim, true, 0
+	return p.shim, nil
 }
 
 // host returns the run, if one has been attached.

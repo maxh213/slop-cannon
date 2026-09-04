@@ -444,7 +444,12 @@ var gfViewGoldens = []string{
 	"agents-wide",
 	"anim-burst", "anim-confetti", "anim-disabled", "anim-over-frame",
 	"anim-queue", "anim-ricochet", "anim-shot", "anim-shot-tab",
-	"anim-smoke", "feedback", "feedback-arbitration", "feedback-changes",
+	"anim-smoke",
+	// The run-control frames (P7-10): a whole frame each, but owned by
+	// TestControlGoldenFrames in controls_wiring_test.go rather than by
+	// gfScenarios, because they need a Controller attached.
+	"controls-ammo", "controls-confirm", "controls-footer", "controls-help",
+	"feedback", "feedback-arbitration", "feedback-changes",
 	"feedback-details", "feedback-empty", "feedback-escalation", "feedback-narrow",
 	"feedback-pushback", "feedback-rereview", "feedback-rules", "feedback-scrolled",
 	"graph-50-200x50", "graph-50-80x24", "graph-chain-200x50", "graph-chain-80x24",

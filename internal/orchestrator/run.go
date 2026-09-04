@@ -997,22 +997,55 @@ func (r *Run) stopAgents(ctx context.Context, agents []domain.Agent) {
 // releaseLeases returns the beads held by the run's live agents to the
 // ready set so a resumed run can claim them (D-06). A killed run skips
 // this: beads.RecoverStale picks the leases up on the next resume.
+//
+// The release is a D-07 transition like any other, so it goes through the
+// [StateMachine] (P6-03): only the agents whose role holds the claim are
+// considered ([HeldBeads]), only the in_progress --released--> open edge is
+// ever taken, and the beads that do go back to open publish an
+// [events.BeadStateChanged] so the run log, `sc status`, state.json and the
+// TUI agree with bd. A bead a tester was still reviewing or the product
+// owner was ruling on keeps its state and its round.
 func (r *Run) releaseLeases(ctx context.Context, agents []domain.Agent) {
 	if r.opts.Leases == nil || r.aborted() {
 		return
 	}
-	seen := map[domain.BeadID]bool{}
-	for _, a := range agents {
-		if a.Bead == "" || seen[a.Bead] {
-			continue
-		}
-		seen[a.Bead] = true
-		if _, err := r.opts.Leases.Release(ctx, a.Bead); err != nil {
-			r.Warn(SourceRun, fmt.Sprintf("could not release the lease on %s", a.Bead), err)
-			continue
-		}
-		r.log.Info("lease released", slog.String("bead", a.Bead.String()), slog.String("agent", a.ID.String()))
+	// Ask bd where the beads are only when there is something to release.
+	held := HeldBeads(agents, nil)
+	if len(held) == 0 {
+		return
 	}
+	if states := r.beadStatesForRelease(ctx); len(states) > 0 {
+		held = HeldBeads(agents, states)
+	}
+	states := NewStateMachine(ReleaseOnlyStore{Releaser: r.opts.Leases},
+		WithStatePublisher(PublisherFunc(r.Publish)),
+		WithStateRun(r.ID()),
+		WithStateClock(r.now))
+	for _, o := range states.ReleaseHeld(ctx, held, "the run stopped") {
+		switch {
+		case o.Err != nil:
+			r.Warn(SourceRun, fmt.Sprintf("could not release the lease on %s", o.Bead), o.Err)
+		case o.Released:
+			r.log.Info("lease released", slog.String("bead", o.Bead.String()), slog.String("agent", o.Agent.String()))
+		default:
+			r.log.Info("lease kept", slog.String("bead", o.Bead.String()),
+				slog.String("agent", o.Agent.String()), slog.String("state", string(o.From)),
+				slog.String("why", o.Kept))
+		}
+	}
+}
+
+// beadStatesForRelease reads the run's beads so the lease release knows
+// where each held bead actually is. No source, or a source that fails,
+// leaves the states unknown and the release falls back to the in_progress
+// the claim itself set.
+func (r *Run) beadStatesForRelease(ctx context.Context) []domain.Bead {
+	list, err := r.listBeads(ctx)
+	if err != nil {
+		r.Warn(SourceRun, "could not read the run's beads before releasing their leases", err)
+		return nil
+	}
+	return list
 }
 
 // cleanupWorktrees is P6-18: at run finish the worktrees of closed beads

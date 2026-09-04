@@ -30,7 +30,12 @@
 //
 // Every status write goes through the [StateMachine] (state.go), the pure
 // D-07 table plus persistence, so a refused move is one warning and no
-// write. The [GatePoller] (gates.go) is a sidecar rather than a loop: it
+// write — the shutdown release of a held bead included, which is why a stop
+// during a review leaves the bead in_review instead of forcing it open. The
+// one exception is the scheduler's claim (P6-13): bd's `update --claim` is
+// atomic and sets in_progress itself, so [Scheduler.announceClaim] publishes
+// that transition rather than performing it. The [GatePoller] (gates.go) is
+// a sidecar rather than a loop: it
 // resolves the gh:pr gates of delivered beads (D-20). The [EventLog]
 // (eventlog.go) is a [Publisher] the run's bus tees into, and [Summarise]
 // folds it back for `sc status`.

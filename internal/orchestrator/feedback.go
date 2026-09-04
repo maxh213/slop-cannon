@@ -44,9 +44,13 @@ import (
 //     product owner instead, whose ruling (approve with notes, narrow the
 //     scope, block) is binding.
 //   - D-08 an item the engineer pushes back on goes to the tester that
-//     raised it in evaluate-pushback mode; a tester that holds its ground
-//     limits.max_pushback_rounds times hands the item to the product owner,
-//     whose ruling either overrules the item or sends it back to the
+//     raised it in evaluate-pushback mode, and an item the engineer says it
+//     fixed goes back to that tester as a re-review of the diff. A round
+//     that mixes the two is two firings, in that order: the evaluation
+//     judges the argument alone, because its mode shows no diff and nothing
+//     may be settled that nobody looked at. A tester that holds its ground
+//     limits.max_pushback_rounds exchanges hands the item to the product
+//     owner, whose ruling either overrules the item or sends it back to the
 //     engineer.
 //   - D-09 only testers that did not approve the previous round review
 //     again, unless the engineer's round moved more than
@@ -70,6 +74,10 @@ import (
 // large conflict resolution owes (D-09); and [Feedback.Observe] keeps the
 // loop's view of a bead honest when somebody else moved it. None of those
 // writes a status: the delivery already did.
+//
+// The loop never leases a bead either: the scheduler claims it before the
+// firing and renews it while the agent runs (P6-13), and [Supervisor.Fire]
+// marks every firing NoLease, so nothing here has to.
 //
 // Nothing in here reads the wall clock or talks to git or bd directly: the
 // clock is [FeedbackOptions.Now], the bead's context comes from
@@ -437,8 +445,11 @@ type fbItem struct {
 	per map[domain.Lens]domain.ItemStatus
 	// response is the engineer's latest answer to the consolidated item.
 	response domain.Response
-	// holds counts how many times a tester rejected a pushback (D-08).
+	// holds counts how many pushback exchanges a tester rejected (D-08).
 	holds int
+	// heldAt is the round the last hold was counted in, so two testers
+	// holding one consolidated issue (P6-21) spend one exchange, not two.
+	heldAt int
 	// hold is the reason the tester gave the last time it held.
 	hold string
 	// ruling is the product owner's binding arbitration, once there is one.
@@ -497,6 +508,19 @@ func (i *fbItem) awaitingEvaluation() bool {
 	default:
 		return false
 	}
+}
+
+// evaluatedBy reports whether this lens still owes the issue a pushback
+// evaluation: the engineer argued the point and the lens has neither
+// settled it nor already held its ground on it (D-08). It is the one place
+// the loop decides that, so the phase [Feedback.plan] chooses and the items
+// [Feedback.planTester] sends cannot drift apart.
+func (i *fbItem) evaluatedBy(l domain.Lens) bool {
+	if !i.awaitingEvaluation() {
+		return false
+	}
+	s := i.per[l]
+	return s == "" || (!s.Settled() && s != domain.ItemHeld)
 }
 
 // awaitingArbitration reports whether the product owner owes a ruling: the
@@ -569,16 +593,28 @@ type fbThread struct {
 	fullReview bool
 	ratio      gitx.ChangeRatio
 
-	conflict   agents.EngineerConflict
-	history    []prompt.Round
-	rulings    []domain.Arbitration
-	responses  []domain.Response
+	conflict  agents.EngineerConflict
+	history   []prompt.Round
+	rulings   []domain.Arbitration
+	responses []domain.Response
+	// escalation is the product owner's ruling in the round now open. It is
+	// filed into the history when the round closes and cleared with it, so a
+	// narrowed bead's later rounds do not each repeat the ruling that
+	// narrowed it.
 	escalation *domain.Escalation
+	// lastEscalation is the newest ruling whatever round it landed in, for
+	// the thread snapshot.
+	lastEscalation *domain.Escalation
+	// acceptance is the acceptance criteria a narrow_scope ruling replaced
+	// the bead's with (D-08). bd still shows the original ones until P6-24
+	// writes them back, so the thread's copy wins in every prompt.
+	acceptance string
 	notes      []string
 	engineer   domain.AgentID
-	// quiet suppresses bd writes and events while a thread is rebuilt from
-	// the bead's comments ([Feedback.Restore]).
-	quiet bool
+	// restoring means the thread is being rebuilt from the bead's comments
+	// ([Feedback.Restore]): the replay publishes nothing, and the one
+	// transition it concludes is written only when bd is not already there.
+	restoring bool
 }
 
 // Feedback is the D-08/D-09 feedback loop engine (P6-04). It is safe for
@@ -712,6 +748,11 @@ func (f *Feedback) Track(bs ...domain.Bead) {
 			continue
 		}
 		t.bead = b
+		if t.acceptance != "" {
+			// A narrow_scope ruling replaced the criteria (D-08); the
+			// refresh from bd must not put the old ones back.
+			t.bead.Acceptance = t.acceptance
+		}
 		if b.State.Terminal() && t.state != b.State {
 			t.state, t.phase = b.State, FeedbackSettled
 		}
@@ -800,7 +841,7 @@ func (f *Feedback) snapshot(t *fbThread) FeedbackThread {
 		Phase:      t.phase,
 		Round:      t.round,
 		Reviewers:  append([]domain.Lens(nil), t.reviewers...),
-		Escalation: t.escalation,
+		Escalation: t.lastEscalation,
 		FullReview: t.fullReview,
 	}
 	for _, l := range f.lenses {
@@ -959,20 +1000,53 @@ func (f *Feedback) itemsFor(t *fbThread, l domain.Lens) []domain.FeedbackItem {
 		if i.settled() {
 			continue
 		}
-		own, ok := i.con.ForLens(l)
-		if !ok {
+		if _, ok := i.con.ForLens(l); !ok {
 			continue
 		}
 		if s := i.per[l]; s != "" && s.Settled() {
 			continue
 		}
-		own.Status = i.per[l]
-		if own.Status == "" || own.Status == domain.ItemOverruled {
-			own.Status = domain.ItemOpen
-		}
-		out = append(out, own)
+		out = append(out, fbOwnItem(i, l))
 	}
 	return out
+}
+
+// disputedFor returns the items of one lens the engineer pushed back on and
+// the answers it gave them, and nothing else: it is what an
+// evaluate-pushback firing judges (D-08). An item the engineer fixed is not
+// in dispute, so it is left for the re-review that reads the diff.
+func (f *Feedback) disputedFor(t *fbThread, l domain.Lens) ([]domain.FeedbackItem, []domain.Response) {
+	var (
+		items []domain.FeedbackItem
+		out   []domain.Response
+	)
+	for _, i := range t.items {
+		if !i.evaluatedBy(l) {
+			continue
+		}
+		if _, ok := i.con.ForLens(l); !ok {
+			continue
+		}
+		r, ok := i.con.ResponseFor(l, i.response)
+		if !ok {
+			continue
+		}
+		items = append(items, fbOwnItem(i, l))
+		out = append(out, r)
+	}
+	return items, out
+}
+
+// fbOwnItem is one lens's own wording of a consolidated issue, with the
+// status that lens must see it carried back with (P6-21,
+// agents.ValidateTesterVerdict refuses a rewritten one).
+func fbOwnItem(i *fbItem, l domain.Lens) domain.FeedbackItem {
+	own := i.con.Raised[l]
+	own.Status = i.per[l]
+	if own.Status == "" || own.Status == domain.ItemOverruled {
+		own.Status = domain.ItemOpen
+	}
+	return own
 }
 
 // responsesFor rewrites the engineer's answers for one lens (P6-21).
@@ -1058,6 +1132,12 @@ func (f *Feedback) mergeBead(t *fbThread, b domain.Bead) domain.Bead {
 	}
 	if b.Title == "" {
 		b.Title = t.bead.Title
+	}
+	if t.acceptance != "" {
+		// D-08: the product owner narrowed the criteria this bead is judged
+		// against. The context func reads them from bd, which still holds
+		// the originals (P6-24), so the ruling wins here.
+		b.Acceptance = t.acceptance
 	}
 	b.State = t.state
 	b.Round = t.round
@@ -1188,6 +1268,18 @@ func (f *Feedback) planTester(ctx context.Context, t *fbThread, w FeedbackWork, 
 	if diff == nil {
 		diff = bc.Diff
 	}
+	items, responses := f.itemsFor(t, w.Lens), f.responsesFor(t, w.Lens)
+	if w.Tester == agents.TesterModeEvaluatePushback {
+		// D-08 fires two different things at a tester: an item the engineer
+		// argued about goes to it in evaluate-pushback mode, and an item the
+		// engineer says it fixed goes back for a re-review of the diff. This
+		// firing is the first of those, so it carries the disputed items
+		// alone: sweeping a fixed item in would let the tester settle it
+		// without anyone having looked at the code (the mode renders no
+		// diff). The fixed ones come back as the re-review this round plans
+		// next.
+		items, responses = f.disputedFor(t, w.Lens)
+	}
 	req := agents.TesterRequest{
 		Mode:       w.Tester,
 		Lens:       w.Lens,
@@ -1203,8 +1295,8 @@ func (f *Feedback) planTester(ctx context.Context, t *fbThread, w FeedbackWork, 
 		History:    append([]prompt.Round(nil), t.history...),
 		Report:     t.report,
 		Diff:       diff,
-		Items:      f.itemsFor(t, w.Lens),
-		Responses:  f.responsesFor(t, w.Lens),
+		Items:      items,
+		Responses:  responses,
 		Notes:      append(append([]string(nil), t.notes...), bc.Notes...),
 		Budget:     bc.Budget,
 		Model:      bc.Model,
@@ -1226,7 +1318,6 @@ func (f *Feedback) planTester(ctx context.Context, t *fbThread, w FeedbackWork, 
 		Round:     w.Round,
 		BeadTitle: bc.Bead.Bead.Title,
 		Worktree:  bc.Bead.Worktree,
-		NoLease:   true,
 		Build: func(_ context.Context, fc FiringContext) (agents.AgentRun, error) {
 			r := req
 			r.Env = mergeEnv(bc.Env, fc.Env)
@@ -1279,7 +1370,6 @@ func (f *Feedback) planArbitration(ctx context.Context, t *fbThread, w FeedbackW
 		Round:     w.Round,
 		BeadTitle: bc.Bead.Bead.Title,
 		Worktree:  bc.Bead.Worktree,
-		NoLease:   true,
 		Build: func(_ context.Context, fc FiringContext) (agents.AgentRun, error) {
 			spec, err := fbPORunSpec(req.PromptRequest, events.TaskArbitrate, bc, fc)
 			if err != nil {
@@ -1326,7 +1416,6 @@ func (f *Feedback) planEscalation(ctx context.Context, t *fbThread, w FeedbackWo
 		Round:     w.Round,
 		BeadTitle: bc.Bead.Bead.Title,
 		Worktree:  bc.Bead.Worktree,
-		NoLease:   true,
 		Build: func(_ context.Context, fc FiringContext) (agents.AgentRun, error) {
 			spec, err := fbPORunSpec(req.PromptRequest, events.TaskEscalate, bc, fc)
 			if err != nil {
@@ -1545,15 +1634,22 @@ func (f *Feedback) applyVerdict(t *fbThread, lens domain.Lens, mode agents.Teste
 }
 
 // countHolds bumps the pushback counter of every item this lens held, once
-// per evaluation (D-08).
+// per round rather than once per lens. D-08 budgets pushback *exchanges*
+// (max_pushback_rounds per item), and one exchange is one engineer answer
+// judged by everybody that raised the issue: a consolidated item (P6-21) two
+// testers both hold has still had one exchange, and spending two of the
+// budget on it would arbitrate a round early.
 func (f *Feedback) countHolds(t *fbThread, lens domain.Lens, v domain.Verdict) {
 	for _, it := range v.Items {
 		if it.Status != domain.ItemHeld {
 			continue
 		}
-		if i := f.itemByOrigin(t, lens, it.ID); i != nil {
-			i.holds++
+		i := f.itemByOrigin(t, lens, it.ID)
+		if i == nil || i.heldAt == t.round {
+			continue
 		}
+		i.heldAt = t.round
+		i.holds++
 	}
 }
 
@@ -1663,7 +1759,7 @@ func (f *Feedback) escalated(ctx context.Context, t *fbThread, agent domain.Agen
 	}
 	f.mu.Lock()
 	esc := e
-	t.escalation = &esc
+	t.escalation, t.lastEscalation = &esc, &esc
 	round := t.round
 	f.mu.Unlock()
 
@@ -1702,10 +1798,13 @@ func (f *Feedback) escalated(ctx context.Context, t *fbThread, agent domain.Agen
 		t.lookedAt = map[domain.Lens]string{}
 		t.verdicts = map[domain.Lens]domain.Verdict{}
 		t.round = 1
-		t.escalation = &esc
 		t.notes = append(t.notes,
 			"the product owner narrowed this bead's acceptance criteria to: "+fbOneLine(e.NewAcceptance))
-		t.bead.Acceptance = fbFirstNonEmpty(e.NewAcceptance, t.bead.Acceptance)
+		// The ruling's criteria are what every later prompt judges the bead
+		// against, so they replace the bead's own until bd carries them
+		// (P6-24); the ruling itself stays in the round that made it.
+		t.acceptance = fbFirstNonEmpty(e.NewAcceptance, t.acceptance)
+		t.bead.Acceptance = fbFirstNonEmpty(t.acceptance, t.bead.Acceptance)
 		f.mu.Unlock()
 		return f.plan(ctx, t)
 
@@ -1742,7 +1841,7 @@ func (f *Feedback) plan(ctx context.Context, t *fbThread) error {
 		switch {
 		case i.awaitingEvaluation():
 			for _, l := range i.con.Lenses {
-				if s := i.per[l]; s == "" || (!s.Settled() && s != domain.ItemHeld) {
+				if i.evaluatedBy(l) {
 					evaluate = fbWith(evaluate, l)
 				}
 			}
@@ -1769,9 +1868,9 @@ func (f *Feedback) plan(ctx context.Context, t *fbThread) error {
 	if len(reviewers) > 0 {
 		t.phase, t.reviewers = FeedbackReviewing, reviewers
 		commit, kind, round, lenses := fbHead(t.diff), t.kind, t.round, append([]domain.Lens(nil), reviewers...)
-		quiet := t.quiet
+		restoring := t.restoring
 		f.mu.Unlock()
-		if !quiet {
+		if !restoring {
 			f.publish(events.RoundStarted{
 				Meta: f.meta(), Bead: t.id, Round: round,
 				RoundKind: kind, Lenses: lenses, Commit: commit,
@@ -1850,6 +1949,12 @@ func (f *Feedback) closeRound(t *fbThread) {
 	t.responses = nil
 	t.rulings = nil
 	t.notes = nil
+	// The report and the escalation belong to the round that just closed:
+	// leaving them set would file the same implementation report against a
+	// round in which the engineer only answered items, and repeat a
+	// narrow_scope ruling in every round after the one that made it.
+	t.report = nil
+	t.escalation = nil
 }
 
 // refreshDiff reads the change set the next review looks at and works out
@@ -1885,13 +1990,21 @@ func (f *Feedback) refreshDiff(ctx context.Context, t *fbThread) {
 }
 
 // move applies a state transition and remembers where the bead now is.
+//
+// A restored thread ([Feedback.Restore]) re-derives transitions the killed
+// run already made, so it writes only the one bd is still behind on — the
+// approval of a bead whose last verdict comment landed but whose status
+// write did not — and drops a transition the D-07 table refuses or one that
+// would stand still, rather than warning about it.
 func (f *Feedback) move(ctx context.Context, t *fbThread, ev BeadEvent, agent domain.AgentID, reason string) error {
 	f.mu.Lock()
 	req := StateRequest{Bead: t.id, From: t.state, Event: ev, Agent: agent, Reason: reason, Round: t.round}
-	quiet := t.quiet
+	restoring := t.restoring
 	f.mu.Unlock()
-	if quiet {
-		return nil
+	if restoring {
+		if to, err := Transition(req.From, req.Event); err != nil || to == req.From {
+			return nil
+		}
 	}
 	if f.opts.States == nil {
 		to, err := Transition(req.From, req.Event)
@@ -2003,8 +2116,18 @@ func (f *Feedback) ReviewAgain(_ context.Context, bead domain.Bead, round int, r
 
 // Restore rebuilds a bead's thread from the structured comments the loop
 // wrote in an earlier run (D-06, D-25), so a resumed run picks the feedback
-// up where it stopped instead of starting the bead again. It writes nothing
-// to bd and publishes nothing: the bead is already where its status says.
+// up where it stopped instead of starting the bead again. It publishes none
+// of the replay and writes no comments: the thread is being re-read, not
+// re-run.
+//
+// It does write the one status the killed run owed. A run killed between
+// the last verdict comment and the status write leaves a bead bd still
+// holds in in_review although every tester approved it; replaying that
+// thread concludes the approval, and dropping it would strand the bead in
+// review for ever while [Feedback.Outstanding] reported the run finished.
+// Only a transition the D-07 table allows and that actually moves the bead
+// is written, so a replay that merely re-derives where the bead already is
+// stays silent (see [Feedback.move]).
 func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.Message) error {
 	f.Track(bead)
 	f.mu.Lock()
@@ -2013,7 +2136,7 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 		f.mu.Unlock()
 		return fmt.Errorf("%w: %s", ErrNoFeedbackThread, bead.ID)
 	}
-	t.quiet = true
+	t.restoring = true
 	for _, m := range msgs {
 		if m.Err != nil {
 			continue
@@ -2050,14 +2173,18 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 			}
 		case domain.Escalation:
 			esc := payload
-			t.escalation = &esc
+			t.escalation, t.lastEscalation = &esc, &esc
+			if esc.Outcome == domain.EscalationNarrowScope {
+				t.acceptance = fbFirstNonEmpty(esc.NewAcceptance, t.acceptance)
+				t.bead.Acceptance = fbFirstNonEmpty(t.acceptance, t.bead.Acceptance)
+			}
 		}
 	}
 	f.mu.Unlock()
 
 	err := f.plan(ctx, t)
 	f.mu.Lock()
-	t.quiet = false
+	t.restoring = false
 	f.mu.Unlock()
 	return err
 }

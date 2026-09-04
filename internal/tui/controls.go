@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -16,9 +17,9 @@ import (
 )
 
 // Controller is the slice of the orchestrator the run-control keys (P7-10)
-// drive: pause and resume the run, stop it, re-fire a bead that failed or is
-// blocked, close one by hand, and change the safety flag and the ammo for
-// the work that has not been fired yet.
+// drive: pause and resume the run, stop it, re-fire a bead the run gave up
+// on, close one by hand, and change the safety flag and the ammo for the
+// work that has not been fired yet.
 //
 // It is deliberately narrow and deliberately declared here: the TUI never
 // touches [State] — the folded event stream is what the orchestrator says
@@ -42,7 +43,8 @@ type Controller interface {
 	Resume(ctx context.Context, reason string) error
 	// Stop asks the run to shut down gracefully.
 	Stop(ctx context.Context, reason string) error
-	// Refire puts a failed or blocked bead back in the ready queue.
+	// Refire puts a bead the run gave up on back in the ready queue; see
+	// [ControlRefirable] for which states those are.
 	Refire(ctx context.Context, bead domain.BeadID, reason string) error
 	// MarkDone closes a bead by hand, without delivering it.
 	MarkDone(ctx context.Context, bead domain.BeadID, reason string) error
@@ -66,6 +68,11 @@ const ControlTimeout = 5 * time.Second
 // minimum (one PO, one engineer, one tester); the ceiling is a two-digit
 // number because ammo counts concurrent subprocesses on one machine, and a
 // typo of three digits is far more likely than an intention.
+//
+// The ceiling is a default, not a limit on the run: a caller raises it with
+// [ControlsOptions.MaxAmmo] (or [Options.ControlMaxAmmo]), and a run whose
+// own cap is higher — the configuration enforces only a minimum — is always
+// allowed to have that number back.
 const (
 	ControlMinAmmo = config.MinAmmo
 	ControlMaxAmmo = 99
@@ -84,7 +91,7 @@ const (
 	ControlResume ControlAction = "resume"
 	// ControlStop stops the run (`s`, confirmed).
 	ControlStop ControlAction = "stop"
-	// ControlRefire fires a failed or blocked bead again (`r`).
+	// ControlRefire fires a bead the run gave up on again (`r`).
 	ControlRefire ControlAction = "refire"
 	// ControlMarkDone closes a bead by hand (`x`, confirmed).
 	ControlMarkDone ControlAction = "mark-done"
@@ -309,13 +316,80 @@ func TargetFor(st *State, id domain.BeadID) ControlTarget {
 	return t
 }
 
+// controlRefirableStates are the states a bead can be put back in the queue
+// from, in the order the refusal message lists them. They are the three the
+// run itself parks abandoned work in — `failed` when a firing ran out of
+// attempts, `needs_human` when a delivery or a `gh:pr` gate handed the bead
+// to a person (D-20), and `escalated` when the review-round cap was reached
+// (D-08) — plus bd's own `blocked`, which `sc` never writes (D-07) but a
+// bead edited outside the run can still carry through [beads.SafeState].
+//
+// The P7-10 task text says "failed/blocked", which predates D-07's state
+// vocabulary: `blocked` is kept for that foreign-status case, and the two
+// states a run really does hand to a human were added, because refusing
+// those is refusing the only situations `r` exists for.
+var controlRefirableStates = []domain.BeadState{
+	domain.BeadStateFailed,
+	domain.BeadStateNeedsHuman,
+	domain.BeadStateEscalated,
+	domain.BeadStateBlocked,
+}
+
+// ControlRefirableStates returns the bead states the `r` key accepts.
+func ControlRefirableStates() []domain.BeadState {
+	return slices.Clone(controlRefirableStates)
+}
+
+// controlTarget resolves the bead the bead-scoped control keys (`r`, `x`)
+// act on from the view that is up, which is what [ControlTarget] promises
+// and what docs/tui.md's run-control table says: the Graph view has the bead
+// under its cursor, the Agents view has the bead its selected agent works
+// on, and the Feedback and PRs views have the bead of their selected row.
+//
+// The Log view has no bead under its cursor, so it yields nothing and the
+// keys refuse with "select a bead first". That is deliberate: falling back
+// to another tab's cursor would raise a confirmation about a bead that is
+// not on the screen.
+func (m Model) controlTarget() ControlTarget {
+	switch m.tab {
+	case TabGraph:
+		return TargetFor(m.state, m.graph.SelectedID())
+	case TabAgents:
+		if a, ok := m.state.Agent(m.agents.SelectedID()); ok {
+			return TargetFor(m.state, a.Bead)
+		}
+	case TabFeedback:
+		if th, ok := m.feedback.Selected(m.state); ok {
+			return TargetFor(m.state, th.Bead)
+		}
+	case TabPRs:
+		if row, ok := m.prs.Selected(m.state); ok {
+			return TargetFor(m.state, row.Bead)
+		}
+	}
+	return ControlTarget{}
+}
+
 // ControlRefirable reports whether a bead in state s can be fired again.
-// Only work the cannon gave up on qualifies: a `failed` bead ran out of
-// attempts and a `blocked` one is waiting on something a human cleared.
-// Anything else is either in flight or finished, and re-firing it would
+// Only work the run gave up on qualifies (see [controlRefirableStates]);
+// anything else is either in flight or finished, and re-firing it would
 // duplicate an agent or undo a delivery.
 func ControlRefirable(s domain.BeadState) bool {
-	return s == domain.BeadStateFailed || s == domain.BeadStateBlocked
+	return slices.Contains(controlRefirableStates, s)
+}
+
+// controlRefirableList names the re-firable states for the refusal message,
+// so the message can never promise a state the predicate refuses.
+func controlRefirableList() string {
+	names := make([]string, 0, len(controlRefirableStates))
+	for _, s := range controlRefirableStates {
+		names = append(names, string(s))
+	}
+	last := len(names) - 1
+	if last <= 0 {
+		return strings.Join(names, "")
+	}
+	return strings.Join(names[:last], ", ") + " or " + names[last]
 }
 
 // ControlsKeyMap are the run-control bindings (P7-10). They are global —
@@ -327,7 +401,7 @@ type ControlsKeyMap struct {
 	PauseResume key.Binding
 	// Stop asks the run to shut down, after a confirmation.
 	Stop key.Binding
-	// Refire fires a failed or blocked bead again.
+	// Refire fires a bead the run gave up on again.
 	Refire key.Binding
 	// MarkDone closes the selected bead by hand, after a confirmation.
 	MarkDone key.Binding
@@ -470,6 +544,28 @@ type ControlsModel struct {
 	flash    string
 	flashErr bool
 	inflight int
+
+	// safetySet and ammoSet are the last values the orchestrator accepted
+	// for `S` and `a`; safetyBase and ammoBase are what the run's own
+	// configuration said when they were asked for.
+	//
+	// They exist because nothing reports a configuration change back: the
+	// events have no kind for one, so [State.Run] keeps the snapshot
+	// [events.RunStarted] carried for the life of the run (P7-20 is the
+	// orchestrator half of these keys). Without the override `S` would ask
+	// for the same flip for ever — safety could be turned off but never back
+	// on — and `a` could never restore a value it had already set, because
+	// the prompt would re-offer the stale cap and then refuse it as
+	// unchanged.
+	//
+	// The run still wins the moment it says anything: the override applies
+	// only while the run's own value is the one it was taken against, so an
+	// event that finally moves the snapshot drops it.
+	safetyKnown bool
+	safetySet   bool
+	safetyBase  bool
+	ammoSet     int
+	ammoBase    int
 }
 
 // NewControlsModel builds the control layer. The zero [ControlsOptions] is
@@ -534,6 +630,46 @@ func (v ControlsModel) AmmoBounds() (min, max int) { return v.minAmmo, v.maxAmmo
 // reports a failure. It is empty when there is nothing to say.
 func (v ControlsModel) Flash() (string, bool) { return v.flash, v.flashErr }
 
+// ClearFlash drops that line. A program calls it where it clears its own
+// footer flash — on the next key press — so a control's answer cannot
+// outlive the key after it and shadow everything a view has to say for the
+// rest of the run.
+func (v ControlsModel) ClearFlash() ControlsModel {
+	v.flash, v.flashErr = "", false
+	return v
+}
+
+// Safety returns the safety flag the next `S` press would flip: the value
+// the run published, or the last one the orchestrator accepted from this
+// layer while the run's own value has not moved since.
+func (v ControlsModel) Safety(st *State) bool {
+	base := controlsSafety(st)
+	if v.safetyKnown && base == v.safetyBase {
+		return v.safetySet
+	}
+	return base
+}
+
+// Ammo returns the cap the `a` prompt starts from and measures a new value
+// against: the run's own, or the last one the orchestrator accepted while
+// the run's own has not moved since.
+func (v ControlsModel) Ammo(st *State) int {
+	base := controlsAmmo(st)
+	if v.ammoSet > 0 && base == v.ammoBase {
+		return v.ammoSet
+	}
+	return base
+}
+
+// maxAmmoFor is the largest ammo the prompt accepts for this run: the
+// configured ceiling, the run's own cap, or the last cap the orchestrator
+// accepted — whichever is largest. The configuration enforces only a
+// minimum, so a run fired with more ammo than the ceiling must still be able
+// to get its own number back, including after it has been lowered.
+func (v ControlsModel) maxAmmoFor(st *State) int {
+	return max(v.maxAmmo, controlsAmmo(st), v.Ammo(st))
+}
+
 // InFlight returns how many controller calls have been made and not yet
 // answered. It is what a caller can show as a spinner, and what a test uses
 // to know a command is still outstanding.
@@ -579,10 +715,21 @@ func (v ControlsModel) Update(msg tea.Msg, st *State, keys KeyMap, target Contro
 }
 
 // Apply folds a controller's answer back in: the call is no longer in
-// flight, and the footer says how it went.
+// flight, the footer says how it went, and a configuration change the
+// orchestrator accepted is remembered, because no event will report it back
+// (see [ControlsModel]'s safetySet and ammoSet).
 func (v ControlsModel) Apply(msg ControlResultMsg) ControlsModel {
 	v.inflight = max(v.inflight-1, 0)
 	v.flash, v.flashErr = msg.Flash()
+	if msg.Err != nil {
+		return v
+	}
+	switch msg.Request.Action {
+	case ControlSafety:
+		v.safetyKnown, v.safetySet = true, msg.Request.Safety
+	case ControlAmmo:
+		v.ammoSet = msg.Request.Ammo
+	}
 	return v
 }
 
@@ -607,7 +754,7 @@ func (v ControlsModel) stop(st *State) (ControlsModel, tea.Cmd, bool) {
 }
 
 // refire asks for the selected bead to be fired again, refusing anything
-// that is not failed or blocked.
+// that is not one of the states [ControlRefirable] takes.
 func (v ControlsModel) refire(st *State, t ControlTarget) (ControlsModel, tea.Cmd, bool) {
 	if reason, ok := v.refuse(st); !ok {
 		return v.deny(reason), nil, true
@@ -616,7 +763,7 @@ func (v ControlsModel) refire(st *State, t ControlTarget) (ControlsModel, tea.Cm
 		return v.deny("select a bead first"), nil, true
 	}
 	if !ControlRefirable(t.State) {
-		return v.deny(fmt.Sprintf("%s is %s — only a failed or blocked bead can be re-fired", t.Bead, orDash(string(t.State)))), nil, true
+		return v.deny(fmt.Sprintf("%s is %s — only a %s bead can be re-fired", t.Bead, orDash(string(t.State)), controlRefirableList())), nil, true
 	}
 	return v.request(controlBeadRequest(ControlRefire, t))
 }
@@ -640,7 +787,9 @@ func (v ControlsModel) safety(st *State) (ControlsModel, tea.Cmd, bool) {
 	if reason, ok := v.refuse(st); !ok {
 		return v.deny(reason), nil, true
 	}
-	return v.request(ControlRequest{Action: ControlSafety, Safety: !st.Run.Config.Safety})
+	want := !v.Safety(st)
+	v.safetyBase = controlsSafety(st)
+	return v.request(ControlRequest{Action: ControlSafety, Safety: want})
 }
 
 // openAmmo opens the ammo prompt, pre-filled with the run's current ammo so
@@ -650,8 +799,9 @@ func (v ControlsModel) openAmmo(st *State) (ControlsModel, tea.Cmd, bool) {
 		return v.deny(reason), nil, true
 	}
 	v.prompting, v.buf = true, ""
-	total := controlsAmmo(st)
-	if total >= v.minAmmo && total <= v.maxAmmo {
+	total, ceiling := v.Ammo(st), v.maxAmmoFor(st)
+	v.ammoBase = controlsAmmo(st)
+	if total >= v.minAmmo && total <= ceiling {
 		v.buf = strconv.Itoa(total)
 	}
 	v.flash, v.flashErr = "", false
@@ -710,12 +860,13 @@ func (v ControlsModel) answer(km tea.KeyMsg, keys KeyMap) (ControlsModel, tea.Cm
 func (v ControlsModel) typeAmmo(km tea.KeyMsg, st *State) (ControlsModel, tea.Cmd, bool) {
 	switch {
 	case key.Matches(km, v.keys.Apply):
+		ceiling := v.maxAmmoFor(st)
 		ammo, err := strconv.Atoi(v.buf)
-		if v.buf == "" || err != nil || ammo < v.minAmmo || ammo > v.maxAmmo {
-			v.flash, v.flashErr = fmt.Sprintf("ammo must be a number between %d and %d", v.minAmmo, v.maxAmmo), true
+		if v.buf == "" || err != nil || ammo < v.minAmmo || ammo > ceiling {
+			v.flash, v.flashErr = fmt.Sprintf("ammo must be a number between %d and %d", v.minAmmo, ceiling), true
 			return v, nil, true
 		}
-		if controlsAmmo(st) == ammo {
+		if v.Ammo(st) == ammo {
 			v.prompting, v.buf = false, ""
 			v.flash, v.flashErr = fmt.Sprintf("ammo is already %d", ammo), false
 			return v, nil, true
@@ -731,7 +882,7 @@ func (v ControlsModel) typeAmmo(km tea.KeyMsg, st *State) (ControlsModel, tea.Cm
 		}
 		v.flash, v.flashErr = "", false
 	case km.Type == tea.KeyRunes:
-		v.buf, v.flash, v.flashErr = controlAppendDigits(v.buf, km.Runes, v.maxAmmo), "", false
+		v.buf, v.flash, v.flashErr = controlAppendDigits(v.buf, km.Runes, v.maxAmmoFor(st)), "", false
 	}
 	return v, nil, true
 }
@@ -837,12 +988,12 @@ func controlsBeadLine(req ControlRequest) string {
 // ammoBox renders the ammo prompt: the field, the bounds and the keys.
 func (v ControlsModel) ammoBox(st *State, w int) string {
 	inner := max(w-controlsBoxInset, 1)
-	total := controlsAmmo(st)
+	total := v.Ammo(st)
 	field := v.styles.Value.Render(v.buf) + v.styles.Cursor.Render("▏")
 	lines := []string{
 		v.styles.Title.Render(clip("Ammo for future ticks", inner)),
 		clip(v.styles.Muted.Render("› ")+field, inner),
-		v.styles.Text.Render(clip(fmt.Sprintf("%d–%d concurrent agents; the run's cap today is %d.", v.minAmmo, v.maxAmmo, total), inner)),
+		v.styles.Text.Render(clip(fmt.Sprintf("%d–%d concurrent agents; the run's cap today is %d.", v.minAmmo, v.maxAmmoFor(st), total), inner)),
 		"",
 		clip(v.styles.Value.Render("enter")+" apply   "+v.styles.Value.Render("esc")+" cancel", inner),
 	}
@@ -861,12 +1012,23 @@ func controlsRunID(st *State) string {
 }
 
 // controlsAmmo is the run's ammo cap, zero when nothing has been seen yet.
+// It is the run's own number: [ControlsModel.Ammo] is what a key reads,
+// because it also knows about a change the orchestrator has accepted since.
 func controlsAmmo(st *State) int {
 	if st == nil {
 		return 0
 	}
 	_, total := st.Ammo()
 	return total
+}
+
+// controlsSafety is the run's safety flag, false when nothing has been seen
+// yet. [ControlsModel.Safety] is what a key reads, for the same reason.
+func controlsSafety(st *State) bool {
+	if st == nil {
+		return false
+	}
+	return st.Run.Config.Safety
 }
 
 // controlsLiveAgents counts the agents a stop would kill.

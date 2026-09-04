@@ -1,19 +1,21 @@
 run        20260903-120000-abcd
-phase      running
+phase      running (no live process: the run was killed or crashed)
+process    none; nothing holds the run lock
 epic       sc-0
 repo       <tmp>/repo
 run dir    <state>/runs/20260903-120000-abcd
 started    2026-09-03 12:00:00Z
 last event 2026-09-03 12:01:01Z
 
-beads      2
+beads      3
+  open       1
   in_review  1
   closed     1
 
-agents     1 live
+agents     1 last seen
   tester-qa-sc-2-r1  tester/qa  sc-2  running  pid 4243
 
-events     3 of 20 (1 output line, 1 warning)
+events     3 of 18 (1 output line, 1 warning)
   12:00:58 ! warning [gates] gh is unavailable; gate polling skipped
   12:01:00 ▶ fired tester/qa(claude/fable) at sc-2 "Document retries" [review, round 1, agent tester-qa-sc-2-r1]
   12:01:01 → bead sc-2 in_progress → in_review (round 1)

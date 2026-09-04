@@ -37,6 +37,11 @@ import (
 // Use [TransitionStatus] when the state came off a listing rather than out of
 // the cannon's own bookkeeping, so a foreign status that happens to map onto a
 // workflow state is still refused.
+//
+// [StateMachine.ReleaseHeld] is the same rule applied to a shutting-down run:
+// the beads its live agents hold go back to the ready set through the table
+// (in_progress --released--> open) or not at all, because the bd update the
+// release performs would just as happily drag an in_review bead out of review.
 
 // Errors reported by the state machine, matched with errors.Is.
 var (
@@ -128,6 +133,15 @@ const (
 	BeadEventBlocked BeadEvent = "blocked"
 	// BeadEventFailed: the bead is abandoned after unrecoverable errors.
 	// Valid from every non-terminal state. → failed.
+	//
+	// TODO(P6-31): nothing in the assembled cannon raises this yet. The
+	// trigger D-07 wants for it is a demand whose firing keeps failing —
+	// the consecutive-failure budget P6-31 owns — so until that lands the
+	// failed state is reachable only when a person sets it in bd by hand.
+	// The edges are here because P6-05's stop condition and
+	// [BeadStateSettled] already treat failed as terminal, so the day the
+	// budget parks a bead the write must go through this table like every
+	// other.
 	BeadEventFailed BeadEvent = "failed"
 )
 
@@ -190,7 +204,9 @@ type transitionKey struct {
 var beadTransitionTable = buildBeadTransitionTable()
 
 // buildBeadTransitionTable spells out the flow, then adds the two side exits
-// (blocked, failed) for every non-terminal state.
+// (blocked, failed) for every non-terminal state. That is 15 flow edges plus
+// two exits for each of the seven non-terminal workflow states: 29 in all, as
+// [TestStateTransitionCountIsTheOneTheRecordClaims] pins.
 func buildBeadTransitionTable() map[transitionKey]domain.BeadState {
 	edges := []BeadTransition{
 		// The happy path.
@@ -533,6 +549,173 @@ func claimsBead(ev BeadEvent) bool {
 	default:
 		return false
 	}
+}
+
+// ----------------------------------------------------- the shutdown release
+
+// RoleHoldsBeadClaim reports whether an agent in this role owns the bd claim
+// on the bead it is working on.
+//
+// Only the engineer does: the scheduler claims a bead for a DemandImplement
+// firing (ClaimNew or ClaimRework) and fires testers and the product owner
+// with ClaimNone, because a review or a ruling reads a bead, it does not take
+// it (D-05, P6-13). The distinction matters at shutdown: a live agent's bead
+// may only be handed back by the agent that holds it, and the D-07 edge that
+// hands it back — in_progress --released--> open — is the engineer's.
+func RoleHoldsBeadClaim(r domain.Role) bool { return r == domain.RoleEngineer }
+
+// HeldBead is a bead one of a run's live agents still holds when the run
+// shuts down, with the state bd has that bead in.
+type HeldBead struct {
+	// Bead is the bead the agent was working on.
+	Bead domain.BeadID
+	// Agent is the agent holding it.
+	Agent domain.AgentID
+	// Role is that agent's role; see [RoleHoldsBeadClaim].
+	Role domain.Role
+	// From is the state bd has the bead in, empty when the caller could not
+	// find out. [StateMachine.ReleaseHeld] then falls back to in_progress,
+	// which is what the claim itself set.
+	From domain.BeadState
+}
+
+// HeldBeads works out which beads a shutting-down run actually holds: one
+// entry per bead, for the live agents whose role holds the claim
+// ([RoleHoldsBeadClaim]), stamped with the state the bead listing has that
+// bead in.
+//
+// It is deliberately narrow. A tester reviewing an in_review bead and a
+// product owner ruling on an escalated one are registered as live agents with
+// the bead set, but they hold no claim, and releasing their bead would take
+// an edge D-07 does not have — driving a reviewed bead with a committed diff
+// back into `bd ready` to be implemented from scratch on the next resume.
+//
+// states may be nil (or miss the bead): the entry then carries no From.
+func HeldBeads(agents []domain.Agent, states []domain.Bead) []HeldBead {
+	if len(agents) == 0 {
+		return nil
+	}
+	known := make(map[domain.BeadID]domain.BeadState, len(states))
+	for _, b := range states {
+		known[b.ID] = b.State
+	}
+	seen := make(map[domain.BeadID]bool, len(agents))
+	var out []HeldBead
+	for _, a := range agents {
+		if a.Bead == "" || seen[a.Bead] || !RoleHoldsBeadClaim(a.Role) {
+			continue
+		}
+		seen[a.Bead] = true
+		out = append(out, HeldBead{Bead: a.Bead, Agent: a.ID, Role: a.Role, From: known[a.Bead]})
+	}
+	return out
+}
+
+// ReleaseOutcome is what [StateMachine.ReleaseHeld] did with one held bead.
+type ReleaseOutcome struct {
+	// HeldBead is the bead the outcome is about, with the state the release
+	// judged it from.
+	HeldBead
+	// Released says the bead went back to the ready set: bd was written and
+	// an events.BeadStateChanged published.
+	Released bool
+	// Kept says, in a few words, why the bead was left where it was; empty
+	// when it was released.
+	Kept string
+	// Err is the bd failure that stopped the release, if any.
+	Err error
+}
+
+// ReleaseHeld hands the beads a shutting-down run holds back to the ready set
+// along the one D-07 edge that exists for it, in_progress --released--> open
+// (P6-01's graceful stop, P3-05's lease).
+//
+// It is the release side of the guarantee the claim side already keeps: every
+// status write goes through the table, and every status write that happens is
+// published. A bead whose state has no released edge — an in_review bead the
+// testers were still judging, an escalated bead the product owner was ruling
+// on, a delivering bead mid-handoff — is kept, with the reason, and nothing is
+// written for it: bd itself would take an update to open with the assignee
+// cleared quite happily, so the table is the only thing standing between a
+// stop and a reviewed bead losing its round.
+//
+// A bead whose From is empty is treated as in_progress, which is what the
+// claim that made this agent live set atomically.
+//
+// The outcomes come back in the order they were given, one per distinct bead,
+// so the caller can log or warn about each; nothing here logs or warns
+// itself. A bd failure is reported in [ReleaseOutcome.Err] and does not stop
+// the other releases.
+func (m *StateMachine) ReleaseHeld(ctx context.Context, held []HeldBead, reason string) []ReleaseOutcome {
+	var out []ReleaseOutcome
+	done := make(map[domain.BeadID]bool, len(held))
+	for _, h := range held {
+		if h.Bead == "" || done[h.Bead] {
+			continue
+		}
+		done[h.Bead] = true
+		if h.From == "" {
+			h.From = domain.BeadStateInProgress
+		}
+		if !CanTransition(h.From, BeadEventReleased) {
+			out = append(out, ReleaseOutcome{HeldBead: h,
+				Kept: fmt.Sprintf("a bead in %q cannot be released (D-07)", string(h.From))})
+			continue
+		}
+		if _, err := m.Apply(ctx, StateRequest{
+			Bead: h.Bead, From: h.From, Event: BeadEventReleased, Reason: reason,
+		}); err != nil {
+			out = append(out, ReleaseOutcome{HeldBead: h, Err: err})
+			continue
+		}
+		out = append(out, ReleaseOutcome{HeldBead: h, Released: true})
+	}
+	return out
+}
+
+// ErrReleaseOnlyStore is returned by [ReleaseOnlyStore] for every write other
+// than a release. Reaching it is a bug: the only event that store is ever
+// asked for is BeadEventReleased.
+var ErrReleaseOnlyStore = errors.New("orchestrator: this state store can only release beads")
+
+// ReleaseOnlyStore adapts a bare lease releaser — all a shutting-down run is
+// given ([Options.Leases]) — to [StateStore], so the shutdown release can go
+// through the state machine rather than writing a status behind its back.
+// *beads.Client satisfies both, so nothing is lost in production.
+type ReleaseOnlyStore struct {
+	// Releaser performs the release; a nil one makes every call an error.
+	Releaser LeaseReleaser
+}
+
+// ReleaseOnlyStore is a StateStore.
+var _ StateStore = ReleaseOnlyStore{}
+
+// Release returns the bead to the ready set.
+func (s ReleaseOnlyStore) Release(ctx context.Context, id domain.BeadID) (beads.Issue, error) {
+	if s.Releaser == nil {
+		return beads.Issue{}, fmt.Errorf("%w: no releaser", ErrReleaseOnlyStore)
+	}
+	return s.Releaser.Release(ctx, id)
+}
+
+// SetStatus is not available on a release-only store.
+func (s ReleaseOnlyStore) SetStatus(_ context.Context, id domain.BeadID, st domain.BeadState) (beads.Issue, error) {
+	return beads.Issue{}, fmt.Errorf("%w: set %s to %q", ErrReleaseOnlyStore, id, string(st))
+}
+
+// ClaimFor is not available on a release-only store.
+func (s ReleaseOnlyStore) ClaimFor(_ context.Context, id domain.BeadID, a domain.AgentID) (beads.Issue, error) {
+	return beads.Issue{}, fmt.Errorf("%w: claim %s for %s", ErrReleaseOnlyStore, id, a)
+}
+
+// Reclaim is not available on a release-only store.
+func (s ReleaseOnlyStore) Reclaim(_ context.Context, id domain.BeadID, a domain.AgentID) (beads.Issue, error) {
+	return beads.Issue{}, fmt.Errorf("%w: reclaim %s for %s", ErrReleaseOnlyStore, id, a)
+}
+
+// Close is not available on a release-only store.
+func (s ReleaseOnlyStore) Close(_ context.Context, id domain.BeadID, _ string) (beads.Issue, error) {
+	return beads.Issue{}, fmt.Errorf("%w: close %s", ErrReleaseOnlyStore, id)
 }
 
 // warn publishes the Warning that a refused transition owes a human.

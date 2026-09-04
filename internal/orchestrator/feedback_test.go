@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,6 +112,9 @@ func (s *fbStore) State() domain.BeadState {
 type fbMessages struct {
 	mu   sync.Mutex
 	sent []beads.Message
+	// fail is the message type the store refuses to record, so a test can
+	// see what the loop does when bd is unavailable.
+	fail domain.MessageType
 }
 
 func (m *fbMessages) PostMessage(_ context.Context, id domain.BeadID, actor string, msg any) (beads.Message, error) {
@@ -118,11 +122,24 @@ func (m *fbMessages) PostMessage(_ context.Context, id domain.BeadID, actor stri
 	if err != nil {
 		return beads.Message{}, err
 	}
+	m.mu.Lock()
+	refuse := m.fail != "" && m.fail == t
+	m.mu.Unlock()
+	if refuse {
+		return beads.Message{}, errors.New("bd is not answering")
+	}
 	rec := beads.Message{Type: t, IssueID: id, Author: actor, Payload: msg}
 	m.mu.Lock()
 	m.sent = append(m.sent, rec)
 	m.mu.Unlock()
 	return rec, nil
+}
+
+// failOn makes the store refuse to record that message type.
+func (m *fbMessages) failOn(t domain.MessageType) {
+	m.mu.Lock()
+	m.fail = t
+	m.mu.Unlock()
 }
 
 func (m *fbMessages) Types() []domain.MessageType {
@@ -154,13 +171,26 @@ type fbRig struct {
 	Messages *fbMessages
 	Worktree string
 	Sub      *events.Subscription
+	// Opts are the options Loop was built with, so a test can build the
+	// second loop a resumed run would build ([Feedback.Restore]).
+	Opts FeedbackOptions
 
-	mu    sync.Mutex
-	diff  *gitx.Diff
-	ratio float64
-	fired []string
-	seen  []events.Event
+	mu       sync.Mutex
+	diff     *gitx.Diff
+	ratio    float64
+	ratioErr error
+	fired    []string
+	seen     []events.Event
 }
+
+// fbRules and fbVibes are the configured prompt documents every firing must
+// carry (P5-01: rules and vibes are pasted verbatim in all three roles).
+var (
+	fbRules = []prompt.Doc{{Name: "rules.md", Path: "/repo/rules.md",
+		Content: "never widen a public API without a bead"}}
+	fbVibes = []prompt.Doc{{Name: "vibes.md", Path: "/repo/vibes.md",
+		Content: "short functions, boring names"}}
+)
 
 // fbSetup builds the rig. tweak may change the loop's options before it is
 // built (the D-08 caps, the D-09 threshold, the lenses).
@@ -219,6 +249,7 @@ func fbSetup(t *testing.T, sc *mock.Scenario, tweak func(*FeedbackOptions)) *fbR
 	if tweak != nil {
 		tweak(&opts)
 	}
+	rig.Opts = opts
 	loop, err := NewFeedback(opts)
 	require.NoError(t, err)
 	rig.Loop = loop
@@ -264,16 +295,29 @@ func (r *fbRig) context(_ context.Context, bead domain.BeadID) (FeedbackBeadCont
 		},
 		Repo:    prompt.RepoContext{Root: r.Worktree, DefaultBranch: "main", CheckCommand: "go test ./..."},
 		Brief:   "make the retry loop terminate",
+		Rules:   fbRules,
+		Vibes:   fbVibes,
 		Diff:    diff,
 		Timeout: time.Minute,
 	}, nil
 }
 
-// changeRatio is the rig's D-09 measurement; the test sets the ratio.
+// changeRatio is the rig's D-09 measurement; the test sets the ratio, or
+// makes the measurement fail.
 func (r *fbRig) changeRatio(_ context.Context, _ domain.BeadID, _, cur *gitx.Diff) (gitx.ChangeRatio, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.ratioErr != nil {
+		return gitx.ChangeRatio{}, r.ratioErr
+	}
 	return gitx.ChangeRatio{Current: cur.Head(), Total: cur.ChangedLines(), Ratio: r.ratio}, nil
+}
+
+// failRatio makes the D-09 measurement unavailable from now on.
+func (r *fbRig) failRatio(err error) {
+	r.mu.Lock()
+	r.ratioErr = err
+	r.mu.Unlock()
 }
 
 // setDiff replaces the change set the next round reviews and how far the
@@ -364,6 +408,33 @@ func (r *fbRig) Prompt(agent string) string {
 	return ""
 }
 
+// Prompts returns every prompt the named agent was fired with, in order: a
+// round that both judges a pushback and re-reviews a fix fires one lens
+// twice, and a narrowed bead reviews its first round again.
+func (r *fbRig) Prompts(agent string) []string {
+	var out []string
+	for _, c := range r.Adapter.Calls() {
+		if c.Spec.Labels.Get(cartridge.LabelAgent) == agent {
+			out = append(out, c.Spec.Prompt)
+		}
+	}
+	if len(out) == 0 {
+		r.T.Fatalf("agent %q was never fired (fired %v)", agent, r.Fired())
+	}
+	return out
+}
+
+// PromptFor returns the prompt of the named agent's firing for one task.
+func (r *fbRig) PromptFor(agent string, task events.Task) string {
+	for _, c := range r.Adapter.Calls() {
+		if c.Spec.Labels.Get(cartridge.LabelAgent) == agent && c.Spec.Labels.Get(cartridge.LabelTask) == task.String() {
+			return c.Spec.Prompt
+		}
+	}
+	r.T.Fatalf("agent %q was never fired for %s (fired %v)", agent, task, r.Fired())
+	return ""
+}
+
 // Events returns the published events of one kind. The bus delivers into a
 // buffered channel, so draining it here (rather than in a goroutine) keeps
 // the assertions deterministic.
@@ -443,6 +514,15 @@ func fbScenario(name string) *mock.Scenario {
 // fbSay scripts one agent's reply.
 func fbSay(sc *mock.Scenario, agent string, payload any) {
 	sc.Rule(agent, mock.Match{Agent: agent}).Say("working on " + agent).Structured(payload)
+}
+
+// fbSayTask scripts one agent's reply to one task, for the round where a
+// tester is fired twice: once to judge a pushback and once to re-review the
+// fix (D-08). The rules are matched in the order they are added, so a
+// task-specific rule must be added before any fbSay for the same agent.
+func fbSayTask(sc *mock.Scenario, agent string, task events.Task, payload any) {
+	sc.Rule(agent+"/"+task.String(), mock.Match{Agent: agent, Task: task.String()}).
+		Say("working on " + agent + " (" + task.String() + ")").Structured(payload)
 }
 
 // --- (a) all three testers approve in round one -----------------------
@@ -573,6 +653,11 @@ func TestFeedbackArbitrationUpholdsEngineer(t *testing.T) {
 	require.NotNil(t, th.Items[0].Ruling)
 	assert.Equal(t, domain.RulingUpholdEngineer, th.Items[0].Ruling.Ruling)
 	assert.Contains(t, rig.Fired(), "po-sc-fb1-r2-qa-r1-1")
+	// The arbitration firing carries the configured rules and vibes too
+	// (P5-01), which is what makes a ruling that lets a rules violation
+	// ship impossible for the product owner to give by accident.
+	assert.Contains(t, rig.Prompt("po-sc-fb1-r2-qa-r1-1"), fbRules[0].Content)
+	assert.Contains(t, rig.Prompt("po-sc-fb1-r2-qa-r1-1"), fbVibes[0].Content)
 	require.Len(t, rig.Events(events.KindArbitrationReceived), 1)
 	assert.Contains(t, rig.Messages.Types(), domain.MessageArbitration)
 }
@@ -1018,6 +1103,39 @@ func TestFeedbackRestoreRebuildsTheThreadFromTheBeadsComments(t *testing.T) {
 	assert.Empty(t, rig.Messages.All(), "a restore writes no comments")
 }
 
+// A run killed between the last verdict comment (post writes it before the
+// status) and the status write leaves bd holding an approved bead in
+// in_review. The resumed run's replay concludes the approval, and it has to
+// write it: nobody else will, the deliverer only ever sees approved beads,
+// and Outstanding would report the run finished with the bead abandoned
+// mid-review.
+func TestFeedbackRestoreWritesTheApprovalTheKilledRunOwed(t *testing.T) {
+	rig := fbSetup(t, fbScenario("restore-approved"), nil)
+	resumed, err := NewFeedback(rig.Opts)
+	require.NoError(t, err)
+
+	msgs := []beads.Message{{Type: domain.MessageImplReport, Payload: fbReport("added the retry")}}
+	for _, l := range domain.Lenses() {
+		msgs = append(msgs, beads.Message{Type: domain.MessageVerdict, Payload: domain.Verdict{
+			Lens: l, Round: 1, Outcome: domain.VerdictApprove, Summary: "fine",
+		}})
+	}
+	require.NoError(t, resumed.Restore(context.Background(), domain.Bead{
+		ID: fbBead, Title: "make the retry loop terminate", State: domain.BeadStateInReview, Round: 1,
+	}, msgs))
+
+	th, ok := resumed.Thread(fbBead)
+	require.True(t, ok)
+	assert.Equal(t, FeedbackSettled, th.Phase)
+	assert.Equal(t, domain.BeadStateApproved, th.State)
+	assert.Zero(t, resumed.Outstanding(), "the bead is finished with the loop, not abandoned in review")
+	assert.Equal(t, []string{"status:approved"}, rig.Store.Moves(),
+		"the one transition the killed run owed, and nothing else")
+	assert.Empty(t, rig.Messages.All(), "a restore writes no comments")
+	assert.Empty(t, rig.Events(events.KindRoundStarted), "a restore replays no rounds")
+	assert.Len(t, rig.Events(events.KindBeadStateChanged), 1, "the resumed run is told where the bead went")
+}
+
 // --- the loop refuses what is not its work ------------------------------
 
 func TestFeedbackPlanFiringRefusesForeignWork(t *testing.T) {
@@ -1040,4 +1158,298 @@ func TestFeedbackPlanFiringRefusesForeignWork(t *testing.T) {
 func TestNewFeedbackNeedsAContextFunc(t *testing.T) {
 	_, err := NewFeedback(FeedbackOptions{})
 	require.ErrorIs(t, err, ErrNoFeedbackContext)
+}
+
+// --- D-08: a round that mixes a pushback and a fix is two firings ------
+
+// A tester that pushed back on one item and was told another was fixed owes
+// two different judgements: an argument to weigh, and a diff to look at.
+// Sweeping the fixed item into the evaluate-pushback firing would let it be
+// settled by a prompt that renders no diff at all, so the loop fires the
+// evaluation first, with the disputed items alone, and then the re-review
+// with the change set.
+func TestFeedbackMixedRoundEvaluatesThePushbackAndReReviewsTheFix(t *testing.T) {
+	spin := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMinor, domain.ItemOpen)
+	leak := fbItemAt("qa-r1-2", "the log line leaks the token", "log.go", domain.SeverityMajor, domain.ItemOpen)
+
+	sc := fbScenario("mixed-round")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("two problems", spin, leak))
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(
+		domain.Response{ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already"},
+		domain.Response{ItemID: "qa-r1-2", Action: domain.ActionFixed, Rationale: "redacted the token"},
+	))
+	accepted := spin
+	accepted.Status = domain.ItemAccepted
+	fbSayTask(sc, "tester-qa-sc-fb1-r2", events.TaskEvaluatePushback, fbSettled("fair enough", accepted))
+	resolved := leak
+	resolved.Status = domain.ItemResolved
+	fbSayTask(sc, "tester-qa-sc-fb1-r2", events.TaskReview, fbSettled("the token is redacted", resolved))
+
+	rig := fbSetup(t, sc, nil)
+	rig.setDiff("head2", 24, 0.1)
+	rig.pump(t, 12)
+
+	// The pushback firing judges the argument and nothing else.
+	pushback := rig.PromptFor("tester-qa-sc-fb1-r2", events.TaskEvaluatePushback)
+	disputed := fbSection(t, pushback, "The items the engineer pushed back on")
+	assert.Contains(t, disputed, "qa-r1-1")
+	assert.NotContains(t, disputed, "qa-r1-2",
+		"an item the engineer fixed is not in dispute and must not be settled without the diff")
+	assert.NotContains(t, pushback, "## The change under review",
+		"evaluate_pushback renders no diff (agents.testerSections)")
+
+	// The fix comes back as a re-review of the change set.
+	review := rig.PromptFor("tester-qa-sc-fb1-r2", events.TaskReview)
+	assert.Contains(t, review, "## The change under review")
+	carried := fbSection(t, review, "The items you raised last round")
+	assert.Contains(t, carried, "qa-r1-2")
+	assert.NotContains(t, carried, "qa-r1-1", "the accepted pushback is settled and is not carried again")
+
+	assert.Equal(t, []string{
+		"eng-sc-fb1-r1", "tester-ux-sc-fb1-r1", "tester-qa-sc-fb1-r1", "tester-test-sc-fb1-r1",
+		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2", "tester-qa-sc-fb1-r2",
+	}, rig.Fired())
+
+	th := rig.Thread()
+	assert.Equal(t, domain.BeadStateApproved, th.State)
+	assert.Equal(t, 2, th.Round)
+	require.Len(t, th.Items, 2)
+	assert.Equal(t, domain.ItemAccepted, th.Items[0].Status)
+	assert.Equal(t, domain.ItemResolved, th.Items[1].Status)
+}
+
+// --- D-08: the pushback budget is spent per exchange, not per tester ----
+
+func TestFeedbackMergedItemSpendsOnePushbackRoundPerExchange(t *testing.T) {
+	ux := fbItemAt("ux-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	qa := fbItemAt("qa-r1-1", "retry loop never terminates on error", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	uxHeld, qaHeld := ux, qa
+	uxHeld.Status, qaHeld.Status = domain.ItemHeld, domain.ItemHeld
+	uxHeld.Detail = "the other entry point is not bounded"
+	qaHeld.Detail = "the error path is not bounded"
+
+	sc := fbScenario("merged-pushback")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbChanges("it spins", ux))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins on error", qa))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	pushback := fbResponses(domain.Response{
+		ItemID: "ux-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
+	})
+	fbSay(sc, "eng-sc-fb1-r2", pushback)
+	fbSay(sc, "tester-ux-sc-fb1-r2", fbChanges("not convinced", uxHeld))
+	fbSay(sc, "tester-qa-sc-fb1-r2", fbChanges("not convinced", qaHeld))
+	fbSay(sc, "eng-sc-fb1-r3", pushback)
+	fbSay(sc, "tester-ux-sc-fb1-r3", fbChanges("still not convinced", uxHeld))
+	fbSay(sc, "tester-qa-sc-fb1-r3", fbChanges("still not convinced", qaHeld))
+	fbSay(sc, "po-sc-fb1-r3-ux-r1-1", domain.Arbitration{
+		ItemID: "ux-r1-1", Ruling: domain.RulingUpholdEngineer, Rationale: "the bound is documented and tested",
+	})
+
+	rig := fbSetup(t, sc, nil) // the default D-08 budget: max_pushback_rounds = 2
+	require.Equal(t, 1, rig.step(t), "the engineer implements")
+	require.Equal(t, 3, rig.step(t), "three lenses review")
+	require.Equal(t, 1, rig.step(t), "the engineer pushes back")
+	require.Equal(t, 2, rig.step(t), "both testers that raised the issue judge the pushback")
+
+	th := rig.Thread()
+	require.Len(t, th.Items, 1, "the two testers raised one consolidated issue (P6-21)")
+	assert.Equal(t, 1, th.Items[0].Holds, "two lenses holding one item is one pushback exchange (D-08)")
+	assert.Equal(t, FeedbackAddressing, th.Phase,
+		"half the budget is left, so the item goes back to the engineer rather than to the product owner")
+
+	require.Equal(t, 1, rig.step(t), "the engineer pushes back a second time")
+	require.Equal(t, 2, rig.step(t), "both testers hold again")
+	th = rig.Thread()
+	assert.Equal(t, 2, th.Items[0].Holds, "the second exchange spends the second round of the budget")
+	assert.Equal(t, FeedbackArbitrating, th.Phase, "the budget is spent, so the product owner rules (D-08)")
+
+	rig.pump(t, 6)
+	th = rig.Thread()
+	assert.Equal(t, domain.BeadStateApproved, th.State)
+	require.NotNil(t, th.Items[0].Ruling)
+	assert.Contains(t, rig.Fired(), "po-sc-fb1-r3-ux-r1-1")
+}
+
+// --- the round history keeps each round's own report and ruling --------
+
+func TestFeedbackRoundHistoryKeepsTheReportAndTheRulingToTheirOwnRound(t *testing.T) {
+	rig := fbSetup(t, fbScenario("round-history"), nil)
+	report := fbReport("the first round's work")
+	esc := domain.Escalation{Outcome: domain.EscalationNarrowScope, NewAcceptance: "the error path only"}
+
+	loop := rig.Loop
+	loop.mu.Lock()
+	th := loop.threads[fbBead]
+	th.round, th.report, th.escalation = 1, &report, &esc
+	loop.closeRound(th)
+	th.round = 2 // a round in which the engineer only answered items
+	loop.closeRound(th)
+	history := append([]prompt.Round(nil), th.history...)
+	loop.mu.Unlock()
+
+	require.Len(t, history, 2)
+	assert.NotNil(t, history[0].Report)
+	assert.NotNil(t, history[0].Escalation)
+	assert.Nil(t, history[1].Report, "a round with no new report must not file the previous round's")
+	assert.Nil(t, history[1].Escalation, "a ruling belongs to the round that made it, not to every round after")
+}
+
+// --- D-08: a narrow_scope ruling's criteria are what the bead is judged by
+
+func TestFeedbackNarrowedAcceptanceReachesEveryLaterPrompt(t *testing.T) {
+	const narrowed = "the loop terminates for the error path only"
+	sc := fbCapScenario("narrow-acceptance", domain.Escalation{
+		Outcome: domain.EscalationNarrowScope, NewAcceptance: narrowed,
+	})
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) { o.Limits.MaxReviewRounds = 2 })
+	rig.setDiff("head2", 22, 0.1)
+	for i := 0; i < 5; i++ {
+		rig.step(t)
+	}
+	require.Equal(t, narrowed, rig.Thread().Escalation.NewAcceptance)
+
+	// The next refresh from bd still carries the criteria the ruling
+	// replaced (P6-24 has not written them back yet); it must not undo the
+	// ruling.
+	rig.Loop.Track(domain.Bead{
+		ID: fbBead, Title: "make the retry loop terminate",
+		Acceptance: "the loop terminates", State: domain.BeadStateInReview,
+	})
+
+	require.Equal(t, 3, rig.step(t), "the narrowed bead is reviewed again by every lens")
+	prompts := rig.Prompts("tester-ux-sc-fb1-r1")
+	require.Len(t, prompts, 2, "the ux lens reviewed the bead before and after the ruling")
+	assert.Contains(t, fbAcceptance(t, prompts[1]), narrowed,
+		"the tester judges the bead against the criteria the product owner narrowed it to")
+
+	require.Equal(t, 1, rig.step(t), "the round the narrowed review opened goes to the engineer")
+	eng := rig.Prompts("eng-sc-fb1-r2")
+	require.Len(t, eng, 2)
+	assert.Contains(t, fbAcceptance(t, eng[1]), narrowed,
+		"the engineer works to the narrowed criteria too")
+}
+
+// fbAcceptance returns the bead's acceptance criteria as one prompt renders
+// them.
+func fbAcceptance(t *testing.T, text string) string {
+	t.Helper()
+	i := strings.Index(text, "Acceptance criteria")
+	require.GreaterOrEqual(t, i, 0, "the prompt states no acceptance criteria")
+	rest := text[i:]
+	if j := strings.Index(rest, "\n## "); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// --- the configured rules and vibes reach every role -------------------
+
+func TestFeedbackSendsTheRulesAndVibesToEveryRole(t *testing.T) {
+	sc := fbCapScenario("rules-and-vibes", domain.Escalation{
+		Outcome: domain.EscalationBlock, Summary: "two rounds could not bound the loop",
+	})
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) { o.Limits.MaxReviewRounds = 2 })
+	rig.setDiff("head2", 22, 0.1)
+	rig.pump(t, 12)
+
+	for _, agent := range []string{
+		"eng-sc-fb1-r1", "eng-sc-fb1-r2",
+		"tester-ux-sc-fb1-r1", "tester-qa-sc-fb1-r1", "tester-test-sc-fb1-r1", "tester-qa-sc-fb1-r2",
+		"po-sc-fb1-r2-escalate",
+	} {
+		p := rig.Prompt(agent)
+		assert.Containsf(t, p, fbRules[0].Content, "%s was fired without the configured rules", agent)
+		assert.Containsf(t, p, fbVibes[0].Content, "%s was fired without the configured vibes", agent)
+	}
+}
+
+// --- what the loop does when bd or git will not answer -----------------
+
+func TestFeedbackWarnsWhenItCannotRecordAMessage(t *testing.T) {
+	sc := fbScenario("message-store-down")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	for _, l := range domain.Lenses() {
+		fbSay(sc, "tester-"+l.String()+"-sc-fb1-r1", fbApprove("fine"))
+	}
+	rig := fbSetup(t, sc, nil)
+	rig.Messages.failOn(domain.MessageVerdict)
+	rig.pump(t, 8)
+
+	w := fbWarning(t, rig, "could not record the message")
+	assert.Equal(t, FeedbackWarningSource, w.Source)
+	assert.Equal(t, fbBead, w.Bead)
+	assert.Contains(t, w.Err, "bd is not answering")
+	assert.Equal(t, domain.BeadStateApproved, rig.Thread().State,
+		"a bead comment that will not write is a warning, not a stopped run")
+}
+
+func TestFeedbackUnmeasurableRoundSendsEveryTesterBack(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	sc := fbScenario("ratio-unmeasurable")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionFixed, Rationale: "bounded the loop",
+	}))
+	resolved := item
+	resolved.Status = domain.ItemResolved
+	fbSay(sc, "tester-qa-sc-fb1-r2", fbSettled("bounded now", resolved))
+	fbSay(sc, "tester-ux-sc-fb1-r2", fbApprove("still reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r2", fbApprove("still covered"))
+
+	rig := fbSetup(t, sc, nil)
+	rig.setDiff("head2", 24, 0.1)
+	rig.failRatio(errors.New("git is not answering"))
+	rig.pump(t, 12)
+
+	w := fbWarning(t, rig, "could not measure how far the round moved")
+	assert.Equal(t, FeedbackWarningSource, w.Source)
+	th := rig.Thread()
+	assert.True(t, th.FullReview, "an unmeasurable round reads as everything changed (D-09)")
+	for _, l := range domain.Lenses() {
+		assert.Contains(t, rig.Fired(), "tester-"+l.String()+"-sc-fb1-r2")
+	}
+	assert.Equal(t, domain.BeadStateApproved, th.State)
+}
+
+// fbWarning is the first feedback-loop warning whose message contains want.
+func fbWarning(t *testing.T, rig *fbRig, want string) events.Warning {
+	t.Helper()
+	for _, ev := range rig.Events(events.KindWarning) {
+		w, ok := ev.(events.Warning)
+		if ok && w.Source == FeedbackWarningSource && strings.Contains(w.Message, want) {
+			return w
+		}
+	}
+	t.Fatalf("the loop published no warning about %q", want)
+	return events.Warning{}
+}
+
+// --- the snapshot of every tracked bead --------------------------------
+
+func TestFeedbackThreadsSnapshotsEveryTrackedBead(t *testing.T) {
+	rig := fbSetup(t, fbScenario("threads"), nil)
+	rig.Loop.Track(
+		domain.Bead{ID: "sc-fb2", Title: "the second bead", State: domain.BeadStateInReview},
+		domain.Bead{ID: "sc-fb3", Title: "already shipped", State: domain.BeadStateClosed},
+	)
+
+	ths := rig.Loop.Threads()
+	require.Len(t, ths, 2, "a bead in a terminal state is not adopted")
+	assert.Equal(t, fbBead, ths[0].Bead, "threads come back in the order the loop adopted them")
+	assert.Equal(t, FeedbackImplementing, ths[0].Phase)
+	assert.Equal(t, domain.BeadID("sc-fb2"), ths[1].Bead)
+	assert.Equal(t, "the second bead", ths[1].Title)
+	assert.Equal(t, FeedbackReviewing, ths[1].Phase)
+
+	one, ok := rig.Loop.Thread("sc-fb2")
+	require.True(t, ok)
+	assert.Equal(t, ths[1], one, "Threads and Thread render the same snapshot")
+	assert.Equal(t, 2, rig.Loop.Outstanding())
 }

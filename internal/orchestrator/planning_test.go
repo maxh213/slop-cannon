@@ -7,7 +7,9 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -778,11 +780,8 @@ func TestPlannerRequestCarriesTheRunTheModeAndTheOpenBeads(t *testing.T) {
 	assert.Equal(t, domain.BeadID("sc-open"), req.OpenBeads[0].ID)
 	assert.NoError(t, req.Validate())
 
-	joined := ""
-	for _, n := range req.Notes {
-		joined += n + "\n"
-	}
-	assert.Contains(t, joined, "deprioritise", "autopilot may deprioritise its own beads (Q-04)")
+	assert.Empty(t, req.Notes,
+		"the first autopilot plan has nothing to say until there is work to reprioritise (Q-04)")
 }
 
 func TestPlannerBriefRequestCarriesTheBriefAndNoNotes(t *testing.T) {
@@ -1041,4 +1040,609 @@ func planningRunConfig(t *testing.T, brief string) *config.RunConfig {
 	})
 	require.NoError(t, err)
 	return rc
+}
+
+// --- D-21: the planning product owner's read-only bd shim -----------------
+
+// planningFakeBD writes a stand-in for the real bd binary, so the shim can
+// be generated and exercised without a bd on this machine.
+func planningFakeBD(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), "fakebin")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	path := filepath.Join(dir, "bd")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\necho \"real bd: $*\"\n"), 0o700)) //nolint:gosec // test fixture
+	return path
+}
+
+// planningFailingShim is a [PlanShimInstaller] that fails until a test lets
+// it succeed, so the retry policy can be observed.
+type planningFailingShim struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+	real  string
+}
+
+func (s *planningFailingShim) install(_ context.Context, dir, _ string, _ beads.ShimOptions) (beads.Shim, error) {
+	s.mu.Lock()
+	s.calls++
+	err := s.err
+	real := s.real
+	s.mu.Unlock()
+	if err != nil {
+		return beads.Shim{}, err
+	}
+	return beads.WriteShim(dir, beads.ShimOptions{Real: real})
+}
+
+func (s *planningFailingShim) heal() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = nil
+}
+
+func (s *planningFailingShim) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+func TestPlannerFiresTheProductOwnerBehindTheReadOnlyBDShim(t *testing.T) {
+	fake := planningFakeBD(t)
+	f := planningSetup(t, "ship the thing", func(o *PlannerOptions) {
+		o.NoShim = false
+		o.ShimOptions = beads.ShimOptions{Real: fake, SkipVerify: true}
+	})
+	f.Runner.setPlan(planningPlan("alpha"))
+	f.Beads.set(planningBead("sc-alpha", domain.BeadStateOpen))
+	f.start()
+
+	planningEventually(t, "the first plan", func() bool {
+		f.Clock.Advance(time.Second)
+		return f.Runner.count() >= 1
+	})
+	req, ok := f.Runner.last()
+	require.True(t, ok)
+
+	// The planning agent is the one agent with no throw-away worktree: it
+	// runs in the user's own repository (PlanAgentRun sets the workdir to
+	// it), so the shim is the only thing between the product owner and the
+	// user's beads database.
+	assert.Equal(t, f.Repo, req.Dir(), "the planning product owner reads the repository itself")
+
+	shimDir := filepath.Join(f.Run.Dirs().Shims, PlanShimDirName)
+	path := req.Env["PATH"]
+	require.NotEmpty(t, path, "the firing carries a PATH")
+	assert.Equal(t, shimDir, strings.SplitN(path, string(os.PathListSeparator), 2)[0],
+		"the product owner's PATH starts with the shim directory")
+	assert.False(t, strings.HasPrefix(shimDir, f.Repo+string(os.PathSeparator)),
+		"the shim lives beside the run, never inside the repository (D-23)")
+
+	shimPath := filepath.Join(shimDir, "bd")
+	// A read reaches the real binary, always with --readonly in front...
+	out, err := exec.Command(shimPath, "ready").CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Contains(t, string(out), "real bd: --readonly ready")
+
+	// ...and every write is refused before bd ever runs (P3-09, D-21).
+	for _, args := range [][]string{
+		{"create", "sneaky bead"},
+		{"update", "sc-alpha", "-s", "closed"},
+		{"--readonly=false", "create", "sneakier bead"},
+	} {
+		out, err = exec.Command(shimPath, args...).CombinedOutput() //nolint:gosec // fixed test arguments
+		require.Error(t, err, "a write through the shim must fail: %s", out)
+		assert.NotContains(t, string(out), "real bd:", "bd never saw `%s`", strings.Join(args, " "))
+		assert.Contains(t, string(out), "is not allowed in read-only mode")
+	}
+}
+
+func TestInstallPlanShimWritesTheShimAndVerifiesIt(t *testing.T) {
+	fake := planningFakeBD(t)
+	dir := filepath.Join(t.TempDir(), "po-plan")
+	repo := t.TempDir()
+
+	shim, err := InstallPlanShim(context.Background(), dir, repo, beads.ShimOptions{Real: fake, SkipVerify: true})
+	require.NoError(t, err)
+	assert.Equal(t, dir, shim.Dir)
+	assert.Equal(t, filepath.Join(dir, "bd"), shim.Path)
+	assert.True(t, beads.IsShim(shim.Path), "the file it wrote is a slop-cannon shim")
+
+	// The self-check runs when it is not skipped, and a bd that answers
+	// nothing useful fails it rather than being handed to an agent.
+	_, err = InstallPlanShim(context.Background(), filepath.Join(t.TempDir(), "po-plan"), repo,
+		beads.ShimOptions{Real: fake})
+	require.Error(t, err, "a bd whose `version --json` prints no version cannot be verified")
+	assert.Contains(t, err.Error(), "shim")
+}
+
+func TestPlannerRetriesAShimInstallThatFailed(t *testing.T) {
+	installer := &planningFailingShim{err: errors.New("no space left on device"), real: planningFakeBD(t)}
+	f := planningSetup(t, "", func(o *PlannerOptions) {
+		o.NoShim = false
+		o.Shim = installer.install
+	})
+	f.Runner.setPlan(domain.Plan{Brief: "nothing for now"})
+	f.start()
+
+	planningEventually(t, "two failed shim installs", func() bool {
+		f.Clock.Advance(config.DefaultIdleReplanInterval)
+		return installer.count() >= 2
+	})
+	assert.Zero(t, f.Runner.count(), "no product owner is fired without the shim it was promised")
+	st := f.Planner.Status()
+	assert.Contains(t, st.LastError, "no space left on device")
+	assert.Contains(t, st.LastError, "in a row", "a repeated failure says how many times it has happened")
+	assert.False(t, st.Finished, "autopilot never stops on its own (D-18)")
+
+	// The condition clears, and the very next round installs the shim and
+	// fires: a failure is never cached for the life of the run.
+	installer.heal()
+	planningEventually(t, "the planner to recover", func() bool {
+		f.Clock.Advance(config.DefaultIdleReplanInterval)
+		return f.Runner.count() >= 1
+	})
+	req, ok := f.Runner.last()
+	require.True(t, ok)
+	assert.Contains(t, req.Env["PATH"], PlanShimDirName)
+}
+
+// --- P6-05: the rules and vibes documents ---------------------------------
+
+// planningDoc writes a rules or vibes file and returns its path.
+func planningDoc(t *testing.T, name, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+	return path
+}
+
+func TestPlannerLoadsTheDocumentTheCallerDidNotSupply(t *testing.T) {
+	rulesPath := planningDoc(t, "rules.md", "- Never delete a test.\n")
+	vibesPath := planningDoc(t, "vibes.md", "- Short functions.\n")
+	supplied := []prompt.Doc{{Name: "given.md", Content: "- Supplied by the caller.\n"}}
+
+	tests := []struct {
+		name               string
+		rules, vibes       []prompt.Doc
+		wantRule, wantVibe string
+	}{
+		{name: "neither supplied", wantRule: "rules.md", wantVibe: "vibes.md"},
+		{name: "rules supplied", rules: supplied, wantRule: "given.md", wantVibe: "vibes.md"},
+		{name: "vibes supplied", vibes: supplied, wantRule: "rules.md", wantVibe: "given.md"},
+		{name: "both supplied", rules: supplied, vibes: supplied, wantRule: "given.md", wantVibe: "given.md"},
+		{name: "empty means none", rules: []prompt.Doc{}, vibes: []prompt.Doc{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rc := planningRunConfig(t, "")
+			rc.Effective.Rules = []string{rulesPath}
+			rc.Effective.Vibes = []string{vibesPath}
+			p, err := NewPlanner(PlannerOptions{
+				Config: rc, Runner: &planningRunner{}, Applier: &planningApplier{},
+				Rules: tc.rules, Vibes: tc.vibes, NoShim: true,
+			})
+			require.NoError(t, err)
+			rules, vibes, err := p.docs()
+			require.NoError(t, err)
+			if tc.wantRule == "" {
+				assert.Empty(t, rules, "a non-nil empty slice means the caller says there are none")
+				assert.Empty(t, vibes)
+				return
+			}
+			require.Len(t, rules, 1)
+			require.Len(t, vibes, 1)
+			assert.Equal(t, tc.wantRule, rules[0].Name)
+			assert.Equal(t, tc.wantVibe, vibes[0].Name,
+				"supplying one document must never lose the other")
+		})
+	}
+}
+
+func TestPlannerRetriesAnUnreadableRulesFile(t *testing.T) {
+	rc := planningRunConfig(t, "")
+	path := filepath.Join(t.TempDir(), "rules.md")
+	rc.Effective.Rules = []string{path}
+	p, err := NewPlanner(PlannerOptions{
+		Config: rc, Runner: &planningRunner{}, Applier: &planningApplier{}, NoShim: true,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	_, _, err = p.docs()
+	require.Error(t, err, "the rules are hard constraints: a plan made without them is not the plan the user asked for")
+	assert.Contains(t, err.Error(), "rules")
+
+	// The failure is not cached: the file appears and the next round works.
+	require.NoError(t, os.WriteFile(path, []byte("- Never delete a test.\n"), 0o600))
+	rules, _, err := p.docs()
+	require.NoError(t, err)
+	require.Len(t, rules, 1)
+	assert.Equal(t, "rules.md", rules[0].Name)
+}
+
+// --- Q-04: the product owner deprioritises its own open beads -------------
+
+// planningPriorityCall is one bd priority update the planner made.
+type planningPriorityCall struct {
+	Bead     domain.BeadID
+	Priority domain.Priority
+}
+
+// planningPrioritiser is a fake [PlanPrioritiser].
+type planningPrioritiser struct {
+	mu    sync.Mutex
+	calls []planningPriorityCall
+	err   error
+}
+
+func (p *planningPrioritiser) Update(_ context.Context, id domain.BeadID, patch beads.Patch) (beads.Issue, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err != nil {
+		return beads.Issue{}, p.err
+	}
+	if patch.Priority == nil {
+		return beads.Issue{}, fmt.Errorf("the planner must only ever set a priority, got %+v", patch)
+	}
+	p.calls = append(p.calls, planningPriorityCall{Bead: id, Priority: *patch.Priority})
+	return beads.Issue{ID: id}, nil
+}
+
+func (p *planningPrioritiser) applied() []planningPriorityCall {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]planningPriorityCall(nil), p.calls...)
+}
+
+// planningDeprioritiseFixture is a planner whose product owner returns plan
+// over an open bead the run proposed earlier ("Do alpha", priority 1).
+func planningDeprioritiseFixture(t *testing.T, brief string, plan domain.Plan, withPrioritiser bool) (*Planner, *planningApplier, *planningPrioritiser) {
+	t.Helper()
+	rc := planningRunConfig(t, brief)
+	store := &planningBeadStore{}
+	store.set(domain.Bead{
+		ID: "sc-old", Title: "Do alpha", Type: domain.BeadTypeTask,
+		State: domain.BeadStateOpen, Priority: domain.Priority(1),
+	})
+	applier := &planningApplier{}
+	pr := &planningPrioritiser{}
+	opts := PlannerOptions{
+		Config: rc, Runner: &planningRunner{plan: plan}, Applier: applier, Beads: store.source(),
+		NoShim: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if withPrioritiser {
+		opts.Prioritiser = pr
+	}
+	p, err := NewPlanner(opts)
+	require.NoError(t, err)
+	return p, applier, pr
+}
+
+// planningRestate returns a plan that repeats the open bead "Do alpha" at
+// priority want, alongside the genuinely new beads named by extra.
+func planningRestate(want domain.Priority, extra ...string) domain.Plan {
+	plan := planningPlan(append([]string{"alpha"}, extra...)...)
+	plan.Beads[0].Priority = want
+	return plan
+}
+
+func TestPlannerDeprioritisesAnOpenBeadTheProductOwnerRestates(t *testing.T) {
+	p, applier, pr := planningDeprioritiseFixture(t, "", planningRestate(domain.PriorityLowest, "beta"), true)
+	_, err := p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.NoError(t, err)
+
+	// The restated bead was not created a second time...
+	require.Equal(t, 1, applier.count())
+	applier.mu.Lock()
+	created := applier.calls[0].Plan.Beads
+	applier.mu.Unlock()
+	require.Len(t, created, 1, "only the genuinely new bead is created")
+	assert.Equal(t, "beta", created[0].Key)
+
+	// ...its priority was lowered instead (Q-04).
+	assert.Equal(t, []planningPriorityCall{{Bead: "sc-old", Priority: domain.PriorityLowest}}, pr.applied())
+	assert.Equal(t, 1, p.Status().Deprioritised)
+	assert.Equal(t, 1, p.Status().Beads, "the deprioritised bead is not a new bead")
+}
+
+func TestPlannerAppliesADeprioritisationEvenWhenThePlanProposesNothingElse(t *testing.T) {
+	p, applier, pr := planningDeprioritiseFixture(t, "", planningRestate(domain.Priority(3)), true)
+	_, err := p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.NoError(t, err, "an empty autopilot plan is an answer, not a failed agent (D-18)")
+	assert.Zero(t, applier.count(), "nothing is created")
+	assert.Equal(t, []planningPriorityCall{{Bead: "sc-old", Priority: domain.Priority(3)}}, pr.applied())
+	assert.Equal(t, 1, p.Status().Deprioritised)
+	assert.Equal(t, 1, p.Status().Empty)
+}
+
+func TestPlannerRefusesARestatementThatIsNotADeprioritisation(t *testing.T) {
+	tests := []struct {
+		name            string
+		plan            domain.Plan
+		brief           string
+		withPrioritiser bool
+	}{
+		{name: "same priority is a plain duplicate", plan: planningRestate(domain.Priority(1)), withPrioritiser: true},
+		{name: "more urgent is a plain duplicate", plan: planningRestate(domain.PriorityHighest), withPrioritiser: true},
+		{name: "brief mode never deprioritises", plan: planningRestate(domain.PriorityLowest), brief: "ship it", withPrioritiser: true},
+		{name: "no prioritiser, no deprioritisation", plan: planningRestate(domain.PriorityLowest)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p, applier, pr := planningDeprioritiseFixture(t, tc.brief, tc.plan, tc.withPrioritiser)
+			_, err := p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+			require.Error(t, err)
+			assert.ErrorIs(t, err, agents.ErrPlanRejected, "a repeat that is not a demotion is still a duplicate")
+			assert.Contains(t, err.Error(), "duplicates open bead sc-old")
+			assert.Zero(t, applier.count())
+			assert.Empty(t, pr.applied())
+			assert.Zero(t, p.Status().Deprioritised)
+		})
+	}
+}
+
+func TestPlannerKeepsARestatedBeadThatTheRestOfThePlanDependsOn(t *testing.T) {
+	plan := planningRestate(domain.PriorityLowest, "beta")
+	plan.Beads[1].Deps = []string{"alpha"}
+	p, applier, pr := planningDeprioritiseFixture(t, "", plan, true)
+	_, err := p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, agents.ErrPlanRejected,
+		"dropping a bead another one depends on would dangle the dependency; the validator rules on it instead")
+	assert.Zero(t, applier.count())
+	assert.Empty(t, pr.applied())
+}
+
+func TestPlannerWarnsWhenBdRefusesADeprioritisation(t *testing.T) {
+	p, applier, pr := planningDeprioritiseFixture(t, "", planningRestate(domain.PriorityLowest, "beta"), true)
+	pr.mu.Lock()
+	pr.err = errors.New("bd is locked")
+	pr.mu.Unlock()
+
+	_, err := p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.NoError(t, err, "a refused priority update never undoes the beads that were created")
+	assert.Equal(t, 1, applier.count())
+	assert.Zero(t, p.Status().Deprioritised)
+}
+
+func TestPlannerTellsTheProductOwnerHowToDeprioritise(t *testing.T) {
+	plan := domain.Plan{Brief: "nothing for now"}
+	p, _, _ := planningDeprioritiseFixture(t, "", plan, true)
+	_, err := p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.NoError(t, err)
+	runner, ok := p.opts.Runner.(*planningRunner)
+	require.True(t, ok)
+	req, ok := runner.last()
+	require.True(t, ok)
+	joined := strings.Join(req.Notes, "\n")
+	assert.Contains(t, joined, "deprioritise", "autopilot may deprioritise its own beads (Q-04)")
+	assert.Contains(t, joined, "larger `priority` number", "the note describes the convention the planner implements")
+	assert.Contains(t, joined, "`sc-old` 1", "the product owner is told the priority each open bead has now")
+
+	// A planner that cannot reprioritise never offers to.
+	q, _, _ := planningDeprioritiseFixture(t, "", plan, false)
+	_, err = q.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.NoError(t, err)
+	quiet, ok := q.opts.Runner.(*planningRunner)
+	require.True(t, ok)
+	req, ok = quiet.last()
+	require.True(t, ok)
+	assert.NotContains(t, strings.Join(req.Notes, "\n"), "deprioritise",
+		"an instruction the orchestrator would drop on the floor is never given")
+}
+
+// --- P6-19: a plan the validator really rejects ---------------------------
+
+// planningCyclicPlan is schema-valid and rule-invalid: a depends on b and b
+// on a, which is the rejection domain.Plan.Validate finds and no JSON schema
+// can express.
+func planningCyclicPlan() domain.Plan {
+	plan := planningPlan("a", "b")
+	plan.Beads[0].Deps = []string{"b"}
+	plan.Beads[1].Deps = []string{"a"}
+	return plan
+}
+
+func TestPlannerDropsACyclicPlanItsOwnValidatorRejects(t *testing.T) {
+	f := planningSetup(t, "ship the thing", nil)
+	// The product owner answers with a cyclic plan every time: nothing is
+	// injected by hand, so the planner's own second-line validator
+	// (agents.CreatePlanBeads -> ValidatePlan) is what rejects it.
+	f.Runner.setPlan(planningCyclicPlan())
+	f.start()
+
+	planningEventually(t, "the brief run to fail", func() bool {
+		f.Clock.Advance(time.Second)
+		select {
+		case <-f.Run.Done():
+			return true
+		default:
+			return false
+		}
+	})
+	out, err := f.wait()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPlanningGaveUp)
+	assert.Equal(t, events.FinishFailed, out.Reason)
+	assert.Equal(t, 2, f.Runner.count(), "the brief is retried once, then dropped")
+	assert.Zero(t, f.Applier.count(), "a cyclic plan creates nothing")
+	assert.Contains(t, f.Planner.Status().LastError, "dependency cycle: a -> b -> a")
+	assert.Equal(t, 1, f.Planner.Status().GaveUp)
+}
+
+// planningSupervisor builds a real agent supervisor over the mock cartridge
+// and attaches it to the run, so a planning firing goes through the
+// production path: FireAgent -> agents.RunAgent -> PlanCheck ->
+// ParsePlanOutput. The adapter is registered as "mock" because that is the
+// name agents.EnforcementFor knows holds read_only in-process; an adapter
+// under any other name would need the unimplemented copied-worktree
+// degrade, and a planning firing has no worktree to copy.
+func planningSupervisor(t *testing.T, f *planningFixture, sc *mock.Scenario) *Supervisor {
+	t.Helper()
+	adapter, err := mock.NewAdapter("mock", sc)
+	require.NoError(t, err)
+	cfg := f.Eff.Config
+	cfg.ActiveCartridge = "mock"
+	cfg.Cartridges = map[string]config.Cartridge{"mock": {Model: "opus"}}
+	sel, err := cartridge.NewSelector(cfg,
+		map[string]cartridge.Cartridge{"mock": adapter}, cartridge.WithClock(f.Clock.Now))
+	require.NoError(t, err)
+	sup, err := NewSupervisor(SupervisorOptions{
+		Cartridges: sel, Bus: f.Bus, Timeout: time.Minute, Now: f.Clock.Now, NoShims: true,
+		Sleep:  func(context.Context, time.Duration) error { return nil },
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	sup.Attach(f.Run)
+	t.Cleanup(func() { _ = sup.Close() })
+	return sup
+}
+
+func TestPlannerFailsABriefWhoseProductOwnerAlwaysReturnsACyclicPlan(t *testing.T) {
+	// P6-19 end to end, with nothing stubbed between the model's words and
+	// the policy: a mock cartridge that always answers with a cyclic plan,
+	// fired through the real supervisor. The rejection therefore reaches
+	// Planner.record over the production error chain — *agents.AgentError
+	// wrapping *structured.ParseError wrapping agents.ErrPlanRejected —
+	// which is what record's errors.Is depends on.
+	var sup *Supervisor
+	var errs []error
+	var mu sync.Mutex
+	f := planningSetup(t, "ship the thing", func(o *PlannerOptions) {
+		o.Runner = PlanRunnerFunc(func(ctx context.Context, fr Firing, req agents.PlanRequest) (domain.Plan, agents.Transcript, error) {
+			plan, tr, err := SupervisorPlanRunner(sup).RunPlan(ctx, fr, req)
+			mu.Lock()
+			errs = append(errs, err)
+			mu.Unlock()
+			return plan, tr, err
+		})
+	})
+	sc := mock.NewScenario("po-plan")
+	sc.Otherwise("cyclic").Say("Here is the plan.\n").Structured(
+		`{"brief":"a and b need each other","beads":[` +
+			`{"key":"a","title":"A","acceptance":"a works","deps":["b"]},` +
+			`{"key":"b","title":"B","acceptance":"b works","deps":["a"]}]}`)
+	sup = planningSupervisor(t, f, sc)
+	f.start()
+
+	planningEventually(t, "the brief run to fail", func() bool {
+		f.Clock.Advance(time.Second)
+		select {
+		case <-f.Run.Done():
+			return true
+		default:
+			return false
+		}
+	})
+	out, err := f.wait()
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrPlanningGaveUp, "brief mode has no other way to scope the run (P6-19)")
+	assert.Equal(t, events.FinishFailed, out.Reason)
+	assert.Zero(t, f.Applier.count(), "a rejected plan creates nothing")
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, errs, 2, "the plan is dropped after the second rejection in a row")
+	for i, fired := range errs {
+		require.Error(t, fired, "firing %d", i)
+		assert.ErrorIs(t, fired, agents.ErrPlanRejected,
+			"the sentinel must survive every wrapper, or P6-19 degrades into the cool-off branch")
+		var agentErr *agents.AgentError
+		require.ErrorAs(t, fired, &agentErr)
+		assert.Equal(t, 2, agentErr.Attempts, "P5-08 retries a rule failure once inside the firing")
+		var parseErr *structured.ParseError
+		require.ErrorAs(t, fired, &parseErr)
+		assert.Contains(t, parseErr.Feedback(), "dependency cycle: a -> b -> a")
+	}
+}
+
+// --- P6-11: a plan that landed in bd but never reached state.json ---------
+
+func TestPlannerAdoptsThePlanBdAlreadyHoldsOnResume(t *testing.T) {
+	f := planningSetup(t, "ship the thing", func(o *PlannerOptions) { o.Config.Resume = true })
+	// The kill landed between `bd create --graph` and Run.SetEpic, so bd
+	// holds the epic and its beads while state.json still says the run
+	// never planned.
+	require.Empty(t, f.Run.Epic())
+	f.Beads.set(
+		domain.Bead{ID: "sc-epic", Type: domain.BeadTypeEpic, State: domain.BeadStateOpen},
+		planningBead("sc-alpha", domain.BeadStateOpen),
+	)
+
+	res, err := f.Planner.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.NoError(t, err)
+	assert.Equal(t, domain.MessagePlan, res.Produced)
+	assert.Zero(t, f.Runner.count(), "a resumed brief run must not plan its brief a second time")
+	assert.Zero(t, f.Applier.count())
+	assert.Equal(t, domain.BeadID("sc-epic"), f.Run.Epic(), "the epic bd holds is recorded on the run")
+
+	st := f.Planner.Status()
+	assert.Equal(t, 1, st.Plans)
+	assert.True(t, st.ResumedPlan)
+
+	ds, err := f.Planner.Demands(context.Background())
+	require.NoError(t, err)
+	assert.Empty(t, ds, "brief mode plans once")
+}
+
+func TestPlannerPlansWhenAResumedRunHasNoBeadsInBd(t *testing.T) {
+	f := planningSetup(t, "ship the thing", func(o *PlannerOptions) { o.Config.Resume = true })
+	f.Runner.setPlan(planningPlan("alpha"))
+	// bd has the run's epic but no work beads at all, which is not a plan
+	// that landed: `bd create --graph` creates both or neither (D-22).
+	f.Beads.set(domain.Bead{ID: "sc-epic", Type: domain.BeadTypeEpic, State: domain.BeadStateOpen})
+
+	_, err := f.Planner.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.NoError(t, err)
+	assert.Equal(t, 1, f.Runner.count(), "the interrupted run never planned, so it plans now")
+	assert.Equal(t, 1, f.Applier.count())
+}
+
+func TestPlannerDoesNotLookForAnAdoptedPlanWhenTheRunIsNotResumed(t *testing.T) {
+	f := planningSetup(t, "ship the thing", nil)
+	f.Runner.setPlan(planningPlan("alpha"))
+	f.Beads.set(
+		domain.Bead{ID: "sc-epic", Type: domain.BeadTypeEpic, State: domain.BeadStateOpen},
+		planningBead("sc-alpha", domain.BeadStateOpen),
+	)
+	_, err := f.Planner.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.NoError(t, err)
+	assert.Equal(t, 1, f.Runner.count(), "a fresh run always plans, whatever bd already holds")
+}
+
+func TestInstallPlanShimReportsADirectoryItCannotWrite(t *testing.T) {
+	blocked := filepath.Join(t.TempDir(), "not-a-directory")
+	require.NoError(t, os.WriteFile(blocked, []byte("in the way\n"), 0o600))
+	_, err := InstallPlanShim(context.Background(), filepath.Join(blocked, "po-plan"), t.TempDir(),
+		beads.ShimOptions{Real: planningFakeBD(t), SkipVerify: true})
+	require.Error(t, err, "a shim that cannot be written is never silently skipped")
+}
+
+func TestPlanPrioritiesIsBounded(t *testing.T) {
+	assert.Empty(t, planPriorities(nil))
+	assert.Equal(t, "`sc-1` 2, `sc-2` 0", planPriorities([]domain.Bead{
+		{ID: "sc-1", Priority: domain.PriorityDefault},
+		{ID: "sc-2", Priority: domain.PriorityHighest},
+	}))
+
+	open := make([]domain.Bead, planPrioritiesShown+5)
+	for i := range open {
+		open[i] = domain.Bead{ID: domain.BeadID(fmt.Sprintf("sc-%d", i)), Priority: domain.PriorityDefault}
+	}
+	got := planPriorities(open)
+	assert.Equal(t, planPrioritiesShown+1, strings.Count(got, ", ")+1,
+		"a run with hundreds of open beads cannot crowd out the planning prompt")
+	assert.True(t, strings.HasSuffix(got, "…"), got)
+}
+
+func TestPlannerReportsItsMode(t *testing.T) {
+	brief, err := NewPlanner(PlannerOptions{Config: planningRunConfig(t, "ship it")})
+	require.NoError(t, err)
+	assert.Equal(t, domain.RunModeBrief, brief.Mode())
+
+	auto, err := NewPlanner(PlannerOptions{Config: planningRunConfig(t, "")})
+	require.NoError(t, err)
+	assert.Equal(t, domain.RunModeAutopilot, auto.Mode())
 }

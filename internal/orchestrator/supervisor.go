@@ -319,7 +319,7 @@ func NewSupervisor(opts SupervisorOptions) (*Supervisor, error) {
 		s.shims = ShimInstallerFunc(beads.InstallForWorktree)
 	}
 	if s.copier == nil {
-		s.copier = WorktreeCopierFunc(CopyWorktree)
+		s.copier = WorktreeCopierFunc(s.copyWorktree)
 	}
 	if s.sleep == nil {
 		s.sleep = supSleep
@@ -629,24 +629,40 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 	maxAttempts := 1 + s.crashRetries()
 	attempt, reroutes := 0, 0
 	var lastErr error
+	// pending is the agent an attempt left recorded as running because it
+	// announced its failure with WillRetry=true. Every spawn owes a
+	// terminal agent event, so a firing abandoned before it can try again
+	// (a stop, a dead context, a cartridge that can no longer be picked,
+	// a worktree that can no longer be prepared) reports that failure as
+	// terminal through abandon rather than leaving a ghost behind in
+	// state.json.
+	var pending *domain.Agent
+	pendingAttempt := 0
+	abandon := func(err error) error {
+		if pending != nil {
+			s.failed(h, *pending, f, tr, 0, supAbandonFailure(err), err, pendingAttempt, false)
+			pending = nil
+		}
+		return err
+	}
 	for {
 		attempt++
 		if attempt > 1 && s.Stopped() {
 			// A stop landed while this firing was waiting to try again.
-			return tr, fmt.Errorf("%w: %s gave up after %w", ErrSupervisorStopped, f.Agent.ID, lastErr)
+			return tr, abandon(fmt.Errorf("%w: %s gave up after %w", ErrSupervisorStopped, f.Agent.ID, lastErr))
 		}
 		cart, err := s.pick(ctx, f.Agent.Role)
 		if err != nil {
-			return tr, err
+			return tr, abandon(err)
 		}
 		name := cart.Name()
 		if err := s.awaitPause(ctx, name); err != nil {
-			return tr, err
+			return tr, abandon(err)
 		}
 
 		prep, err := s.prepare(ctx, f, cart)
 		if err != nil {
-			return tr, err
+			return tr, abandon(err)
 		}
 
 		agent := f.Agent
@@ -661,12 +677,15 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 		})
 		if err != nil {
 			prep.discard()
-			return tr, fmt.Errorf("orchestrator: building the firing for %s: %w", agent.ID, err)
+			return tr, abandon(fmt.Errorf("orchestrator: building the firing for %s: %w", agent.ID, err))
 		}
 		s.stamp(&run, f, agent, prep, h)
 		agent.Model = run.Spec.Model
 
 		s.record(h, f, agent)
+		// The agent is recorded and about to be announced again: whatever
+		// the previous attempt left pending is now this attempt's story.
+		pending = nil
 		s.mu.Lock()
 		s.started[agent.ID] = true
 		s.mu.Unlock()
@@ -718,6 +737,7 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 				reroutes++
 				attempt--
 				s.failed(h, agent, f, tr, dur, failure, err, attempt+1, true)
+				pending, pendingAttempt = supPending(agent), attempt+1
 				continue
 			}
 			s.signalExhausted()
@@ -738,6 +758,7 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 			if !willRetry {
 				return tr, err
 			}
+			pending, pendingAttempt = supPending(agent), attempt
 			continue
 
 		case kind == cartridge.KindAuth:
@@ -747,12 +768,13 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 
 		case retryable && attempt < maxAttempts:
 			s.failed(h, agent, f, tr, dur, failure, err, attempt, true)
+			pending, pendingAttempt = supPending(agent), attempt
 			back := s.retryBackoff(attempt)
 			s.log(h).Warn("agent failed; retrying",
 				slog.String("agent", agent.ID.String()), slog.String("failure", string(failure)),
 				slog.Int("attempt", attempt), slog.Duration("backoff", back), slog.Any("err", err))
 			if serr := s.sleep(ctx, back); serr != nil {
-				return tr, serr
+				return tr, abandon(serr)
 			}
 			continue
 
@@ -881,6 +903,28 @@ func supRetryable(err error, failure events.Failure, kind cartridge.Kind) bool {
 	return kind.Retryable()
 }
 
+// supPending copies the agent a retry left recorded as running, so the
+// terminal event a later abandonment publishes reports the agent as it was
+// when it last ran.
+func supPending(a domain.Agent) *domain.Agent {
+	c := a
+	return &c
+}
+
+// supAbandonFailure classifies the terminal failure of a firing given up
+// between attempts: a stop or a dead context killed it, anything else keeps
+// the failure the error itself carries.
+func supAbandonFailure(err error) events.Failure {
+	switch {
+	case errors.Is(err, ErrSupervisorStopped),
+		errors.Is(err, context.Canceled),
+		errors.Is(err, context.DeadlineExceeded):
+		return events.FailureKilled
+	default:
+		return agents.FailureOf(err)
+	}
+}
+
 // supRetryAfter returns the back-off a rate-limited cartridge asked for, or
 // zero.
 func supRetryAfter(err error) time.Duration {
@@ -943,9 +987,18 @@ func (s *Supervisor) Stopped() bool {
 }
 
 // pick returns the cartridge this attempt fires: the one the selector gives
-// the role (D-12), or — when that one is out of credits — any cartridge
-// still alive, because a preference must not stop a run that still has
-// credits somewhere (D-18).
+// the role (D-12), or — when that one has been retired for the run — any
+// cartridge still alive, because a preference must not stop a run that
+// still has credits somewhere (D-18).
+//
+// A selector error is the selector's verdict and is returned as it is: it
+// carries P2-08's Detect diagnosis (not installed, not authenticated, the
+// active cartridge broken too) and firing the very cartridge it refused
+// would bypass that check and repeat the failure without ever naming its
+// cause. The one exception is a run that has already retired a cartridge:
+// D-18's re-route then looks for a live substitute anyway, and says with a
+// Warning naming the selector's error that it is firing one the selector
+// did not approve.
 func (s *Supervisor) pick(ctx context.Context, role domain.Role) (cartridge.Cartridge, error) {
 	if s.opts.Cartridges == nil {
 		return nil, errors.New("orchestrator: the supervisor has no cartridge source")
@@ -955,8 +1008,22 @@ func (s *Supervisor) pick(ctx context.Context, role domain.Role) (cartridge.Cart
 		return nil, fmt.Errorf("%w: no cartridge is built for this run", ErrNoLiveCartridge)
 	}
 	chosen, selErr := s.opts.Cartridges.Select(ctx, role)
-	if selErr == nil && chosen != nil && !s.isDead(chosen.Name()) {
+	switch {
+	case selErr == nil && chosen != nil && !s.isDead(chosen.Name()):
 		return chosen, nil
+	case selErr != nil && !s.anyDead():
+		// Nothing is retired, so there is nothing for D-18 to route
+		// around: the selector's diagnosis is the honest answer.
+		return nil, selErr
+	}
+	var reason string
+	switch {
+	case selErr != nil:
+		reason = fmt.Sprintf("the cartridge selector refused %s (%v)", role, selErr)
+	case chosen != nil:
+		reason = fmt.Sprintf("cartridge %q is retired", chosen.Name())
+	default:
+		reason = fmt.Sprintf("the cartridge selector chose nothing for %s", role)
 	}
 	for _, n := range names {
 		if s.isDead(n) {
@@ -969,11 +1036,8 @@ func (s *Supervisor) pick(ctx context.Context, role domain.Role) (cartridge.Cart
 		if !ok || c == nil {
 			continue
 		}
-		if selErr == nil {
-			if h := s.Host(); h != nil {
-				h.Warn(SourceSupervisor,
-					fmt.Sprintf("cartridge %q is retired; %s fires %q instead", chosen.Name(), role, n), nil)
-			}
+		if h := s.Host(); h != nil {
+			h.Warn(SourceSupervisor, fmt.Sprintf("%s; %s fires %q instead", reason, role, n), selErr)
 		}
 		return c, nil
 	}
@@ -998,6 +1062,13 @@ func (s *Supervisor) invalidate(name string) {
 	if s.opts.Cartridges != nil {
 		s.opts.Cartridges.Invalidate(name)
 	}
+}
+
+// anyDead reports whether any cartridge has been retired for this run.
+func (s *Supervisor) anyDead() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.dead) > 0
 }
 
 // markDead retires a cartridge for the rest of the run and returns how many
@@ -1333,12 +1404,17 @@ func (s *Supervisor) prepare(ctx context.Context, f AgentFiring, c cartridge.Car
 	if err := os.RemoveAll(dst); err != nil {
 		return p, fmt.Errorf("orchestrator: clearing the worktree copy %s: %w", dst, err)
 	}
-	if err := s.copier.Copy(ctx, f.Worktree, dst); err != nil {
-		return p, fmt.Errorf("orchestrator: copying %s for %s: %w", f.Worktree, f.Agent.ID, err)
-	}
+	// Registered before the copy starts, not after it succeeds: a copy
+	// that fails half way has already made the directory, and only a
+	// registered copy is reachable by dropCopy here and by the stop path's
+	// removeCopies.
 	s.mu.Lock()
 	s.copyDirs[dst] = dst
 	s.mu.Unlock()
+	if err := s.copier.Copy(ctx, f.Worktree, dst); err != nil {
+		s.dropCopy(dst)
+		return p, fmt.Errorf("orchestrator: copying %s for %s: %w", f.Worktree, f.Agent.ID, err)
+	}
 
 	wrapped := &supCopiedCartridge{inner: c, root: dst, policy: policy}
 	copied, err := wrapped.ToolPolicyEnforcement(policy)
@@ -1348,17 +1424,7 @@ func (s *Supervisor) prepare(ctx context.Context, f AgentFiring, c cartridge.Car
 	p.workdir = dst
 	p.cartridge = wrapped
 	p.enforcement = copied
-	p.discard = func() {
-		if err := os.RemoveAll(dst); err != nil {
-			if h := s.Host(); h != nil {
-				h.Warn(SourceSupervisor, fmt.Sprintf("could not delete the worktree copy %s", dst), err)
-			}
-			return
-		}
-		s.mu.Lock()
-		delete(s.copyDirs, dst)
-		s.mu.Unlock()
-	}
+	p.discard = func() { s.dropCopy(dst) }
 	if h := s.Host(); h != nil {
 		s.log(h).Info("firing in a throwaway worktree copy (P6-20)",
 			slog.String("agent", f.Agent.ID.String()), slog.String("cartridge", c.Name()),
@@ -1434,6 +1500,21 @@ func (s *Supervisor) removeShims() {
 			}
 		}
 	}
+}
+
+// dropCopy deletes one throwaway worktree copy and forgets it. A copy that
+// cannot be deleted stays registered, so the stop path's removeCopies tries
+// again.
+func (s *Supervisor) dropCopy(dst string) {
+	if err := os.RemoveAll(dst); err != nil {
+		if h := s.Host(); h != nil {
+			h.Warn(SourceSupervisor, fmt.Sprintf("could not delete the worktree copy %s", dst), err)
+		}
+		return
+	}
+	s.mu.Lock()
+	delete(s.copyDirs, dst)
+	s.mu.Unlock()
 }
 
 // removeCopies deletes any throwaway worktree copy still on disk.
@@ -1568,23 +1649,49 @@ func (c *supCopiedCartridge) ToolPolicyEnforcement(p cartridge.ToolPolicy) (agen
 // CopyWorktree copies the tree at src to dst, which must not exist. It is
 // the default [WorktreeCopier] of the P6-20 degrade: regular files (with
 // their permission bits) and directories are copied and symlinks are
-// recreated as symlinks, so nothing outside src is touched.
+// recreated only when they stay inside the copy, so nothing outside dst can
+// be written through the copy.
 //
 // The `.git` entry is deliberately not copied. In a git worktree it is a
 // file pointing back into the real repository's administrative directory,
 // so a copy that kept it would let the very writes the degrade exists to
 // contain reach the real repository. The reviewed diff is in the agent's
 // prompt, not in the copy's history.
+//
+// A symlink is the other way out of the copy, and the tree being reviewed
+// is one an engineer agent wrote: a link with an absolute target, or a
+// relative one that climbs out with "..", would point at the same place
+// from inside the copy as it did from inside the real worktree. Such a link
+// is dropped; an absolute link into src is rewritten to the matching path
+// inside dst; a relative link that stays inside is recreated verbatim and
+// therefore resolves inside the copy. [Supervisor] warns about every
+// dropped link.
 func CopyWorktree(ctx context.Context, src, dst string) error {
+	_, err := copyWorktreeTree(ctx, src, dst)
+	return err
+}
+
+// supDroppedLink is one symlink a copy refused to recreate, with the target
+// that would have escaped.
+type supDroppedLink struct {
+	// Path is the link, relative to the copied tree's root.
+	Path string
+	// Target is what it pointed at, verbatim.
+	Target string
+}
+
+// copyWorktreeTree is [CopyWorktree] and the links it dropped.
+func copyWorktreeTree(ctx context.Context, src, dst string) ([]supDroppedLink, error) {
 	src = filepath.Clean(src)
+	var dropped []supDroppedLink
 	info, err := os.Stat(src)
 	if err != nil {
-		return fmt.Errorf("orchestrator: copy worktree: %w", err)
+		return nil, fmt.Errorf("orchestrator: copy worktree: %w", err)
 	}
 	if !info.IsDir() {
-		return fmt.Errorf("orchestrator: copy worktree: %s is not a directory", src)
+		return nil, fmt.Errorf("orchestrator: copy worktree: %s is not a directory", src)
 	}
-	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+	werr := filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -1617,7 +1724,12 @@ func CopyWorktree(ctx context.Context, src, dst string) error {
 			if lerr != nil {
 				return lerr
 			}
-			return os.Symlink(link, target)
+			contained, ok := supContainedLink(src, dst, path, link)
+			if !ok {
+				dropped = append(dropped, supDroppedLink{Path: rel, Target: link})
+				return nil
+			}
+			return os.Symlink(contained, target)
 		case d.Type().IsRegular():
 			fi, ferr := d.Info()
 			if ferr != nil {
@@ -1629,6 +1741,50 @@ func CopyWorktree(ctx context.Context, src, dst string) error {
 			return nil
 		}
 	})
+	return dropped, werr
+}
+
+// supContainedLink decides what a symlink at path (pointing at link) becomes
+// in the copy of src at dst. A relative link that stays inside src is kept
+// verbatim, because it then resolves inside the copy; an absolute link into
+// src is rewritten to the matching path inside dst; anything else escapes
+// the copy and is refused (ok is false), because a write through it would
+// land in the tree the P6-20 degrade exists to protect.
+func supContainedLink(src, dst, path, link string) (string, bool) {
+	resolved := link
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(filepath.Dir(path), link)
+	}
+	rel, err := filepath.Rel(src, filepath.Clean(resolved))
+	if err != nil {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	if !filepath.IsAbs(link) {
+		return link, true
+	}
+	if rel == "." {
+		return filepath.Clean(dst), true
+	}
+	return filepath.Join(dst, rel), true
+}
+
+// copyWorktree is the supervisor's default [WorktreeCopier]: [CopyWorktree]
+// plus a Warning for every symlink the copy dropped for pointing out of the
+// tree, so the run says why the copy differs from the worktree an agent is
+// reviewing (P6-20).
+func (s *Supervisor) copyWorktree(ctx context.Context, src, dst string) error {
+	dropped, err := copyWorktreeTree(ctx, src, dst)
+	if h := s.Host(); h != nil {
+		for _, l := range dropped {
+			h.Warn(SourceSupervisor, fmt.Sprintf(
+				"the worktree copy left out the symlink %s -> %s: it points outside %s, and a contained session must not reach it (P6-20)",
+				l.Path, l.Target, src), nil)
+		}
+	}
+	return err
 }
 
 // supCopyFile copies one regular file, creating it with mode.

@@ -156,6 +156,14 @@ func (s *deliveryStoreFake) Close(_ context.Context, id domain.BeadID, reason st
 	return beads.Issue{ID: id, Status: "closed"}, err
 }
 
+// failAfter makes every later call whose name starts with prefix fail with
+// err, so a test can let a delivery get part way and then take bd away.
+func (s *deliveryStoreFake) failAfter(prefix string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failOn, s.err = prefix, err
+}
+
 // recorded returns the calls made so far.
 func (s *deliveryStoreFake) recorded() []string {
 	s.mu.Lock()
@@ -240,7 +248,10 @@ func (m *deliveryMergeFake) DeliverMerge(ctx context.Context, bead domain.Bead, 
 		res = m.results[min(i, len(m.results)-1)]
 	}
 	if err != nil {
-		return res, err
+		// gitx.Manager.DeliverMerge returns nil on every error path, so
+		// the fake must too: an outcome may only describe a merge that
+		// happened.
+		return nil, err
 	}
 	// The real merge records sc_merge_sha and would close; the delivery
 	// withholds the close (see Deliverer.mergeBeads).
@@ -680,7 +691,13 @@ func TestDelivererRedeliversAResolvedConflictWithoutANewReview(t *testing.T) {
 	t.Parallel()
 	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
 		h.merge.errs = []error{deliveryConflictErr("internal/a.go"), nil}
-		h.git.ratio = gitx.ChangeRatio{Previous: "aaaaaaa", Current: "bbbbbbb", Delta: 4, Total: 100, Ratio: 0.04}
+		// Nothing here scripts the ratio: the two change sets differ only
+		// in the conflicted line, and the measurement the delivery makes
+		// from them is 4 of 22 changed lines, under the 40% threshold.
+		h.git.diffs = []*gitx.Diff{
+			deliveryDiffOf("aaaaaaa", deliveryPatch("feature line", "three", "branch three")),
+			deliveryDiffOf("bbbbbbb", deliveryPatch("feature line", "main three", "branch three and main three")),
+		}
 	})
 	ctx := context.Background()
 	first, err := h.Deliver(ctx, DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
@@ -707,6 +724,12 @@ func TestDelivererRedeliversAResolvedConflictWithoutANewReview(t *testing.T) {
 	if n := h.git.leftoverCalls(); n != 2 {
 		t.Errorf("CommitLeftovers ran %d times, want 2 (once per attempt, D-14)", n)
 	}
+	if out.Ratio.Delta != 4 || out.Ratio.Total != 22 {
+		t.Errorf("D-09 measurement = %+v, want 4 of 22 changed lines", out.Ratio)
+	}
+	if out.Ratio.Ratio > gitx.DefaultReReviewThreshold {
+		t.Errorf("ratio = %v, want at most the threshold %v", out.Ratio.Ratio, gitx.DefaultReReviewThreshold)
+	}
 }
 
 // TestDelivererReReviewsABigConflictResolution is the D-09 half of the same
@@ -716,7 +739,12 @@ func TestDelivererReReviewsABigConflictResolution(t *testing.T) {
 	t.Parallel()
 	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
 		h.merge.errs = []error{deliveryConflictErr("internal/a.go")}
-		h.git.ratio = gitx.ChangeRatio{Previous: "aaaaaaa", Current: "bbbbbbb", Delta: 80, Total: 100, Ratio: 0.8}
+		// The engineer rewrote the twenty lines that had nothing to do
+		// with the conflict as well as settling it.
+		h.git.diffs = []*gitx.Diff{
+			deliveryDiffOf("aaaaaaa", deliveryPatch("feature line", "three", "branch three")),
+			deliveryDiffOf("bbbbbbb", deliveryPatch("rewritten line", "main three", "branch three and main three")),
+		}
 	})
 	ctx := context.Background()
 	if _, err := h.Deliver(ctx, DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)}); err != nil {
@@ -840,7 +868,6 @@ func TestDelivererHandsOffAfterTooManyConflictRounds(t *testing.T) {
 	h := newDeliveryHarness(t, false, func(o *DeliveryOptions, h *deliveryHarness) {
 		o.MaxConflictRounds = 2
 		h.merge.errs = []error{deliveryConflictErr("a.go"), deliveryConflictErr("a.go"), deliveryConflictErr("a.go")}
-		h.git.ratio = gitx.ChangeRatio{Ratio: 0.01}
 	})
 	ctx := context.Background()
 	if _, err := h.Deliver(ctx, DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)}); err != nil {
@@ -1208,6 +1235,10 @@ func TestDeliveryGitAgainstARealRepository(t *testing.T) {
 	if !lo.Committed || lo.Stats.Empty() {
 		t.Errorf("leftovers = %+v, want a commit with stats", lo)
 	}
+	if _, err := g.CommitLeftovers(ctx, domain.Bead{}, 1); err == nil ||
+		errors.Is(err, ErrRebaseInProgress) || !strings.Contains(err.Error(), "no id") {
+		t.Errorf("CommitLeftovers without a bead id: err = %v, want gitx's own complaint", err)
+	}
 	diff, err := g.Diff(ctx, bead.ID)
 	if err != nil {
 		t.Fatalf("Diff: %v", err)
@@ -1249,6 +1280,593 @@ func TestDeliveryOutcomeSummary(t *testing.T) {
 			t.Errorf("String() = %q, want %q", c.out.Kind.String(), c.out.Kind)
 		}
 	}
+}
+
+// TestDelivererFallsBackToTheTipMeasurement: gitx gives an oversized diff no
+// patch at all, so the two change sets cannot be compared line by line. The
+// delivery then falls back to gitx's own tip-to-tip ChangeRatio, which counts
+// the upstream commits of the rebase as movement too and therefore errs
+// towards a review.
+func TestDelivererFallsBackToTheTipMeasurement(t *testing.T) {
+	t.Parallel()
+	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+		h.merge.errs = []error{deliveryConflictErr("internal/a.go")}
+		big := deliveryDiffOf("aaaaaaa", deliveryPatch("feature line", "three", "branch three"))
+		big.Patch, big.Truncated = "", true
+		h.git.diffs = []*gitx.Diff{big}
+		h.git.ratio = gitx.ChangeRatio{Previous: "aaaaaaa", Current: "bbbbbbb", Delta: 900, Total: 1000, Ratio: 0.9}
+	})
+	ctx := context.Background()
+	if _, err := h.Deliver(ctx, DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)}); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	out, err := h.Resolved(ctx, "sc-68s")
+	if err != nil {
+		t.Fatalf("Resolved: %v", err)
+	}
+	if out.Kind != DeliveryNeedsReview {
+		t.Fatalf("outcome = %s, want needs_review", out.Kind)
+	}
+	if out.Ratio.Delta != 900 {
+		t.Errorf("ratio = %+v, want the tip-to-tip measurement", out.Ratio)
+	}
+}
+
+// TestDelivererMeasuresAnUnfinishedRebaseAsAFullRewrite: an engineer that
+// resolved the markers but never ran "git rebase --continue" has no resolved
+// change set to measure, so D-09 sends the bead back for a review rather
+// than shipping something nobody could compare.
+func TestDelivererMeasuresAnUnfinishedRebaseAsAFullRewrite(t *testing.T) {
+	t.Parallel()
+	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+		h.merge.errs = []error{deliveryConflictErr("internal/a.go")}
+		// The probes in order: the delivery's own (clean), then the one
+		// Resolved makes (still mid-rebase).
+		h.git.rebase = []RebaseState{{}, {InProgress: true, Files: []string{"internal/a.go"}}}
+	})
+	ctx := context.Background()
+	if _, err := h.Deliver(ctx, DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)}); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	out, err := h.Resolved(ctx, "sc-68s")
+	if err != nil {
+		t.Fatalf("Resolved: %v", err)
+	}
+	if out.Kind != DeliveryNeedsReview {
+		t.Fatalf("outcome = %s, want needs_review", out.Kind)
+	}
+	if !deliveryContains(h.host.warnings(), "rebase was left unfinished") {
+		t.Errorf("warnings = %v, want the unfinished rebase", h.host.warnings())
+	}
+}
+
+// TestDelivererKeepsTheConflictRoundWhenABDWriteFails: the pending round is
+// the only thing that makes a bead in a conflict round reachable — the
+// scheduler offers it and AbandonConflict settles it — so a bd write that
+// fails half way must leave it registered. Every other failure in the
+// delivery leaves the bead recoverable; this one used to drop the round
+// first and strand the bead in in_progress with no work source.
+func TestDelivererKeepsTheConflictRoundWhenABDWriteFails(t *testing.T) {
+	t.Parallel()
+	boom := errors.New("bd: connection refused")
+
+	t.Run("the submit fails", func(t *testing.T) {
+		t.Parallel()
+		h := deliveryConflictHarness(t)
+		ctx := context.Background()
+		h.store.failAfter("status:in_review", boom)
+		out, err := h.Resolved(ctx, "sc-68s")
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the bd failure", err)
+		}
+		if out.Kind != DeliveryRetryable {
+			t.Fatalf("outcome = %s, want retryable", out.Kind)
+		}
+		if _, ok := h.PendingFor("sc-68s"); !ok {
+			t.Fatal("the conflict round is gone: the bead is in_progress with nothing offering it")
+		}
+		ds, err := h.Demands(ctx)
+		if err != nil || len(ds) != 1 {
+			t.Fatalf("demands = %d, %v, want the round still offered", len(ds), err)
+		}
+		// bd comes back and the same call finishes the round.
+		h.store.failAfter("", nil)
+		res, err := h.Resolved(ctx, "sc-68s")
+		if err != nil {
+			t.Fatalf("Resolved: %v", err)
+		}
+		if res.Kind != DeliveryMerged {
+			t.Fatalf("outcome = %s, want merged (%s)", res.Kind, res.Summary())
+		}
+	})
+
+	t.Run("the approval fails", func(t *testing.T) {
+		t.Parallel()
+		h := deliveryConflictHarness(t)
+		ctx := context.Background()
+		h.store.failAfter("status:approved", boom)
+		out, err := h.Resolved(ctx, "sc-68s")
+		if !errors.Is(err, boom) {
+			t.Fatalf("err = %v, want the bd failure", err)
+		}
+		if out.Kind != DeliveryRetryable || out.State != domain.BeadStateInReview {
+			t.Fatalf("outcome = %s/%s, want retryable/in_review", out.Kind, out.State)
+		}
+		if _, ok := h.PendingFor("sc-68s"); !ok {
+			t.Fatal("the conflict round is gone, so AbandonConflict cannot settle the bead either")
+		}
+		ds, err := h.Demands(ctx)
+		if err != nil || len(ds) != 0 {
+			t.Fatalf("demands = %d, %v, want none: the engineer already finished", len(ds), err)
+		}
+		h.store.failAfter("", nil)
+		res, err := h.Resolved(ctx, "sc-68s")
+		if err != nil {
+			t.Fatalf("Resolved: %v", err)
+		}
+		if res.Kind != DeliveryMerged {
+			t.Fatalf("outcome = %s, want merged (%s)", res.Kind, res.Summary())
+		}
+		// The retry resumes at the transition that failed rather than
+		// walking the bead through in_review a second time.
+		want := []string{
+			"approved→delivering", "delivering→in_progress", "in_progress→in_review",
+			"in_review→approved", "approved→delivering", "delivering→closed",
+		}
+		if got := h.host.states(); !deliveryEqualStrings(got, want) {
+			t.Errorf("state changes = %v, want %v", got, want)
+		}
+	})
+}
+
+// TestDelivererMergeWithNeitherResultNorError: a merge path that answers
+// nothing at all is a retryable failure, not a nil dereference.
+func TestDelivererMergeWithNeitherResultNorError(t *testing.T) {
+	t.Parallel()
+	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+		h.merge.results = nil
+	})
+	out, err := h.Deliver(context.Background(), DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
+	if !errors.Is(err, errNoMergeResult) {
+		t.Fatalf("err = %v, want errNoMergeResult", err)
+	}
+	if out.Kind != DeliveryRetryable || out.State != domain.BeadStateDelivering {
+		t.Fatalf("outcome = %s/%s, want retryable/delivering", out.Kind, out.State)
+	}
+}
+
+// TestConflictChangeRatioIgnoresUpstreamDrift pins the arithmetic D-09 needs
+// for a conflict round: the two change sets are both measured against their
+// own merge-base, so the commits the branch was rebased onto are in neither
+// of them and only what the engineer did counts.
+func TestConflictChangeRatioIgnoresUpstreamDrift(t *testing.T) {
+	t.Parallel()
+	before := deliveryDiffOf("aaaaaaa", deliveryPatch("feature line", "three", "branch three"))
+	cases := []struct {
+		name  string
+		after *gitx.Diff
+		delta int
+		total int
+		ok    bool
+	}{
+		{
+			name:  "the same change set after a rebase over a busy branch",
+			after: deliveryDiffOf("bbbbbbb", deliveryPatch("feature line", "three", "branch three")),
+			delta: 0, total: 22, ok: true,
+		},
+		{
+			name:  "only the conflicted line was settled",
+			after: deliveryDiffOf("bbbbbbb", deliveryPatch("feature line", "main three", "branch three and main three")),
+			delta: 4, total: 22, ok: true,
+		},
+		{
+			name:  "the whole change set was rewritten",
+			after: deliveryDiffOf("bbbbbbb", deliveryPatch("rewritten line", "main three", "branch three and main three")),
+			delta: 44, total: 22, ok: true,
+		},
+		{
+			name:  "the change set vanished",
+			after: &gitx.Diff{Stats: gitx.DiffStats{Head: "bbbbbbb"}},
+			delta: 22, total: 0, ok: true,
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := conflictChangeRatio(before, c.after)
+			if ok != c.ok {
+				t.Fatalf("ok = %v, want %v", ok, c.ok)
+			}
+			if got.Delta != c.delta || got.Total != c.total {
+				t.Fatalf("measurement = %+v, want delta %d of %d", got, c.delta, c.total)
+			}
+			if want := gitx.RatioOf(c.delta, c.total); got.Ratio != want {
+				t.Errorf("ratio = %v, want %v", got.Ratio, want)
+			}
+			if got.Previous != "aaaaaaa" || got.Current != "bbbbbbb" {
+				t.Errorf("heads = %q..%q, want aaaaaaa..bbbbbbb", got.Previous, got.Current)
+			}
+		})
+	}
+	truncated := deliveryDiffOf("bbbbbbb", deliveryPatch("feature line", "three", "branch three"))
+	truncated.Patch, truncated.Truncated = "", true
+	for _, c := range []struct {
+		name              string
+		previous, current *gitx.Diff
+	}{
+		{"a truncated current diff", before, truncated},
+		{"a truncated previous diff", truncated, before},
+		{"no diff at all", nil, before},
+	} {
+		if _, ok := conflictChangeRatio(c.previous, c.current); ok {
+			t.Errorf("%s: ok = true, want the tip-to-tip fallback", c.name)
+		}
+	}
+}
+
+// TestDelivererResolvesARealRebaseConflict drives the whole D-10 conflict
+// path against real git: the delivery rebases the bead's branch onto a
+// default branch that moved, git stops on a conflict and leaves the worktree
+// mid-rebase, the engineer resolves it, and D-09 decides whether the bead is
+// re-delivered or reviewed again.
+//
+// This is the case the fakes cannot express, and it is why the D-09 baseline
+// is taken before the delivery rather than when the conflict is found: a
+// worktree stopped mid-rebase has the default branch's own tip as HEAD, so a
+// diff taken then is empty, every resolution scores as a full rewrite, and
+// the "re-deliver without a new review" half of D-10 can never happen.
+func TestDelivererResolvesARealRebaseConflict(t *testing.T) {
+	t.Parallel()
+
+	t.Run("a resolution that only settles the conflict is re-delivered", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		r := newDeliveryRealRig(t)
+		r.conflictingBranch()
+		out := r.deliverExpectingAConflict(ctx)
+
+		p, ok := r.PendingFor(r.bead.ID)
+		if !ok {
+			t.Fatal("no conflict round is pending")
+		}
+		if p.Diff == nil || p.Diff.Empty() {
+			t.Fatalf("the D-09 baseline = %+v, want the branch's change set (a diff of a mid-rebase HEAD is empty)", p.Diff)
+		}
+		if n := p.Diff.ChangedLines(); n != 22 {
+			t.Errorf("baseline changed lines = %d, want 22", n)
+		}
+		if got := out.Conflict.Files; !deliveryEqualStrings(got, []string{"conflict.txt"}) {
+			t.Errorf("conflict files = %v, want [conflict.txt]", got)
+		}
+
+		// P6-16(b) at the adapter: the leftovers commit is refused here,
+		// and asking for it leaves the rebase exactly as git left it.
+		if _, err := r.git.CommitLeftovers(ctx, r.bead, 1); !errors.Is(err, ErrRebaseInProgress) {
+			t.Errorf("CommitLeftovers mid-rebase: err = %v, want ErrRebaseInProgress", err)
+		}
+		if !r.wt.RebaseInProgress() {
+			t.Fatal("the rebase state is gone")
+		}
+		if body := r.read("conflict.txt"); !strings.Contains(body, "<<<<<<<") {
+			t.Errorf("conflict.txt = %q, want git's markers still there", body)
+		}
+
+		r.resolve("feature line")
+		res, err := r.Resolved(ctx, r.bead.ID)
+		if err != nil {
+			t.Fatalf("Resolved: %v", err)
+		}
+		if res.Kind != DeliveryMerged || res.State != domain.BeadStateClosed {
+			t.Fatalf("outcome = %s/%s, want merged/closed (%s)", res.Kind, res.State, res.Summary())
+		}
+		if res.Ratio.Delta == 0 || res.Ratio.Total == 0 {
+			t.Errorf("D-09 measurement = %+v, want the resolution measured, not assumed", res.Ratio)
+		}
+		if res.Ratio.Ratio > gitx.DefaultReReviewThreshold {
+			t.Errorf("D-09 ratio = %v (%+v), want at most %v: settling one conflicted line is not a rewrite",
+				res.Ratio.Ratio, res.Ratio, gitx.DefaultReReviewThreshold)
+		}
+		if got := r.fixture.Git(t, "show", "main:conflict.txt"); !strings.Contains(got, "branch three and main three") {
+			t.Errorf("main:conflict.txt = %q, want the resolved line", got)
+		}
+		want := []string{
+			"approved→delivering", "delivering→in_progress", "in_progress→in_review",
+			"in_review→approved", "approved→delivering", "delivering→closed",
+		}
+		if got := r.host.states(); !deliveryEqualStrings(got, want) {
+			t.Errorf("state changes = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("the default branch moving underneath is not the engineer's work", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		r := newDeliveryRealRig(t)
+		r.conflictingBranch()
+		// Somebody else lands twenty unrelated lines on the default
+		// branch, which the rebase carries over the bead's own commit.
+		r.fixture.WriteFile(t, "unrelated.txt", deliveryFeature("unrelated line"))
+		r.fixture.Commit(t, "Someone else lands twenty lines")
+
+		r.deliverExpectingAConflict(ctx)
+		p, ok := r.PendingFor(r.bead.ID)
+		if !ok {
+			t.Fatal("no conflict round is pending")
+		}
+		r.resolve("feature line")
+
+		// The two measurements of the very same resolution, side by side.
+		current, err := r.git.Diff(ctx, r.bead.ID)
+		if err != nil {
+			t.Fatalf("Diff: %v", err)
+		}
+		tips, err := r.git.ChangeRatio(ctx, r.bead.ID, p.Diff, current)
+		if err != nil {
+			t.Fatalf("ChangeRatio: %v", err)
+		}
+		if !tips.Exceeds(gitx.DefaultReReviewThreshold) {
+			t.Fatalf("tip-to-tip ratio = %+v, want it above the threshold: the point of this case is that it misjudges", tips)
+		}
+		sets, ok := conflictChangeRatio(p.Diff, current)
+		if !ok {
+			t.Fatal("the change sets could not be compared")
+		}
+		if sets.Exceeds(gitx.DefaultReReviewThreshold) {
+			t.Errorf("change-set ratio = %+v, want at most the threshold: the engineer only settled one line", sets)
+		}
+
+		res, err := r.Resolved(ctx, r.bead.ID)
+		if err != nil {
+			t.Fatalf("Resolved: %v", err)
+		}
+		if res.Kind != DeliveryMerged {
+			t.Fatalf("outcome = %s, want merged: a busy default branch must not cost a three-lens re-review (%s)",
+				res.Kind, res.Summary())
+		}
+		if res.Ratio.Delta != sets.Delta || res.Ratio.Total != sets.Total {
+			t.Errorf("D-09 measurement = %+v, want the change-set comparison %+v", res.Ratio, sets)
+		}
+	})
+
+	t.Run("a resolution that rewrote the change set is reviewed again", func(t *testing.T) {
+		t.Parallel()
+		ctx := context.Background()
+		r := newDeliveryRealRig(t)
+		r.conflictingBranch()
+		r.deliverExpectingAConflict(ctx)
+
+		// The engineer settles the conflict and rewrites the twenty lines
+		// that had nothing to do with it.
+		r.resolve("rewritten line")
+		before := r.fixture.Git(t, "rev-parse", "main")
+		res, err := r.Resolved(ctx, r.bead.ID)
+		if err != nil {
+			t.Fatalf("Resolved: %v", err)
+		}
+		if res.Kind != DeliveryNeedsReview || res.State != domain.BeadStateInReview {
+			t.Fatalf("outcome = %s/%s, want needs_review/in_review (%s)", res.Kind, res.State, res.Summary())
+		}
+		if res.Ratio.Ratio <= gitx.DefaultReReviewThreshold {
+			t.Errorf("D-09 ratio = %v (%+v), want above %v", res.Ratio.Ratio, res.Ratio, gitx.DefaultReReviewThreshold)
+		}
+		if after := r.fixture.Git(t, "rev-parse", "main"); after != before {
+			t.Errorf("the default branch moved to %s, want %s: nothing ships before the review", after, before)
+		}
+	})
+}
+
+// deliveryRealRig is a real git repository with a bead worktree and a
+// Deliverer wired to a real *gitx.Manager on both git seams: the safety-off
+// path as production runs it, with no network, no user git configuration and
+// no bd (the state machine writes to the recording store fake).
+type deliveryRealRig struct {
+	*Deliverer
+	t       *testing.T
+	fixture *testutil.FixtureRepo
+	manager *gitx.Manager
+	git     DeliveryGit
+	wt      *gitx.Repo
+	host    *deliveryHostFake
+	store   *deliveryStoreFake
+	bead    domain.Bead
+}
+
+// newDeliveryRealRig builds the fixture repository, commits the file both
+// sides of the conflict will edit, and creates the bead's worktree from it.
+func newDeliveryRealRig(t *testing.T) *deliveryRealRig {
+	t.Helper()
+	ctx := context.Background()
+	f := testutil.NewFixtureRepo(t)
+	env := map[string]string{}
+	for _, kv := range f.Env() {
+		if k, v, ok := strings.Cut(kv, "="); ok && k != "PATH" {
+			env[k] = v
+		}
+	}
+	f.WriteFile(t, "conflict.txt", deliveryConflictFile("three"))
+	f.Commit(t, "Add the file both sides edit")
+
+	repo, err := gitx.Open(ctx, f.Dir, gitx.WithEnv(env))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	m, err := gitx.NewManager(repo, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	bead := deliveryBead(domain.BeadStateApproved)
+	if _, err := m.Create(ctx, bead); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	wt, err := m.Open(ctx, bead.ID)
+	if err != nil {
+		t.Fatalf("Open the worktree: %v", err)
+	}
+	host, store, g := newDeliveryHost(false), &deliveryStoreFake{}, NewDeliveryGit(m)
+	d, err := NewDeliverer(DeliveryOptions{
+		Host:         host,
+		Merge:        m,
+		Git:          g,
+		CheckCommand: "true",
+		States: NewStateMachine(store,
+			WithStatePublisher(PublisherFunc(host.Publish)),
+			WithStateRun(host.ID()),
+			WithStateClock(host.Now)),
+	})
+	if err != nil {
+		t.Fatalf("NewDeliverer: %v", err)
+	}
+	return &deliveryRealRig{
+		Deliverer: d, t: t, fixture: f, manager: m, git: g, wt: wt,
+		host: host, store: store, bead: bead,
+	}
+}
+
+// conflictingBranch puts a twenty-line feature file and an edit of line three
+// on the bead's branch, then edits the same line differently on the default
+// branch, so the delivery's rebase must stop.
+func (r *deliveryRealRig) conflictingBranch() {
+	r.t.Helper()
+	r.write("feature.txt", deliveryFeature("feature line"))
+	r.write("conflict.txt", deliveryConflictFile("branch three"))
+	if _, err := r.wt.CommitAll(context.Background(), "Add the feature and edit line three"); err != nil {
+		r.t.Fatalf("CommitAll: %v", err)
+	}
+	r.fixture.WriteFile(r.t, "conflict.txt", deliveryConflictFile("main three"))
+	r.fixture.Commit(r.t, "Edit line three on main")
+}
+
+// deliverExpectingAConflict delivers the bead and fails the test unless git
+// stopped on the conflict.
+func (r *deliveryRealRig) deliverExpectingAConflict(ctx context.Context) *DeliveryOutcome {
+	r.t.Helper()
+	out, err := r.Deliver(ctx, DeliveryRequest{Bead: r.bead})
+	if err != nil {
+		r.t.Fatalf("Deliver: %v", err)
+	}
+	if out.Kind != DeliveryConflict || out.State != domain.BeadStateInProgress {
+		r.t.Fatalf("outcome = %s/%s, want conflict/in_progress (%s)", out.Kind, out.State, out.Summary())
+	}
+	return out
+}
+
+// resolve is the engineer's conflict round: it settles the conflicted line,
+// writes the feature file with the given line prefix (the same one leaves the
+// change set alone, a different one rewrites it), and finishes the rebase the
+// way the resolve-conflict prompt asks.
+func (r *deliveryRealRig) resolve(feature string) {
+	r.t.Helper()
+	ctx := context.Background()
+	r.write("conflict.txt", deliveryConflictFile("branch three and main three"))
+	r.write("feature.txt", deliveryFeature(feature))
+	if _, err := r.wt.Git(ctx, "add", "conflict.txt", "feature.txt"); err != nil {
+		r.t.Fatalf("git add: %v", err)
+	}
+	if _, err := r.wt.Git(ctx, "rebase", "--continue"); err != nil {
+		r.t.Fatalf("git rebase --continue: %v", err)
+	}
+	if r.wt.RebaseInProgress() {
+		r.t.Fatal("the rebase is still in progress after --continue")
+	}
+}
+
+// write puts content in the bead's worktree.
+func (r *deliveryRealRig) write(rel, content string) {
+	r.t.Helper()
+	if err := os.WriteFile(filepath.Join(r.wt.Root, rel), []byte(content), 0o644); err != nil {
+		r.t.Fatalf("writing %s: %v", rel, err)
+	}
+}
+
+// read returns a file from the bead's worktree.
+func (r *deliveryRealRig) read(rel string) string {
+	r.t.Helper()
+	b, err := os.ReadFile(filepath.Join(r.wt.Root, rel))
+	if err != nil {
+		r.t.Fatalf("reading %s: %v", rel, err)
+	}
+	return string(b)
+}
+
+// deliveryConflictHarness is a deliverer whose first delivery conflicted and
+// whose second would merge, with a conflict round pending: the state the
+// tests of what happens after the engineer finishes start from.
+func deliveryConflictHarness(t *testing.T) *deliveryHarness {
+	t.Helper()
+	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+		h.merge.errs = []error{deliveryConflictErr("internal/a.go"), nil}
+		h.git.diffs = []*gitx.Diff{
+			deliveryDiffOf("aaaaaaa", deliveryPatch("feature line", "three", "branch three")),
+			deliveryDiffOf("bbbbbbb", deliveryPatch("feature line", "main three", "branch three and main three")),
+		}
+	})
+	out, err := h.Deliver(context.Background(), DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if out.Kind != DeliveryConflict {
+		t.Fatalf("outcome = %s, want conflict", out.Kind)
+	}
+	return h
+}
+
+// deliveryConflictFile is the five-line file both sides of a conflict edit,
+// with line three replaced by three.
+func deliveryConflictFile(three string) string {
+	return "one\ntwo\n" + three + "\nfour\nfive\n"
+}
+
+// deliveryFeature is the twenty-line file a bead's branch adds, numbered
+// after prefix; two calls with different prefixes share no line.
+func deliveryFeature(prefix string) string {
+	var b strings.Builder
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&b, "%s %d\n", prefix, i)
+	}
+	return b.String()
+}
+
+// deliveryPatch renders the unified diff of that change set: a new
+// twenty-line feature file plus one edited line of a five-line file, where
+// base is the line the change set replaces and resolved the line it puts
+// there. Two calls that differ only in base and resolved are what a conflict
+// resolution that touched nothing else looks like after a rebase — base
+// moves because the merge-base did.
+func deliveryPatch(feature, base, resolved string) string {
+	var b strings.Builder
+	b.WriteString("diff --git a/feature.txt b/feature.txt\n" +
+		"new file mode 100644\nindex 0000000..1111111\n--- /dev/null\n+++ b/feature.txt\n@@ -0,0 +1,20 @@\n")
+	for i := 1; i <= 20; i++ {
+		fmt.Fprintf(&b, "+%s %d\n", feature, i)
+	}
+	b.WriteString("diff --git a/conflict.txt b/conflict.txt\n" +
+		"index 2222222..3333333 100644\n--- a/conflict.txt\n+++ b/conflict.txt\n@@ -1,5 +1,5 @@\n one\n two\n")
+	fmt.Fprintf(&b, "-%s\n+%s\n four\n five\n", base, resolved)
+	return b.String()
+}
+
+// deliveryDiffOf builds a *gitx.Diff around a unified diff, counting the
+// patch's own files and changed lines into the stats, so a test's diff is as
+// internally consistent as git's and the D-09 arithmetic divides by a real
+// denominator.
+func deliveryDiffOf(head, patch string) *gitx.Diff {
+	d := &gitx.Diff{Stats: gitx.DiffStats{Base: "0000000", Head: head}, Patch: patch, MaxBytes: len(patch) + 1}
+	inHunk := false
+	for _, line := range strings.Split(patch, "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			d.Stats.Files++
+			inHunk = false
+		case strings.HasPrefix(line, "@@"):
+			inHunk = true
+		case !inHunk:
+		case strings.HasPrefix(line, "+"):
+			d.Stats.Insertions++
+		case strings.HasPrefix(line, "-"):
+			d.Stats.Deletions++
+		}
+	}
+	d.Bytes = len(patch)
+	return d
 }
 
 // deliveryEqualStrings compares two string slices, treating nil and empty as equal.

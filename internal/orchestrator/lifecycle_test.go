@@ -555,21 +555,113 @@ func TestLifecycleStopStopsAgentsAndReleasesLeases(t *testing.T) {
 	leases := &lifecycleLeases{}
 	opts := f.options()
 	opts.Agents, opts.Leases = stopper, leases
+	// sc-1 is being implemented, sc-2 is being reviewed (P6-03: only the
+	// first has a released edge out of it).
+	opts.Beads = func(context.Context) ([]domain.Bead, error) {
+		return []domain.Bead{
+			{ID: "sc-1", State: domain.BeadStateInProgress},
+			{ID: "sc-2", State: domain.BeadStateInReview},
+		}, nil
+	}
 
 	r, err := New(f.runConfig(t, config.RunSettings{}), opts)
 	require.NoError(t, err)
 	require.NoError(t, r.Start(context.Background()))
-	require.NoError(t, r.AgentStarted(domain.Agent{ID: "eng-1", Bead: "sc-1", State: domain.AgentStateRunning}))
-	require.NoError(t, r.AgentStarted(domain.Agent{ID: "ux-1", Bead: "sc-1", State: domain.AgentStateRunning}))
-	require.NoError(t, r.AgentStarted(domain.Agent{ID: "po-1", State: domain.AgentStateRunning}))
+	require.NoError(t, r.AgentStarted(domain.Agent{ID: "eng-1", Role: domain.RoleEngineer,
+		Bead: "sc-1", State: domain.AgentStateRunning}))
+	require.NoError(t, r.AgentStarted(domain.Agent{ID: "ux-1", Role: domain.RoleTester, Lens: domain.LensUX,
+		Bead: "sc-1", State: domain.AgentStateRunning}))
+	require.NoError(t, r.AgentStarted(domain.Agent{ID: "qa-2", Role: domain.RoleTester, Lens: domain.LensQA,
+		Bead: "sc-2", State: domain.AgentStateRunning}))
+	require.NoError(t, r.AgentStarted(domain.Agent{ID: "po-1", Role: domain.RolePO, State: domain.AgentStateRunning}))
 
 	require.NoError(t, r.Stop("user"))
 	_, err = r.Wait()
 	require.NoError(t, err)
 
 	require.Equal(t, []time.Duration{10 * time.Second}, stopper.calls(), "SIGTERM then a 10 s grace")
-	require.Equal(t, []domain.BeadID{"sc-1"}, leases.ids(), "each held bead is released once; the PO holds none")
+	require.Equal(t, []domain.BeadID{"sc-1"}, leases.ids(),
+		"the engineer's bead is released once; the testers and the PO hold no claim")
+
+	var moved []events.BeadStateChanged
+	for _, ev := range f.drain() {
+		if c, ok := ev.(events.BeadStateChanged); ok {
+			moved = append(moved, c)
+		}
+	}
+	require.Len(t, moved, 1, "the release publishes exactly one state change")
+	require.Equal(t, domain.BeadID("sc-1"), moved[0].Bead)
+	require.Equal(t, domain.BeadStateInProgress, moved[0].From)
+	require.Equal(t, domain.BeadStateOpen, moved[0].To)
 	require.Empty(t, lifecycleRead(t, r).Agents)
+}
+
+// TestLifecycleStopKeepsABeadThatCannotTakeTheReleasedEdge is the D-07 half
+// of the shutdown release (P6-03): a stop while a bead is in review or in
+// front of the product owner must not force it back to open. Both beads here
+// carry a live agent with the engineer's role — the role that does hold the
+// claim — so nothing but the transition table can save them.
+func TestLifecycleStopKeepsABeadThatCannotTakeTheReleasedEdge(t *testing.T) {
+	f := lifecycleSetup(t)
+	leases := &lifecycleLeases{}
+	opts := f.options()
+	opts.Leases = leases
+	opts.Beads = func(context.Context) ([]domain.Bead, error) {
+		return []domain.Bead{
+			{ID: "sc-1", State: domain.BeadStateInReview},
+			{ID: "sc-2", State: domain.BeadStateEscalated},
+			{ID: "sc-3", State: domain.BeadStateInProgress},
+		}, nil
+	}
+
+	r, err := New(f.runConfig(t, config.RunSettings{}), opts)
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	for _, b := range []domain.BeadID{"sc-1", "sc-2", "sc-3"} {
+		require.NoError(t, r.AgentStarted(domain.Agent{ID: domain.AgentID("eng-" + b), Role: domain.RoleEngineer,
+			Bead: b, State: domain.AgentStateRunning}))
+	}
+
+	require.NoError(t, r.Stop("user"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+
+	require.Equal(t, []domain.BeadID{"sc-3"}, leases.ids(),
+		"only the in_progress bead has a released edge out of it")
+	for _, ev := range f.drain() {
+		if c, ok := ev.(events.BeadStateChanged); ok {
+			require.Equal(t, domain.BeadID("sc-3"), c.Bead, "no other bead may be announced as moved")
+		}
+		if w, ok := ev.(events.Warning); ok {
+			require.NotEqual(t, StateWarningSource, w.Source,
+				"a bead that cannot be released is kept quietly, not refused noisily")
+		}
+	}
+}
+
+// TestLifecycleStopFallsBackWhenTheBeadListingFails covers the other half of
+// the release: bd could not say where the beads are, so the engineer's bead
+// falls back to the in_progress its claim set and still goes back to the
+// ready set, with one warning to say the listing failed.
+func TestLifecycleStopFallsBackWhenTheBeadListingFails(t *testing.T) {
+	f := lifecycleSetup(t)
+	leases := &lifecycleLeases{}
+	opts := f.options()
+	opts.Leases = leases
+	opts.Beads = func(context.Context) ([]domain.Bead, error) { return nil, fmt.Errorf("bd is down") }
+
+	r, err := New(f.runConfig(t, config.RunSettings{}), opts)
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	require.NoError(t, r.AgentStarted(domain.Agent{ID: "eng-1", Role: domain.RoleEngineer,
+		Bead: "sc-1", State: domain.AgentStateRunning}))
+
+	require.NoError(t, r.Stop("user"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+
+	require.Equal(t, []domain.BeadID{"sc-1"}, leases.ids())
+	require.Contains(t, lifecycleWarnings(f), "could not read the run's beads before releasing their leases")
 }
 
 func TestLifecycleSecondInterruptKillsImmediately(t *testing.T) {
@@ -1228,7 +1320,8 @@ func TestLifecycleAgentAndLeaseFailuresAreWarnings(t *testing.T) {
 	r, err := New(f.runConfig(t, config.RunSettings{}), opts)
 	require.NoError(t, err)
 	require.NoError(t, r.Start(context.Background()))
-	require.NoError(t, r.AgentStarted(domain.Agent{ID: "eng-1", Bead: "sc-1", State: domain.AgentStateRunning}))
+	require.NoError(t, r.AgentStarted(domain.Agent{ID: "eng-1", Role: domain.RoleEngineer,
+		Bead: "sc-1", State: domain.AgentStateRunning}))
 	require.NoError(t, r.Stop("user"))
 
 	out, err := r.Wait()

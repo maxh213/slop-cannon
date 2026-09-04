@@ -58,7 +58,17 @@ import (
 //     markers of a worktree left mid-rebase by an earlier delivery. Every
 //     delivery therefore probes the worktree first and, when a rebase is in
 //     progress, commits nothing and sends the bead straight to the engineer
-//     as a conflict round.
+//     as a conflict round. The same guard sits inside [DeliveryGit] itself,
+//     because the delivery is not the only caller: the feedback engine
+//     commits leftovers before it builds a round's prompt too.
+//
+// The D-09 measurement a conflict round is judged by is taken with the same
+// care. Its baseline is the branch diff from before the delivery, not from
+// when the conflict was found — a conflicted rebase is left in progress on
+// purpose, and mid-rebase HEAD is the default branch's own tip — and the
+// resolution is scored by comparing the two change sets rather than the two
+// branch tips, so the upstream commits the branch was rebased onto are not
+// counted as the engineer's work (see [Deliverer.reReview]).
 //
 // Every bd write goes through the [StateMachine], so the D-07 table, the
 // Warning on a refused transition and the [events.BeadStateChanged] are the
@@ -75,6 +85,17 @@ const SourceDelivery = "delivery"
 // between the delivery and its engineer for the same delivery. An engineer
 // that keeps leaving the worktree mid-rebase would otherwise loop forever;
 // after this many rounds the bead goes to needs_human.
+//
+// The cap is this package's own policy rather than a Decision: D-08 names
+// only max_review_rounds and max_pushback_rounds, and D-10 deliberately
+// keeps conflict rounds out of both, which leaves nothing bounding them at
+// all. Three is the smallest number that still allows the two rounds a
+// legitimate conflict can need — one for the conflict itself and one more
+// for the default branch moving again underneath the first resolution —
+// plus a spare. It is not a review budget: a conflict round fires one
+// engineer and no testers unless D-09 asks for them. A run that wants a
+// different number sets [DeliveryOptions.MaxConflictRounds]; there is no
+// configuration key for it yet.
 const DefaultMaxConflictRounds = 3
 
 // DefaultCheckItemCategory is the [domain.FeedbackItem] Category of the qa
@@ -95,6 +116,17 @@ var (
 	ErrNotDeliverable = errors.New("orchestrator: bead is not in a deliverable state")
 	// ErrNoConflictRound means the bead has no conflict round outstanding.
 	ErrNoConflictRound = errors.New("orchestrator: no conflict round is pending for this bead")
+	// ErrRebaseInProgress means the bead's worktree is in the middle of a
+	// rebase, so what was asked for would have committed or measured the
+	// conflict markers (P6-16(b)). [DeliveryGit.CommitLeftovers] returns it
+	// rather than silently doing nothing, so every call site — the
+	// delivery's own and the feedback context provider that builds the
+	// conflict round's prompt — has to decide what to do about it.
+	ErrRebaseInProgress = errors.New("orchestrator: the worktree is mid-rebase")
+	// errNoMergeResult is what a merge path that answered neither a result
+	// nor an error is reported as; gitx never does, but a retryable outcome
+	// beats a nil dereference.
+	errNoMergeResult = errors.New("orchestrator: the merge path returned no result")
 )
 
 // DeliveryHost is the slice of [Run] the delivery handoff needs: who it is
@@ -155,9 +187,14 @@ type DeliveryGit interface {
 	// fails with [gitx.ErrWorktreeMissing] when the bead has no worktree.
 	RebaseState(ctx context.Context, id domain.BeadID) (RebaseState, error)
 	// CommitLeftovers commits whatever the engineer left uncommitted
-	// (D-14).
+	// (D-14). It refuses with [ErrRebaseInProgress] in a worktree left
+	// mid-rebase, where "git add -A" would stage the conflict markers and
+	// the commit would destroy the rebase state (P6-16(b)).
 	CommitLeftovers(ctx context.Context, bead domain.Bead, round int) (*gitx.Leftovers, error)
-	// Diff is the bead's branch against the default branch.
+	// Diff is the bead's branch against the default branch. It only means
+	// anything while no rebase is in progress: mid-rebase HEAD is the
+	// commit the branch is being rebased onto, so the diff comes back
+	// empty instead of describing the branch. Probe RebaseState first.
 	Diff(ctx context.Context, id domain.BeadID) (*gitx.Diff, error)
 	// ChangeRatio measures how far the branch moved between two diffs
 	// (D-09).
@@ -199,8 +236,27 @@ func (g *managerGit) RebaseState(ctx context.Context, id domain.BeadID) (RebaseS
 	return RebaseState{InProgress: true, Branch: repo.RebasingBranch(), Files: files}, nil
 }
 
-// CommitLeftovers implements [DeliveryGit].
+// CommitLeftovers implements [DeliveryGit]. The mid-rebase guard of
+// P6-16(b) lives here, not only in [Deliverer.Deliver], because
+// [gitx.Manager.CommitLeftovers] runs "git add -A" and then commits, which
+// in a worktree left mid-rebase stages the conflict markers and destroys
+// the rebase state — and the delivery is not its only caller. The feedback
+// engine commits leftovers before it builds a round's prompt too, including
+// the conflict round's own prompt, which is planned while the worktree is
+// mid-rebase by construction.
 func (g *managerGit) CommitLeftovers(ctx context.Context, bead domain.Bead, round int) (*gitx.Leftovers, error) {
+	if bead.ID == "" {
+		// gitx has its own message for this; let it speak.
+		return g.m.CommitLeftovers(ctx, bead, round)
+	}
+	repo, err := g.m.Open(ctx, bead.ID)
+	if err != nil {
+		return nil, err
+	}
+	if repo.RebaseInProgress() {
+		return nil, fmt.Errorf("%w: %s has conflict markers to resolve, not leftovers to commit",
+			ErrRebaseInProgress, bead.ID)
+	}
 	return g.m.CommitLeftovers(ctx, bead, round)
 }
 
@@ -376,9 +432,11 @@ type PendingConflict struct {
 	Agent domain.AgentID
 	// Conflict is what the engineer is told (P5-12).
 	Conflict agents.EngineerConflict
-	// Diff is the branch as it stood when the conflict was found; the D-09
-	// ratio of the resolution is measured against it. Nil when the diff
-	// could not be taken, which counts as "everything changed".
+	// Diff is the branch as it stood when the delivery started, taken
+	// before the rebase that went on to conflict; the D-09 ratio of the
+	// resolution is measured against it. Nil when no such snapshot could be
+	// taken — the worktree was already mid-rebase when the delivery
+	// started, or the diff failed — which counts as "everything changed".
 	Diff *gitx.Diff
 	// StartedAt is when the round was opened.
 	StartedAt time.Time
@@ -528,6 +586,7 @@ func (d *Deliverer) Deliver(ctx context.Context, req DeliveryRequest) (*Delivery
 
 	// P6-16: a worktree left mid-rebase must never have its conflict
 	// markers committed. Probe before the leftovers commit, not after.
+	var baseline *gitx.Diff
 	if d.git != nil {
 		rs, err := d.git.RebaseState(ctx, bead.ID)
 		switch {
@@ -536,21 +595,37 @@ func (d *Deliverer) Deliver(ctx context.Context, req DeliveryRequest) (*Delivery
 		case err != nil:
 			return d.retryable(out, "the worktree could not be inspected", err)
 		case rs.InProgress:
+			// No baseline: mid-rebase there is no branch tip to diff, so
+			// the resolution cannot be measured and D-09 errs on a review.
 			return d.conflictRound(ctx, req, out, d.conflictOf(ctx, rs.Files, ""),
-				"the worktree was left mid-rebase")
+				"the worktree was left mid-rebase", nil)
 		}
 		if err := d.commitLeftovers(ctx, bead, round, out); err != nil {
-			if errors.Is(err, gitx.ErrWorktreeMissing) {
+			switch {
+			case errors.Is(err, gitx.ErrWorktreeMissing):
 				return d.handOff(ctx, req, out, "the bead has no worktree to deliver from", "", err)
+			case errors.Is(err, ErrRebaseInProgress):
+				// The probe raced with something that started a rebase and
+				// the adapter's own guard caught it.
+				return d.conflictRound(ctx, req, out, d.conflictOf(ctx, nil, err.Error()),
+					"the worktree was left mid-rebase", nil)
+			default:
+				return d.retryable(out, "the engineer's leftovers could not be committed", err)
 			}
-			return d.retryable(out, "the engineer's leftovers could not be committed", err)
 		}
+		// D-09's baseline for a conflict round is taken here, before any
+		// rebase has run. It cannot be taken when the conflict is found:
+		// gitx leaves the failed rebase in progress on purpose, and
+		// mid-rebase HEAD is the default branch's own tip, so a diff taken
+		// then is empty and every resolution, however trivial, would
+		// measure as a full rewrite and go back for a three-lens review.
+		baseline = d.snapshotDiff(ctx, bead.ID)
 	}
 
 	if d.safety {
 		return d.deliverPR(ctx, req, out)
 	}
-	return d.deliverMerge(ctx, req, out)
+	return d.deliverMerge(ctx, req, out, baseline)
 }
 
 // startDelivering moves the bead into delivering and returns the state it
@@ -659,7 +734,7 @@ func (d *Deliverer) deliverPR(ctx context.Context, req DeliveryRequest, out *Del
 }
 
 // deliverMerge is the safety-off path (D-10, D-20).
-func (d *Deliverer) deliverMerge(ctx context.Context, req DeliveryRequest, out *DeliveryOutcome) (*DeliveryOutcome, error) {
+func (d *Deliverer) deliverMerge(ctx context.Context, req DeliveryRequest, out *DeliveryOutcome, baseline *gitx.Diff) (*DeliveryOutcome, error) {
 	if d.merge == nil {
 		return nil, fmt.Errorf("%w: safety is off and there is no merge path", ErrNoDeliveryPath)
 	}
@@ -669,12 +744,16 @@ func (d *Deliverer) deliverMerge(ctx context.Context, req DeliveryRequest, out *
 		BaseSHA:      req.BaseSHA,
 		Beads:        d.mergeBeads(),
 	})
-	if res != nil {
-		out.Target, out.MergeSHA, out.Pushed, out.Check = res.Target, res.Head, res.Pushed, res.Check
-	}
 	if err != nil {
-		return d.mergeFailure(ctx, req, out, err)
+		// gitx returns no result on any failure path, so everything the
+		// outcome can say about a failed merge comes from the
+		// [gitx.DeliveryError] instead (the check result included).
+		return d.mergeFailure(ctx, req, out, err, baseline)
 	}
+	if res == nil {
+		return d.retryable(out, "the merge reported neither a result nor an error", errNoMergeResult)
+	}
+	out.Target, out.MergeSHA, out.Pushed, out.Check = res.Target, res.Head, res.Pushed, res.Check
 	d.host.Publish(events.Merged{
 		Meta:   d.meta(),
 		Bead:   req.Bead.ID,
@@ -699,7 +778,7 @@ func (d *Deliverer) deliverMerge(ctx context.Context, req DeliveryRequest, out *
 }
 
 // mergeFailure maps a failed safety-off delivery onto the D-07 table.
-func (d *Deliverer) mergeFailure(ctx context.Context, req DeliveryRequest, out *DeliveryOutcome, err error) (*DeliveryOutcome, error) {
+func (d *Deliverer) mergeFailure(ctx context.Context, req DeliveryRequest, out *DeliveryOutcome, err error, baseline *gitx.Diff) (*DeliveryOutcome, error) {
 	var de *gitx.DeliveryError
 	if !errors.As(err, &de) {
 		return d.retryable(out, "the merge failed", err)
@@ -709,7 +788,7 @@ func (d *Deliverer) mergeFailure(ctx context.Context, req DeliveryRequest, out *
 		// D-10: the worktree is left mid-rebase with the markers; the
 		// engineer resolves them and the delivery is retried.
 		return d.conflictRound(ctx, req, out, d.conflictOf(ctx, de.Files, de.Output),
-			"the rebase onto the default branch stopped on conflicts")
+			"the rebase onto the default branch stopped on conflicts", baseline)
 	case de.Stage == gitx.StageCheck:
 		return d.checkFailed(ctx, req, out, de)
 	case handOffStage(de):
@@ -884,7 +963,12 @@ func ConflictFromResume(e gitx.ResumeEntry, target string) (agents.EngineerConfl
 // does not count against max_review_rounds, so the bead keeps its round
 // number; it does count against MaxConflictRounds, and a bead that exhausts
 // those is handed to a human instead.
-func (d *Deliverer) conflictRound(ctx context.Context, req DeliveryRequest, out *DeliveryOutcome, conflict agents.EngineerConflict, reason string) (*DeliveryOutcome, error) {
+//
+// baseline is the branch diff taken before the delivery that conflicted; it
+// is what [Deliverer.Resolved] measures the resolution against (D-09). A nil
+// baseline means the branch could not be diffed, which counts as
+// "everything changed" and buys the resolution a full review.
+func (d *Deliverer) conflictRound(ctx context.Context, req DeliveryRequest, out *DeliveryOutcome, conflict agents.EngineerConflict, reason string, baseline *gitx.Diff) (*DeliveryOutcome, error) {
 	attempt := d.nextAttempt(req.Bead.ID)
 	if attempt > d.maxRounds {
 		return d.handOff(ctx, req, out,
@@ -907,7 +991,7 @@ func (d *Deliverer) conflictRound(ctx context.Context, req DeliveryRequest, out 
 		Attempt:   attempt,
 		Agent:     agent,
 		Conflict:  conflict,
-		Diff:      d.snapshotDiff(ctx, req.Bead.ID),
+		Diff:      baseline,
 		StartedAt: d.host.Now(),
 		Request:   req,
 	}
@@ -934,8 +1018,12 @@ func (d *Deliverer) conflictRound(ctx context.Context, req DeliveryRequest, out 
 }
 
 // snapshotDiff takes the branch diff a later D-09 measurement compares
-// against. A failure is not fatal: a nil diff means "everything changed",
-// which sends the bead back for a full review rather than skipping one.
+// against. It is only called before a delivery path runs, while the bead's
+// own branch is still checked out: a conflicted rebase is left in progress
+// by gitx, and mid-rebase HEAD is the commit the branch is being rebased
+// onto, so a diff taken then describes nothing. A failure is not fatal: a
+// nil diff means "everything changed", which sends the bead back for a full
+// review rather than skipping one.
 func (d *Deliverer) snapshotDiff(ctx context.Context, id domain.BeadID) *gitx.Diff {
 	if d.git == nil {
 		return nil
@@ -1014,6 +1102,13 @@ func (d *Deliverer) Demands(context.Context) ([]Demand, error) {
 	pending := d.Pending()
 	out := make([]Demand, 0, len(pending))
 	for _, p := range pending {
+		if p.Bead.State != domain.BeadStateInProgress {
+			// The engineer's work is done and only a transition after it
+			// failed (see [Deliverer.Resolved]); re-firing the round would
+			// undo it. The round stays registered so Resolved can be
+			// retried and AbandonConflict still has something to give up.
+			continue
+		}
 		out = append(out, Demand{
 			Kind:      DemandImplement,
 			Bead:      p.Bead.ID,
@@ -1040,28 +1135,37 @@ func (d *Deliverer) Demands(context.Context) ([]Demand, error) {
 // the D-07 table stays honest about where the bead has been — and otherwise
 // it stops at in_review and lets the feedback engine run a full round. A
 // bead with no diff to compare against is treated as "everything changed".
+//
+// The pending round is forgotten only once the bead has actually moved. If
+// a bd write fails the outcome is [DeliveryRetryable] and the round is
+// still registered, so this method can be called again (it resumes at the
+// transition that failed) and [Deliverer.AbandonConflict] still has a bead
+// to hand to a human. A conflict round that vanished with its bead left in
+// in_progress would be offered by no work source and reachable by no
+// caller.
 func (d *Deliverer) Resolved(ctx context.Context, id domain.BeadID) (*DeliveryOutcome, error) {
 	p, ok := d.PendingFor(id)
 	if !ok {
 		return nil, fmt.Errorf("%w: %s", ErrNoConflictRound, id)
 	}
-	d.mu.Lock()
-	delete(d.pending, id)
-	d.mu.Unlock()
-
 	ratio, full := d.reReview(ctx, p)
 	out := &DeliveryOutcome{
 		Bead: id, Round: p.Round, Safety: d.safety, Branch: gitx.BranchName(p.Bead),
-		State: domain.BeadStateInProgress, Ratio: ratio,
+		State: p.Bead.State, Ratio: ratio,
 	}
-	if _, err := d.states.Apply(ctx, StateRequest{
-		Bead: id, From: domain.BeadStateInProgress, Event: BeadEventSubmitted,
-		Round: p.Round, Reason: "conflict resolved",
-	}); err != nil {
-		return d.retryable(out, "the resolved conflict could not be submitted", err)
+	if p.Bead.State != domain.BeadStateInReview {
+		if _, err := d.states.Apply(ctx, StateRequest{
+			Bead: id, From: domain.BeadStateInProgress, Event: BeadEventSubmitted,
+			Round: p.Round, Reason: "conflict resolved",
+		}); err != nil {
+			return d.retryable(out, "the resolved conflict could not be submitted", err)
+		}
+		p.Bead.State = domain.BeadStateInReview
+		d.rememberConflict(p)
 	}
 	out.State = domain.BeadStateInReview
 	if full {
+		d.dropConflict(id)
 		out.Kind = DeliveryNeedsReview
 		out.Reason = fmt.Sprintf("the conflict resolution changed %d of %d lines, above the %.0f%% re-review threshold",
 			ratio.Delta, ratio.Total, d.threshold*100)
@@ -1075,6 +1179,7 @@ func (d *Deliverer) Resolved(ctx context.Context, id domain.BeadID) (*DeliveryOu
 	}); err != nil {
 		return d.retryable(out, "the resolved conflict could not be approved", err)
 	}
+	d.dropConflict(id)
 	req := p.Request
 	req.Bead = p.Bead
 	req.Bead.State = domain.BeadStateApproved
@@ -1088,6 +1193,18 @@ func (d *Deliverer) Resolved(ctx context.Context, id domain.BeadID) (*DeliveryOu
 
 // reReview applies D-09 to a conflict round: it returns the measurement and
 // whether every tester must review again.
+//
+// It compares the two change sets — the branch's diff against its merge-base
+// before the delivery and again after the resolution — rather than the two
+// branch tips. A rebase moves the tip by every upstream commit as well as by
+// the engineer's resolution, so [gitx.ChangeRatio]'s tip-to-tip delta counts
+// the whole default branch's movement as the engineer's work: on any busy
+// branch that is more than the change set itself, and every conflict,
+// however trivial, would score above the threshold and buy a three-lens
+// re-review. [conflictChangeRatio] compares the lines the two patches add
+// and remove instead, which upstream's own commits are in neither of.
+// Tip-to-tip is still the fallback for a diff too large to have a patch,
+// where it over-reports and so errs towards a review.
 func (d *Deliverer) reReview(ctx context.Context, p PendingConflict) (gitx.ChangeRatio, bool) {
 	if d.git == nil {
 		// Nothing to measure with: the delivery has no git of its own, so
@@ -1099,10 +1216,26 @@ func (d *Deliverer) reReview(ctx context.Context, p PendingConflict) (gitx.Chang
 		// much moved is unknown: err on the side of a full review (D-09).
 		return gitx.ChangeRatio{Ratio: 1}, true
 	}
+	rs, err := d.git.RebaseState(ctx, p.Bead.ID)
+	switch {
+	case err != nil:
+		d.warn(p.Bead.ID, "the conflict resolution could not be measured; reviewing it again", err)
+		return gitx.ChangeRatio{Ratio: 1}, true
+	case rs.InProgress:
+		// The engineer stopped short of "git rebase --continue", which its
+		// prompt asks for, so the resolved change set does not exist yet
+		// and there is nothing to measure. gitx finishes such a rebase on
+		// the next delivery, but the review decision has to be made now.
+		d.warn(p.Bead.ID, "the rebase was left unfinished, so the resolution could not be measured; reviewing it again", nil)
+		return gitx.ChangeRatio{Ratio: 1}, true
+	}
 	current, err := d.git.Diff(ctx, p.Bead.ID)
 	if err != nil {
 		d.warn(p.Bead.ID, "the conflict resolution could not be measured; reviewing it again", err)
 		return gitx.ChangeRatio{Ratio: 1}, true
+	}
+	if ratio, ok := conflictChangeRatio(p.Diff, current); ok {
+		return ratio, ratio.Exceeds(d.threshold)
 	}
 	ratio, err := d.git.ChangeRatio(ctx, p.Bead.ID, p.Diff, current)
 	if err != nil {
@@ -1110,6 +1243,111 @@ func (d *Deliverer) reReview(ctx context.Context, p PendingConflict) (gitx.Chang
 		return gitx.ChangeRatio{Ratio: 1}, true
 	}
 	return ratio, ratio.Exceeds(d.threshold)
+}
+
+// conflictChangeRatio measures how far a conflict resolution moved the
+// change set under review, in the shape D-09's threshold is expressed in:
+// Delta is the number of added or removed lines that differ between the two
+// patches, Total the current change set's changed lines, Ratio their
+// quotient (see [gitx.RatioOf], so an emptied change set is 1 rather than a
+// division by zero).
+//
+// It is the rebase-safe counterpart of [gitx.Repo.ChangeRatio]: the change
+// sets are both measured against their own merge-base, so the upstream
+// commits the branch was rebased onto are in neither and cancel out. A
+// resolution that only settled the conflict therefore scores near zero even
+// when the default branch moved a long way underneath it.
+//
+// The second result is false when either patch is missing (gitx truncates
+// an oversized diff to its file list), which the caller answers with the
+// tip-to-tip measurement.
+func conflictChangeRatio(previous, current *gitx.Diff) (gitx.ChangeRatio, bool) {
+	before, ok := changeSetLines(previous)
+	if !ok {
+		return gitx.ChangeRatio{}, false
+	}
+	after, ok := changeSetLines(current)
+	if !ok {
+		return gitx.ChangeRatio{}, false
+	}
+	delta := 0
+	for line, n := range before {
+		delta += deliveryAbs(n - after[line])
+	}
+	for line, n := range after {
+		if _, seen := before[line]; !seen {
+			delta += n
+		}
+	}
+	c := gitx.ChangeRatio{
+		Previous: previous.Head(), Current: current.Head(),
+		Delta: delta, Total: current.ChangedLines(),
+	}
+	c.Ratio = gitx.RatioOf(c.Delta, c.Total)
+	return c, true
+}
+
+// changeSetLines counts the lines a diff's patch adds and removes, keyed by
+// the file's own "diff --git" header line so that identical lines in
+// different files are told apart. The header is the key rather than a parsed
+// path because it needs to be nothing more than stable between two diffs of
+// the same file, and it changes when the file is renamed — which is a
+// change. Hunk headers, context lines and the file headers before the first
+// hunk are ignored, so upstream commits that move the surrounding code do
+// not count as the engineer's work.
+//
+// The second result is false when there is no patch to read: an empty change
+// set counts as an empty tally, but a diff gitx truncated cannot be compared
+// this way.
+func changeSetLines(d *gitx.Diff) (map[string]int, bool) {
+	if d == nil {
+		return nil, false
+	}
+	lines := map[string]int{}
+	if d.Empty() {
+		return lines, true
+	}
+	if d.Truncated || d.Patch == "" {
+		return nil, false
+	}
+	file, inHunk := "", false
+	for _, line := range strings.Split(d.Patch, "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			file, inHunk = line, false
+		case strings.HasPrefix(line, "@@"):
+			inHunk = true
+		case !inHunk:
+			// "index", "new file mode", "--- a/x", "+++ b/x" and the rest
+			// of the extended header: not content.
+		case strings.HasPrefix(line, "+"), strings.HasPrefix(line, "-"):
+			lines[file+"\x00"+line]++
+		}
+	}
+	return lines, true
+}
+
+// deliveryAbs is the absolute value of an int.
+func deliveryAbs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+// rememberConflict stores an updated conflict round.
+func (d *Deliverer) rememberConflict(p PendingConflict) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pending[p.Bead.ID] = p
+}
+
+// dropConflict stops offering a conflict round, without forgetting how many
+// the delivery has had: the re-delivery may conflict again.
+func (d *Deliverer) dropConflict(id domain.BeadID) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.pending, id)
 }
 
 // AbandonConflict gives up on a conflict round: the bead goes to needs_human
@@ -1123,7 +1361,7 @@ func (d *Deliverer) AbandonConflict(ctx context.Context, id domain.BeadID, reaso
 	if strings.TrimSpace(reason) == "" {
 		reason = "the delivery conflict was not resolved"
 	}
-	out := &DeliveryOutcome{Bead: id, Round: p.Round, Safety: d.safety, State: domain.BeadStateInProgress}
+	out := &DeliveryOutcome{Bead: id, Round: p.Round, Safety: d.safety, State: p.Bead.State}
 	req := p.Request
 	req.Bead = p.Bead
 	if _, err := d.handOff(ctx, req, out, reason, "", cause); err != nil {
@@ -1184,7 +1422,8 @@ func (d *Deliverer) ConflictRound(ctx context.Context, e gitx.ResumeEntry) error
 		out.State = domain.BeadStateInProgress
 	}
 	req := DeliveryRequest{Bead: bead, Round: round, Agent: domain.AgentID(strings.TrimSpace(bead.Assignee))}
-	res, err := d.conflictRound(ctx, req, out, conflict, "the worktree was left mid-rebase before the restart")
+	res, err := d.conflictRound(ctx, req, out, conflict,
+		"the worktree was left mid-rebase before the restart", nil)
 	if err != nil {
 		return err
 	}

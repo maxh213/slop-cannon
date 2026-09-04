@@ -49,12 +49,23 @@ attached and the run has not finished; a recorded run leaves them out of the
 |---|---|
 | `p` | pause the run (no new agents; running ones finish), or resume a paused one |
 | `s` | stop the run gracefully — asks to confirm |
-| `r` | re-fire the selected bead; only a `failed` or `blocked` bead can be re-fired |
+| `r` | re-fire the bead the active view has selected; only a bead the run gave up on — `failed`, `needs_human`, `escalated` or bd's own `blocked` — can be re-fired |
 | `x` | mark the selected bead done without delivering it — asks to confirm |
 | `S` | turn safety on or off for the rest of the run — asks to confirm |
 | `a` | set ammo: a prompt pre-filled with the run's current value, `enter` applies and `esc` cancels |
 
-The footer reports what each one did, or why it was refused.
+The two bead keys act on the bead the tab that is up has under its cursor:
+the Graph view's selected bead, the bead the Agents view's selected agent is
+working on, or the bead of the selected Feedback or PRs row. The Log view has
+no bead under its cursor, so they refuse there with "select a bead first"
+rather than acting on a bead you cannot see.
+
+The footer reports what each one did, or why it was refused, until the next
+key press.
+
+`S` and `a` remember the value the orchestrator accepted, so safety can be
+turned back on and ammo put back to a number it already had; the run's own
+events still win the moment they say anything.
 
 ## Views
 

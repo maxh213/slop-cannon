@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -180,8 +181,10 @@ type supFixture struct {
 }
 
 // supSetup builds a run whose state lives in temp directories (D-23: never
-// the real home) with the given mock scenarios, one per cartridge name.
-func supSetup(t *testing.T, scenarios map[string]*mock.Scenario) *supFixture {
+// the real home) with the given mock scenarios, one per cartridge name. The
+// optional tweaks edit the configuration once every scenario is built —
+// which cartridge is active, and the D-12 per-role overrides.
+func supSetup(t *testing.T, scenarios map[string]*mock.Scenario, tweaks ...func(*config.Config)) *supFixture {
 	t.Helper()
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -206,6 +209,9 @@ func supSetup(t *testing.T, scenarios map[string]*mock.Scenario) *supFixture {
 		require.NoError(t, err)
 		adapters[name] = a
 		built[name] = a
+	}
+	for _, tweak := range tweaks {
+		tweak(&cfg)
 	}
 	eff := &config.Effective{Config: cfg, Sources: map[string]config.Source{}}
 
@@ -329,6 +335,29 @@ func (f *supFixture) supEvents() []events.Event {
 			return out
 		}
 	}
+}
+
+// supFailuresIn and supWarningsIn filter an already drained event slice, for
+// a test that needs both (supEvents drains the subscription, so it can only
+// be called once).
+func supFailuresIn(evs []events.Event) []events.AgentFailed {
+	var out []events.AgentFailed
+	for _, ev := range evs {
+		if af, ok := ev.(events.AgentFailed); ok {
+			out = append(out, af)
+		}
+	}
+	return out
+}
+
+func supWarningsIn(evs []events.Event) []events.Warning {
+	var out []events.Warning
+	for _, ev := range evs {
+		if w, ok := ev.(events.Warning); ok {
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 // supFailures returns every AgentFailed published so far.
@@ -714,6 +743,13 @@ func TestSupervisorAbandonsARetryWhenItIsStopped(t *testing.T) {
 	require.ErrorIs(t, err, ErrSupervisorStopped)
 	require.ErrorIs(t, err, cartridge.ErrCrash, "the failure that was being retried is still reported")
 	assert.Len(t, f.Adapters[supAlpha].Calls(), 1, "no session starts after the stop")
+
+	fails := f.supFailures()
+	require.Len(t, fails, 2, "the abandoned retry still owes a terminal agent event")
+	assert.True(t, fails[0].WillRetry)
+	assert.False(t, fails[1].WillRetry)
+	assert.Equal(t, events.FailureKilled, fails[1].Failure)
+	assert.Empty(t, f.Run.Agents(), "no agent is left recorded as running")
 }
 
 func TestSupervisorInstallsTheReadOnlyBDShim(t *testing.T) {
@@ -788,6 +824,10 @@ func (c *supBareCartridge) Run(_ context.Context, spec cartridge.RunSpec) (cartr
 		c.mu.Unlock()
 		// The whole point: it writes even under read_exec.
 		_ = os.WriteFile(filepath.Join(spec.Workdir, "agent-wrote.txt"), []byte("mine now\n"), 0o644)
+		// And it writes through any symlink the tree it was given carries,
+		// which is the other way out of a contained copy (P6-20).
+		_ = os.WriteFile(filepath.Join(spec.Workdir, "escape", "pwned.txt"), []byte("mine now\n"), 0o644)
+		_ = os.WriteFile(filepath.Join(spec.Workdir, "climb", "pwned.txt"), []byte("mine now\n"), 0o644)
 
 		block, err := mock.ResultBlock(json.RawMessage(`{"outcome":"approve"}`))
 		if err != nil {
@@ -1006,4 +1046,304 @@ func TestSupervisorKeepsTheWorkdirOfAWorktreeLessFiring(t *testing.T) {
 	call, ok := f.Adapters[supAlpha].LastCall()
 	require.True(t, ok)
 	assert.Equal(t, repo, call.Spec.Workdir)
+}
+
+// supUndetectable wraps a cartridge whose CLI does not answer the P2-08
+// Detect probe — not installed, or not authenticated. The wrapped adapter
+// would happily run: the selector's verdict is the only thing standing
+// between the run and firing it.
+type supUndetectable struct {
+	inner cartridge.Cartridge
+
+	mu    sync.Mutex
+	err   error
+	after error
+	ran   int
+}
+
+func (c *supUndetectable) Name() string { return c.inner.Name() }
+
+func (c *supUndetectable) Detect(ctx context.Context) (cartridge.Status, error) {
+	c.mu.Lock()
+	err := c.err
+	c.mu.Unlock()
+	if err != nil {
+		return cartridge.Status{}, err
+	}
+	return c.inner.Detect(ctx)
+}
+
+func (c *supUndetectable) Run(ctx context.Context, spec cartridge.RunSpec) (cartridge.Session, error) {
+	c.mu.Lock()
+	c.ran++
+	if c.after != nil {
+		c.err = c.after
+	}
+	c.mu.Unlock()
+	return c.inner.Run(ctx, spec)
+}
+
+// Ran is how many sessions the wrapped adapter was actually asked for.
+func (c *supUndetectable) Ran() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ran
+}
+
+// supSelectorFor builds a real selector over cartridges, with active
+// active, so the tests exercise the P2-08 policy rather than a stub.
+func supSelectorFor(t *testing.T, active string, cartridges map[string]cartridge.Cartridge) *cartridge.Selector {
+	t.Helper()
+	cfg := config.Config{ActiveCartridge: active, Cartridges: map[string]config.Cartridge{}}
+	for name := range cartridges {
+		cfg.Cartridges[name] = config.Cartridge{}
+	}
+	sel, err := cartridge.NewSelector(cfg, cartridges)
+	require.NoError(t, err)
+	return sel
+}
+
+func TestSupervisorRefusesToFireACartridgeTheSelectorRejected(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+	gated := &supUndetectable{
+		inner: f.Adapters[supAlpha],
+		err:   fmt.Errorf("cartridge %q is not installed", supAlpha),
+	}
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.Cartridges = supSelectorFor(t, supAlpha, map[string]cartridge.Cartridge{supAlpha: gated})
+	})
+
+	_, _, err := FireAgent[domain.Verdict](context.Background(), sup,
+		supTesterFiring("tester-qa-bd-21-r1", "bd-21", f.worktree(t, "bd-21")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is not installed",
+		"the selector's diagnosis is what the caller is told, not a second failure")
+	assert.Zero(t, gated.Ran(), "a cartridge the selector refused is never fired")
+	assert.Empty(t, f.Adapters[supAlpha].Calls())
+
+	for _, ev := range f.supEvents() {
+		_, spawned := ev.(events.AgentSpawned)
+		assert.False(t, spawned, "no agent is announced for a firing that never happened")
+	}
+}
+
+func TestSupervisorReRoutesPastARetiredCartridgeEvenWhenTheSelectorRefuses(t *testing.T) {
+	broke := mock.NewScenario("broke")
+	broke.Otherwise("no-credits").FailWith(mock.Failure{Kind: mock.FailCreditsExhausted})
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: broke, supBeta: supApproval("beta")})
+	// The exhausted cartridge stops answering Detect once it has run, so
+	// the re-route has to happen against a selector that refuses.
+	gated := &supUndetectable{
+		inner: f.Adapters[supAlpha],
+		after: fmt.Errorf("cartridge %q is not authenticated", supAlpha),
+	}
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.Cartridges = supSelectorFor(t, supAlpha, map[string]cartridge.Cartridge{
+			supAlpha: gated, supBeta: f.Adapters[supBeta],
+		})
+	})
+
+	v, tr, err := FireAgent[domain.Verdict](context.Background(), sup,
+		supTesterFiring("tester-qa-bd-22-r1", "bd-22", f.worktree(t, "bd-22")))
+	require.NoError(t, err)
+	assert.Equal(t, domain.VerdictApprove, v.Outcome)
+	assert.Equal(t, supBeta, tr.Cartridge, "D-18 still routes around the retired cartridge")
+	assert.Equal(t, []string{supAlpha}, sup.DeadCartridges())
+
+	var said bool
+	for _, w := range supWarningsIn(f.supEvents()) {
+		if strings.Contains(w.Message, "the cartridge selector refused") {
+			said = true
+			assert.Contains(t, w.Message, supBeta, "the warning names the cartridge fired instead")
+			assert.Contains(t, w.Err, "is not authenticated", "and the selector's own diagnosis")
+		}
+	}
+	assert.True(t, said, "firing a cartridge the selector did not approve is always announced")
+}
+
+func TestSupervisorIgnoresTheRoleOverrideOfARetiredCartridge(t *testing.T) {
+	broke := mock.NewScenario("broke")
+	broke.Otherwise("no-credits").FailWith(mock.Failure{Kind: mock.FailCreditsExhausted})
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: broke, supBeta: supApproval("beta")},
+		func(c *config.Config) {
+			// D-12: the tester is sent to its own cartridge, not the active one.
+			c.ActiveCartridge = supBeta
+			c.Roles = map[domain.Role]string{domain.RoleTester: supAlpha}
+		})
+	require.Equal(t, supAlpha, f.Sel.Requested(domain.RoleTester), "D-12 asks for the override")
+	sup := f.supervisor(t, nil)
+
+	v, tr, err := FireAgent[domain.Verdict](context.Background(), sup,
+		supTesterFiring("tester-qa-bd-23-r1", "bd-23", f.worktree(t, "bd-23")))
+	require.NoError(t, err)
+	assert.Equal(t, domain.VerdictApprove, v.Outcome)
+	assert.Equal(t, supBeta, tr.Cartridge,
+		"the D-12 override is ignored once its cartridge is out of credits (D-18)")
+	assert.Equal(t, []string{supAlpha}, sup.DeadCartridges())
+	assert.Equal(t, supAlpha, f.Sel.Requested(domain.RoleTester),
+		"the override itself is untouched: only this run's routing changed")
+
+	// A second firing for the same role goes straight to the live cartridge.
+	_, tr2, err := FireAgent[domain.Verdict](context.Background(), sup,
+		supTesterFiring("tester-qa-bd-23-r2", "bd-23", f.worktree(t, "bd-23")))
+	require.NoError(t, err)
+	assert.Equal(t, supBeta, tr2.Cartridge)
+	assert.Len(t, f.Adapters[supAlpha].Calls(), 1, "the retired override is not tried again")
+}
+
+func TestSupervisorWorktreeCopyDoesNotEscapeThroughASymlink(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+	bare := &supBareCartridge{}
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.Cartridges = supSelectorFor(t, supBare, map[string]cartridge.Cartridge{supBare: bare})
+	})
+	wt := f.worktree(t, "bd-24")
+
+	// The links an engineer agent could have left in the tree the degraded
+	// tester is about to review.
+	outside := t.TempDir()
+	require.NoError(t, os.Symlink(outside, filepath.Join(wt, "escape")))
+	require.NoError(t, os.Symlink(filepath.Join("..", "..", ".."), filepath.Join(wt, "climb")))
+
+	v, tr, err := FireAgent[domain.Verdict](context.Background(), sup,
+		supTesterFiring("tester-qa-bd-24-r1", "bd-24", wt))
+	require.NoError(t, err)
+	assert.Equal(t, domain.VerdictApprove, v.Outcome)
+	assert.Equal(t, agents.EnforceCopiedWorktree, tr.Enforcement.Mode)
+
+	entries, rerr := os.ReadDir(outside)
+	require.NoError(t, rerr)
+	assert.Empty(t, entries, "a write through the symlink must not leave the copy")
+	_, statErr := os.Stat(filepath.Join(wt, "escape", "pwned.txt"))
+	assert.True(t, os.IsNotExist(statErr))
+
+	dropped := map[string]bool{}
+	for _, w := range supWarningsIn(f.supEvents()) {
+		if strings.Contains(w.Message, "the worktree copy left out the symlink") {
+			for _, name := range []string{"escape", "climb"} {
+				if strings.Contains(w.Message, " "+name+" -> ") {
+					dropped[name] = true
+				}
+			}
+		}
+	}
+	assert.Equal(t, map[string]bool{"escape": true, "climb": true}, dropped,
+		"every dropped link is named on the event stream")
+}
+
+func TestCopyWorktreeContainsEverySymlink(t *testing.T) {
+	src := t.TempDir()
+	outside := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(src, "pkg"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(src, "source.txt"), []byte("code\n"), 0o644))
+	require.NoError(t, os.Symlink(outside, filepath.Join(src, "escape")))
+	require.NoError(t, os.Symlink(filepath.Join(outside, "file.txt"), filepath.Join(src, "escape-file")))
+	require.NoError(t, os.Symlink(filepath.Join("..", "..", "elsewhere"), filepath.Join(src, "pkg", "climb")))
+	require.NoError(t, os.Symlink(filepath.Join("..", "source.txt"), filepath.Join(src, "pkg", "inside")))
+	require.NoError(t, os.Symlink(filepath.Join(src, "source.txt"), filepath.Join(src, "absolute")))
+
+	dst := filepath.Join(t.TempDir(), "copy")
+	dropped, err := copyWorktreeTree(context.Background(), src, dst)
+	require.NoError(t, err)
+
+	var names []string
+	for _, l := range dropped {
+		names = append(names, l.Path)
+	}
+	sort.Strings(names)
+	assert.Equal(t, []string{"escape", "escape-file", filepath.Join("pkg", "climb")}, names)
+	for _, name := range names {
+		_, lerr := os.Lstat(filepath.Join(dst, name))
+		assert.True(t, os.IsNotExist(lerr), "an escaping link is not recreated: %s", name)
+	}
+
+	// A relative link that stays inside is kept verbatim, so it resolves
+	// inside the copy...
+	link, err := os.Readlink(filepath.Join(dst, "pkg", "inside"))
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("..", "source.txt"), link)
+	body, err := os.ReadFile(filepath.Join(dst, "pkg", "inside"))
+	require.NoError(t, err)
+	assert.Equal(t, "code\n", string(body))
+
+	// ...and an absolute one into the worktree is rewritten into the copy.
+	link, err = os.Readlink(filepath.Join(dst, "absolute"))
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join(dst, "source.txt"), link)
+
+	// Writing through the copy's links cannot reach the source or beyond.
+	require.NoError(t, os.WriteFile(filepath.Join(dst, "pkg", "inside"), []byte("rewritten\n"), 0o644))
+	body, err = os.ReadFile(filepath.Join(src, "source.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, "code\n", string(body), "the reviewed worktree is untouched")
+	entries, err := os.ReadDir(outside)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
+func TestSupervisorReportsATerminalFailureWhenARetryIsAbandoned(t *testing.T) {
+	sc := mock.NewScenario("always-crashes")
+	sc.Otherwise("crash").FailWith(mock.Failure{Kind: mock.FailCrash})
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: sc})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.Sleep = func(_ context.Context, _ time.Duration) error {
+			// The caller gives up while the firing waits out its back-off.
+			cancel()
+			return context.Canceled
+		}
+	})
+
+	_, _, err := FireAgent[domain.Verdict](ctx, sup,
+		supTesterFiring("tester-qa-bd-25-r1", "bd-25", f.worktree(t, "bd-25")))
+	require.ErrorIs(t, err, context.Canceled)
+
+	fails := f.supFailures()
+	require.Len(t, fails, 2, "every spawn is matched by a terminal agent event")
+	assert.True(t, fails[0].WillRetry)
+	assert.False(t, fails[1].WillRetry, "the abandoned retry is reported as terminal")
+	assert.Equal(t, events.FailureKilled, fails[1].Failure)
+	assert.Equal(t, domain.AgentID("tester-qa-bd-25-r1"), fails[1].Agent)
+
+	for _, a := range f.Run.Agents() {
+		assert.NotEqual(t, domain.AgentID("tester-qa-bd-25-r1"), a.ID,
+			"no ghost agent is left recorded as running")
+	}
+	assert.Len(t, f.Adapters[supAlpha].Calls(), 1, "the retry never started")
+}
+
+func TestSupervisorRemovesTheDirectoryOfAFailedWorktreeCopy(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+	bare := &supBareCartridge{}
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.Cartridges = supSelectorFor(t, supBare, map[string]cartridge.Cartridge{supBare: bare})
+		o.Copier = WorktreeCopierFunc(func(_ context.Context, _, dst string) error {
+			// A copy that dies half way has already made the directory.
+			if err := os.MkdirAll(dst, 0o700); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(dst, "half.txt"), []byte("partial\n"), 0o600); err != nil {
+				return err
+			}
+			return errors.New("no space left on device")
+		})
+	})
+	wt := f.worktree(t, "bd-26")
+
+	_, _, err := FireAgent[domain.Verdict](context.Background(), sup,
+		supTesterFiring("tester-qa-bd-26-r1", "bd-26", wt))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no space left on device")
+	assert.Empty(t, bare.Workdirs(), "nothing is fired without a copy to fire it in")
+
+	copyDir := filepath.Join(f.Run.Dirs().Dir, CopiesDirName, "tester-qa-bd-26-r1")
+	_, statErr := os.Stat(copyDir)
+	assert.True(t, os.IsNotExist(statErr), "a half-made copy is not left on disk")
+
+	// And the stop path would have caught it too, had it survived.
+	require.NoError(t, sup.StopAgents(context.Background(), 0))
+	_, statErr = os.Stat(copyDir)
+	assert.True(t, os.IsNotExist(statErr))
 }

@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,12 +25,13 @@ import (
 // [Run] publishes through [Options.Bus], so the wiring is one line:
 //
 //	log, err := orchestrator.OpenEventLog(runDir, logger)
-//	run, err := orchestrator.New(cfg, orchestrator.Options{Bus: orchestrator.Tee(bus, log), …})
+//	run, err := orchestrator.New(cfg, orchestrator.Options{Bus: orchestrator.Tee(log, bus), …})
 //	defer log.Close()
 //
 // [Tee] keeps the live bus (the TUI, the headless renderer) and the file in
-// step: the file is written first, so anything a subscriber renders is
-// already durable.
+// step. The log comes first in that argument list on purpose: [Tee]
+// forwards in argument order, so the file is written before any subscriber
+// is told, and anything a subscriber renders is already durable.
 
 // EventLogName is the run log file inside the run directory.
 const EventLogName = "events.jsonl"
@@ -303,6 +306,10 @@ type RunSummary struct {
 	// Agents are the agents still live at the end of the log, in the order
 	// they were fired.
 	Agents []domain.Agent `json:"live_agents,omitempty"`
+	// Notes report what the fold could not use: a record that parses as an
+	// event but carries no bead id, for instance. A damaged run log is
+	// reported, never fatal — `sc status` exists to read the wreckage.
+	Notes []string `json:"notes,omitempty"`
 	// Recent are the last events, AgentOutput excluded, oldest first. They
 	// are not marshalled: an events.Event is an interface, so a caller that
 	// wants them in JSON renders them itself (tui.FormatHeadless) or
@@ -336,15 +343,51 @@ func (s RunSummary) Settled() int {
 	return n
 }
 
-// SummariseLog reads <runDir>/events.jsonl and folds it. A truncated last
+// SummariseLog folds <runDir>/events.jsonl as it reads it. A truncated last
 // line (a run killed mid-write) still yields a summary of everything before
 // it, together with the parse error.
+//
+// The file is streamed rather than slurped: a run log grows for the life of
+// the run — one line per cartridge output line (P5-08), and under D-18 an
+// autopilot run never stops on its own — while `sc status` reads it only to
+// print a fold and the last few events. Nothing but the summary and those
+// few events is ever held in memory. (Trimming or rolling the file itself is
+// P6-33.)
 func SummariseLog(runDir string, recent int) (RunSummary, error) {
-	evs, readErr := ReadEventLog(runDir)
-	if readErr != nil && len(evs) == 0 {
-		return RunSummary{}, readErr
+	path := EventLogPath(runDir)
+	f, err := os.Open(path) //nolint:gosec // the run directory sc owns (D-23).
+	if errors.Is(err, os.ErrNotExist) {
+		return RunSummary{}, fmt.Errorf("%w at %s", ErrNoEventLog, path)
 	}
-	return Summarise(evs, recent), readErr
+	if err != nil {
+		return RunSummary{}, fmt.Errorf("orchestrator: read %s: %w", path, err)
+	}
+	defer func() { _ = f.Close() }()
+	s, err := SummariseReader(f, recent)
+	if err != nil {
+		return s, fmt.Errorf("orchestrator: read %s: %w", path, err)
+	}
+	return s, nil
+}
+
+// SummariseReader folds a run log read from r, following [Summarise] for
+// recent. It holds the summary and at most recent events, never the log, so
+// the cost of a status report does not grow with the run's output. A line
+// that does not parse stops the read and is returned along with the summary
+// of everything before it.
+func SummariseReader(r io.Reader, recent int) (RunSummary, error) {
+	f := newLogFold(recent)
+	jr := events.NewJSONLReader(r)
+	for {
+		ev, err := jr.Next()
+		if errors.Is(err, io.EOF) {
+			return f.done(), nil
+		}
+		if err != nil {
+			return f.done(), err
+		}
+		f.add(ev)
+	}
 }
 
 // Summarise folds a run's events into a [RunSummary]. recent is how many
@@ -352,178 +395,304 @@ func SummariseLog(runDir string, recent int) (RunSummary, error) {
 // and a negative number keeps none. Events are assumed to be in publication
 // order, which is the order the run log holds them.
 func Summarise(evs []events.Event, recent int) RunSummary {
+	f := newLogFold(recent)
+	for _, ev := range evs {
+		f.add(ev)
+	}
+	return f.done()
+}
+
+// logFold accumulates a [RunSummary] one event at a time. It is the shared
+// engine of [Summarise] and [SummariseReader]; everything it holds is
+// bounded by the run's beads, its live agents and recent, never by the
+// number of events folded.
+type logFold struct {
+	s      RunSummary
+	recent int
+	index  map[domain.BeadID]int
+	live   map[domain.AgentID]int
+	// noBead counts records that parse as an event but name no bead, by
+	// kind. They are skipped and reported in [RunSummary.Notes] rather than
+	// dereferenced (a nil bead used to crash `sc status`).
+	noBead map[events.Kind]int
+}
+
+// newLogFold starts a fold. recent follows [Summarise].
+func newLogFold(recent int) *logFold {
 	if recent == 0 {
 		recent = DefaultRecentEvents
 	}
-	s := RunSummary{Phase: PhaseNew}
-	index := make(map[domain.BeadID]int)
-	live := make(map[domain.AgentID]int)
-
-	bead := func(id domain.BeadID, at time.Time) *BeadSummary {
-		if id == "" {
-			return nil
-		}
-		i, ok := index[id]
-		if !ok {
-			s.Beads = append(s.Beads, BeadSummary{ID: id})
-			i = len(s.Beads) - 1
-			index[id] = i
-		}
-		b := &s.Beads[i]
-		if at.After(b.UpdatedAt) {
-			b.UpdatedAt = at
-		}
-		return b
+	return &logFold{
+		s:      RunSummary{Phase: PhaseNew},
+		recent: recent,
+		index:  make(map[domain.BeadID]int),
+		live:   make(map[domain.AgentID]int),
 	}
-	drop := func(id domain.AgentID) {
-		i, ok := live[id]
-		if !ok {
+}
+
+// bead returns the summary of id, creating it on first mention, and stamps
+// it with at. A record with no bead id yields nil: every caller checks, and
+// reports it through skip.
+func (f *logFold) bead(id domain.BeadID, at time.Time) *BeadSummary {
+	if id == "" {
+		return nil
+	}
+	i, ok := f.index[id]
+	if !ok {
+		f.s.Beads = append(f.s.Beads, BeadSummary{ID: id})
+		i = len(f.s.Beads) - 1
+		f.index[id] = i
+	}
+	b := &f.s.Beads[i]
+	if at.After(b.UpdatedAt) {
+		b.UpdatedAt = at
+	}
+	return b
+}
+
+// skip records that one event named no bead and could not be folded.
+func (f *logFold) skip(kind events.Kind) {
+	if f.noBead == nil {
+		f.noBead = make(map[events.Kind]int, 2)
+	}
+	f.noBead[kind]++
+}
+
+// dropAgent removes a finished agent from the live list, keeping the order
+// of the rest.
+func (f *logFold) dropAgent(id domain.AgentID) {
+	i, ok := f.live[id]
+	if !ok {
+		return
+	}
+	f.s.Agents = append(f.s.Agents[:i], f.s.Agents[i+1:]...)
+	delete(f.live, id)
+	for k, j := range f.live {
+		if j > i {
+			f.live[k] = j - 1
+		}
+	}
+}
+
+// planBeads registers every bead a plan created, in the plan's own order, so
+// a bead that has been planned but not yet claimed is counted too. This is
+// the only inventory a real run publishes: BeadCreated and GraphChanged
+// exist but nothing in production emits them (P6-32), so without this a bead
+// would enter the summary only when the scheduler claimed it, and `sc status`
+// on a ten-bead plan would report the three beads agents had touched.
+//
+// A created bead is recorded open, which is the state bd mints one in and
+// the entry state of the D-07 flow; any later event overwrites it.
+func (f *logFold) planBeads(e events.PlanProduced, at time.Time) {
+	if len(e.Created) == 0 {
+		return
+	}
+	seen := make(map[string]bool, len(e.Created))
+	add := func(key, title string) {
+		id, ok := e.Created[key]
+		if !ok || seen[key] {
 			return
 		}
-		s.Agents = append(s.Agents[:i], s.Agents[i+1:]...)
-		delete(live, id)
-		for k, j := range live {
-			if j > i {
-				live[k] = j - 1
-			}
+		seen[key] = true
+		b := f.bead(id, at)
+		if b == nil {
+			f.skip(e.Kind())
+			return
+		}
+		if title != "" && b.Title == "" {
+			b.Title = title
+		}
+		if b.State == "" {
+			b.State = domain.BeadStateOpen
 		}
 	}
+	for _, pb := range e.Plan.Beads {
+		add(pb.Key, pb.Title)
+	}
+	// Anything Created holds that the plan does not name (it should not
+	// happen) is folded in too, in a fixed order so the summary is stable.
+	rest := make([]string, 0, len(e.Created))
+	for k := range e.Created {
+		if !seen[k] {
+			rest = append(rest, k)
+		}
+	}
+	sort.Strings(rest)
+	for _, k := range rest {
+		add(k, "")
+	}
+}
 
-	for _, ev := range evs {
-		if ev == nil {
-			continue
+// add folds one event. A nil event is ignored.
+func (f *logFold) add(ev events.Event) {
+	if ev == nil {
+		return
+	}
+	s := &f.s
+	s.Events++
+	at := ev.At()
+	if s.Run == "" {
+		s.Run = ev.RunID()
+	}
+	if at.After(s.LastAt) {
+		s.LastAt = at
+	}
+	switch e := ev.(type) {
+	case events.RunStarted:
+		s.Phase = PhaseRunning
+		s.Resumed = e.Resumed
+		s.StartedAt = e.Info.StartedAt
+		if s.StartedAt.IsZero() {
+			s.StartedAt = at
 		}
-		s.Events++
-		at := ev.At()
-		if s.Run == "" {
-			s.Run = ev.RunID()
+		if e.Info.Epic != "" {
+			s.Epic = e.Info.Epic
 		}
-		if at.After(s.LastAt) {
-			s.LastAt = at
+	case events.RunPaused:
+		s.Phase = PhasePaused
+		s.PauseReason = e.Reason
+	case events.RunResumed:
+		s.Phase = PhaseRunning
+		s.PauseReason = ""
+	case events.RunStopped:
+		s.Phase = PhaseStopping
+		s.StopReason = e.Reason
+	case events.RunFinished:
+		s.Phase = PhaseFinished
+		s.Finish = e.Reason
+		s.FinishSummary = e.Summary
+		s.Duration = e.Duration
+		s.FinishedAt = at
+	case events.PlanProduced:
+		s.Plans++
+		if e.Epic != "" {
+			s.Epic = e.Epic
 		}
-		switch e := ev.(type) {
-		case events.RunStarted:
-			s.Phase = PhaseRunning
-			s.Resumed = e.Resumed
-			s.StartedAt = e.Info.StartedAt
-			if s.StartedAt.IsZero() {
-				s.StartedAt = at
-			}
-			if e.Info.Epic != "" {
-				s.Epic = e.Info.Epic
-			}
-		case events.RunPaused:
-			s.Phase = PhasePaused
-			s.PauseReason = e.Reason
-		case events.RunResumed:
-			s.Phase = PhaseRunning
-			s.PauseReason = ""
-		case events.RunStopped:
-			s.Phase = PhaseStopping
-			s.StopReason = e.Reason
-		case events.RunFinished:
-			s.Phase = PhaseFinished
-			s.Finish = e.Reason
-			s.FinishSummary = e.Summary
-			s.Duration = e.Duration
-			s.FinishedAt = at
-		case events.PlanProduced:
-			s.Plans++
-			if e.Epic != "" {
-				s.Epic = e.Epic
-			}
-		case events.BeadCreated:
-			b := bead(e.Bead.ID, at)
+		f.planBeads(e, at)
+	case events.BeadCreated:
+		b := f.bead(e.Bead.ID, at)
+		if b == nil {
+			f.skip(e.Kind())
+			break
+		}
+		b.Title = e.Bead.Title
+		if e.Bead.State != "" {
+			b.State = e.Bead.State
+		}
+	case events.BeadUpdated:
+		b := f.bead(e.Bead.ID, at)
+		if b == nil {
+			f.skip(e.Kind())
+			break
+		}
+		if e.Bead.Title != "" {
 			b.Title = e.Bead.Title
-			if e.Bead.State != "" {
-				b.State = e.Bead.State
-			}
-		case events.BeadUpdated:
-			b := bead(e.Bead.ID, at)
-			if e.Bead.Title != "" {
-				b.Title = e.Bead.Title
-			}
-			if e.Bead.State != "" {
-				b.State = e.Bead.State
-			}
-			if e.Bead.Round > 0 {
-				b.Round = e.Bead.Round
-			}
-		case events.BeadStateChanged:
-			b := bead(e.Bead, at)
-			b.State = e.To
-			if e.Round > 0 {
-				b.Round = e.Round
-			}
-		case events.GraphChanged:
-			if e.Epic != "" {
-				s.Epic = e.Epic
-			}
-			for _, gb := range e.Beads {
-				b := bead(gb.ID, at)
-				if gb.Title != "" {
-					b.Title = gb.Title
-				}
-				if gb.State != "" {
-					b.State = gb.State
-				}
-				if gb.Round > 0 {
-					b.Round = gb.Round
-				}
-			}
-		case events.RoundStarted:
-			s.Rounds++
-			b := bead(e.Bead, at)
-			if e.Round > 0 {
-				b.Round = e.Round
-			}
-		case events.AgentSpawned:
-			s.Fired++
-			a := e.Agent
-			if i, ok := live[a.ID]; ok {
-				s.Agents[i] = a
-			} else {
-				s.Agents = append(s.Agents, a)
-				live[a.ID] = len(s.Agents) - 1
-			}
-			if e.BeadTitle != "" {
-				if b := bead(a.Bead, at); b != nil && b.Title == "" {
-					b.Title = e.BeadTitle
-				}
-			}
-		case events.AgentOutput:
-			s.Output++
-		case events.AgentFinished:
-			s.Completed++
-			drop(e.Agent)
-		case events.AgentFailed:
-			s.Failed++
-			drop(e.Agent)
-		case events.PROpened:
-			s.PRs++
-			b := bead(e.Bead, at)
-			b.PR = e.URL
-			b.PRNumber = e.Number
-		case events.Merged:
-			s.Merges++
-			b := bead(e.Bead, at)
-			b.Merged = true
-			if e.PRNumber > 0 && b.PRNumber == 0 {
-				b.PRNumber = e.PRNumber
-			}
-		case events.Warning:
-			s.Warnings++
-		case events.Error:
-			s.Errors++
 		}
-		if recent > 0 && ev.Kind() != events.KindAgentOutput {
-			s.Recent = append(s.Recent, ev)
-			if len(s.Recent) > recent {
-				s.Recent = s.Recent[len(s.Recent)-recent:]
+		if e.Bead.State != "" {
+			b.State = e.Bead.State
+		}
+		if e.Bead.Round > 0 {
+			b.Round = e.Bead.Round
+		}
+	case events.BeadStateChanged:
+		b := f.bead(e.Bead, at)
+		if b == nil {
+			f.skip(e.Kind())
+			break
+		}
+		b.State = e.To
+		if e.Round > 0 {
+			b.Round = e.Round
+		}
+	case events.GraphChanged:
+		if e.Epic != "" {
+			s.Epic = e.Epic
+		}
+		for _, gb := range e.Beads {
+			b := f.bead(gb.ID, at)
+			if b == nil {
+				f.skip(e.Kind())
+				continue
 			}
+			if gb.Title != "" {
+				b.Title = gb.Title
+			}
+			if gb.State != "" {
+				b.State = gb.State
+			}
+			if gb.Round > 0 {
+				b.Round = gb.Round
+			}
+		}
+	case events.RoundStarted:
+		s.Rounds++
+		b := f.bead(e.Bead, at)
+		if b == nil {
+			f.skip(e.Kind())
+			break
+		}
+		if e.Round > 0 {
+			b.Round = e.Round
+		}
+	case events.AgentSpawned:
+		s.Fired++
+		a := e.Agent
+		if i, ok := f.live[a.ID]; ok {
+			s.Agents[i] = a
+		} else {
+			s.Agents = append(s.Agents, a)
+			f.live[a.ID] = len(s.Agents) - 1
+		}
+		if e.BeadTitle != "" {
+			if b := f.bead(a.Bead, at); b != nil && b.Title == "" {
+				b.Title = e.BeadTitle
+			}
+		}
+	case events.AgentOutput:
+		s.Output++
+	case events.AgentFinished:
+		s.Completed++
+		f.dropAgent(e.Agent)
+	case events.AgentFailed:
+		s.Failed++
+		f.dropAgent(e.Agent)
+	case events.PROpened:
+		s.PRs++
+		b := f.bead(e.Bead, at)
+		if b == nil {
+			f.skip(e.Kind())
+			break
+		}
+		b.PR = e.URL
+		b.PRNumber = e.Number
+	case events.Merged:
+		s.Merges++
+		b := f.bead(e.Bead, at)
+		if b == nil {
+			f.skip(e.Kind())
+			break
+		}
+		b.Merged = true
+		if e.PRNumber > 0 && b.PRNumber == 0 {
+			b.PRNumber = e.PRNumber
+		}
+	case events.Warning:
+		s.Warnings++
+	case events.Error:
+		s.Errors++
+	}
+	if f.recent > 0 && ev.Kind() != events.KindAgentOutput {
+		s.Recent = append(s.Recent, ev)
+		if len(s.Recent) > f.recent {
+			s.Recent = s.Recent[len(s.Recent)-f.recent:]
 		}
 	}
+}
 
+// done finishes the fold: the per-state counts, the live-agent list and the
+// notes about anything skipped.
+func (f *logFold) done() RunSummary {
+	s := f.s
 	if len(s.Beads) > 0 {
 		s.Counts = make(map[domain.BeadState]int, len(s.Beads))
 		for _, b := range s.Beads {
@@ -535,7 +704,67 @@ func Summarise(evs []events.Event, recent int) RunSummary {
 	if len(s.Agents) == 0 {
 		s.Agents = nil
 	}
+	if note := f.noBeadNote(); note != "" {
+		s.Notes = append(s.Notes, note)
+	}
 	return s
+}
+
+// noBeadNote describes the records that named no bead, or "" if none did.
+func (f *logFold) noBeadNote() string {
+	if len(f.noBead) == 0 {
+		return ""
+	}
+	total := 0
+	kinds := make([]string, 0, len(f.noBead))
+	for k, n := range f.noBead {
+		total += n
+		kinds = append(kinds, string(k))
+	}
+	sort.Strings(kinds)
+	if total == 1 {
+		return fmt.Sprintf("1 record in the run log names no bead and was skipped (%s)",
+			strings.Join(kinds, ", "))
+	}
+	return fmt.Sprintf("%d records in the run log name no bead and were skipped (%s)",
+		total, strings.Join(kinds, ", "))
+}
+
+// Liveness is what the repository's run lock (see [LockPath]) says about a
+// run: who holds it and whether that process still exists. A run directory
+// on its own cannot tell a run that is still firing from one that was
+// killed — both leave `phase: running` behind — so `sc status` asks the lock
+// (P6-08).
+type Liveness struct {
+	// Holder is what the lock file records; the zero value when Held is
+	// false.
+	Holder LockHolder `json:"holder,omitempty"`
+	// Held is true when a lock file exists and could be read.
+	Held bool `json:"held"`
+	// Mine is true when the lock names the run that was asked about.
+	Mine bool `json:"mine,omitempty"`
+	// Alive is true when a process with the holder's id exists. It cannot
+	// say the process is *that* process: pids are reused, which P9-04
+	// hardens.
+	Alive bool `json:"alive"`
+}
+
+// Running reports whether a live process still holds the lock for this run.
+func (l Liveness) Running() bool { return l.Held && l.Mine && l.Alive }
+
+// ProbeLiveness reads the run lock of the repository whose run directory is
+// runDir and reports what it says about run (an empty run matches whatever
+// holds the lock). A missing or unreadable lock is not an error: it means
+// nothing holds it, which is the normal end of a finished run and the
+// tell-tale of a crashed one.
+func ProbeLiveness(runDir string, run domain.RunID) Liveness {
+	h, err := readLock(LockPath(runDir))
+	if err != nil {
+		return Liveness{}
+	}
+	l := Liveness{Holder: h, Held: true, Mine: run == "" || h.Run == run}
+	l.Alive = h.PID > 0 && processAlive(h.PID)
+	return l
 }
 
 // WriteEventLog writes evs to w as a run log, for tests and for tools that
