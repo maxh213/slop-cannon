@@ -1,0 +1,33 @@
+run        20260903-120000-abcd
+phase      finished (completed)
+mode       brief
+brief      add retries to the client
+epic       sc-0
+repo       <tmp>/repo
+run dir    <state>/runs/20260903-120000-abcd
+started    2026-09-03 12:00:00Z
+last event 2026-09-03 12:01:13Z
+finished   2026-09-03 12:01:13Z
+outcome    2 beads landed; kept 1 worktree
+stopped by SIGINT
+resumes    1
+cartridge  claude (model fable)
+ammo       10 → 1 PO, up to 2 engineers, up to 7 testers
+safety     on (pull requests)
+
+beads      2
+  closed  2
+
+agents     0 live of 10 ammo
+
+events     10 of 24 (1 output line, 1 warning)
+  12:00:52 → bead sc-1 approved → delivering (round 1)
+  12:00:55 ⤵ sc-1 merged 0123456 into main (PR #7, pushed)
+  12:00:56 → bead sc-1 delivering → closed (round 1)
+  12:00:58 ! warning [gates] gh is unavailable; gate polling skipped
+  12:01:00 ▶ fired tester/qa(claude/fable) at sc-2 "Document retries" [review, round 1, agent tester-qa-sc-2-r1]
+  12:01:01 → bead sc-2 in_progress → in_review (round 1)
+  12:01:10 → bead sc-2 in_review → closed (round 1)
+  12:01:11 ✔ tester-qa-sc-2-r1 (tester, sc-2) finished in 11s: verdict, exit 0
+  12:01:12 ■ run stopping (SIGINT)
+  12:01:13 ◇ run finished: completed after 1m13s (exit 0) — 2 beads landed; kept 1 worktree

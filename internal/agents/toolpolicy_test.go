@@ -284,12 +284,15 @@ func TestToolPolicyClaudeMapping(t *testing.T) {
 		assert.Equal(t, agents.EnforceNative, en.Mode)
 	})
 
-	t.Run("ClaudeEnforcement rejects an invalid policy", func(t *testing.T) {
+	t.Run("the adapter's own method rejects an invalid policy", func(t *testing.T) {
 		t.Parallel()
-		_, err := agents.ClaudeEnforcement(claude.Name, "read_everything")
+		// P5-11: the mapping is the adapter's, so it is asked directly here.
+		adapter, ok := toolPolicyClaude(t, claude.Name).(agents.ToolPolicyEnforcer)
+		require.True(t, ok, "the Claude adapter must implement agents.ToolPolicyEnforcer")
+		_, err := adapter.ToolPolicyEnforcement("read_everything")
 		require.ErrorIs(t, err, domain.ErrUnknownValue)
 
-		en, err := agents.ClaudeEnforcement("", cartridge.ToolReadWrite)
+		en, err := adapter.ToolPolicyEnforcement(cartridge.ToolReadWrite)
 		require.NoError(t, err)
 		assert.Equal(t, claude.Name, en.Cartridge)
 	})

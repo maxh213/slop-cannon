@@ -1,0 +1,1240 @@
+package orchestrator
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"slop-cannon/internal/beads"
+	"slop-cannon/internal/domain"
+	"slop-cannon/internal/events"
+)
+
+// The gate poller tests (P6-10, P6-14) feed the poller the exact text bd
+// 1.2.2 prints for a `bd gate check --type=gh:pr` run — the samples
+// captured live in internal/beads/testdata/bd — through the real
+// beads.ParseGateCheck, so what the poller acts on is what bd says and not
+// a hand-written struct.
+
+const (
+	gateRun    = domain.RunID("20260903-120000-abcd")
+	gateBranch = "main"
+)
+
+var gateEpoch = time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+
+// The captured bd output. Each pair is one `bd gate check` run.
+const (
+	gateOutMerged = `✓ fx-qba: resolved - PR 'Fix Max' was merged
+
+Checked 1 gates: 1 resolved, 0 escalated, 0 errors
+{
+  "data": {"checked": 1, "dry_run": false, "errors": 0, "escalated": 0, "resolved": 1},
+  "schema_version": 1
+}
+`
+	gateOutPending = `○ fx-qba: pending - PR 'Fix Max' is still open
+
+Checked 1 gates: 0 resolved, 0 escalated, 0 errors
+{
+  "data": {"checked": 1, "dry_run": false, "errors": 0, "escalated": 0, "resolved": 0},
+  "schema_version": 1
+}
+`
+	gateOutClosedPR = `⚠ fx-8za: ESCALATE - PR 'Fix Max' was closed without merging
+
+Checked 1 gates: 0 resolved, 1 escalated, 0 errors
+{
+  "data": {"checked": 1, "dry_run": false, "errors": 0, "escalated": 1, "resolved": 0},
+  "schema_version": 1
+}
+`
+	gateOutErrors = `
+Checked 1 gates: 0 resolved, 0 escalated, 1 errors
+{
+  "data": {"checked": 1, "dry_run": false, "errors": 1, "escalated": 0, "resolved": 0},
+  "schema_version": 1
+}
+`
+	gateErrMissingGH = "✗ fx-qba: error checking - gh CLI not installed\n"
+	gateErrNetwork   = "✗ fx-qba: error checking - gh pr view failed: error connecting to api.github.com\n"
+
+	gateOutNone = "No open gates of type 'gh:pr' found.\n"
+
+	// One run reporting on two gates at once.
+	gateOutBoth = `✓ fx-qba: resolved - PR 'Fix Max' was merged
+⚠ fx-8za: ESCALATE - PR 'Fix Max' was closed without merging
+
+Checked 2 gates: 1 resolved, 1 escalated, 0 errors
+{
+  "data": {"checked": 2, "dry_run": false, "errors": 0, "escalated": 1, "resolved": 1},
+  "schema_version": 1
+}
+`
+)
+
+// gateCheck parses one captured bd run.
+func gateCheck(t *testing.T, stdout, stderr string) beads.GateCheck {
+	t.Helper()
+	check, err := beads.ParseGateCheck(stdout, stderr)
+	require.NoError(t, err, "the captured bd output must parse")
+	return check
+}
+
+// gateClock is a fake beads.Clock: nothing in the poller reads the wall
+// clock, so a test drives every interval itself.
+type gateClock struct {
+	mu      sync.Mutex
+	now     time.Time
+	waiters []gateWaiter
+}
+
+type gateWaiter struct {
+	at time.Time
+	ch chan time.Time
+}
+
+func newGateClock() *gateClock { return &gateClock{now: gateEpoch} }
+
+func (c *gateClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *gateClock) After(d time.Duration) <-chan time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ch := make(chan time.Time, 1)
+	if d <= 0 {
+		ch <- c.now
+		return ch
+	}
+	c.waiters = append(c.waiters, gateWaiter{at: c.now.Add(d), ch: ch})
+	return ch
+}
+
+// Advance moves the clock and releases every waiter that has come due.
+func (c *gateClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	c.now = c.now.Add(d)
+	var keep []gateWaiter
+	var due []gateWaiter
+	for _, w := range c.waiters {
+		if !w.at.After(c.now) {
+			due = append(due, w)
+			continue
+		}
+		keep = append(keep, w)
+	}
+	c.waiters = keep
+	now := c.now
+	c.mu.Unlock()
+	for _, w := range due {
+		w.ch <- now
+	}
+}
+
+// Waiting reports how many timers are pending.
+func (c *gateClock) Waiting() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.waiters)
+}
+
+// gateFakeBD is the bd the poller talks to: the gate store, the bead
+// reader and the state store in one, so a transition the poller applies is
+// visible to the next poll.
+type gateFakeBD struct {
+	mu sync.Mutex
+
+	checks   []beads.GateCheck
+	last     beads.GateCheck
+	hasLast  bool
+	checkErr error
+	Checks   int
+
+	gates       map[domain.BeadID]beads.Gate
+	issues      map[domain.BeadID]beads.Issue
+	showGateErr error
+	showErr     error
+	gateForErr  error
+	resolveErr  error
+	closeErr    error
+
+	Resolved []string // "<gate>: <reason>"
+	Statuses []string // "<bead>=<state>"
+	Closed   []string // "<bead>: <reason>"
+}
+
+func newGateFakeBD() *gateFakeBD {
+	return &gateFakeBD{gates: map[domain.BeadID]beads.Gate{}, issues: map[domain.BeadID]beads.Issue{}}
+}
+
+// Answer queues one `bd gate check` reply; the last queued answer repeats.
+func (f *gateFakeBD) Answer(checks ...beads.GateCheck) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.checks = append(f.checks, checks...)
+}
+
+// AddGate registers a gh:pr gate blocking bead.
+func (f *gateFakeBD) AddGate(id, bead domain.BeadID, pr int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gates[id] = beads.Gate{
+		ID:        id,
+		Title:     fmt.Sprintf("Gate: gh:pr %d", pr),
+		Status:    "open",
+		Type:      "gate",
+		AwaitType: beads.GateTypePR,
+		AwaitID:   fmt.Sprint(pr),
+		Blocks:    bead,
+	}
+}
+
+// AddBead registers a bead of the run in the given state.
+func (f *gateFakeBD) AddBead(id domain.BeadID, state domain.BeadState, pr int, labels ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(labels) == 0 {
+		labels = []string{beads.RunLabel(gateRun)}
+	}
+	f.issues[id] = beads.Issue{
+		ID:       id,
+		Title:    "Fix Max",
+		Status:   string(state),
+		Labels:   labels,
+		Metadata: beads.Metadata{beads.MetaPRNumber: pr, beads.MetaRound: 2},
+	}
+}
+
+// State returns a bead's current status.
+func (f *gateFakeBD) State(id domain.BeadID) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.issues[id].Status
+}
+
+func (f *gateFakeBD) CheckGates(_ context.Context, opts beads.GateCheckOptions) (beads.GateCheck, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Checks++
+	if f.checkErr != nil {
+		return beads.GateCheck{}, f.checkErr
+	}
+	if opts.Escalate || opts.DryRun {
+		return beads.GateCheck{}, fmt.Errorf("unexpected options %+v", opts)
+	}
+	if len(f.checks) > 0 {
+		f.last, f.hasLast = f.checks[0], true
+		f.checks = f.checks[1:]
+	}
+	if !f.hasLast {
+		return beads.GateCheck{}, nil
+	}
+	return f.last, nil
+}
+
+func (f *gateFakeBD) ShowGate(_ context.Context, id domain.BeadID) (beads.Gate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.showGateErr != nil {
+		return beads.Gate{}, f.showGateErr
+	}
+	g, ok := f.gates[id]
+	if !ok {
+		return beads.Gate{}, fmt.Errorf("beads: %w: gate %s", beads.ErrNotFound, id)
+	}
+	return g, nil
+}
+
+func (f *gateFakeBD) ResolveGate(_ context.Context, id domain.BeadID, reason string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.resolveErr != nil {
+		return f.resolveErr
+	}
+	g, ok := f.gates[id]
+	if !ok {
+		return fmt.Errorf("beads: %w: gate %s", beads.ErrNotFound, id)
+	}
+	g.Status = "closed"
+	g.CloseReason = reason
+	f.gates[id] = g
+	f.Resolved = append(f.Resolved, fmt.Sprintf("%s: %s", id, reason))
+	return nil
+}
+
+func (f *gateFakeBD) GateFor(_ context.Context, bead domain.BeadID) (beads.Gate, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.gateForErr != nil {
+		return beads.Gate{}, f.gateForErr
+	}
+	for _, g := range f.gates {
+		if g.Blocks == bead && g.IsOpen() {
+			return g, nil
+		}
+	}
+	return beads.Gate{}, fmt.Errorf("beads: %w: %s", beads.ErrNoGate, bead)
+}
+
+func (f *gateFakeBD) Show(_ context.Context, ids ...domain.BeadID) ([]beads.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.showErr != nil {
+		return nil, f.showErr
+	}
+	var out []beads.Issue
+	for _, id := range ids {
+		if is, ok := f.issues[id]; ok {
+			out = append(out, is)
+		}
+	}
+	if len(out) != len(ids) {
+		return out, fmt.Errorf("beads: %w: %v", beads.ErrNotFound, ids)
+	}
+	return out, nil
+}
+
+func (f *gateFakeBD) SetStatus(_ context.Context, id domain.BeadID, state domain.BeadState) (beads.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Statuses = append(f.Statuses, fmt.Sprintf("%s=%s", id, state))
+	return f.setLocked(id, state), nil
+}
+
+func (f *gateFakeBD) Close(_ context.Context, id domain.BeadID, reason string) (beads.Issue, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.closeErr != nil {
+		return beads.Issue{}, f.closeErr
+	}
+	f.Closed = append(f.Closed, fmt.Sprintf("%s: %s", id, reason))
+	is := f.setLocked(id, domain.BeadStateClosed)
+	is.CloseReason = reason
+	f.issues[id] = is
+	return is, nil
+}
+
+func (f *gateFakeBD) ClaimFor(_ context.Context, id domain.BeadID, _ domain.AgentID) (beads.Issue, error) {
+	return beads.Issue{}, fmt.Errorf("the gate poller must never claim %s", id)
+}
+
+func (f *gateFakeBD) Reclaim(_ context.Context, id domain.BeadID, _ domain.AgentID) (beads.Issue, error) {
+	return beads.Issue{}, fmt.Errorf("the gate poller must never reclaim %s", id)
+}
+
+func (f *gateFakeBD) Release(_ context.Context, id domain.BeadID) (beads.Issue, error) {
+	return beads.Issue{}, fmt.Errorf("the gate poller must never release %s", id)
+}
+
+// setLocked records the new status; the caller holds the lock.
+func (f *gateFakeBD) setLocked(id domain.BeadID, state domain.BeadState) beads.Issue {
+	is := f.issues[id]
+	is.ID = id
+	is.Status = string(state)
+	f.issues[id] = is
+	return is
+}
+
+// gateRecorder collects the published events.
+type gateRecorder struct {
+	mu  sync.Mutex
+	evs []events.Event
+}
+
+func (r *gateRecorder) Publish(ev events.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evs = append(r.evs, ev)
+}
+
+func (r *gateRecorder) all() []events.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]events.Event(nil), r.evs...)
+}
+
+func (r *gateRecorder) warnings() []events.Warning {
+	var out []events.Warning
+	for _, ev := range r.all() {
+		if w, ok := ev.(events.Warning); ok {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+func (r *gateRecorder) merges() []events.Merged {
+	var out []events.Merged
+	for _, ev := range r.all() {
+		if m, ok := ev.(events.Merged); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func (r *gateRecorder) transitions() []string {
+	var out []string
+	for _, ev := range r.all() {
+		if c, ok := ev.(events.BeadStateChanged); ok {
+			out = append(out, fmt.Sprintf("%s %s→%s", c.Bead, c.From, c.To))
+		}
+	}
+	return out
+}
+
+func (r *gateRecorder) kinds() []events.Kind {
+	var out []events.Kind
+	for _, ev := range r.all() {
+		out = append(out, ev.Kind())
+	}
+	return out
+}
+
+// gateHarness wires a poller to the fake bd, the fake clock and a recorder.
+type gateHarness struct {
+	t     *testing.T
+	BD    *gateFakeBD
+	Rec   *gateRecorder
+	Clock *gateClock
+	P     *GatePoller
+}
+
+func newGateHarness(t *testing.T, tweak func(*GatePollerOptions)) *gateHarness {
+	t.Helper()
+	bd := newGateFakeBD()
+	rec := &gateRecorder{}
+	clock := newGateClock()
+	opts := GatePollerOptions{
+		Gates:    bd,
+		Beads:    bd,
+		Sink:     rec,
+		Run:      gateRun,
+		Scope:    gateRun,
+		Branch:   gateBranch,
+		Clock:    clock,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Statuses: beads.StatusMap{},
+	}
+	if tweak != nil {
+		tweak(&opts)
+	}
+	if opts.States == nil && opts.Gates == GateStore(bd) {
+		opts.States = NewStateMachine(bd,
+			WithStatePublisher(rec),
+			WithStateRun(gateRun),
+			WithStateClock(clock.Now))
+	}
+	p, err := NewGatePoller(opts)
+	require.NoError(t, err)
+	return &gateHarness{t: t, BD: bd, Rec: rec, Clock: clock, P: p}
+}
+
+// poll runs one pass and fails the test on an unexpected error.
+func (h *gateHarness) poll() GatePollResult {
+	h.t.Helper()
+	res, err := h.P.Poll(context.Background())
+	require.NoError(h.t, err)
+	return res
+}
+
+func TestGatePollerNeedsAStore(t *testing.T) {
+	t.Parallel()
+	_, err := NewGatePoller(GatePollerOptions{})
+	require.ErrorIs(t, err, ErrNoGateStore)
+}
+
+func TestGatePollerDefaults(t *testing.T) {
+	t.Parallel()
+	p, err := NewGatePoller(GatePollerOptions{Gates: newGateFakeBD()})
+	require.NoError(t, err)
+	assert.Equal(t, DefaultGatePollInterval, p.Interval(), "the documented gate_poll_interval default")
+	assert.Equal(t, 60*time.Second, DefaultGatePollInterval)
+	assert.Equal(t, EscalatedGateResolve, p.Policy(), "P6-14: the poller resolves an escalated gate by default")
+	assert.Equal(t, "resolve", p.Policy().String())
+	assert.True(t, p.Policy().Resolves())
+	assert.False(t, EscalatedGateKeep.Resolves())
+	assert.Equal(t, "keep", EscalatedGateKeep.String())
+
+	// A poller with no state machine is a dry run, not a nil dereference.
+	bd := newGateFakeBD()
+	bd.AddGate("fx-qba", "fx-byi", 1)
+	bd.AddBead("fx-byi", domain.BeadStateDelivering, 1)
+	bd.Answer(gateCheck(t, gateOutMerged, ""))
+	dry, err := NewGatePoller(GatePollerOptions{Gates: bd, Beads: bd, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	require.NoError(t, err)
+	res, err := dry.Poll(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, []domain.BeadID{"fx-byi"}, res.Closed, "the dry run still reports what it would close")
+	assert.Empty(t, bd.Closed, "and writes nothing to bd")
+}
+
+// P6-10: a resolved gate closes its bead and emits Merged.
+func TestGatePollerClosesTheBeadOfAMergedPR(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadStateDelivering, 1)
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+
+	res := h.poll()
+
+	assert.Equal(t, []domain.BeadID{"fx-byi"}, res.Closed)
+	assert.Empty(t, res.Blocked)
+	assert.False(t, res.Skipped)
+	assert.False(t, res.Empty())
+	assert.Equal(t, []string{"fx-byi: pull request #1 merged"}, h.BD.Closed, "the bead is closed with the PR in the reason")
+	assert.Equal(t, string(domain.BeadStateClosed), h.BD.State("fx-byi"))
+	assert.Equal(t, []string{"fx-byi delivering→closed"}, h.Rec.transitions())
+
+	merges := h.Rec.merges()
+	require.Len(t, merges, 1, "exactly one Merged event")
+	assert.Equal(t, domain.BeadID("fx-byi"), merges[0].Bead)
+	assert.Equal(t, 1, merges[0].PRNumber)
+	assert.Equal(t, gateBranch, merges[0].Branch)
+	assert.True(t, merges[0].Pushed, "a merged PR is on the remote")
+	assert.Equal(t, gateRun, merges[0].Run)
+	assert.Empty(t, h.Rec.warnings())
+
+	stats := h.P.Stats()
+	assert.Equal(t, 1, stats.Polls)
+	assert.Equal(t, 1, stats.Closed)
+	assert.Equal(t, gateEpoch, stats.LastAt)
+
+	// A second verdict for the same merge (a resume, a duplicated line)
+	// finds the bead closed and does nothing.
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+	second := h.poll()
+	assert.True(t, second.Empty(), "closing a closed bead is not attempted twice")
+	assert.Len(t, h.BD.Closed, 1)
+	assert.Len(t, h.Rec.merges(), 1)
+}
+
+// P6-10 + P6-14: an escalated gate parks the bead and, with the default
+// policy, the gate is resolved so it stops blocking the bead's dependents.
+func TestGatePollerEscalatedGateBlocksTheBeadAndResolvesTheGate(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-8za", "fx-6z4", 2)
+	h.BD.AddBead("fx-6z4", domain.BeadStateDelivering, 2)
+	h.BD.Answer(gateCheck(t, gateOutClosedPR, ""))
+
+	res := h.poll()
+
+	assert.Equal(t, []domain.BeadID{"fx-6z4"}, res.Blocked)
+	assert.Equal(t, []domain.BeadID{"fx-8za"}, res.Resolved, "P6-14: the escalated gate is resolved")
+	assert.Empty(t, res.Closed)
+	assert.Equal(t, []string{"fx-6z4=needs_human"}, h.BD.Statuses)
+	assert.Equal(t, string(domain.BeadStateNeedsHuman), h.BD.State("fx-6z4"))
+	assert.Equal(t, []string{"fx-6z4 delivering→needs_human"}, h.Rec.transitions())
+	assert.Empty(t, h.BD.Closed, "an abandoned PR never closes a bead")
+
+	require.Len(t, h.BD.Resolved, 1)
+	assert.Contains(t, h.BD.Resolved[0], "fx-8za: pull request #2 was closed without merging")
+	assert.Contains(t, h.BD.Resolved[0], "PR 'Fix Max' was closed without merging", "bd's own detail is kept")
+
+	warns := h.Rec.warnings()
+	require.Len(t, warns, 1, "one Warning: a human has to look at the bead")
+	assert.Equal(t, GateWarningSource, warns[0].Source)
+	assert.Equal(t, domain.BeadID("fx-6z4"), warns[0].Bead)
+	assert.Contains(t, warns[0].Message, "needs a human")
+	assert.Equal(t, 1, h.P.Stats().Blocked)
+	assert.Equal(t, 1, h.P.Stats().Resolved)
+}
+
+// P6-14, the other half of the choice: EscalatedGateKeep leaves the gate
+// for a human, and says so once.
+func TestGatePollerEscalatedGateCanBeKept(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, func(o *GatePollerOptions) { o.Escalated = EscalatedGateKeep })
+	h.BD.AddGate("fx-8za", "fx-6z4", 2)
+	h.BD.AddBead("fx-6z4", domain.BeadStateDelivering, 2)
+	h.BD.Answer(gateCheck(t, gateOutClosedPR, ""))
+
+	res := h.poll()
+
+	assert.Equal(t, []domain.BeadID{"fx-6z4"}, res.Blocked)
+	assert.Empty(t, res.Resolved)
+	assert.Empty(t, h.BD.Resolved, "the gate is left open on purpose")
+	assert.Equal(t, string(domain.BeadStateNeedsHuman), h.BD.State("fx-6z4"))
+
+	var kept int
+	for _, w := range h.Rec.warnings() {
+		if strings.Contains(w.Message, "stays open") {
+			kept++
+		}
+	}
+	assert.Equal(t, 1, kept, "the kept gate is reported once")
+
+	// bd keeps reporting the same escalation; the bead is already parked
+	// and nothing is warned about twice.
+	h.BD.Answer(gateCheck(t, gateOutClosedPR, ""))
+	again := h.poll()
+	assert.True(t, again.Empty())
+	assert.Len(t, h.BD.Statuses, 1, "the bead is not moved to needs_human twice")
+	assert.Len(t, h.Rec.warnings(), 2, "and no warning repeats")
+}
+
+// A pull request that was reopened and merged after the gate escalated
+// still closes its bead.
+func TestGatePollerMergeAfterAnEscalationRevivesTheBead(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadStateNeedsHuman, 1)
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+
+	res := h.poll()
+
+	assert.Equal(t, []domain.BeadID{"fx-byi"}, res.Closed)
+	assert.Equal(t, []string{"fx-byi=delivering"}, h.BD.Statuses, "the bead goes back in flight before it closes")
+	assert.Equal(t, []string{"fx-byi: pull request #1 merged"}, h.BD.Closed)
+	assert.Equal(t, []string{"fx-byi needs_human→delivering", "fx-byi delivering→closed"}, h.Rec.transitions())
+}
+
+// A resolved gate on a bead that is neither delivering nor needs_human is
+// reported, not forced: something else owns that bead.
+func TestGatePollerLeavesABeadThatIsNotDelivering(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadStateInProgress, 1)
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""), gateCheck(t, gateOutMerged, ""))
+
+	res := h.poll()
+	assert.True(t, res.Empty())
+	assert.Empty(t, h.BD.Closed)
+	require.Len(t, h.Rec.warnings(), 1)
+	assert.Contains(t, h.Rec.warnings()[0].Message, "is in_progress, not delivering")
+
+	h.poll()
+	assert.Len(t, h.Rec.warnings(), 1, "the same complaint is not repeated every minute")
+}
+
+// A pending gate is the normal case: no writes, no events, no noise.
+func TestGatePollerPendingGateChangesNothing(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadStateDelivering, 1)
+	h.BD.Answer(gateCheck(t, gateOutPending, ""))
+
+	res := h.poll()
+
+	assert.True(t, res.Empty())
+	assert.Equal(t, 1, res.Check.Checked)
+	assert.Empty(t, h.Rec.all(), "a pending gate publishes nothing at all")
+	assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State("fx-byi"))
+}
+
+// "No open gates" is not an error and not a warning.
+func TestGatePollerWithNoGates(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.Answer(gateCheck(t, gateOutNone, ""))
+
+	res := h.poll()
+
+	assert.True(t, res.Empty())
+	assert.Zero(t, res.Check.Checked)
+	assert.Empty(t, h.Rec.all())
+}
+
+// P6-10: gh missing means one Warning for the outage, not one per gate and
+// not one per poll.
+func TestGatePollerSkipsWithOneWarningWhenGHIsMissing(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadStateDelivering, 1)
+	h.BD.Answer(gateCheck(t, gateOutErrors, gateErrMissingGH))
+
+	for i := 0; i < 3; i++ {
+		res := h.poll()
+		assert.True(t, res.Skipped, "poll %d is skipped", i)
+		assert.Contains(t, res.Reason, "gh CLI not installed")
+	}
+
+	warns := h.Rec.warnings()
+	require.Len(t, warns, 1, "one Warning for the outage, however long it lasts")
+	assert.Equal(t, GateWarningSource, warns[0].Source)
+	assert.Contains(t, warns[0].Message, "gh is unavailable")
+	assert.Contains(t, warns[0].Err, "gh CLI not installed")
+	assert.Empty(t, warns[0].Bead, "the outage is not one bead's problem")
+	assert.Empty(t, h.BD.Closed)
+	assert.Empty(t, h.BD.Statuses)
+
+	stats := h.P.Stats()
+	assert.Equal(t, 3, stats.Polls)
+	assert.Equal(t, 3, stats.Skipped)
+	assert.True(t, stats.GHDown)
+
+	// gh comes back, the merge is picked up, and a later outage warns again.
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""), gateCheck(t, gateOutErrors, gateErrMissingGH))
+	assert.Equal(t, []domain.BeadID{"fx-byi"}, h.poll().Closed)
+	assert.False(t, h.P.Stats().GHDown)
+	assert.True(t, h.poll().Skipped)
+	assert.Len(t, h.Rec.warnings(), 2, "a new outage is worth a new Warning")
+}
+
+// An unauthenticated gh is the same outage, recognised from bd's two-line
+// message.
+func TestGatePollerSkipsWhenGHIsUnauthenticated(t *testing.T) {
+	t.Parallel()
+	unauth := "✗ fx-qba: error checking - gh pr view failed: To get started with GitHub CLI, please run:  gh auth login\n" +
+		"Alternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.\n"
+	h := newGateHarness(t, nil)
+	h.BD.Answer(gateCheck(t, gateOutErrors, unauth))
+
+	res := h.poll()
+
+	assert.True(t, res.Skipped)
+	assert.Contains(t, res.Reason, "gh auth login")
+	require.Len(t, h.Rec.warnings(), 1)
+	assert.Contains(t, h.Rec.warnings()[0].Message, "gh is unavailable")
+}
+
+// A network failure is not gh being unavailable: it is one gate's problem,
+// reported once and retried on the next poll.
+func TestGatePollerReportsATransientCheckFailureOnce(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadStateDelivering, 1)
+	h.BD.Answer(gateCheck(t, gateOutErrors, gateErrNetwork))
+
+	first := h.poll()
+	assert.False(t, first.Skipped, "one failing gate is not a gh outage")
+	assert.True(t, first.Empty())
+	require.Len(t, h.Rec.warnings(), 1)
+	assert.Contains(t, h.Rec.warnings()[0].Message, "api.github.com")
+
+	h.poll()
+	assert.Len(t, h.Rec.warnings(), 1, "the same failure is not warned about every minute")
+
+	// The next check succeeds and the bead closes.
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+	assert.Equal(t, []domain.BeadID{"fx-byi"}, h.poll().Closed)
+	assert.False(t, h.P.Stats().GHDown)
+}
+
+// bd itself failing is returned to the caller, warned about once, and the
+// loop keeps going.
+func TestGatePollerSurfacesABDFailure(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	boom := errors.New("bd: exit status 1")
+	h.BD.mu.Lock()
+	h.BD.checkErr = boom
+	h.BD.mu.Unlock()
+
+	_, err := h.P.Poll(context.Background())
+	require.ErrorIs(t, err, boom)
+	_, err = h.P.Poll(context.Background())
+	require.ErrorIs(t, err, boom)
+
+	require.Len(t, h.Rec.warnings(), 1)
+	assert.Contains(t, h.Rec.warnings()[0].Message, "could not check the pull request gates")
+	stats := h.P.Stats()
+	assert.Equal(t, 2, stats.Polls)
+	assert.Equal(t, 2, stats.Failures)
+}
+
+// A gate the poller cannot read, and a gate that names no bead, are
+// reported and skipped rather than crashing the loop.
+func TestGatePollerHandlesUnreadableGates(t *testing.T) {
+	t.Parallel()
+	t.Run("gate show fails", func(t *testing.T) {
+		t.Parallel()
+		h := newGateHarness(t, nil)
+		h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+		res := h.poll()
+		assert.True(t, res.Empty())
+		require.Len(t, h.Rec.warnings(), 1)
+		assert.Contains(t, h.Rec.warnings()[0].Message, "could not read gate fx-qba")
+	})
+
+	t.Run("gate blocks nothing", func(t *testing.T) {
+		t.Parallel()
+		h := newGateHarness(t, nil)
+		h.BD.mu.Lock()
+		h.BD.gates["fx-qba"] = beads.Gate{ID: "fx-qba", Status: "open", AwaitType: beads.GateTypePR, AwaitID: "1"}
+		h.BD.mu.Unlock()
+		h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+		res := h.poll()
+		assert.True(t, res.Empty())
+		require.Len(t, h.Rec.warnings(), 1)
+		assert.Contains(t, h.Rec.warnings()[0].Message, "names no bead")
+	})
+
+	t.Run("bead show fails", func(t *testing.T) {
+		t.Parallel()
+		h := newGateHarness(t, nil)
+		h.BD.AddGate("fx-qba", "fx-byi", 1)
+		h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+		res := h.poll()
+		assert.True(t, res.Empty())
+		require.Len(t, h.Rec.warnings(), 1)
+		assert.Contains(t, h.Rec.warnings()[0].Message, "could not read fx-byi")
+	})
+}
+
+// P3-14/P6-12: a bead carrying the repository's own status, or one of bd's
+// read-only built-ins, is never transitioned.
+func TestGatePollerRefusesForeignAndNonWorkflowBeads(t *testing.T) {
+	t.Parallel()
+	t.Run("foreign status", func(t *testing.T) {
+		t.Parallel()
+		h := newGateHarness(t, func(o *GatePollerOptions) {
+			o.Statuses = beads.StatusMap{"reviewing": domain.CategoryWIP}
+		})
+		h.BD.AddGate("fx-qba", "fx-byi", 1)
+		h.BD.AddBead("fx-byi", domain.BeadState("reviewing"), 1)
+		h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+
+		res := h.poll()
+		assert.True(t, res.Empty())
+		assert.Empty(t, h.BD.Closed)
+		require.Len(t, h.Rec.warnings(), 1)
+		assert.Contains(t, h.Rec.warnings()[0].Message, `carries the status "reviewing"`)
+	})
+
+	t.Run("bd built-in", func(t *testing.T) {
+		t.Parallel()
+		h := newGateHarness(t, nil)
+		h.BD.AddGate("fx-qba", "fx-byi", 1)
+		h.BD.AddBead("fx-byi", domain.BeadStateDeferred, 1)
+		h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+
+		res := h.poll()
+		assert.True(t, res.Empty())
+		assert.Empty(t, h.BD.Closed)
+		require.Len(t, h.Rec.warnings(), 1)
+		assert.Contains(t, h.Rec.warnings()[0].Message, "which slop-cannon only reads")
+	})
+}
+
+// A gate on a bead of another run (or of no run at all) is not this run's
+// business, and is passed over in silence.
+func TestGatePollerIgnoresBeadsOutsideTheRun(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadStateDelivering, 1, "sc:run:someone-else")
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+
+	res := h.poll()
+
+	assert.True(t, res.Empty())
+	assert.Empty(t, h.BD.Closed)
+	assert.Empty(t, h.Rec.all(), "another tool's gate is not a warning")
+
+	// Without a scope the same gate is acted on.
+	wide := newGateHarness(t, func(o *GatePollerOptions) { o.Scope = "" })
+	wide.BD.AddGate("fx-qba", "fx-byi", 1)
+	wide.BD.AddBead("fx-byi", domain.BeadStateDelivering, 1, "sc:run:someone-else")
+	wide.BD.Answer(gateCheck(t, gateOutMerged, ""))
+	assert.Equal(t, []domain.BeadID{"fx-byi"}, wide.poll().Closed)
+}
+
+// Without a bead reader the poller assumes the bead is delivering, which is
+// where a gated bead sits by construction (D-20).
+func TestGatePollerWithoutABeadReaderAssumesDelivering(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, func(o *GatePollerOptions) { o.Beads = nil })
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+
+	res := h.poll()
+
+	assert.Equal(t, []domain.BeadID{"fx-byi"}, res.Closed)
+	assert.Equal(t, []string{"fx-byi: pull request #1 merged"}, h.BD.Closed)
+	require.Len(t, h.Rec.merges(), 1)
+	assert.Equal(t, 1, h.Rec.merges()[0].PRNumber, "the PR number comes from the gate's --await-id")
+}
+
+// A bd write that fails leaves the bead where it was, with one Warning and
+// no Merged event claiming work landed.
+func TestGatePollerSurfacesAFailedClose(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadStateDelivering, 1)
+	h.BD.mu.Lock()
+	h.BD.closeErr = fmt.Errorf("beads: close: %w", beads.ErrBlockedOpen)
+	h.BD.mu.Unlock()
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+
+	res := h.poll()
+
+	assert.True(t, res.Empty())
+	assert.Empty(t, h.Rec.merges(), "nothing merged, so nothing is announced")
+	require.Len(t, h.Rec.warnings(), 1)
+	assert.Contains(t, h.Rec.warnings()[0].Message, "could not move fx-byi")
+	assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State("fx-byi"))
+}
+
+// bd printing counts but no verdict lines is worth exactly one complaint.
+func TestGatePollerReportsMissingVerdictLines(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.Answer(beads.GateCheck{Checked: 2, Resolved: 1})
+
+	h.poll()
+	h.poll()
+
+	require.Len(t, h.Rec.warnings(), 1)
+	assert.Contains(t, h.Rec.warnings()[0].Message, "no per-gate verdict")
+}
+
+// The poller never claims, reclaims or releases a bead: those belong to the
+// scheduler (P6-13). The fake fails the test if it is asked to.
+func TestGatePollerOnlyEverSetsStatusesAndCloses(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddGate("fx-8za", "fx-6z4", 2)
+	h.BD.AddBead("fx-byi", domain.BeadStateDelivering, 1)
+	h.BD.AddBead("fx-6z4", domain.BeadStateDelivering, 2)
+	h.BD.Answer(gateCheck(t, gateOutBoth, ""))
+
+	res := h.poll()
+
+	assert.Equal(t, []domain.BeadID{"fx-byi"}, res.Closed)
+	assert.Equal(t, []domain.BeadID{"fx-6z4"}, res.Blocked)
+	kinds := h.Rec.kinds()
+	assert.Contains(t, kinds, events.KindMerged)
+	assert.Contains(t, kinds, events.KindBeadStateChanged)
+	assert.Contains(t, kinds, events.KindWarning)
+}
+
+// The Run loop polls at once, then every interval, and a Kick brings the
+// next poll forward. Everything is driven by the fake clock.
+func TestGatePollerRunLoopPollsOnTheInterval(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, func(o *GatePollerOptions) { o.Interval = 30 * time.Second })
+	h.BD.Answer(gateCheck(t, gateOutPending, ""))
+	require.Equal(t, 30*time.Second, h.P.Interval())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- h.P.Run(ctx) }()
+
+	gateEventually(t, "the first poll", func() bool { return h.BD.polls() == 1 })
+	gateEventually(t, "the loop to arm its timer", func() bool { return h.Clock.Waiting() == 1 })
+
+	h.Clock.Advance(30 * time.Second)
+	gateEventually(t, "the second poll", func() bool { return h.BD.polls() == 2 })
+
+	gateEventually(t, "the loop to arm its timer again", func() bool { return h.Clock.Waiting() == 1 })
+	h.P.Kick()
+	gateEventually(t, "the kicked poll", func() bool { return h.BD.polls() == 3 })
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err, "cancellation ends the loop cleanly")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gate poller did not stop")
+	}
+}
+
+// A wake channel is the delivery handoff saying "a PR just opened".
+func TestGatePollerRunLoopWakesOnDemand(t *testing.T) {
+	t.Parallel()
+	wake := make(chan struct{}, 1)
+	h := newGateHarness(t, func(o *GatePollerOptions) { o.Wake = wake })
+	h.BD.Answer(gateCheck(t, gateOutPending, ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	done := make(chan error, 1)
+	go func() { done <- h.P.Run(ctx) }()
+
+	gateEventually(t, "the first poll", func() bool { return h.BD.polls() == 1 })
+	wake <- struct{}{}
+	gateEventually(t, "the woken poll", func() bool { return h.BD.polls() == 2 })
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the gate poller did not stop")
+	}
+}
+
+// A cancelled context ends a poll without warning about the cancellation.
+func TestGatePollerCancelledPollIsQuiet(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.mu.Lock()
+	h.BD.checkErr = context.Canceled
+	h.BD.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := h.P.Poll(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Empty(t, h.Rec.all(), "shutting down is not a warning")
+	assert.NoError(t, h.P.Run(ctx))
+}
+
+// P6-14, second half: a delivery retry must not leave the bead behind a
+// gate for a pull request that is no longer the one being delivered.
+func TestClearStaleGate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("no gate at all", func(t *testing.T) {
+		t.Parallel()
+		bd := newGateFakeBD()
+		g, cleared, err := ClearStaleGate(ctx, bd, "fx-byi", 2, "")
+		require.NoError(t, err)
+		assert.False(t, cleared)
+		assert.Empty(t, g.ID)
+		assert.Empty(t, bd.Resolved)
+	})
+
+	t.Run("the gate already awaits this PR", func(t *testing.T) {
+		t.Parallel()
+		bd := newGateFakeBD()
+		bd.AddGate("fx-qba", "fx-byi", 2)
+		g, cleared, err := ClearStaleGate(ctx, bd, "fx-byi", 2, "")
+		require.NoError(t, err)
+		assert.False(t, cleared, "the retry's own gate is left where it is")
+		assert.Equal(t, domain.BeadID("fx-qba"), g.ID)
+		assert.Empty(t, bd.Resolved)
+	})
+
+	t.Run("a gate for an older PR is resolved", func(t *testing.T) {
+		t.Parallel()
+		bd := newGateFakeBD()
+		bd.AddGate("fx-qba", "fx-byi", 1)
+		g, cleared, err := ClearStaleGate(ctx, bd, "fx-byi", 2, "")
+		require.NoError(t, err)
+		assert.True(t, cleared)
+		assert.Equal(t, domain.BeadID("fx-qba"), g.ID)
+		require.Len(t, bd.Resolved, 1)
+		assert.Equal(t, "fx-qba: superseded by pull request #2", bd.Resolved[0])
+		_, err = bd.GateFor(ctx, "fx-byi")
+		assert.ErrorIs(t, err, beads.ErrNoGate, "the bead is free for the new gate")
+	})
+
+	t.Run("an unknown PR number clears any gh:pr gate", func(t *testing.T) {
+		t.Parallel()
+		bd := newGateFakeBD()
+		bd.AddGate("fx-qba", "fx-byi", 1)
+		_, cleared, err := ClearStaleGate(ctx, bd, "fx-byi", 0, "the pull request is gone")
+		require.NoError(t, err)
+		assert.True(t, cleared)
+		assert.Equal(t, []string{"fx-qba: the pull request is gone"}, bd.Resolved)
+	})
+
+	t.Run("a gate of another type is left alone", func(t *testing.T) {
+		t.Parallel()
+		bd := newGateFakeBD()
+		bd.mu.Lock()
+		bd.gates["fx-hum"] = beads.Gate{ID: "fx-hum", Status: "open", AwaitType: "human", Blocks: "fx-byi"}
+		bd.mu.Unlock()
+		_, cleared, err := ClearStaleGate(ctx, bd, "fx-byi", 2, "")
+		require.NoError(t, err)
+		assert.False(t, cleared)
+		assert.Empty(t, bd.Resolved)
+	})
+
+	t.Run("errors reach the caller", func(t *testing.T) {
+		t.Parallel()
+		bd := newGateFakeBD()
+		bd.AddGate("fx-qba", "fx-byi", 1)
+		bd.mu.Lock()
+		bd.resolveErr = errors.New("bd: exit status 1")
+		bd.mu.Unlock()
+		_, cleared, err := ClearStaleGate(ctx, bd, "fx-byi", 2, "")
+		require.Error(t, err)
+		assert.False(t, cleared)
+
+		_, _, err = ClearStaleGate(ctx, nil, "fx-byi", 2, "")
+		assert.ErrorIs(t, err, ErrNoGateStore)
+	})
+}
+
+// polls reports how many `bd gate check` calls the fake has served.
+func (f *gateFakeBD) polls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.Checks
+}
+
+// gateEventually polls cond until it holds, so a test never sleeps for a
+// fixed time.
+func gateEventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// gateFakeHost is a run for the poller to publish and log through.
+type gateFakeHost struct {
+	rec *gateRecorder
+	at  time.Time
+}
+
+func (h gateFakeHost) Meta() events.Meta       { return events.MetaAt(gateRun, h.at) }
+func (h gateFakeHost) Publish(ev events.Event) { h.rec.Publish(ev) }
+func (h gateFakeHost) Log() *slog.Logger       { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// With a host (the run, in production) every event goes through it and
+// carries the run's own event header.
+func TestGatePollerPublishesThroughItsHost(t *testing.T) {
+	t.Parallel()
+	rec := &gateRecorder{}
+	host := gateFakeHost{rec: rec, at: gateEpoch.Add(90 * time.Second)}
+	bd := newGateFakeBD()
+	bd.AddGate("fx-qba", "fx-byi", 1)
+	bd.AddBead("fx-byi", domain.BeadStateDelivering, 1)
+	bd.Answer(gateCheck(t, gateOutMerged, ""))
+
+	p, err := NewGatePoller(GatePollerOptions{
+		Gates: bd, Beads: bd, Host: host, Run: gateRun, Branch: gateBranch, Clock: newGateClock(),
+		States: NewStateMachine(bd, WithStatePublisher(rec), WithStateRun(gateRun)),
+	})
+	require.NoError(t, err)
+	require.Equal(t, []domain.BeadID{"fx-byi"}, mustGatePoll(t, p).Closed)
+
+	merges := rec.merges()
+	require.Len(t, merges, 1)
+	assert.Equal(t, host.at, merges[0].At(), "the host stamps the event, not the poller's clock")
+	assert.Equal(t, gateRun, merges[0].Run)
+}
+
+// mustGatePoll runs one poll and fails on an error.
+func mustGatePoll(t *testing.T, p *GatePoller) GatePollResult {
+	t.Helper()
+	res, err := p.Poll(context.Background())
+	require.NoError(t, err)
+	return res
+}
+
+// A gate whose bead is already closed or failed still gets cleared, so it
+// stops blocking that bead's dependents (P6-14).
+func TestGatePollerClearsAnEscalatedGateOnASettledBead(t *testing.T) {
+	t.Parallel()
+	for _, state := range []domain.BeadState{domain.BeadStateClosed, domain.BeadStateFailed, domain.BeadStateNeedsHuman} {
+		t.Run(string(state), func(t *testing.T) {
+			t.Parallel()
+			h := newGateHarness(t, nil)
+			h.BD.AddGate("fx-8za", "fx-6z4", 2)
+			h.BD.AddBead("fx-6z4", state, 2)
+			h.BD.Answer(gateCheck(t, gateOutClosedPR, ""))
+
+			res := h.poll()
+
+			assert.Empty(t, res.Blocked, "a settled bead is not moved again")
+			assert.Equal(t, []domain.BeadID{"fx-8za"}, res.Resolved)
+			assert.Empty(t, h.BD.Statuses)
+			assert.Empty(t, h.BD.Closed)
+			require.Len(t, h.BD.Resolved, 1)
+		})
+	}
+}
+
+// A gate the poller cannot resolve is reported once and left open.
+func TestGatePollerReportsAFailedGateResolve(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-8za", "fx-6z4", 2)
+	h.BD.AddBead("fx-6z4", domain.BeadStateDelivering, 2)
+	h.BD.mu.Lock()
+	h.BD.resolveErr = errors.New("bd: exit status 1")
+	h.BD.mu.Unlock()
+	h.BD.Answer(gateCheck(t, gateOutClosedPR, ""))
+
+	res := h.poll()
+
+	assert.Equal(t, []domain.BeadID{"fx-6z4"}, res.Blocked, "the bead is parked whatever the gate does")
+	assert.Empty(t, res.Resolved)
+	var complaints int
+	for _, w := range h.Rec.warnings() {
+		if strings.Contains(w.Message, "could not resolve the escalated gate") {
+			complaints++
+		}
+	}
+	assert.Equal(t, 1, complaints)
+}
+
+// The PR number falls back to the bead's own metadata when bd's gate
+// carries no --await-id, and the reason says so plainly when there is no
+// number at all.
+func TestGatePollerPRNumberFallsBackToTheBead(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.mu.Lock()
+	h.BD.gates["fx-qba"] = beads.Gate{ID: "fx-qba", Status: "open", AwaitType: beads.GateTypePR, Blocks: "fx-byi"}
+	h.BD.mu.Unlock()
+	h.BD.AddBead("fx-byi", domain.BeadStateDelivering, 7)
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+
+	h.poll()
+
+	assert.Equal(t, []string{"fx-byi: pull request #7 merged"}, h.BD.Closed)
+	require.Len(t, h.Rec.merges(), 1)
+	assert.Equal(t, 7, h.Rec.merges()[0].PRNumber)
+
+	assert.Equal(t, "the pull request merged", gateMergeReason(0))
+	assert.Equal(t, "the pull request was closed without merging", gateEscalationReason(0, ""))
+	assert.Equal(t,
+		"pull request #3 was closed without merging",
+		gateEscalationReason(3, "pull request #3 was closed without merging"),
+		"bd repeating what we already said is not appended twice")
+}
+
+// A transition the machine refuses is the machine's own Warning, not a
+// second one from the poller.
+func TestGatePollerDoesNotDoubleWarnOnARefusedTransition(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+
+	ok := h.P.apply(context.Background(), StateRequest{
+		Bead:  "fx-byi",
+		From:  domain.BeadStateClosed,
+		Event: BeadEventDelivered,
+	})
+
+	assert.False(t, ok)
+	warns := h.Rec.warnings()
+	require.Len(t, warns, 1, "one Warning, from the state machine")
+	assert.Equal(t, StateWarningSource, warns[0].Source)
+	assert.True(t, gateTransitionRefused(fmt.Errorf("wrapped: %w", ErrInvalidTransition)))
+	assert.False(t, gateTransitionRefused(errors.New("bd: exit status 1")))
+}
+
+// A gate lookup that fails for a reason other than "there is none" reaches
+// the caller of ClearStaleGate.
+func TestClearStaleGateSurfacesALookupFailure(t *testing.T) {
+	t.Parallel()
+	bd := newGateFakeBD()
+	bd.mu.Lock()
+	bd.gateForErr = errors.New("bd: exit status 1")
+	bd.mu.Unlock()
+	_, cleared, err := ClearStaleGate(context.Background(), bd, "fx-byi", 2, "")
+	require.Error(t, err)
+	assert.False(t, cleared)
+}

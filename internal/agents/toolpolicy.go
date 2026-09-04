@@ -8,7 +8,6 @@ import (
 	"sync"
 
 	"slop-cannon/internal/cartridge"
-	"slop-cannon/internal/cartridge/claude"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
 )
@@ -20,17 +19,18 @@ import (
 //     may run commands but not edit, engineers may do everything. See
 //     [Policy] and [ApplyPolicy].
 //  2. How will the chosen cartridge actually enforce that policy? Adapters
-//     differ, so the mapping lives behind a per-adapter method and is
-//     resolved by [EnforcementFor]. Claude Code translates the policy into
-//     its own tool controls (claude.ToolFlags: --permission-mode dontAsk
-//     plus allowed/disallowed tool lists) and the mock honours the policy
-//     in-process. A future adapter with no tool controls at all cannot be
-//     trusted with read_only or read_exec, so it resolves to
-//     [EnforceCopyWorktree]: the orchestrator would copy the worktree to a
-//     temporary directory, fire the agent there, and throw the copy away, so
-//     a tester that writes cannot damage the reviewed tree. That degrade is
-//     documented, not implemented (P5-06); [Enforcement.Check] fails loudly
-//     with [ErrCopyWorktreeUnimplemented] until it is.
+//     differ, so the mapping lives behind a per-adapter method
+//     ([ToolPolicyEnforcer]) and is resolved by [EnforcementFor]. Claude
+//     Code translates the policy into its own tool controls
+//     (--permission-mode dontAsk plus allowed/disallowed tool lists) in its
+//     own package (P5-11) and the mock honours the policy in-process. An
+//     adapter with no tool controls at all cannot be trusted with read_only
+//     or read_exec, so it resolves to [EnforceCopyWorktree]: the firing may
+//     only happen in a throwaway copy of the worktree, which the
+//     orchestrator's supervisor makes (P6-20) and reports back as
+//     [EnforceCopiedWorktree]. A caller that cannot make that copy gets
+//     [ErrCopyWorktreeUnimplemented] from [Enforcement.Check] rather than an
+//     unrestricted agent.
 
 // rolePolicies is the tool policy each role runs under when no task narrows
 // it (D-05 roles; see the per-role Phase 5 tasks).
@@ -173,9 +173,16 @@ const (
 	EnforceNone EnforcementMode = "none"
 	// EnforceCopyWorktree means the adapter has no tool controls and the
 	// policy forbids something, so the firing must happen in a throwaway
-	// copy of the worktree. Documented, not implemented (P5-06); see
-	// [ErrCopyWorktreeUnimplemented].
+	// copy of the worktree — and nothing has made one. [Enforcement.Check]
+	// refuses it with [ErrCopyWorktreeUnimplemented] so no unrestricted
+	// agent is ever fired by accident.
 	EnforceCopyWorktree EnforcementMode = "copy_worktree"
+	// EnforceCopiedWorktree is that same degrade once it is in force: the
+	// orchestrator's agent supervisor has copied the worktree, points the
+	// firing at the copy and throws it away afterwards (P6-20), so whatever
+	// the adapter lets the model do cannot reach the real tree.
+	// [Enforcement.Check] passes.
+	EnforceCopiedWorktree EnforcementMode = "copied_worktree"
 )
 
 // String returns the canonical name.
@@ -228,8 +235,8 @@ func (e Enforcement) String() string {
 // ToolPolicyEnforcer is the per-adapter method the mapping hides behind. An
 // adapter that can restrict its own sessions implements it and describes
 // what it will do; anything else falls back to the copied worktree. The
-// Claude adapter predates the interface and is recognised by type, so new
-// adapters are the ones that implement this.
+// Claude adapter implements it in internal/cartridge/claude (P5-11), which
+// is why this package does not import any adapter.
 type ToolPolicyEnforcer interface {
 	// ToolPolicyEnforcement reports how the adapter will hold p. Returning
 	// an error means the adapter refuses the policy outright.
@@ -286,34 +293,9 @@ func lookupEnforcement(name string) (EnforcementFunc, bool) {
 	return fn, ok
 }
 
-// ClaudeEnforcement is the Claude Code mapping: every policy is native,
-// carried by the flags claude.ToolFlags builds (--permission-mode dontAsk
-// plus the allowed and disallowed tool lists verified against Claude Code
-// 2.1.258). read_only keeps a restricted Bash allowlist because that CLI
-// offers Glob and Grep only when Bash is disallowed (P5-09); read_exec adds
-// Bash and still denies the file-editing tools; read_write allows them.
-func ClaudeEnforcement(name string, p cartridge.ToolPolicy) (Enforcement, error) {
-	if !p.Valid() {
-		return Enforcement{}, fmt.Errorf("%w: tool policy %q", domain.ErrUnknownValue, string(p))
-	}
-	if name == "" {
-		name = claude.Name
-	}
-	detail := map[cartridge.ToolPolicy]string{
-		cartridge.ToolReadOnly:  "file-editing tools removed; Bash restricted to a read-only allowlist",
-		cartridge.ToolReadExec:  "file-editing tools removed; Bash allowed for tests and builds",
-		cartridge.ToolReadWrite: "Bash and the file-editing tools allowed",
-	}[p]
-	return Enforcement{
-		Cartridge: name, Policy: p, Mode: EnforceNative,
-		Controls: claude.ToolFlags(p),
-		Detail:   detail,
-	}, nil
-}
-
 // EnforcementFor reports how c will hold p, resolving in this order: the
-// adapter's own [ToolPolicyEnforcer] method, the Claude adapter's mapping
-// (matched by type), an enforcement registered under the cartridge's name
+// adapter's own [ToolPolicyEnforcer] method (Claude Code implements it,
+// P5-11), an enforcement registered under the cartridge's name
 // (see [RegisterEnforcement]), and finally the fallback for an adapter with
 // no tool controls: [EnforceNone] for read_write, which restricts nothing,
 // and [EnforceCopyWorktree] for read_only and read_exec. Call
@@ -341,9 +323,6 @@ func EnforcementFor(c cartridge.Cartridge, p cartridge.ToolPolicy) (Enforcement,
 			return Enforcement{}, fmt.Errorf("agents: cartridge %q reported no enforcement mode for %s", name, p)
 		}
 		return en, nil
-	}
-	if _, ok := c.(*claude.Adapter); ok {
-		return ClaudeEnforcement(name, p)
 	}
 	if fn, ok := lookupEnforcement(name); ok {
 		en, err := fn(name, p)

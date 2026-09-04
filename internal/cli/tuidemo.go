@@ -1,13 +1,17 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"slices"
+	"sync"
 	"time"
 
 	"github.com/charmbracelet/x/term"
 	"github.com/spf13/cobra"
 
+	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
 	"slop-cannon/internal/tui"
 )
@@ -93,19 +97,83 @@ func runTUIDemo(cmd *cobra.Command, _ []string) error {
 	}
 
 	stopped := false
+	ctrl := &demoController{}
 	err = demoTUI(cmd.Context(), demo, tui.Options{
-		NoColor:   opts.NoColor,
-		NoAnim:    noAnim,
-		AltScreen: alt,
-		OnStop:    func() { stopped = true },
+		NoColor:    opts.NoColor,
+		NoAnim:     noAnim,
+		AltScreen:  alt,
+		OnStop:     func() { stopped = true },
+		Controller: ctrl,
 	})
 	if err != nil {
 		return err
 	}
+	out := cmd.ErrOrStderr()
 	if stopped {
-		_, err = fmt.Fprintln(cmd.ErrOrStderr(), "sc: stop confirmed (the demo has no orchestrator to stop; P7-10 wires the real one)")
+		if _, err = fmt.Fprintln(out, "sc: stop confirmed (the demo has no orchestrator to stop; `sc run` wires the real one)"); err != nil {
+			return err
+		}
 	}
-	return err
+	for _, c := range ctrl.Calls() {
+		if _, err = fmt.Fprintln(out, "sc: run control: "+c); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// demoController is the stand-in orchestrator behind `sc tui-demo`'s run
+// controls (P7-10). The demo has no run to pause, stop or re-fire, so every
+// call is recorded and reported when the program exits: that is what makes
+// the keys live in the demo instead of disabled, which is how a nil
+// [tui.Controller] would render them.
+type demoController struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+var _ tui.Controller = (*demoController)(nil)
+
+func (c *demoController) record(format string, args ...any) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, fmt.Sprintf(format, args...))
+	return nil
+}
+
+// Calls returns what the user asked for, in order.
+func (c *demoController) Calls() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.calls)
+}
+
+func (c *demoController) Pause(_ context.Context, reason string) error {
+	return c.record("pause (%s)", reason)
+}
+
+func (c *demoController) Resume(_ context.Context, reason string) error {
+	return c.record("resume (%s)", reason)
+}
+
+func (c *demoController) Stop(_ context.Context, reason string) error {
+	return c.record("stop (%s)", reason)
+}
+
+func (c *demoController) Refire(_ context.Context, bead domain.BeadID, reason string) error {
+	return c.record("re-fire %s (%s)", bead, reason)
+}
+
+func (c *demoController) MarkDone(_ context.Context, bead domain.BeadID, reason string) error {
+	return c.record("mark %s done (%s)", bead, reason)
+}
+
+func (c *demoController) SetSafety(_ context.Context, on bool) error {
+	return c.record("safety %s", map[bool]string{true: "on", false: "off"}[on])
+}
+
+func (c *demoController) SetAmmo(_ context.Context, ammo int) error {
+	return c.record("ammo %d", ammo)
 }
 
 // demoTUI is [tui.Demo], and isTerminal reports whether a file is a

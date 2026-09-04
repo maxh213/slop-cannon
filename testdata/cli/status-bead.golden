@@ -1,0 +1,6 @@
+sc-1  Add retry
+  status closed; run 20260903-120000-abcd; round 1; assignee sc:eng-sc-1-r1
+  2026-09-03 12:00:00  sc:orchestrator       created (task, p2)
+  2026-09-03 12:00:20  sc:eng-sc-1-r1        claimed
+  2026-09-03 12:00:45  sc:tester-qa-sc-1-r1  Verdict (qa, round 1): changes requested, 1 item
+  2026-09-03 12:00:56                        closed: merged as 0123456

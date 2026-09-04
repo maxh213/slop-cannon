@@ -14,6 +14,7 @@ import (
 
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
+	"slop-cannon/internal/orchestrator"
 )
 
 // runTestEnv isolates HOME and the XDG directories under a temp base and
@@ -72,7 +73,9 @@ func runJSON(t *testing.T, args ...string) config.RunConfig {
 	t.Helper()
 	stdout, stderr, code := runExec(t, append([]string{"--json"}, args...)...)
 	require.Equal(t, 0, code, stderr)
-	require.Equal(t, runNote+"\n", stderr)
+	// A resumed run may print notes of its own before the placeholder note
+	// (P6-11), so the placeholder is required to be there rather than alone.
+	require.Contains(t, stderr, runNote+"\n")
 	var rc config.RunConfig
 	require.NoError(t, json.Unmarshal([]byte(stdout), &rc), stdout)
 	return rc
@@ -352,6 +355,48 @@ func TestRunResume(t *testing.T) {
 	stdout, _, code := runExec(t, repo, "--resume")
 	require.Equal(t, 0, code)
 	require.Contains(t, runNormalise(stdout, base, repo), "run        20260902-000000-2222 (resumed)\n")
+}
+
+// TestRunResumeRestoresTheFrozenSnapshot is P6-11's Done-when at the
+// cli.ResolveRun level: a run recorded ammo 10, the config file then says 4,
+// and the resumed run still fires with 10 — while an explicit --ammo wins
+// and says so.
+func TestRunResumeRestoresTheFrozenSnapshot(t *testing.T) {
+	_, repo := runTestEnv(t)
+	runAddCartridge(t, "claude", "fable")
+
+	const id = "20260903-000000-3333"
+	dir := config.RunDir(repo, id)
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	rc0, err := ResolveRun(RunOptions{Path: repo, Brief: "ship it"})
+	require.NoError(t, err)
+	rc0.Run.ID, rc0.Run.StateDir = id, dir
+	rc0.Run.Config.Ammo = 10
+	require.NoError(t, orchestrator.WriteState(dir, orchestrator.State{
+		Version: orchestrator.StateFileVersion,
+		Run:     rc0.Run,
+		Phase:   orchestrator.PhaseRunning,
+	}))
+
+	configWriteFile(t, config.RepoConfigPath(repo), "ammo = 4\n")
+
+	rc, notes, err := ResolveRunWithNotes(RunOptions{Path: repo, Resume: true})
+	require.NoError(t, err)
+	require.Equal(t, 10, rc.Run.Config.Ammo, "the frozen snapshot wins over the edited config file")
+	require.Equal(t, domain.RunModeBrief, rc.Run.Mode)
+	require.Equal(t, "ship it", rc.Run.Brief)
+	require.Empty(t, notes)
+
+	ammo := 6
+	rc, notes, err = ResolveRunWithNotes(RunOptions{
+		Path:      repo,
+		Resume:    true,
+		Overrides: config.Overrides{Ammo: &ammo},
+	})
+	require.NoError(t, err)
+	require.Equal(t, 6, rc.Run.Config.Ammo, "an explicit --ammo wins over the snapshot")
+	require.Len(t, notes, 1)
+	require.Contains(t, notes[0], "--ammo 6 overrides the run's recorded ammo 10")
 }
 
 func TestRunReportsConfigErrors(t *testing.T) {

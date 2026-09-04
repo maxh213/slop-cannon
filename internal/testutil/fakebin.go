@@ -125,8 +125,24 @@ func FakeBin(t testing.TB, name, script string, opts ...ShimOption) *Shim {
 	b.WriteString("export SC_FAKEBIN_NAME SC_FAKEBIN_DIR SC_FAKEBIN_LOG SC_FAKEBIN_REAL\n")
 	// Serialise recording with a mkdir lock so concurrent calls never
 	// interleave their records and sequence numbers stay unique.
+	//
+	// A shim killed mid-record — a test that kills a run takes its children
+	// with it — would otherwise leave the lock behind and hang every later
+	// call, so a lock still held after five seconds is stolen. Recording
+	// takes microseconds, so no live holder ever reaches that. The loop
+	// uses only mkdir, rmdir and sleep, because a test may put a very small
+	// PATH in front of it (internal/cli's doctor tests do).
 	b.WriteString(`_sc_lock="$SC_FAKEBIN_DIR/.lock"
-while ! mkdir "$_sc_lock" 2>/dev/null; do sleep 0.01; done
+_sc_wait=0
+while ! mkdir "$_sc_lock" 2>/dev/null; do
+  if [ "$_sc_wait" -ge 500 ]; then
+    rmdir "$_sc_lock" 2>/dev/null
+    _sc_wait=0
+    continue
+  fi
+  _sc_wait=$(( _sc_wait + 1 ))
+  sleep 0.01
+done
 SC_FAKEBIN_SEQ=$(( $(tr -cd '\036' < "$SC_FAKEBIN_LOG" | wc -c) + 1 ))
 SC_FAKEBIN_STDIN=''
 `)

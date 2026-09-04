@@ -39,6 +39,23 @@ name — Graph, Agents, Feedback and PRs each add some; the Log view adds
 none — and a view with room in its headings puts the important ones there
 too, so the binding is discoverable without opening the overlay.
 
+### Run controls
+
+These act on the run itself. They are live only while an orchestrator is
+attached and the run has not finished; a recorded run leaves them out of the
+`?` overlay entirely, because there is nothing behind them.
+
+| Key | What it does |
+|---|---|
+| `p` | pause the run (no new agents; running ones finish), or resume a paused one |
+| `s` | stop the run gracefully — asks to confirm |
+| `r` | re-fire the selected bead; only a `failed` or `blocked` bead can be re-fired |
+| `x` | mark the selected bead done without delivering it — asks to confirm |
+| `S` | turn safety on or off for the rest of the run — asks to confirm |
+| `a` | set ammo: a prompt pre-filled with the run's current value, `enter` applies and `esc` cancels |
+
+The footer reports what each one did, or why it was refused.
+
 ## Views
 
 | Tab | Shows |

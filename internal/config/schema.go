@@ -40,6 +40,11 @@ const (
 	// DefaultIdleReplanInterval is how long an idle autopilot waits before the
 	// PO plans again (D-18).
 	DefaultIdleReplanInterval = 10 * time.Minute
+	// DefaultMaxBeadsPerPlan is how many beads one planning firing may
+	// propose before the plan is rejected outright (P5-02, P1-16). Dropping
+	// the surplus is not an option: it would break the dependencies of the
+	// beads that stayed.
+	DefaultMaxBeadsPerPlan = 8
 	// DefaultMaxReviewRounds is the review-round cap before PO escalation (D-08).
 	DefaultMaxReviewRounds = 5
 	// DefaultMaxPushbackRounds is the pushback cap per feedback item (D-08).
@@ -180,6 +185,8 @@ type File struct {
 	CheckCommand *string `toml:"check_command,omitempty"`
 	// IdleReplanInterval is the autopilot re-plan delay when idle (D-18).
 	IdleReplanInterval *Duration `toml:"idle_replan_interval,omitempty"`
+	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02).
+	MaxBeadsPerPlan *int `toml:"max_beads_per_plan,omitempty"`
 	// Limits holds the feedback-loop and budget limits (D-08, D-18).
 	Limits LimitsFile `toml:"limits,omitempty"`
 	// Cartridges are the configured subscriptions, keyed by name (global only).
@@ -233,6 +240,9 @@ type Config struct {
 	CheckCommand string `json:"check_command"`
 	// IdleReplanInterval is the autopilot re-plan delay when idle.
 	IdleReplanInterval Duration `json:"idle_replan_interval"`
+	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02);
+	// always at least 1.
+	MaxBeadsPerPlan int `json:"max_beads_per_plan"`
 	// Limits are the feedback-loop and budget limits.
 	Limits Limits `json:"limits"`
 	// Roles maps a role to the cartridge it should use (D-12); roles absent
@@ -249,6 +259,7 @@ func Defaults() Config {
 		Vibes:              []string{},
 		Rules:              []string{},
 		IdleReplanInterval: NewDuration(DefaultIdleReplanInterval),
+		MaxBeadsPerPlan:    DefaultMaxBeadsPerPlan,
 		Limits: Limits{
 			MaxReviewRounds:   DefaultMaxReviewRounds,
 			MaxPushbackRounds: DefaultMaxPushbackRounds,

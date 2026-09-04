@@ -43,6 +43,7 @@ vibes = ["global-vibes.md"]
 rules = ["/abs/rules.md"]
 check_command = "make check"
 idle_replan_interval = "5m"
+max_beads_per_plan = 6
 
 [limits]
 max_review_rounds = 4
@@ -68,6 +69,7 @@ vibes = ["repo-vibes.md", "global-vibes.md"]
 rules = ["docs/rules.md"]
 check_command = "go test ./..."
 idle_replan_interval = "1h"
+max_beads_per_plan = 4
 
 [limits]
 max_review_rounds = 6
@@ -148,6 +150,7 @@ func TestLoadGlobalOnly(t *testing.T) {
 	assert.Equal(t, []string{"/abs/rules.md"}, eff.Rules)
 	assert.Equal(t, "make check", eff.CheckCommand)
 	assert.Equal(t, 5*time.Minute, eff.IdleReplanInterval.Duration())
+	assert.Equal(t, 6, eff.MaxBeadsPerPlan)
 	assert.Equal(t, Limits{MaxReviewRounds: 4, MaxPushbackRounds: 1, AgentTimeout: NewDuration(20 * time.Minute), MaxTokens: 1000, MaxCostUSD: 2.5}, eff.Limits)
 	assert.Equal(t, map[domain.Role]string{domain.RoleTester: "claude"}, eff.Roles)
 
@@ -319,6 +322,8 @@ func TestLoadValidation(t *testing.T) {
 		{"bad role", "[roles.janitor]\ncartridge = \"claude\"\n", "", "roles.janitor", `role "janitor"`},
 		{"bad role cartridge", "", "[roles.tester]\ncartridge = \"kimi\"\n", "roles.tester.cartridge", `cartridge "kimi" is not supported yet (only "claude" for now)`},
 		{"zero interval", "idle_replan_interval = \"0s\"\n", "", KeyIdleReplanInterval, "must be a positive duration"},
+		{"zero beads per plan", "max_beads_per_plan = 0\n", "", KeyMaxBeadsPerPlan, "must be at least 1"},
+		{"negative beads per plan", "", "max_beads_per_plan = -3\n", KeyMaxBeadsPerPlan, "must be at least 1"},
 		{"zero rounds", "", "[limits]\nmax_review_rounds = 0\n", KeyMaxReviewRounds, "must be at least 1"},
 		{"negative pushback", "", "[limits]\nmax_pushback_rounds = -1\n", KeyMaxPushbackRounds, "must not be negative"},
 		{"zero timeout", "[limits]\nagent_timeout = \"0s\"\n", "", KeyAgentTimeout, "must be a positive duration"},
@@ -464,6 +469,7 @@ func TestEntries(t *testing.T) {
 	assert.Equal(t, "[--verbose]", byKey["cartridges.claude.args"].Value)
 	assert.Equal(t, "[FOO=bar]", byKey["cartridges.claude.env"].Value)
 	assert.Equal(t, "5m", byKey[KeyIdleReplanInterval].Value)
+	assert.Equal(t, Entry{Key: KeyMaxBeadsPerPlan, Value: "6", Source: SourceGlobal}, byKey[KeyMaxBeadsPerPlan])
 	assert.Equal(t, "20m", byKey[KeyAgentTimeout].Value)
 	assert.Equal(t, "2.5", byKey[KeyMaxCostUSD].Value)
 	assert.Equal(t, "1000", byKey[KeyMaxTokens].Value)

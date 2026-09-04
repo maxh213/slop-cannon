@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "run": {
+    "id": "20260903-120000-abcd",
+    "repo_path": "<repo>",
+    "state_dir": "<run-dir>",
+    "mode": "brief",
+    "brief": "add a --version flag",
+    "epic": "sc-epic",
+    "started_at": "2026-09-03T12:00:00Z",
+    "config": {
+      "ammo": 10,
+      "safety": true,
+      "cartridge": "claude",
+      "model": "opus",
+      "review_prs": false,
+      "headless": true
+    }
+  },
+  "phase": "finished",
+  "resumes": 0,
+  "updated_at": "2026-09-03T12:01:30Z",
+  "last_seq": 2,
+  "last_event_kind": "run_finished",
+  "last_event_at": "2026-09-03T12:01:30Z",
+  "finish_reason": "completed",
+  "finish_summary": "1 bead landed",
+  "finished_at": "2026-09-03T12:01:30Z"
+}

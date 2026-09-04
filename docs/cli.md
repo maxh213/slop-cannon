@@ -21,6 +21,7 @@ Every command, flag, and example of the `sc` binary, in the words of
 - [sc rules](#sc-rules) — Manage the rule files every agent must follow
 - [sc run](#sc-run) — Fire the cannon at a repository (same as `sc PATH`)
 - [sc safety](#sc-safety) — Open PRs (on, the default) or merge straight to the default branch (off)
+- [sc status](#sc-status) — Show the state of a run, or one bead's timeline
 - [sc version](#sc-version) — Print the sc version, commit, and build date
 - [sc vibes](#sc-vibes) — Manage the style files every agent is given
 
@@ -96,6 +97,7 @@ sc safety off
 - [sc rules](#sc-rules) — Manage the rule files every agent must follow
 - [sc run](#sc-run) — Fire the cannon at a repository (same as `sc PATH`)
 - [sc safety](#sc-safety) — Open PRs (on, the default) or merge straight to the default branch (off)
+- [sc status](#sc-status) — Show the state of a run, or one bead's timeline
 - [sc version](#sc-version) — Print the sc version, commit, and build date
 - [sc vibes](#sc-vibes) — Manage the style files every agent is given
 
@@ -666,6 +668,63 @@ sc safety
 
 ```
   -h, --help   help for safety
+```
+
+### Options inherited from parent commands
+
+```
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging
+```
+
+### See also
+
+- [sc](#sc) — Fire LLM agents at a repository
+
+## sc status
+
+Show the state of a run, or one bead's timeline
+
+### Synopsis
+
+Report what a run did and is doing.
+
+Without arguments it describes the most recent run recorded for the
+repository (--run ID picks another): its phase, how its beads are spread
+across the workflow states, which agents are live, and the last few events.
+Everything comes from the run directory — state.json and events.jsonl — so
+it also works after a crash and while another process holds the run.
+
+With a bead id it prints that bead's timeline from beads: creation, the
+claim, every structured message sc recorded (verdicts, responses,
+arbitrations, deliveries) and where the bead stands now. This form needs bd
+on PATH and a beads database in the repository.
+
+### Usage
+
+```
+sc status [BEAD-ID] [flags]
+```
+
+### Examples
+
+```
+sc status
+sc status --repo ./repo-path
+sc status --run 20260902-010203-abcd --events 25
+sc status sc-1a2b
+sc status --json
+```
+
+### Options
+
+```
+      --events N   how many recent events to print (N, 0 for none) (default 10)
+  -h, --help       help for status
+      --run ID     report on run ID instead of the most recent one
 ```
 
 ### Options inherited from parent commands

@@ -39,6 +39,7 @@ Available Commands:
   rules       Manage the rule files every agent must follow
   run         Fire the cannon at a repository (same as `sc PATH`)
   safety      Open PRs (on, the default) or merge straight to the default branch (off)
+  status      Show the state of a run, or one bead's timeline
   version     Print the sc version, commit, and build date
   vibes       Manage the style files every agent is given
 

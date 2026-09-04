@@ -61,9 +61,18 @@ type Options struct {
 	// request URL to (P7-05); nil means [OpenURL]. A test passes its own so
 	// nothing ever launches a browser.
 	Open URLOpener
-	// OnStop is called when the user confirms a stop. P7-10 points it at the
-	// orchestrator; until then it is how `sc tui-demo` reports the request.
+	// OnStop is called when the user confirms a stop with `q` on a live run.
+	// It is how `sc tui-demo` reports the request; a real run also attaches
+	// a Controller, whose `s` key stops the orchestrator itself.
 	OnStop func()
+	// Controller is the orchestrator the run-control keys act on (P7-10):
+	// `p` pause/resume, `s` stop, `r` re-fire, `x` mark done, `S` safety and
+	// `a` ammo. A nil Controller disables the whole keymap, so a recorded
+	// run never offers a key that cannot do anything.
+	Controller Controller
+	// ControlKeys overrides the run-control bindings; nil means
+	// [DefaultControlsKeyMap].
+	ControlKeys *ControlsKeyMap
 	// Output is where the program draws; nil means os.Stdout.
 	Output io.Writer
 	// Input is where key presses are read from; nil means os.Stdin.
@@ -120,6 +129,12 @@ func New(ctx context.Context, opts Options) Model {
 	m.agents = NewAgentsModel(AgentsOptions{NoColor: opts.NoColor, Theme: theme, Now: opts.Now})
 	m.feedback = NewFeedbackModel(FeedbackOptions{NoColor: opts.NoColor, Theme: theme})
 	m.prs = NewPRsModel(PRsOptions{NoColor: opts.NoColor, Theme: theme, Open: opts.Open})
+	m.controls = NewControlsModel(ControlsOptions{
+		NoColor:    opts.NoColor,
+		Theme:      theme,
+		Keys:       opts.ControlKeys,
+		Controller: opts.Controller,
+	})
 	m.anim = NewAnimator(AnimOptions{
 		Disabled: AnimDisabled(opts.NoAnim, nil),
 		NoColor:  opts.NoColor,

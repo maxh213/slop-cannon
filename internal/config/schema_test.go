@@ -101,6 +101,8 @@ func TestDefaultsMatchD04(t *testing.T) {
 	assert.Empty(t, d.Cartridges)
 	assert.Equal(t, "", d.ActiveCartridge)
 	assert.Equal(t, 10*time.Minute, d.IdleReplanInterval.Duration())
+	assert.Equal(t, DefaultMaxBeadsPerPlan, d.MaxBeadsPerPlan)
+	assert.Equal(t, 8, d.MaxBeadsPerPlan)
 	assert.Equal(t, Limits{MaxReviewRounds: 5, MaxPushbackRounds: 2, AgentTimeout: NewDuration(30 * time.Minute)}, d.Limits)
 	assert.Empty(t, d.Roles)
 }

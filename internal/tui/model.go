@@ -668,6 +668,10 @@ type Model struct {
 	feedback FeedbackModel
 	prs      PRsModel
 	anim     Animator
+	// controls is the run-control layer (P7-10): the p/s/r/x/S/a keys, the
+	// confirmations and the ammo prompt. It disables itself when no
+	// [Controller] is attached.
+	controls ControlsModel
 
 	tab           Tab
 	cursor        int
@@ -724,6 +728,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case URLOpenedMsg:
 		return m.opened(msg), nil
+	case ControlResultMsg:
+		m.controls = m.controls.Apply(msg)
+		return m, nil
 	case tea.KeyMsg:
 		return m.handleKey(msg)
 	}
@@ -760,6 +767,14 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.showHelp = false
 		}
 		return m, nil
+	}
+	// The run controls come before the views and before the global keys: an
+	// overlay of theirs is modal, and otherwise they consume only their own
+	// keys (P7-10). With no [Controller] attached the whole keymap is
+	// disabled and every key falls straight through.
+	if c, cmd, ok := m.controls.Update(msg, m.state, k, TargetFor(m.state, m.graph.SelectedID())); ok {
+		m.controls = c
+		return m, cmd
 	}
 	if mm, cmd, ok := m.updateView(msg); ok {
 		return mm, cmd
@@ -1019,12 +1034,18 @@ func (m Model) footer(w int) string {
 	if m.state.Dropped > 0 {
 		line += m.styles.Sep.Render("  ") + m.styles.Warn.Render(fmt.Sprintf("missed %d events", m.state.Dropped))
 	}
-	if m.flash != "" {
+	flash, flashErr := m.flash, m.flashErr
+	// A control's answer outlives a key press, so it wins over the flash the
+	// views set (P7-10).
+	if f, isErr := m.controls.Flash(); f != "" {
+		flash, flashErr = f, isErr
+	}
+	if flash != "" {
 		style := m.styles.Muted
-		if m.flashErr {
+		if flashErr {
 			style = m.styles.Warn
 		}
-		line += m.styles.Sep.Render("  ") + style.Render(m.flash)
+		line += m.styles.Sep.Render("  ") + style.Render(flash)
 	}
 	return clip(line, w)
 }
@@ -1064,7 +1085,9 @@ func (m Model) now() time.Time {
 func (m Model) body(w, h int) string {
 	h = max(h, 1)
 	var content string
-	switch {
+	switch o, ok := m.controls.Overlay(m.state, w, h); {
+	case ok:
+		content = o
 	case m.showHelp:
 		content = m.helpOverlay(w, h)
 	case m.confirmStop:
@@ -1079,6 +1102,12 @@ func (m Model) body(w, h int) string {
 // keys of the active view under their own title.
 func (m Model) helpOverlay(w, h int) string {
 	full := m.help.FullHelpView(m.keys.FullHelp())
+	// The run controls are documented only when they can do something: the
+	// bindings disable themselves with no [Controller], and bubbles' help
+	// skips a disabled binding (P7-10).
+	if m.controls.Keys().Enabled() {
+		full += "\n\n" + m.styles.Title.Render("Run controls") + "\n" + m.help.FullHelpView(m.controls.Keys().FullHelp())
+	}
 	if cols := m.viewKeys(); len(cols) > 0 {
 		full += "\n\n" + m.styles.Title.Render(m.tab.String()+" keys") + "\n" + m.help.FullHelpView(cols)
 	}

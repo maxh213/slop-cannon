@@ -41,6 +41,7 @@
       "rules": [],
       "check_command": "",
       "idle_replan_interval": "10m",
+      "max_beads_per_plan": 8,
       "limits": {
         "max_review_rounds": 5,
         "max_pushback_rounds": 2,
@@ -60,6 +61,7 @@
       "limits.max_pushback_rounds": "default",
       "limits.max_review_rounds": "default",
       "limits.max_tokens": "default",
+      "max_beads_per_plan": "default",
       "rules": "default",
       "safety": "default",
       "vibes": "default"

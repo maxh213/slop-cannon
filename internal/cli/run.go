@@ -13,6 +13,7 @@ import (
 
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
+	"slop-cannon/internal/orchestrator"
 )
 
 // Flag names of the run form (`sc <repo-path>` and `sc run <repo-path>`).
@@ -179,17 +180,32 @@ func runOptionsFrom(cmd *cobra.Command, path string, opts GlobalOptions) (RunOpt
 // there is none), loads the effective configuration, applies the flag
 // overrides, and refuses when no cartridge is active. P8-01 hands the
 // result to the orchestrator; P8-06 may call it directly.
+//
+// Use [ResolveRunWithNotes] when the notes a resumed run produces matter.
 func ResolveRun(opts RunOptions) (*config.RunConfig, error) {
+	rc, _, err := ResolveRunWithNotes(opts)
+	return rc, err
+}
+
+// ResolveRunWithNotes is [ResolveRun] plus whatever the caller should tell
+// the user about the run it resolved.
+//
+// On `--resume` it hands the rebuilt config to
+// [orchestrator.RestoreRunConfig], which puts back the frozen
+// [domain.ConfigSnapshot] the earlier invocation recorded (P6-11): a config
+// file edited between the two invocations does not change the run, while an
+// explicit --ammo/--safety/--cartridge does and says so in the notes.
+func ResolveRunWithNotes(opts RunOptions) (*config.RunConfig, []string, error) {
 	root, err := runRepoRoot(opts.Path)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	eff, err := config.Load(root)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := eff.Apply(opts.Overrides); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	now := runNow()
 	settings := config.RunSettings{
@@ -205,12 +221,19 @@ func ResolveRun(opts RunOptions) (*config.RunConfig, error) {
 	}
 	rc, err := config.NewRunConfig(root, eff, settings)
 	if errors.Is(err, config.ErrNoCartridge) {
-		return nil, fmt.Errorf("%w — add one with: %s", config.ErrNoCartridge, CartridgeAddHint)
+		return nil, nil, fmt.Errorf("%w — add one with: %s", config.ErrNoCartridge, CartridgeAddHint)
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return rc, nil
+	if !opts.Resume {
+		return rc, nil, nil
+	}
+	res, err := orchestrator.RestoreRunConfig(rc)
+	if err != nil {
+		return nil, nil, err
+	}
+	return rc, res.Notes, nil
 }
 
 // runRepoRoot makes path absolute, checks it is a directory, and returns
@@ -255,9 +278,14 @@ func runTarget(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
-	rc, err := ResolveRun(ro)
+	rc, notes, err := ResolveRunWithNotes(ro)
 	if err != nil {
 		return err
+	}
+	for _, n := range notes {
+		if _, err := fmt.Fprintln(cmd.ErrOrStderr(), "note: "+n); err != nil {
+			return err
+		}
 	}
 	out := cmd.OutOrStdout()
 	if opts.JSON {

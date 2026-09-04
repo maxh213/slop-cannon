@@ -56,6 +56,7 @@ pass silently. Durations are Go duration strings (`"10m"`, `"1h30m"`,
 | `rules` | string array | `[]` | both | Hard constraint files appended to every agent prompt as MUST / MUST NOT. Same path and size rules as `vibes`. |
 | `check_command` | string | `""` | both | Command run in the worktree before a safety-off merge. Empty or blank means autodetect in this order: `make test` (a Makefile with a `test` target), `npm test` (a `package.json` with a `test` script), `go test ./...`, `pytest`, `cargo test`, by the files present. Nothing detected means no check runs. |
 | `idle_replan_interval` | duration > 0 | `"10m"` | both | Autopilot only: when the PO has nothing to add, the run idles this long before planning again (D-18). |
+| `max_beads_per_plan` | integer ≥ 1 | `8` | both | How many beads one PO planning firing may propose. A plan with more is rejected outright and the PO is asked to redo it — the surplus is never trimmed, because dropping beads would break the dependencies of the ones that stayed (P5-02). |
 | `limits.max_review_rounds` | integer ≥ 1 | `5` | both | Review rounds per bead before the PO escalates (D-08). |
 | `limits.max_pushback_rounds` | integer ≥ 0 | `2` | both | Pushback exchanges per feedback item before PO arbitration (D-08). |
 | `limits.agent_timeout` | duration > 0 | `"30m"` | both | Maximum wall-clock time for one agent session. |
