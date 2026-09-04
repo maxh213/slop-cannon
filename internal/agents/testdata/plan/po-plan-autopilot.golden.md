@@ -88,7 +88,7 @@ Do not propose work that duplicates any of these:
 
 You are in autopilot: there is no brief, so what to build is your call, and it must be justified by what is actually in this repository.
 
-1. Research first. Read the README, the tests, the build files and the code the tree above points at. Use your read-only tools; you may not edit anything.
+1. Research first. Read the README, the tests, the build files and the code the tree above points at. Use your read-only tools; you may not edit anything, and your shell is limited to an allow-list of read-only commands, so builds, tests and anything that writes will be refused. Plan from what you read, not from what you run.
 2. Propose only work you can point at evidence for: a bug you found, a feature the project clearly wants, a chore the code is asking for. Never invent work to look busy.
 3. Propose at most 8 beads, ordered most valuable first, and prefer a few well-scoped beads to many vague ones.
 4. Never propose a bead that duplicates or restates one of the open beads listed above.

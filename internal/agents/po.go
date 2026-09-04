@@ -297,7 +297,9 @@ func planWhatToDo(req PlanRequest, limit int) string {
 	var b strings.Builder
 	if req.Mode == domain.RunModeBrief {
 		b.WriteString("You are in brief mode. The human's brief is above, and it is the whole scope of this plan.\n\n")
-		b.WriteString("1. Read the brief closely, then read enough of the repository to know how the work fits into it.\n")
+		b.WriteString("1. Read the brief closely, then read enough of the repository to know how the work fits into it. " +
+			"You are read-only: your shell is limited to an allow-list of read-only commands, so builds, tests and " +
+			"anything that writes will be refused. Plan from what you read, not from what you run.\n")
 		b.WriteString("2. Decompose the brief into beads that together deliver exactly what it asks for. " +
 			"Do not add work the brief does not ask for, and do not leave part of it unplanned.\n")
 		b.WriteString("3. Ask no questions: nobody is there to answer them. " +
@@ -311,7 +313,8 @@ func planWhatToDo(req PlanRequest, limit int) string {
 	b.WriteString("You are in autopilot: there is no brief, so what to build is your call, and it must be justified " +
 		"by what is actually in this repository.\n\n")
 	b.WriteString("1. Research first. Read the README, the tests, the build files and the code the tree above points at. " +
-		"Use your read-only tools; you may not edit anything.\n")
+		"Use your read-only tools; you may not edit anything, and your shell is limited to an allow-list of read-only " +
+		"commands, so builds, tests and anything that writes will be refused. Plan from what you read, not from what you run.\n")
 	b.WriteString("2. Propose only work you can point at evidence for: a bug you found, a feature the project " +
 		"clearly wants, a chore the code is asking for. Never invent work to look busy.\n")
 	fmt.Fprintf(&b, "3. Propose at most %s, ordered most valuable first, and prefer a few well-scoped beads to many vague ones.\n", plural(limit, "bead"))

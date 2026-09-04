@@ -830,9 +830,11 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (*cann
 		prReviewPlanner(reviewer, runFeedbackPlanner(feedback)))))
 
 	planner, err := orchestrator.NewPlanner(orchestrator.PlannerOptions{
-		Config:         rc,
-		ShimOptions:    runShimOptions,
-		Runner:         orchestrator.SupervisorPlanRunner(sup),
+		Config:      rc,
+		ShimOptions: runShimOptions,
+		// The planning firing bypasses the scheduler's firing planner, so
+		// it is metered here or nowhere (P9-17).
+		Runner:         c.spend.meterPlan(budget.MeterPlanRunner(orchestrator.SupervisorPlanRunner(sup))),
 		Applier:        client,
 		Beads:          cond.BeadSource(),
 		Credits:        sup,
@@ -1022,6 +1024,23 @@ func (s *runSpend) meter(inner orchestrator.FiringPlanner) orchestrator.FiringPl
 			return nil
 		}
 		return af, nil
+	})
+}
+
+// meterPlan is meter for the planning product owner, whose firing the
+// planner builds itself rather than through a firing planner (P9-17):
+// without it the run summary reports one fewer session than it fired, and
+// the missing one is always the product owner.
+func (s *runSpend) meterPlan(inner orchestrator.PlanRunner) orchestrator.PlanRunner {
+	if inner == nil {
+		return nil
+	}
+	return orchestrator.PlanRunnerFunc(func(ctx context.Context, f orchestrator.Firing, req agents.PlanRequest) (domain.Plan, agents.Transcript, error) {
+		plan, tr, err := inner.RunPlan(ctx, f, req)
+		if orchestrator.UsageReported(tr.Usage) {
+			s.add(tr.Usage)
+		}
+		return plan, tr, err
 	})
 }
 

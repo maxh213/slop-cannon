@@ -567,6 +567,75 @@ func TestFeedbackAllApproveInRoundOne(t *testing.T) {
 	assert.Len(t, rig.Events(events.KindVerdictReceived), 3)
 }
 
+// TestFeedbackThreadCarriesTheReportAndVerdicts pins P8-30: the pull
+// request body is rendered from the thread snapshot, so the snapshot has to
+// carry the engineer's implementation report and the round's verdicts. It
+// used to carry neither, and every pull request a run opened said "_No
+// implementation report was recorded._" over an approved bead.
+func TestFeedbackThreadCarriesTheReportAndVerdicts(t *testing.T) {
+	sc := fbScenario("snapshot-carries-the-evidence")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the break"))
+	for _, l := range domain.Lenses() {
+		fbSay(sc, "tester-"+l.String()+"-sc-fb1-r1", fbApprove(l.String()+" is happy"))
+	}
+	rig := fbSetup(t, sc, nil)
+	rig.pump(t, 8)
+
+	th := rig.Thread()
+	require.Equal(t, domain.BeadStateApproved, th.State)
+	require.NotNil(t, th.Report, "the delivered bead's report is what the pull request body renders")
+	assert.Equal(t, "added the break", th.Report.Summary)
+	assert.Equal(t, []string{"retry.go"}, th.Report.FilesChanged)
+
+	require.Len(t, th.Verdicts, len(domain.Lenses()), "one verdict per lens, in lens order")
+	var summaries []string
+	for _, v := range th.Verdicts {
+		assert.Equal(t, domain.VerdictApprove, v.Outcome)
+		summaries = append(summaries, v.Summary)
+	}
+	assert.Equal(t, []string{"ux is happy", "qa is happy", "test is happy"}, summaries)
+}
+
+// A bead that took two rounds still shows every lens: D-09 does not fire a
+// tester again to repeat an approval it already gave, so the round that
+// settles the bead holds one verdict and the other two are a round old
+// (P8-30).
+func TestFeedbackThreadKeepsEveryLensesLatestVerdict(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	sc := fbScenario("snapshot-across-rounds")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(domain.Response{ItemID: "qa-r1-1", Action: domain.ActionFixed, Rationale: "added the break"}))
+	resolved := item
+	resolved.Status = domain.ItemResolved
+	fbSay(sc, "tester-qa-sc-fb1-r2", fbSettled("the break is there", resolved))
+
+	rig := fbSetup(t, sc, nil)
+	rig.setDiff("head2", 24, 0.1)
+	rig.pump(t, 10)
+
+	th := rig.Thread()
+	require.Equal(t, domain.BeadStateApproved, th.State)
+	require.Equal(t, 2, th.Round)
+	require.NotNil(t, th.Report)
+	assert.Equal(t, "added the retry", th.Report.Summary, "the report is round one's; round two only answered items")
+
+	require.Len(t, th.Verdicts, 3)
+	got := map[domain.Lens]string{}
+	rounds := map[domain.Lens]int{}
+	for _, v := range th.Verdicts {
+		got[v.Lens], rounds[v.Lens] = v.Summary, v.Round
+		assert.Equal(t, domain.VerdictApprove, v.Outcome, "%s's latest verdict", v.Lens)
+	}
+	assert.Equal(t, "reads fine", got[domain.LensUX])
+	assert.Equal(t, "covered", got[domain.LensTest])
+	assert.Equal(t, "the break is there", got[domain.LensQA], "qa's round-two re-review replaces its round-one changes")
+	assert.Equal(t, 1, rounds[domain.LensUX])
+	assert.Equal(t, 2, rounds[domain.LensQA])
+}
+
 // --- (b) one tester requests changes, the fix is approved in round two --
 
 func TestFeedbackChangesThenApprovedInRoundTwo(t *testing.T) {

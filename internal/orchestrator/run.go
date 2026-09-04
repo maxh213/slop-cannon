@@ -2016,15 +2016,27 @@ func (c *Conductor) Deliver(ctx context.Context, b domain.Bead) error {
 	if b.Round > 0 {
 		round = b.Round
 	}
+	// The pull request body is the only part of a run a human reviewer
+	// reads, so it carries what the loop knows: the round it settled in,
+	// the engineer's implementation report and the verdicts that approved
+	// it (P8-30). Only the feedback loop holds those, so a run without one
+	// still delivers, with the body's "not recorded" lines.
+	var (
+		report   *domain.ImplReport
+		verdicts []domain.Verdict
+	)
 	if feedback != nil {
-		if th, ok := feedback.Thread(b.ID); ok && th.Round > 0 {
-			round = th.Round
+		if th, ok := feedback.Thread(b.ID); ok {
+			if th.Round > 0 {
+				round = th.Round
+			}
+			report, verdicts = th.Report, th.Verdicts
 		}
 	}
 	c.mu.Lock()
 	c.stats.Delivered++
 	c.mu.Unlock()
-	out, err := delivery.Deliver(ctx, DeliveryRequest{Bead: b, Round: round})
+	out, err := delivery.Deliver(ctx, DeliveryRequest{Bead: b, Round: round, Report: report, Verdicts: verdicts})
 	if err != nil {
 		c.release(b.ID)
 		return fmt.Errorf("orchestrator: conductor: delivering %s: %w", b.ID, err)

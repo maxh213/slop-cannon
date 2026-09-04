@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
+	"time"
 
 	"slop-cannon/internal/proc"
 )
@@ -556,7 +558,7 @@ var shimProbes = []struct {
 // by the script itself, so the check stays cheap enough to run before every
 // agent.
 func (s Shim) Verify(ctx context.Context, dir string) error {
-	res, err := proc.Run(ctx, s.spec(dir, "version", "--json"))
+	res, err := s.verifyVersion(ctx, dir)
 	if err != nil {
 		return fmt.Errorf("beads: shim %s cannot run bd: %w", s.Path, err)
 	}
@@ -577,6 +579,79 @@ func (s Shim) Verify(ctx context.Context, dir string) error {
 		}
 	}
 	return s.verifyBDReadOnly(ctx, dir)
+}
+
+// Retry budget for the very first execution of a freshly written
+// executable (P8-02). Twenty attempts a few milliseconds apart cover a
+// window that is normally microseconds long without delaying a real
+// failure noticeably.
+const (
+	// TextBusyAttempts is how many times RetryTextBusy runs its function.
+	TextBusyAttempts = 20
+	// TextBusyBackoff is the pause between those attempts.
+	TextBusyBackoff = 25 * time.Millisecond
+)
+
+// verifyVersion runs `bd version --json` through the shim, retrying while
+// the kernel refuses to execute it with ETXTBSY.
+//
+// This is the first execution of a file this process wrote moments ago, and
+// it races with every other fork in the process (golang/go#22315): a child
+// forked while the shim's descriptor was still open for writing inherits
+// it until it execs, and until then the kernel will not run the file. A run
+// forks constantly — the gate poller, the pull-request watcher, git — so
+// the race is not theoretical: it killed the first P8-02 manual run
+// outright ("shim … cannot run bd: fork/exec …/bd: text file busy"), and
+// because a shim that will not install is not the plan's fault, planning
+// counted it as a failure and waited a whole idle interval before trying
+// again. Later probes need no retry: by the time this one has succeeded the
+// descriptor is gone.
+func (s Shim) verifyVersion(ctx context.Context, dir string) (proc.Result, error) {
+	var res proc.Result
+	err := RetryTextBusy(ctx, func() error {
+		var runErr error
+		res, runErr = proc.Run(ctx, s.spec(dir, "version", "--json"))
+		return runErr
+	})
+	return res, err
+}
+
+// RetryTextBusy runs fn again, after a short pause, while it fails with
+// ETXTBSY, and returns as soon as fn returns anything else.
+//
+// Executing a file that was written moments ago races with any concurrent
+// fork in this process (golang/go#22315): the child inherits the writer's
+// descriptor until it execs, and until then the kernel refuses to run the
+// file. The window is microseconds long, so a few attempts always suffice.
+// Every exec of a freshly written bd, or of a shim in front of one, goes
+// through here — the beads shim's own first probe, and the conformance
+// suite's bd and shim invocations.
+func RetryTextBusy(ctx context.Context, fn func() error) error {
+	var err error
+	for attempt := 0; attempt < TextBusyAttempts; attempt++ {
+		if err = fn(); !IsTextBusy(err) {
+			return err
+		}
+		select {
+		case <-time.After(TextBusyBackoff):
+		case <-ctx.Done():
+			return err
+		}
+	}
+	return err
+}
+
+// IsTextBusy reports whether err is the kernel's ETXTBSY, either directly
+// (the executable itself could not be started) or as the shell's "text file
+// busy" complaint about the binary a shim chains to.
+func IsTextBusy(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ETXTBSY) {
+		return true
+	}
+	return strings.Contains(strings.ToLower(err.Error()), "text file busy")
 }
 
 // verifyAllowed runs one read probe through the shim and requires that the

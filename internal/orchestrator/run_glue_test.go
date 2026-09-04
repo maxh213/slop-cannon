@@ -159,6 +159,10 @@ type glueFeedback struct {
 	rounds    map[domain.BeadID]int
 	onTrack   func(bs []domain.Bead)
 	restoreEr error
+	// report and verdicts are what the thread snapshot carries into a
+	// delivery (P8-30).
+	report   *domain.ImplReport
+	verdicts []domain.Verdict
 }
 
 func newGlueFeedback() *glueFeedback {
@@ -196,7 +200,7 @@ func (f *glueFeedback) Thread(bead domain.BeadID) (FeedbackThread, bool) {
 	if !ok {
 		return FeedbackThread{}, false
 	}
-	return FeedbackThread{Bead: bead, Round: r}, true
+	return FeedbackThread{Bead: bead, Round: r, Report: f.report, Verdicts: f.verdicts}, true
 }
 
 func (f *glueFeedback) Observe(bead domain.BeadID, state domain.BeadState) {
@@ -582,6 +586,47 @@ func TestGlueRoutesDeliveryOutcomesBackIntoTheLoops(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+// TestGlueDeliveryCarriesTheReportAndTheVerdicts is the other half of
+// P8-30: gitx.PRBody renders DeliveryRequest.Report and .Verdicts, and the
+// conductor is the only production caller that fills them. It used to fill
+// neither, so every pull request a run opened said "_No implementation
+// report was recorded._" over a bead three testers had just approved.
+func TestGlueDeliveryCarriesTheReportAndTheVerdicts(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "approved", "add the retry"),
+	)
+	feedback := newGlueFeedback()
+	feedback.rounds["sc-1"] = 2
+	feedback.report = &domain.ImplReport{Summary: "added the retry", FilesChanged: []string{"retry.go"}}
+	feedback.verdicts = []domain.Verdict{
+		{Outcome: domain.VerdictApprove, Summary: "reads fine"},
+		{Outcome: domain.VerdictApprove, Summary: "covered"},
+	}
+	delivery := &glueDelivery{deliver: func(req DeliveryRequest) (*DeliveryOutcome, error) {
+		return &DeliveryOutcome{Bead: req.Bead.ID, Round: req.Round, Kind: DeliveryPending,
+			State: domain.BeadStateDelivering}, nil
+	}}
+	rig := glueSetup(t, bd, ConductorOptions{
+		Feedback: feedback, Delivery: delivery, Gates: &glueGates{},
+	}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+
+	require.Len(t, delivery.sent(), 1)
+	req := delivery.sent()[0]
+	assert.Equal(t, 2, req.Round)
+	require.NotNil(t, req.Report, "the pull request body renders the engineer's report")
+	assert.Equal(t, "added the retry", req.Report.Summary)
+	require.Len(t, req.Verdicts, 2, "the pull request body renders the testers' verdicts")
+	assert.Equal(t, "reads fine", req.Verdicts[0].Summary)
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
 }
 
 // --- a resumed run keeps its feedback threads (P8-16) --------------------

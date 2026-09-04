@@ -186,12 +186,15 @@ func TestBeadsCheck_SkipsWithOldBD(t *testing.T) {
 	assert.Empty(t, a.Calls(), "no session runs for an unusable bd")
 }
 
+// TestRetryTextBusy exercises the shared beads helper from the caller that
+// depends on it hardest: every exec in this package of a bd, or of a shim,
+// that was written moments ago.
 func TestRetryTextBusy(t *testing.T) {
 	t.Parallel()
 	t.Run("retries ETXTBSY until it clears", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := retryTextBusy(context.Background(), func() error {
+		err := beads.RetryTextBusy(context.Background(), func() error {
 			calls++
 			if calls < 3 {
 				return &os.PathError{Op: "fork/exec", Path: "/tmp/bd", Err: syscall.ETXTBSY}
@@ -204,7 +207,7 @@ func TestRetryTextBusy(t *testing.T) {
 	t.Run("retries the shell's complaint", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := retryTextBusy(context.Background(), func() error {
+		err := beads.RetryTextBusy(context.Background(), func() error {
 			calls++
 			if calls == 1 {
 				return errors.New("proc: /tmp/bd version: exit status 126: sh: 1: /tmp/real/bd: Text file busy")
@@ -218,25 +221,25 @@ func TestRetryTextBusy(t *testing.T) {
 		t.Parallel()
 		calls := 0
 		want := errors.New("boom")
-		err := retryTextBusy(context.Background(), func() error { calls++; return want })
+		err := beads.RetryTextBusy(context.Background(), func() error { calls++; return want })
 		assert.Same(t, want, err)
 		assert.Equal(t, 1, calls)
 	})
 	t.Run("gives up after the attempt budget", func(t *testing.T) {
 		t.Parallel()
 		calls := 0
-		err := retryTextBusy(context.Background(), func() error { calls++; return syscall.ETXTBSY })
+		err := beads.RetryTextBusy(context.Background(), func() error { calls++; return syscall.ETXTBSY })
 		assert.ErrorIs(t, err, syscall.ETXTBSY)
-		assert.Equal(t, textBusyAttempts, calls)
+		assert.Equal(t, beads.TextBusyAttempts, calls)
 	})
 	t.Run("stops when the context ends", func(t *testing.T) {
 		t.Parallel()
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
 		calls := 0
-		err := retryTextBusy(ctx, func() error { calls++; return syscall.ETXTBSY })
+		err := beads.RetryTextBusy(ctx, func() error { calls++; return syscall.ETXTBSY })
 		assert.ErrorIs(t, err, syscall.ETXTBSY)
 		assert.Equal(t, 1, calls)
 	})
-	assert.False(t, isTextBusy(nil))
+	assert.False(t, beads.IsTextBusy(nil))
 }

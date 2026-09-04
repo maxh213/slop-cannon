@@ -577,6 +577,45 @@ func (b *RunBudget) MeterPlanner(inner FiringPlanner) FiringPlanner {
 	})
 }
 
+// MeterPlanRunner wraps the planning product owner's runner so its session
+// is metered too (P9-17).
+//
+// The planning firing does not go through the scheduler's [FiringPlanner]:
+// [PlanRouter] hands a plan demand to the [Planner], which fires the
+// product owner through its own [PlanRunner] and builds the [AgentFiring]
+// itself. So [RunBudget.MeterPlanner] never sees it, and without this
+// wrapper `limits.max_tokens` and `limits.max_cost_usd` under-count by the
+// whole planning spend — which in autopilot is the one agent that fires for
+// ever (D-18).
+//
+// Unlike a firing planner's Result hook, which only runs on a session that
+// finished and decoded, the plan runner is handed the transcript on both
+// paths, and a plan the planner rejected (P6-19) cost real tokens and will
+// be fired again. So anything that reported usage is counted, whatever the
+// outcome; a session that reported none is not counted at all.
+//
+// A nil or disabled budget returns inner unchanged.
+func (b *RunBudget) MeterPlanRunner(inner PlanRunner) PlanRunner {
+	if b == nil || !b.Enabled() || inner == nil {
+		return inner
+	}
+	return PlanRunnerFunc(func(ctx context.Context, f Firing, req agents.PlanRequest) (domain.Plan, agents.Transcript, error) {
+		plan, tr, err := inner.RunPlan(ctx, f, req)
+		if UsageReported(tr.Usage) {
+			b.Record(tr.Usage)
+		}
+		return plan, tr, err
+	})
+}
+
+// UsageReported reports whether a cartridge said anything about what a
+// session cost. A cartridge that reports nothing leaves an empty
+// [cartridge.Usage], and metering that would count sessions the budget
+// cannot price.
+func UsageReported(u cartridge.Usage) bool {
+	return u.TotalTokens() > 0 || u.CacheReadTokens > 0 || u.CacheWriteTokens > 0 || u.HasCost
+}
+
 // MeterFiring chains usage accounting onto one firing's [AgentFiring.Result]
 // hook, for a caller that builds an [AgentFiring] itself rather than
 // through a [FiringPlanner]. The hook it adds never fails, so it can never

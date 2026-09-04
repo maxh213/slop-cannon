@@ -92,7 +92,7 @@ Do not propose work that duplicates any of these:
 
 You are in brief mode. The human's brief is above, and it is the whole scope of this plan.
 
-1. Read the brief closely, then read enough of the repository to know how the work fits into it.
+1. Read the brief closely, then read enough of the repository to know how the work fits into it. You are read-only: your shell is limited to an allow-list of read-only commands, so builds, tests and anything that writes will be refused. Plan from what you read, not from what you run.
 2. Decompose the brief into beads that together deliver exactly what it asks for. Do not add work the brief does not ask for, and do not leave part of it unplanned.
 3. Ask no questions: nobody is there to answer them. Where the brief is ambiguous, choose the most reasonable reading, plan for it, and say in the bead's description which reading you chose and why.
 4. Propose at least one bead and at most 3 beads. If the brief is smaller than that, propose fewer.

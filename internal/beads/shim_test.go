@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -795,4 +799,61 @@ func TestInstallForWorktree(t *testing.T) {
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "was not refused")
 	})
+}
+
+// TestShimVerifyRetriesWhileTheShimIsOpenForWriting pins the P8-02 fix. The
+// first thing done with a freshly written shim is to execute it, and while
+// any descriptor on it is still open for writing the kernel refuses with
+// ETXTBSY (golang/go#22315) — which is exactly what a child forked
+// elsewhere in the process holds until it execs. The first manual brief run
+// died on it: "shim … cannot run bd: fork/exec …/bd: text file busy".
+func TestShimVerifyRetriesWhileTheShimIsOpenForWriting(t *testing.T) {
+	t.Run("a held descriptor really does make exec fail", func(t *testing.T) {
+		s, _ := shimInstall(t)
+		f, err := os.OpenFile(s.Path, os.O_WRONLY, 0)
+		require.NoError(t, err)
+		defer func() { _ = f.Close() }()
+		err = exec.Command(s.Path, "version", "--json").Run()
+		require.Error(t, err, "the premise of the retry: exec is refused while a writer holds the file")
+		assert.True(t, IsTextBusy(err), "want ETXTBSY, got %v", err)
+	})
+
+	t.Run("verify waits for the descriptor instead of failing", func(t *testing.T) {
+		s, _ := shimInstall(t)
+		f, err := os.OpenFile(s.Path, os.O_WRONLY, 0)
+		require.NoError(t, err)
+		var released atomic.Bool
+		timer := time.AfterFunc(150*time.Millisecond, func() {
+			released.Store(true)
+			_ = f.Close()
+		})
+		defer timer.Stop()
+
+		require.NoError(t, s.Verify(context.Background(), t.TempDir()))
+		assert.True(t, released.Load(), "the probe must have waited for the writer to let go")
+	})
+
+	t.Run("a cancelled context stops the retry", func(t *testing.T) {
+		s, _ := shimInstall(t)
+		f, err := os.OpenFile(s.Path, os.O_WRONLY, 0)
+		require.NoError(t, err)
+		defer func() { _ = f.Close() }()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		err = s.Verify(ctx, t.TempDir())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "cannot run bd")
+	})
+}
+
+// TestIsTextBusy covers the two shapes the kernel's refusal arrives in: the
+// errno itself, and the shell's complaint about the binary the shim chains
+// to, which reaches us only as text.
+func TestIsTextBusy(t *testing.T) {
+	assert.False(t, IsTextBusy(nil))
+	assert.False(t, IsTextBusy(errors.New("no such file or directory")))
+	assert.True(t, IsTextBusy(syscall.ETXTBSY))
+	assert.True(t, IsTextBusy(&os.PathError{Op: "fork/exec", Path: "/tmp/bd", Err: syscall.ETXTBSY}))
+	assert.True(t, IsTextBusy(fmt.Errorf("running bd: %w", syscall.ETXTBSY)))
+	assert.True(t, IsTextBusy(errors.New("/bin/sh: /tmp/bd: Text file busy")))
 }

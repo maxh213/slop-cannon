@@ -784,6 +784,12 @@ type FeedbackThread struct {
 	Escalation *domain.Escalation
 	// FullReview is set when the D-09 ratio sent every lens back this round.
 	FullReview bool
+	// Report is the engineer's latest implementation report, nil until one
+	// has been filed. The pull request body renders it (P8-30).
+	Report *domain.ImplReport
+	// Verdicts are the current round's verdicts, in lens order, for the
+	// same pull request body (P8-30).
+	Verdicts []domain.Verdict
 }
 
 // Track adopts beads into the loop, or refreshes the ones it already holds.
@@ -916,6 +922,7 @@ func (f *Feedback) snapshot(t *fbThread) FeedbackThread {
 			out.Approved = append(out.Approved, l)
 		}
 	}
+	out.Report, out.Verdicts = f.evidence(t)
 	for _, i := range t.items {
 		out.Items = append(out.Items, FeedbackTrackedItem{
 			Item:     i.con.Item,
@@ -929,6 +936,40 @@ func (f *Feedback) snapshot(t *fbThread) FeedbackThread {
 		})
 	}
 	return out
+}
+
+// evidence is what a human reading the bead's pull request needs: the
+// newest implementation report, and each lens's latest verdict in lens
+// order (D-09: an approval given in round one still stands in round three,
+// and the tester is not fired again to repeat it).
+//
+// It has to look in the history because closeRound moves both out of the
+// thread's own fields the moment a round ends — and a bead is approved, and
+// so delivered, exactly when its last round closes (P8-30).
+func (f *Feedback) evidence(t *fbThread) (*domain.ImplReport, []domain.Verdict) {
+	var report *domain.ImplReport
+	latest := map[domain.Lens]domain.Verdict{}
+	for _, r := range t.history {
+		if r.Report != nil {
+			report = r.Report
+		}
+		for _, v := range r.Verdicts {
+			latest[v.Lens] = v
+		}
+	}
+	if t.report != nil {
+		report = t.report
+	}
+	for l, v := range t.verdicts {
+		latest[l] = v
+	}
+	var verdicts []domain.Verdict
+	for _, l := range f.lenses {
+		if v, ok := latest[l]; ok {
+			verdicts = append(verdicts, v)
+		}
+	}
+	return report, verdicts
 }
 
 // Demands implements [WorkSource]: it reports the firing every tracked bead

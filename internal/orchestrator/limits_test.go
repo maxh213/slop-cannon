@@ -464,6 +464,76 @@ func TestRunBudgetMeterPlannerRecordsWhatEachFiringSpent(t *testing.T) {
 	}
 }
 
+// TestRunBudgetMeterPlanRunnerMetersThePlanningProductOwner is P9-17: the
+// planning firing never goes through a FiringPlanner, so before this
+// wrapper existed the budget under-counted by the whole planning spend.
+func TestRunBudgetMeterPlanRunnerMetersThePlanningProductOwner(t *testing.T) {
+	t.Parallel()
+	b, _, _ := limBudget(t, domain.RunModeAutopilot, 1000, 0)
+
+	tr := agents.Transcript{Usage: cartridge.Usage{InputTokens: 300, OutputTokens: 100}}
+	runner := b.MeterPlanRunner(PlanRunnerFunc(func(context.Context, Firing, agents.PlanRequest) (domain.Plan, agents.Transcript, error) {
+		return domain.Plan{Brief: "planned"}, tr, nil
+	}))
+	plan, got, err := runner.RunPlan(t.Context(), Firing{}, agents.PlanRequest{})
+	if err != nil {
+		t.Fatalf("RunPlan: %v", err)
+	}
+	if plan.Brief != "planned" || got.Usage != tr.Usage {
+		t.Errorf("the wrapper changed the result: %+v / %+v", plan, got)
+	}
+	if spent := b.Spent(); spent.Tokens != 400 || spent.Firings != 1 {
+		t.Errorf("Spent = %+v, want 400 tokens over 1 firing", spent)
+	}
+
+	// A rejected plan cost tokens too, and the planner will fire again.
+	boom := errors.New("the plan was rejected")
+	rejected := b.MeterPlanRunner(PlanRunnerFunc(func(context.Context, Firing, agents.PlanRequest) (domain.Plan, agents.Transcript, error) {
+		return domain.Plan{}, agents.Transcript{Usage: cartridge.Usage{InputTokens: 50}}, boom
+	}))
+	if _, _, err := rejected.RunPlan(t.Context(), Firing{}, agents.PlanRequest{}); !errors.Is(err, boom) {
+		t.Errorf("RunPlan error = %v, want %v", err, boom)
+	}
+	if spent := b.Spent(); spent.Tokens != 450 || spent.Firings != 2 {
+		t.Errorf("Spent = %+v, want 450 tokens over 2 firings", spent)
+	}
+
+	// A session the cartridge reported nothing for is not a firing.
+	silent := b.MeterPlanRunner(PlanRunnerFunc(func(context.Context, Firing, agents.PlanRequest) (domain.Plan, agents.Transcript, error) {
+		return domain.Plan{}, agents.Transcript{}, nil
+	}))
+	if _, _, err := silent.RunPlan(t.Context(), Firing{}, agents.PlanRequest{}); err != nil {
+		t.Fatalf("RunPlan: %v", err)
+	}
+	if spent := b.Spent(); spent.Firings != 2 {
+		t.Errorf("Spent = %+v, want the silent session uncounted", spent)
+	}
+
+	// A disabled budget hands the runner straight back.
+	var off *RunBudget
+	inner := PlanRunnerFunc(func(context.Context, Firing, agents.PlanRequest) (domain.Plan, agents.Transcript, error) {
+		return domain.Plan{}, agents.Transcript{}, nil
+	})
+	if got := off.MeterPlanRunner(inner); got == nil {
+		t.Error("a nil budget dropped the runner")
+	}
+}
+
+func TestUsageReported(t *testing.T) {
+	t.Parallel()
+	if UsageReported(cartridge.Usage{}) {
+		t.Error("an empty usage reports nothing")
+	}
+	for _, u := range []cartridge.Usage{
+		{InputTokens: 1}, {OutputTokens: 1}, {CacheReadTokens: 1},
+		{CacheWriteTokens: 1}, {HasCost: true},
+	} {
+		if !UsageReported(u) {
+			t.Errorf("UsageReported(%+v) = false", u)
+		}
+	}
+}
+
 func TestRunBudgetMeterFiringNeverFailsAFinishedSession(t *testing.T) {
 	t.Parallel()
 	b, _, _ := limBudget(t, domain.RunModeAutopilot, 10, 0)

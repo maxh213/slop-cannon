@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"time"
 
 	"slop-cannon/internal/beads"
@@ -32,13 +31,6 @@ const beadsPrefix = "sc"
 
 // beadsSetupTimeout bounds `git init` in the check's workdir.
 const beadsSetupTimeout = 30 * time.Second
-
-// Bounds for retryTextBusy: how many times a freshly written executable is
-// re-run when the kernel reports it busy, and the pause between attempts.
-const (
-	textBusyAttempts = 20
-	textBusyBackoff  = 10 * time.Millisecond
-)
 
 // BeadsPrompt is the beads check's prompt: run a write and a read through
 // bd and report both outputs so the refusal shows up in the transcript.
@@ -74,13 +66,13 @@ func runBeads(ctx context.Context, e *env) (string, cartridge.Usage, error) {
 			return "", cartridge.Usage{}, skipf("bd is not installed: %v", err)
 		}
 	}
-	// Every bd invocation below goes through retryTextBusy: Options.BD may
+	// Every bd invocation below goes through beads.RetryTextBusy: Options.BD may
 	// name a binary this process wrote moments ago (the suite's own fake bd
 	// does), and executing it races with any concurrent fork
 	// (golang/go#22315). Without the retry the race surfaces as a spurious
 	// StatusSkip — "bd version failed: text file busy" — rather than a
 	// cartridge result.
-	if err := retryTextBusy(ctx, func() error { return beadsVersionOK(ctx, real) }); err != nil {
+	if err := beads.RetryTextBusy(ctx, func() error { return beadsVersionOK(ctx, real) }); err != nil {
 		return "", cartridge.Usage{}, err
 	}
 	if _, err := proc.LookPath("git"); err != nil {
@@ -91,14 +83,14 @@ func runBeads(ctx context.Context, e *env) (string, cartridge.Usage, error) {
 	if err != nil {
 		return "", cartridge.Usage{}, err
 	}
-	if err := retryTextBusy(ctx, func() error { return beadsProject(ctx, real, spec.Workdir) }); err != nil {
+	if err := beads.RetryTextBusy(ctx, func() error { return beadsProject(ctx, real, spec.Workdir) }); err != nil {
 		return "", cartridge.Usage{}, err
 	}
 	shim, err := beads.WriteShim(filepath.Join(e.base, CheckBeads+"-bin"), beads.ShimOptions{Real: real})
 	if err != nil {
 		return "", cartridge.Usage{}, fmt.Errorf("install the read-only bd shim: %w", err)
 	}
-	if err := retryTextBusy(ctx, func() error { return shim.Verify(ctx, spec.Workdir) }); err != nil {
+	if err := beads.RetryTextBusy(ctx, func() error { return shim.Verify(ctx, spec.Workdir) }); err != nil {
 		return "", cartridge.Usage{}, fmt.Errorf("the shim chain does not hold before any session ran: %w", err)
 	}
 	if spec.Env == nil {
@@ -164,41 +156,6 @@ func beadsProject(ctx context.Context, real, dir string) error {
 		return fmt.Errorf("bd init in the workdir: %s", beads.ErrorSummary(err))
 	}
 	return nil
-}
-
-// retryTextBusy runs fn again, after a short pause, while it fails with
-// ETXTBSY. Every exec of a freshly written binary in this package goes
-// through it: the shim, and the bd the shim chains to. Executing a file that was written moments ago races with any
-// concurrent fork in this process (golang/go#22315): the child inherits
-// the writer's descriptor until it execs, and until then the kernel
-// refuses to run the file. The window is microseconds long, so a few
-// attempts always suffice; any other error is returned at once.
-func retryTextBusy(ctx context.Context, fn func() error) error {
-	var err error
-	for i := 0; i < textBusyAttempts; i++ {
-		if err = fn(); !isTextBusy(err) {
-			return err
-		}
-		select {
-		case <-time.After(textBusyBackoff):
-		case <-ctx.Done():
-			return err
-		}
-	}
-	return err
-}
-
-// isTextBusy reports whether err is ETXTBSY, either directly (the shim
-// itself could not be executed) or as the shell's "Text file busy"
-// complaint about the bd it chains to.
-func isTextBusy(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, syscall.ETXTBSY) {
-		return true
-	}
-	return strings.Contains(strings.ToLower(err.Error()), "text file busy")
 }
 
 // transcriptContains reports whether any tool result or the final output
