@@ -89,6 +89,13 @@ type State struct {
 	FinishedAt time.Time `json:"finished_at,omitempty"`
 	// FinishError is the unrecoverable failure that ended the run, if any.
 	FinishError string `json:"finish_error,omitempty"`
+	// Vitals is the "why is nothing happening?" snapshot as of this write:
+	// what the planner is doing and what the gate poller has seen (P6-29).
+	// It is absent for a run assembled without a planner or a gate poller,
+	// and for a state file written by an older sc. `sc status` reads a run
+	// off disk and has no live component to ask, so this is the only way
+	// the two numbers reach it.
+	Vitals *RunVitals `json:"vitals,omitempty"`
 }
 
 // clone returns a copy that shares no slice with s.

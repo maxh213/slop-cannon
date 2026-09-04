@@ -1,0 +1,7 @@
+sc could not start a run in /repo: preparing the bead tracker: beads: bd init in /repo: exec: "bd": executable file not found in $PATH
+
+Fix it in this order:
+  1. bd: not found on PATH
+     install beads 1.2.2 or newer: brew install beads, or the upstream install script (scripts/install.sh at https://github.com/gastownhall/beads); CGO_ENABLED=0 go install builds are server-mode only and cannot run embedded Dolt
+
+Then check everything at once with: sc doctor

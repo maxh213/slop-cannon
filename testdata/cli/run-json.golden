@@ -46,7 +46,9 @@
       "limits": {
         "max_review_rounds": 5,
         "max_pushback_rounds": 2,
-        "agent_timeout": "30m"
+        "agent_timeout": "30m",
+        "max_plan_rejections": 2,
+        "max_plan_failures": 5
       },
       "roles": {}
     },
@@ -56,10 +58,13 @@
       "cartridges": "global",
       "cartridges.claude": "global",
       "check_command": "default",
+      "exclude": "default",
       "gate_poll_interval": "default",
       "idle_replan_interval": "default",
       "limits.agent_timeout": "default",
       "limits.max_cost_usd": "default",
+      "limits.max_plan_failures": "default",
+      "limits.max_plan_rejections": "default",
       "limits.max_pushback_rounds": "default",
       "limits.max_review_rounds": "default",
       "limits.max_tokens": "default",

@@ -26,7 +26,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -358,12 +357,15 @@ type e2eRig struct {
 	Deliverer *Deliverer
 	Poller    *GatePoller
 	Run       *Run
+	// Cond is the production run-level glue (P8-14). The rig drives it
+	// rather than a conductor of its own: `sc run` and this test must fire
+	// the same code, or the e2e proves the rig instead of the product.
+	Cond *Conductor
 
 	RepoCtx prompt.RepoContext
 	now     func() time.Time
 
 	mu        sync.Mutex
-	inflight  map[domain.BeadID]bool
 	delivered map[domain.BeadID]*DeliveryOutcome
 	problems  []string
 	peak      int
@@ -429,9 +431,9 @@ func e2eBuild(t *testing.T, env *e2eEnv, safety, resume bool) *e2eRig {
 	start := time.Now()
 	rig := &e2eRig{
 		T: t, Safety: safety, Repo: repo, BD: bd, GH: gh, Resumed: resume,
-		inflight: map[domain.BeadID]bool{}, delivered: map[domain.BeadID]*DeliveryOutcome{},
-		peakRole: map[domain.Role]int{},
-		now:      func() time.Time { return e2eEpoch.Add(time.Since(start)) },
+		delivered: map[domain.BeadID]*DeliveryOutcome{},
+		peakRole:  map[domain.Role]int{},
+		now:       func() time.Time { return e2eEpoch.Add(time.Since(start)) },
 	}
 
 	cfg := config.Defaults()
@@ -605,7 +607,55 @@ func e2eBuild(t *testing.T, env *e2eEnv, safety, resume bool) *e2eRig {
 	require.NoError(t, err)
 	rig.Poller = poller
 
+	// P8-14: the run-level glue is the production Conductor. The rig only
+	// records the delivery outcomes on their way past (e2eDelivery), which
+	// the assertions read.
+	cond, err := NewConductor(ConductorOptions{
+		Run: run, Beads: client, Statuses: rig.Statuses,
+		Worktrees: manager, Git: rig.Git, Repo: scan,
+		Brief: e2eBrief, CheckCommand: scan.CheckCommand,
+		Timeout: 30 * time.Second, Interval: 15 * time.Millisecond,
+		Logger: logger,
+	})
+	require.NoError(t, err)
+	cond.Attach(ConductorParts{
+		Feedback: feedback, Delivery: e2eDelivery{rig: rig}, Gates: poller,
+	})
+	rig.Cond = cond
+
 	return rig
+}
+
+// e2eDelivery is the glue's delivery seam with the rig's own bookkeeping
+// around it: every outcome is recorded so the assertions can read what the
+// run shipped and how.
+type e2eDelivery struct{ rig *e2eRig }
+
+func (d e2eDelivery) Deliver(ctx context.Context, req DeliveryRequest) (*DeliveryOutcome, error) {
+	out, err := d.rig.deliverer().Deliver(ctx, req)
+	d.rig.record(req.Bead.ID, out, err)
+	return out, err
+}
+
+func (d e2eDelivery) Resolved(ctx context.Context, id domain.BeadID) (*DeliveryOutcome, error) {
+	out, err := d.rig.deliverer().Resolved(ctx, id)
+	d.rig.record(id, out, err)
+	return out, err
+}
+
+// record remembers one delivery outcome (and reports a failure, which is
+// far more use than a timeout).
+func (r *e2eRig) record(id domain.BeadID, out *DeliveryOutcome, err error) {
+	if err != nil {
+		r.problem("delivering %s: %v", id, err)
+		return
+	}
+	if out == nil {
+		return
+	}
+	r.mu.Lock()
+	r.delivered[id] = out
+	r.mu.Unlock()
 }
 
 // e2eResumeHandler is the run's [ResumeHandler]: it forwards to the
@@ -694,66 +744,26 @@ func (r *e2eRig) beadSource(ctx context.Context) ([]domain.Bead, error) {
 	return beads.SafeBeads(issues, r.Statuses), nil
 }
 
-// beadContext is the FeedbackContextFunc: it makes sure the bead has a
-// worktree, commits whatever the last engineer left uncommitted (D-14) so
-// the testers always review committed code, and describes the change set.
-//
-// The leftovers commit goes through the DeliveryGit adapter rather than
-// straight to gitx because of P6-16(b): a conflict round's prompt is built
-// while the worktree is mid-rebase by construction, and "git add -A"
-// followed by a commit there would commit the conflict markers and destroy
-// the rebase state. The adapter refuses that with ErrRebaseInProgress,
-// which is not a failure of the round — there is simply nothing to commit
-// until the engineer has resolved the conflict.
+// beadContext, changeRatio and conflictResolved are the three seams the
+// feedback loop is given. All three are the production glue's
+// ([Conductor.BeadContext], which makes sure the bead has a worktree,
+// commits whatever the last engineer left uncommitted through DeliveryGit
+// so the testers always review committed code (D-14, P6-16(b), P8-18), and
+// describes the change set). They are indirections only because the loop is
+// built before the run, and the glue after it.
 func (r *e2eRig) beadContext(ctx context.Context, id domain.BeadID) (FeedbackBeadContext, error) {
-	issues, err := r.Beads.Show(ctx, id)
-	if err != nil {
-		return FeedbackBeadContext{}, err
-	}
-	bead, _ := issues[0].SafeBead(r.Statuses)
-	round := 1
-	if th, ok := r.Feedback.Thread(id); ok && th.Round > 0 {
-		round = th.Round
-	}
-	wt := r.Manager.PathFor(id)
-	if _, err := os.Stat(wt); err != nil {
-		if _, err := r.Manager.Create(ctx, bead); err != nil {
-			return FeedbackBeadContext{}, err
-		}
-	}
-	if _, err := r.Git.CommitLeftovers(ctx, bead, round); err != nil && !errors.Is(err, ErrRebaseInProgress) {
-		return FeedbackBeadContext{}, err
-	}
-	diff, err := r.Manager.Diff(ctx, id)
-	if err != nil {
-		return FeedbackBeadContext{}, err
-	}
-	return FeedbackBeadContext{
-		Bead: prompt.BeadContext{
-			Bead: bead, Worktree: wt, Branch: gitx.BranchName(bead),
-			Epic: r.Run.Epic(), Round: round,
-		},
-		Repo:         r.RepoCtx,
-		Brief:        e2eBrief,
-		CheckCommand: r.RepoCtx.CheckCommand,
-		Diff:         diff,
-		Timeout:      30 * time.Second,
-	}, nil
+	return r.Cond.BeadContext(ctx, id)
 }
 
 // changeRatio is the D-09 measurement, taken from the real repository.
 func (r *e2eRig) changeRatio(ctx context.Context, id domain.BeadID, previous, current *gitx.Diff) (gitx.ChangeRatio, error) {
-	return r.Git.ChangeRatio(ctx, id, previous, current)
+	return r.Cond.ChangeRatio(ctx, id, previous, current)
 }
 
 // conflictResolved hands a resolved delivery conflict back to the delivery
 // handoff, which owns what happens to the bead next (P6-06).
 func (r *e2eRig) conflictResolved(ctx context.Context, id domain.BeadID) error {
-	out, err := r.Deliverer.Resolved(ctx, id)
-	if err != nil {
-		return err
-	}
-	return r.applyOutcome(ctx, id, out)
+	return r.Cond.ConflictResolved(ctx, id)
 }
 
 // ---------------------------------------------------------------------------
@@ -770,7 +780,7 @@ func (r *e2eRig) start(ctx context.Context) {
 	var wg sync.WaitGroup
 	wg.Add(3)
 	go func() { defer wg.Done(); _ = r.Poller.Run(loop) }()
-	go func() { defer wg.Done(); r.conduct(loop) }()
+	go func() { defer wg.Done(); _ = r.Cond.Run(loop) }()
 	go func() { defer wg.Done(); r.sampleAmmo(loop) }()
 	r.stopHelpers = func() { cancel(); wg.Wait() }
 	r.T.Cleanup(func() {
@@ -892,125 +902,6 @@ func (r *e2eRig) diagnose() string {
 	}
 	fmt.Fprintf(&b, "problems: %v", r.Problems())
 	return b.String()
-}
-
-// conduct is the run-level glue that lives above the scheduler: it adopts
-// the beads that become ready into the feedback loop and ships the ones the
-// loop approved. P8-01 wires the same two steps in cmd/sc.
-//
-// It paces itself: the wait between passes is the longer of 15 ms and the
-// time the last pass took. Every pass spawns `bd` subprocesses through the
-// serialised beads client, so a fixed 15 ms tick on a loaded machine (a
-// race-instrumented binary competing with others for the same cores) would
-// keep that one mutex busy with bookkeeping and starve the agents' own bd
-// calls, which is how the run stops making progress rather than merely
-// running slower. On an idle machine a pass costs a couple of milliseconds
-// and the pacing never engages.
-func (r *e2eRig) conduct(ctx context.Context) {
-	const base = 15 * time.Millisecond
-	for {
-		started := time.Now()
-		r.sync(ctx)
-		wait := max(base, time.Since(started))
-		timer := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-r.Run.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-	}
-}
-
-// sync is one pass of the conductor.
-func (r *e2eRig) sync(ctx context.Context) {
-	epic := r.Run.Epic()
-	if epic == "" {
-		return
-	}
-	if issues, err := r.Beads.Ready(ctx, epic); err != nil {
-		r.problem("listing the ready beads: %v", err)
-	} else {
-		r.Feedback.Track(beads.SafeBeads(issues, r.Statuses)...)
-	}
-	list, err := r.beadSource(ctx)
-	if err != nil {
-		r.problem("listing the run's beads: %v", err)
-		return
-	}
-	for _, b := range list {
-		if b.State != domain.BeadStateApproved || !r.claim(b.ID) {
-			continue
-		}
-		r.deliver(ctx, b)
-	}
-}
-
-// claim reserves a bead for delivery so the conductor never ships one twice.
-func (r *e2eRig) claim(id domain.BeadID) bool {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.inflight[id] {
-		return false
-	}
-	r.inflight[id] = true
-	return true
-}
-
-// release lets a bead be delivered again (a retryable failure, a check
-// failure or a conflict, all of which come back through the feedback loop).
-func (r *e2eRig) release(id domain.BeadID) {
-	r.mu.Lock()
-	delete(r.inflight, id)
-	r.mu.Unlock()
-}
-
-// deliver ships one approved bead and acts on the outcome.
-func (r *e2eRig) deliver(ctx context.Context, b domain.Bead) {
-	round := 1
-	if th, ok := r.Feedback.Thread(b.ID); ok && th.Round > 0 {
-		round = th.Round
-	}
-	out, err := r.Deliverer.Deliver(ctx, DeliveryRequest{Bead: b, Round: round})
-	if err != nil {
-		r.problem("delivering %s: %v", b.ID, err)
-		r.release(b.ID)
-		return
-	}
-	r.mu.Lock()
-	r.delivered[b.ID] = out
-	r.mu.Unlock()
-	if err := r.applyOutcome(ctx, b.ID, out); err != nil {
-		r.problem("acting on the delivery of %s: %v", b.ID, err)
-	}
-}
-
-// applyOutcome is the boundary between the delivery handoff and the
-// feedback loop: the deliverer has already written every status, so the
-// loop is only told where the bead went.
-func (r *e2eRig) applyOutcome(ctx context.Context, id domain.BeadID, out *DeliveryOutcome) error {
-	if out == nil {
-		return nil
-	}
-	bead := domain.Bead{ID: id, State: out.State, Round: out.Round}
-	switch out.Kind {
-	case DeliveryPending:
-		// Safety on: the bead waits in delivering behind its gh:pr gate.
-		r.Poller.Kick()
-	case DeliveryCheckFailed:
-		r.release(id)
-		return r.Feedback.CheckFailed(ctx, bead, out.Round, out.Items)
-	case DeliveryNeedsReview:
-		r.release(id)
-		return r.Feedback.ReviewAgain(ctx, bead, out.Round, out.Reason)
-	case DeliveryConflict, DeliveryRetryable:
-		r.release(id)
-	}
-	r.Feedback.Observe(id, out.State)
-	return nil
 }
 
 // problem records something the conductor could not do; a failing test

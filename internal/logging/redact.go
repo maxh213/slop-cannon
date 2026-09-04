@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+
+	"slop-cannon/internal/events"
+	"slop-cannon/internal/textsafe"
 )
 
 // Redacted is the text that replaces the secret part of a matched token.
@@ -133,4 +136,52 @@ func ContainsSecret(s string) bool {
 		}
 	}
 	return false
+}
+
+// SafeText is what every piece of untrusted text goes through on its way
+// into an event, a log record or a terminal: the escape scrubber first, so a
+// cartridge cannot repaint the screen — and so a token cut in half by an
+// escape sequence is put back together — and the redaction rules second, so
+// what is left carries no secret. It keeps the line structure its author
+// wrote and honours a carriage return the way a terminal does
+// ([textsafe.DisplayPolicy]), because the text is going to a screen as often
+// as to a file.
+//
+// It is idempotent: both halves are, so a second pass downstream changes
+// nothing.
+func SafeText(s string) string {
+	return Redact(textsafe.ScrubBlock(s, textsafe.DisplayPolicy()))
+}
+
+// SafeEvent is the publication-time hook (P7-17, P9-09): it returns ev with
+// every untrusted field — an agent's output line, a warning's message, a
+// verdict's prose, a bead title a model wrote — put through [SafeText].
+//
+// [events.Bus] never transforms what it carries, on purpose: one subscriber
+// must not be able to change what another sees, and the JSONL run log has to
+// be a faithful record of what was published. So the orchestrator, the
+// supervisor and the cartridge adapters call this where they build the
+// event, once, and every consumer — the run log, the headless renderer, the
+// TUI and `sc status` — is then reading text that is already safe. The views
+// keep their own scrubbing as a second line of defence for events built
+// elsewhere; it is idempotent, so it costs a scan and changes nothing.
+func SafeEvent(ev events.Event) events.Event { return events.Redacted(ev, SafeText) }
+
+// RedactEvent is [SafeEvent] without the escape scrubbing: the secret rules
+// only. Use it when the text has already been scrubbed, or when the
+// destination is not a terminal.
+func RedactEvent(ev events.Event) events.Event { return events.Redacted(ev, Redact) }
+
+// Event is [RedactEvent] for a redactor with extra rules of its own.
+func (r *Redactor) Event(ev events.Event) events.Event { return events.Redacted(ev, r.Redact) }
+
+// SafeEvent is [SafeEvent] for a redactor with extra rules of its own: the
+// escape scrub first — so a token split by an escape sequence is still
+// masked — then this redactor's rules. It is what a run wires in front of
+// its event log and its bus, with the redactor the run's `exclude` list
+// built ([agents.SecretFilter.Redactor], P9-05).
+func (r *Redactor) SafeEvent(ev events.Event) events.Event {
+	return events.Redacted(ev, func(s string) string {
+		return r.Redact(textsafe.ScrubBlock(s, textsafe.DisplayPolicy()))
+	})
 }

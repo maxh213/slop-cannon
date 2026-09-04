@@ -8,6 +8,7 @@ Check that everything a run needs is installed and configured:
   cartridge  every configured cartridge CLI is on PATH (failure when the
              active one is missing)
   repo       --repo is a git repository with a clean working tree (warning)
+  .gitignore ignores .env, so an agent cannot commit a credential (warning)
   .beads     present (warning: it is initialised on the first run)
 
 Rows are pass, warn, or fail. The exit status is 1 when any row fails.

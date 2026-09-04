@@ -1,0 +1,137 @@
+package cli
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"slop-cannon/internal/config"
+	"slop-cannon/internal/domain"
+)
+
+// Tests for `sc resume` (P8-05). It is sugar for `sc PATH --resume`, so
+// most of these assert exactly that: the two forms resolve to the same
+// thing, character for character. The behaviour of resuming itself is
+// tested where it lives (run_test.go's TestRunResume and
+// TestRunResumeRestoresTheFrozenSnapshot).
+
+// resumeSetup makes a repository with a cartridge and two recorded runs,
+// the newer of which is the one a resume continues.
+func resumeSetup(t *testing.T) (base, repo string) {
+	t.Helper()
+	base, repo = runTestEnv(t)
+	runAddCartridge(t, "claude", "fable")
+	for _, id := range []string{"20260901-000000-1111", "20260902-000000-2222"} {
+		require.NoError(t, os.MkdirAll(config.RunDir(repo, id), 0o755))
+	}
+	return base, repo
+}
+
+func TestResumeHelpGolden(t *testing.T) {
+	out, err := rootRun(t, "resume", "--help")
+	require.NoError(t, err)
+	rootGolden(t, "resume-help", out)
+}
+
+// TestResumeIsTheRunFormWithTheFlag is the Done-when: whatever
+// `sc PATH --resume` resolves to, `sc resume PATH` resolves to as well.
+func TestResumeIsTheRunFormWithTheFlag(t *testing.T) {
+	base, repo := resumeSetup(t)
+
+	sugar, sugarErr, code := runResolve(t, "resume", repo)
+	require.Equal(t, 0, code, sugarErr)
+	flag, flagErr, code := runResolve(t, repo, "--resume")
+	require.Equal(t, 0, code, flagErr)
+	require.Equal(t, flag, sugar)
+	require.Equal(t, flagErr, sugarErr)
+	require.Contains(t, runNormalise(sugar, base, repo), "run        20260902-000000-2222 (resumed)\n")
+
+	// The overrides that sit above the frozen snapshot work the same way,
+	// notes included (P6-11).
+	sugar, sugarErr, code = runResolve(t, "resume", repo, "--ammo", "6", "--headless")
+	require.Equal(t, 0, code, sugarErr)
+	flag, flagErr, code = runResolve(t, repo, "--resume", "--ammo", "6", "--headless")
+	require.Equal(t, 0, code, flagErr)
+	require.Equal(t, flag, sugar)
+	require.Equal(t, flagErr, sugarErr)
+}
+
+// TestResumeWithoutAPathUsesTheRepoFlag: `sc resume [--repo]` is the form
+// P8-05 names, so the path is optional.
+func TestResumeWithoutAPathUsesTheRepoFlag(t *testing.T) {
+	_, repo := resumeSetup(t)
+
+	byFlag, stderr, code := runResolve(t, "resume", "--repo", repo)
+	require.Equal(t, 0, code, stderr)
+	byPath, _, code := runResolve(t, "resume", repo)
+	require.Equal(t, 0, code)
+	require.Equal(t, byPath, byFlag)
+
+	// And the current directory when neither is given.
+	t.Chdir(repo)
+	byCwd, _, code := runResolve(t, "resume")
+	require.Equal(t, 0, code)
+	require.Equal(t, byPath, byCwd)
+}
+
+// TestResumeReportsTheSameConfigurationAsTheRunForm checks the resolved
+// value rather than its rendering: same run id, same state directory, and
+// Resume set.
+func TestResumeReportsTheSameConfigurationAsTheRunForm(t *testing.T) {
+	_, repo := resumeSetup(t)
+
+	rc := runJSON(t, "resume", repo)
+	require.True(t, rc.Resume)
+	require.Equal(t, domain.RunID("20260902-000000-2222"), rc.Run.ID)
+	require.Equal(t, config.RunDir(repo, "20260902-000000-2222"), rc.Run.StateDir)
+	require.Equal(t, domain.RunModeAutopilot, rc.Run.Mode)
+}
+
+// TestResumeWithNothingToResume gives the run form's own explanation,
+// which names where it looked.
+func TestResumeWithNothingToResume(t *testing.T) {
+	_, repo := runTestEnv(t)
+	runAddCartridge(t, "claude", "fable")
+
+	stdout, stderr, code := runResolve(t, "resume", repo)
+	require.Equal(t, 1, code)
+	require.Empty(t, stdout)
+	require.Equal(t, "sc: nothing to resume: no runs recorded for "+repo+" (looked in "+
+		filepath.Join(config.StateDir(repo), config.RunsDirName)+")\n", stderr)
+}
+
+// TestResumeRefusesABrief: a resumed run keeps the brief it was started
+// with, so -m is refused here exactly as it is on the run form.
+func TestResumeRefusesABrief(t *testing.T) {
+	_, repo := resumeSetup(t)
+
+	_, stderr, code := runResolve(t, "resume", repo, "-m", "something else")
+	require.Equal(t, 1, code)
+	require.Equal(t, "sc: --message cannot be combined with --resume: a resumed run keeps its original brief\n", stderr)
+}
+
+// TestResumeHidesTheFlagsItImplies: --resume and --message are not in this
+// command's help (one is what it is, the other is refused), but both still
+// parse, so a user who types one is told why rather than "unknown flag".
+func TestResumeHidesTheFlagsItImplies(t *testing.T) {
+	out, err := rootRun(t, "resume", "--help")
+	require.NoError(t, err)
+	require.NotContains(t, out, "\n      --resume", "the command is the flag")
+	require.NotContains(t, out, "\n  -m, --message", "a brief is refused on a resume")
+	require.Contains(t, out, "\n      --headless")
+	require.Contains(t, out, "\n      --ammo")
+
+	_, repo := resumeSetup(t)
+	stdout, stderr, code := runResolve(t, "resume", repo, "--resume")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stdout, "(resumed)")
+}
+
+// TestResumeRejectsTwoArguments keeps the argument shape of the run form.
+func TestResumeRejectsTwoArguments(t *testing.T) {
+	_, repo := resumeSetup(t)
+	_, err := rootRun(t, "resume", repo, repo)
+	require.Error(t, err)
+}

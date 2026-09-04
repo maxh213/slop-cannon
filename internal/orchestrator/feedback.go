@@ -52,7 +52,14 @@ import (
 //     limits.max_pushback_rounds exchanges hands the item to the product
 //     owner, whose ruling either overrules the item or sends it back to the
 //     engineer, and that ruling is binding: an answer that argues with it
-//     again is refused rather than applied.
+//     again is refused rather than applied, and an engineer that argues
+//     [MaxRulingRefusals] times escalates the bead instead of spending
+//     what is left of its review rounds one refused round at a time
+//     (P6-38).
+//   - D-08 each held item is its own ruling: the `arbitration` message
+//     settles exactly one item, so every item the product owner owes a
+//     ruling on is raised as its own demand with its own agent id (P6-25),
+//     and two disputes on one bead need not queue behind one another.
 //   - D-09 only testers that did not approve the previous round review
 //     again, unless the engineer's round moved more than
 //     [gitx.DefaultReReviewThreshold] of the change set, which sends every
@@ -85,9 +92,10 @@ import (
 //
 // Nothing in here reads the wall clock or talks to git or bd directly: the
 // clock is [FeedbackOptions.Now], the bead's context comes from
-// [FeedbackContextFunc], the statuses go through the [StateMachine] and the
-// comments through a [FeedbackMessageStore], so the whole loop is
-// deterministic under a fake clock and a mock cartridge.
+// [FeedbackContextFunc], the statuses go through the [StateMachine], the
+// comments through a [FeedbackMessageStore] and the one field a ruling
+// rewrites through a [BeadAcceptanceWriter] (D-08, P6-24), so the whole loop
+// is deterministic under a fake clock and a mock cartridge.
 
 // SourceFeedback is the [events.Warning] Source the feedback loop
 // stamps on work it had to skip.
@@ -98,6 +106,19 @@ const SourceFeedback = "feedback"
 // share of words they have in common, from 0 (merge nothing but identical
 // titles) to 1 (merge only identical word sets).
 const DefaultTitleSimilarity = 0.6
+
+// MaxRulingRefusals is how many times an engineer may argue with the same
+// binding product owner ruling before the bead is escalated (D-08, P6-38).
+//
+// D-08 makes an arbitration binding, so an answer that argues with one is
+// refused and the item stays owed ([Feedback.refuses]). A model that will
+// not comply would otherwise be asked again every round until the review
+// round cap escalated the bead, spending the whole budget on rounds that
+// judge nothing; the second refusal of the same ruling escalates instead,
+// so one round is spent rather than several. It is not configuration: the
+// point is that the loop gives way after one more chance, whatever
+// limits.max_review_rounds says.
+const MaxRulingRefusals = 2
 
 // Feedback loop errors, matched with errors.Is.
 var (
@@ -218,6 +239,20 @@ type FeedbackMessageStore interface {
 // *beads.Client is the production message store.
 var _ FeedbackMessageStore = (*beads.Client)(nil)
 
+// BeadAcceptanceWriter rewrites a bead's acceptance criteria in bd
+// (`bd update --acceptance`), which is how a D-08 narrow_scope ruling
+// becomes the criteria the bead is really held to rather than a note on the
+// loop's own thread (P6-24). It is the narrowest slice of *beads.Client the
+// loop needs, in the package convention host.go writes down; the planning
+// loop asks for the same shape under its own name ([PlanPrioritiser]),
+// because each component names the bd calls it makes.
+type BeadAcceptanceWriter interface {
+	Update(ctx context.Context, id domain.BeadID, patch beads.Patch) (beads.Issue, error)
+}
+
+// *beads.Client is the production acceptance writer.
+var _ BeadAcceptanceWriter = (*beads.Client)(nil)
+
 // FeedbackOptions configures [NewFeedback].
 type FeedbackOptions struct {
 	// Context describes a bead for the prompt builders. Required.
@@ -252,6 +287,12 @@ type FeedbackOptions struct {
 	// TitleSimilarity is the P6-21 merge threshold; zero means
 	// DefaultTitleSimilarity.
 	TitleSimilarity float64
+	// Acceptance writes a narrow_scope ruling's criteria back to the bead
+	// (D-08, P6-24); pass the run's *beads.Client. Nil keeps them on the
+	// thread only, which is what a dry run wants: the prompts still carry
+	// the narrowed criteria, but bd does not, so a resumed run has only the
+	// ruling comment to recover them from.
+	Acceptance BeadAcceptanceWriter
 	// ConflictResolved is called when the engineer of a delivery conflict
 	// round has finished (P6-06 raises those demands; the loop plans the
 	// firing because building an engineer request is the role layer's job).
@@ -458,6 +499,9 @@ type fbItem struct {
 	hold string
 	// ruling is the product owner's binding arbitration, once there is one.
 	ruling *domain.Arbitration
+	// refusals counts the answers refused because they argued with that
+	// ruling instead of carrying it out (D-08, P6-38).
+	refusals int
 }
 
 // status is the issue's status across every tester that raised it: open
@@ -531,6 +575,13 @@ func (i *fbItem) evaluatedBy(l domain.Lens) bool {
 // tester held its ground the configured number of times (D-08).
 func (i *fbItem) awaitingArbitration(cap int) bool {
 	return i.ruling == nil && i.status() == domain.ItemHeld && i.holds >= cap
+}
+
+// defiant reports whether the engineer has argued with this item's binding
+// ruling often enough that the bead should go to the product owner rather
+// than buy another review round (D-08, P6-38).
+func (i *fbItem) defiant() bool {
+	return !i.settled() && i.ruling != nil && i.refusals >= MaxRulingRefusals
 }
 
 // awaitingEngineer reports whether the engineer owes the issue an answer.
@@ -610,11 +661,16 @@ type fbThread struct {
 	// the thread snapshot.
 	lastEscalation *domain.Escalation
 	// acceptance is the acceptance criteria a narrow_scope ruling replaced
-	// the bead's with (D-08). bd still shows the original ones until P6-24
-	// writes them back, so the thread's copy wins in every prompt.
+	// the bead's with (D-08). The thread's copy is what every prompt reads;
+	// bd carries them too as soon as [FeedbackOptions.Acceptance] has
+	// written them (P6-24), which is what makes them survive a resume.
 	acceptance string
-	notes      []string
-	engineer   domain.AgentID
+	// storedAcceptance is the narrowed criteria bd is known to hold, so the
+	// write is made once and a replayed thread that finds them already
+	// there repairs nothing (P6-24).
+	storedAcceptance string
+	notes            []string
+	engineer         domain.AgentID
 	// restoring means the thread is being rebuilt from the bead's comments
 	// ([Feedback.Restore]): the replay publishes nothing, and the one
 	// transition it concludes is written only when bd is not already there.
@@ -698,6 +754,10 @@ type FeedbackTrackedItem struct {
 	// Ruling is the product owner's binding arbitration, nil until there is
 	// one.
 	Ruling *domain.Arbitration
+	// Refusals counts the answers that argued with that ruling instead of
+	// carrying it out; [MaxRulingRefusals] of them escalate the bead
+	// (D-08, P6-38).
+	Refusals int
 }
 
 // FeedbackThread is a read-only snapshot of one bead's loop, for `sc status`
@@ -754,7 +814,10 @@ func (f *Feedback) Track(bs ...domain.Bead) {
 		t.bead = b
 		if t.acceptance != "" {
 			// A narrow_scope ruling replaced the criteria (D-08); the
-			// refresh from bd must not put the old ones back.
+			// refresh from bd must not put the old ones back — bd carries
+			// the narrowed ones once the P6-24 write has landed, but a
+			// listing that omits the field, or a write bd refused, would
+			// otherwise lose the ruling.
 			t.bead.Acceptance = t.acceptance
 		}
 		if b.State.Terminal() && t.state != b.State {
@@ -862,6 +925,7 @@ func (f *Feedback) snapshot(t *fbThread) FeedbackThread {
 			Response: i.response,
 			Holds:    i.holds,
 			Ruling:   i.ruling,
+			Refusals: i.refusals,
 		})
 	}
 	return out
@@ -926,15 +990,15 @@ func (f *Feedback) demandsFor(t *fbThread, order int) []Demand {
 		return out
 
 	case FeedbackArbitrating:
-		item := f.nextDispute(t)
-		if item == nil {
-			return nil
+		var out []Demand
+		for _, item := range f.disputes(t) {
+			d := base
+			d.Kind, d.Task = DemandArbitrate, events.TaskArbitrate
+			d.Agent = domain.AgentID(fmt.Sprintf("po-%s-r%d-%s", t.id, t.round, item.con.Item.ID))
+			d.Payload = FeedbackWork{Bead: t.id, Round: t.round, Phase: t.phase, Item: item.con.Item.ID}
+			out = append(out, d)
 		}
-		d := base
-		d.Kind, d.Task = DemandArbitrate, events.TaskArbitrate
-		d.Agent = domain.AgentID(fmt.Sprintf("po-%s-r%d-%s", t.id, t.round, item.con.Item.ID))
-		d.Payload = FeedbackWork{Bead: t.id, Round: t.round, Phase: t.phase, Item: item.con.Item.ID}
-		return []Demand{d}
+		return out
 
 	case FeedbackReviewing:
 		if len(t.reviewers) == 0 {
@@ -984,13 +1048,37 @@ func (f *Feedback) hasEngineerWork(t *fbThread) bool {
 	return false
 }
 
-// nextDispute is the item the product owner rules on next. Only one
-// arbitration is in flight per bead and round, because that is what the
-// scheduler's demand identity can express, so held items are ruled on one
-// after another.
-func (f *Feedback) nextDispute(t *fbThread) *fbItem {
+// disputes are the items the product owner owes a ruling on, in the order
+// they were raised (P6-25).
+//
+// One `arbitration` message settles exactly one item
+// ([agents.ArbitrationRequest]), so two held items on one bead are two
+// firings. Each is offered as its own demand, with the item in the payload
+// and in the agent id, so they are independent jobs rather than a queue:
+// nothing in the loop makes the second wait for the first, and a ruling
+// that lands while another is still being made leaves the thread in
+// [FeedbackArbitrating] until every dispute has one (see [Feedback.plan]).
+//
+// Note for whoever wires the scheduler: [Demand.Key] is
+// kind|bead|lens|round, which two arbitrations of one round share, so the
+// scheduler still runs them one after another until the item joins that
+// key. Everything else — the agent ids, the payloads, the bookkeeping —
+// is already per item, and no order or count changes when it does.
+func (f *Feedback) disputes(t *fbThread) []*fbItem {
+	var out []*fbItem
 	for _, i := range t.items {
 		if i.awaitingArbitration(f.pushbk) {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// defiant is the item whose binding ruling the engineer has argued with
+// once too often, or nil (D-08, P6-38); the caller holds the lock.
+func (f *Feedback) defiant(t *fbThread) *fbItem {
+	for _, i := range t.items {
+		if i.defiant() {
 			return i
 		}
 	}
@@ -1552,13 +1640,16 @@ func (f *Feedback) refuses(i *fbItem, r domain.Response) bool {
 	return i.ruling != nil && r.Action != domain.ActionFixed
 }
 
-// answered records the engineer's answers to a round of feedback.
+// applyResponses folds a set of engineer answers into the thread's items
+// and returns the ids it refused, newest note last; the caller holds the
+// lock.
 //
-// D-08 makes the product owner's ruling binding, so an answer that argues
-// with one is refused rather than applied ([Feedback.refuses]): the item
-// keeps its ruling and stays owed.
-func (f *Feedback) answered(ctx context.Context, t *fbThread, agent domain.AgentID, responses []domain.Response) error {
-	f.mu.Lock()
+// It is the one place an answer changes an item, so the live path
+// ([Feedback.answered]) and the replay ([Feedback.Restore]) cannot drift:
+// a resumed thread reopens the same occurrences, refuses the same answers
+// and carries the same refusal count, which is what lets the replay work
+// out afterwards which verdicts were pushback evaluations (P6-26).
+func (f *Feedback) applyResponses(t *fbThread, responses []domain.Response) []string {
 	var refused []string
 	for _, r := range responses {
 		i := fbFind(t, r.ItemID)
@@ -1566,6 +1657,7 @@ func (f *Feedback) answered(ctx context.Context, t *fbThread, agent domain.Agent
 			continue
 		}
 		if f.refuses(i, r) {
+			i.refusals++
 			refused = append(refused, r.ItemID)
 			continue
 		}
@@ -1579,6 +1671,17 @@ func (f *Feedback) answered(ctx context.Context, t *fbThread, agent domain.Agent
 			": that ruling is binding (D-08), so carry it out rather than argue with it again")
 	}
 	t.responses = append(t.responses, responses...)
+	return refused
+}
+
+// answered records the engineer's answers to a round of feedback.
+//
+// D-08 makes the product owner's ruling binding, so an answer that argues
+// with one is refused rather than applied ([Feedback.refuses]): the item
+// keeps its ruling and stays owed.
+func (f *Feedback) answered(ctx context.Context, t *fbThread, agent domain.AgentID, responses []domain.Response) error {
+	f.mu.Lock()
+	refused := f.applyResponses(t, responses)
 	round := t.round
 	f.mu.Unlock()
 
@@ -1639,9 +1742,10 @@ func (f *Feedback) applyVerdict(t *fbThread, lens domain.Lens, mode agents.Teste
 	// nobody reviewed — the engineer's session still moves the code in
 	// such a round, because D-14 commits its leftovers — and a tester that
 	// did not approve the previous round has to see that code.
+	round := f.verdictRound(t, v)
 	if mode != agents.TesterModeEvaluatePushback {
 		t.approved[lens] = v.Outcome == domain.VerdictApprove
-		t.looked[lens] = t.round
+		t.looked[lens] = round
 		t.lookedAt[lens] = fbHead(t.diff)
 	}
 	t.reviewers = fbWithout(t.reviewers, lens)
@@ -1651,7 +1755,7 @@ func (f *Feedback) applyVerdict(t *fbThread, lens domain.Lens, mode agents.Teste
 	for _, it := range v.Items {
 		i := f.itemByOrigin(t, lens, it.ID)
 		if i == nil {
-			f.addItem(t, lens, it)
+			f.addItem(t, lens, it, round)
 			continue
 		}
 		i.per[lens] = it.Status
@@ -1672,26 +1776,44 @@ func (f *Feedback) applyVerdict(t *fbThread, lens domain.Lens, mode agents.Teste
 	// A re-review that says nothing about an item it was given leaves it
 	// where it was; the schema check already refuses that, so nothing to do.
 	if mode == agents.TesterModeEvaluatePushback {
-		f.countHolds(t, lens, v)
+		f.countHolds(t, lens, round, v)
 	}
 }
 
-// countHolds bumps the pushback counter of every item this lens held, once
-// per round rather than once per lens. D-08 budgets pushback *exchanges*
-// (max_pushback_rounds per item), and one exchange is one engineer answer
-// judged by everybody that raised the issue: a consolidated item (P6-21) two
-// testers both hold has still had one exchange, and spending two of the
-// budget on it would arbitrate a round early.
-func (f *Feedback) countHolds(t *fbThread, lens domain.Lens, v domain.Verdict) {
+// verdictRound is the review round a verdict belongs to; the caller holds
+// the lock.
+//
+// Live it is the thread's own round, because the round is what the firing
+// was raised for and a model may not renumber it. A replay
+// ([Feedback.Restore]) folds a whole thread in at once, though, and the
+// thread's round is by then the last one: crediting round one's verdicts to
+// it would tell the resumed loop that every lens has already seen the code
+// the last round left behind, and collapse two rounds of pushback into one
+// exchange. There the comment's own round is the truth (P6-26).
+func (f *Feedback) verdictRound(t *fbThread, v domain.Verdict) int {
+	if t.restoring && v.Round > 0 {
+		return v.Round
+	}
+	return t.round
+}
+
+// countHolds bumps the pushback counter of every item this lens held in the
+// round it judged, once per round rather than once per lens. D-08 budgets
+// pushback *exchanges* (max_pushback_rounds per item), and one exchange is
+// one engineer answer judged by everybody that raised the issue: a
+// consolidated item (P6-21) two testers both hold has still had one
+// exchange, and spending two of the budget on it would arbitrate a round
+// early.
+func (f *Feedback) countHolds(t *fbThread, lens domain.Lens, round int, v domain.Verdict) {
 	for _, it := range v.Items {
 		if it.Status != domain.ItemHeld {
 			continue
 		}
 		i := f.itemByOrigin(t, lens, it.ID)
-		if i == nil || i.heldAt == t.round {
+		if i == nil || i.heldAt == round {
 			continue
 		}
-		i.heldAt = t.round
+		i.heldAt = round
 		i.holds++
 	}
 }
@@ -1709,9 +1831,9 @@ func (f *Feedback) itemByOrigin(t *fbThread, lens domain.Lens, id string) *fbIte
 	return nil
 }
 
-// addItem records a newly raised item, merging it into an existing issue
-// when another tester already raised the same thing (P6-21).
-func (f *Feedback) addItem(t *fbThread, lens domain.Lens, it domain.FeedbackItem) {
+// addItem records a newly raised item as raised in round, merging it into an
+// existing issue when another tester already raised the same thing (P6-21).
+func (f *Feedback) addItem(t *fbThread, lens domain.Lens, it domain.FeedbackItem, round int) {
 	if strings.TrimSpace(it.ID) == "" {
 		return
 	}
@@ -1732,7 +1854,7 @@ func (f *Feedback) addItem(t *fbThread, lens domain.Lens, it domain.FeedbackItem
 			Lenses: []domain.Lens{lens},
 			Raised: map[domain.Lens]domain.FeedbackItem{lens: it},
 		},
-		round: t.round,
+		round: round,
 		per:   map[domain.Lens]domain.ItemStatus{lens: fbOr(it.Status, domain.ItemOpen)},
 	})
 }
@@ -1878,11 +2000,16 @@ func (f *Feedback) escalated(ctx context.Context, t *fbThread, agent domain.Agen
 		t.notes = append(t.notes,
 			"the product owner narrowed this bead's acceptance criteria to: "+fbOneLine(e.NewAcceptance))
 		// The ruling's criteria are what every later prompt judges the bead
-		// against, so they replace the bead's own until bd carries them
-		// (P6-24); the ruling itself stays in the round that made it.
+		// against, so they replace the bead's own; the ruling itself stays
+		// in the round that made it.
 		t.acceptance = fbFirstNonEmpty(e.NewAcceptance, t.acceptance)
 		t.bead.Acceptance = fbFirstNonEmpty(t.acceptance, t.bead.Acceptance)
 		f.mu.Unlock()
+		// And they go to bd, because bd is what the bead asks for (D-06):
+		// without this the testers of the next round hold the engineer to
+		// criteria bd still shows unchanged, and a resume loses the ruling
+		// (P6-24).
+		f.narrowScope(ctx, t, e.NewAcceptance)
 		return f.plan(ctx, t)
 
 	default:
@@ -1894,6 +2021,44 @@ func (f *Feedback) escalated(ctx context.Context, t *fbThread, agent domain.Agen
 		f.mu.Unlock()
 		return nil
 	}
+}
+
+// narrowScope writes a narrow_scope ruling's acceptance criteria to the bead
+// itself (`bd update --acceptance`), so every later reader — the next
+// tester's prompt, `bd show`, a resumed run — is held to what the product
+// owner narrowed the bead to (D-08, P6-24).
+//
+// The thread keeps its own copy whatever happens here: a loop with no
+// [FeedbackOptions.Acceptance], or a write bd refuses, still runs the
+// narrowed rounds, it just cannot survive a resume, and the failure is a
+// warning rather than an error because the ruling itself has already been
+// applied. The write is made once per set of criteria, so a replayed thread
+// that finds bd already holding them repairs nothing.
+func (f *Feedback) narrowScope(ctx context.Context, t *fbThread, criteria string) {
+	if criteria == "" || f.opts.Acceptance == nil {
+		return
+	}
+	f.mu.Lock()
+	restoring, stored := t.restoring, t.storedAcceptance
+	f.mu.Unlock()
+	if stored == criteria {
+		return
+	}
+	if _, err := f.opts.Acceptance.Update(ctx, t.id, beads.Patch{Acceptance: &criteria}); err != nil {
+		f.warn(t.id, "could not write the narrowed acceptance criteria to the bead", err)
+		return
+	}
+	f.mu.Lock()
+	t.storedAcceptance = criteria
+	bead := t.bead
+	f.mu.Unlock()
+	if restoring {
+		// A replay finishes the write the killed run owed but announces
+		// nothing: the thread is being re-read, not re-run.
+		return
+	}
+	bead.Acceptance = criteria
+	f.publish(events.BeadUpdated{Meta: f.meta(), Bead: bead, Fields: []string{"acceptance"}})
 }
 
 // plan works out what the thread wants next and moves the bead's state with
@@ -1908,6 +2073,23 @@ func (f *Feedback) plan(ctx context.Context, t *fbThread) error {
 	if len(t.reviewers) > 0 || len(t.evaluating) > 0 {
 		f.mu.Unlock()
 		return nil
+	}
+	// D-08: an engineer that keeps arguing with a binding ruling is not
+	// going to comply, and every refused round judges nothing while
+	// spending one of the bead's review rounds. The product owner decides
+	// what happens to the bead instead (P6-38).
+	if i := f.defiant(t); i != nil {
+		t.phase = FeedbackEscalating
+		id, n, round, limit := i.con.Item.ID, i.refusals, t.round, f.rounds
+		t.notes = append(t.notes, fmt.Sprintf(
+			"the engineer has argued with your binding ruling on %s %d times instead of carrying it out, "+
+				"so the bead was escalated with %d of its %d review rounds still unspent", id, n, limit-round, limit))
+		f.mu.Unlock()
+		f.log.Info("an engineer argued with a binding ruling once too often, so the bead was escalated",
+			slog.String("bead", t.id.String()), slog.String("item", id),
+			slog.Int("refusals", n), slog.Int("round", round), slog.Int("max_rounds", limit))
+		return f.move(ctx, t, BeadEventEscalated, "",
+			fmt.Sprintf("the engineer argued with the ruling on %s %d times (round %d of %d)", id, n, round, limit))
 	}
 	var (
 		evaluate  []domain.Lens
@@ -2237,6 +2419,13 @@ func (f *Feedback) ReviewAgain(_ context.Context, bead domain.Bead, round int, r
 // of the replay and writes no comments: the thread is being re-read, not
 // re-run.
 //
+// The replay is the live loop's own bookkeeping, not a summary of it: the
+// answers go through [Feedback.applyResponses], so a refused answer is
+// refused again and the D-08 refusal count survives (P6-38), and each
+// verdict is folded in the mode it was fired in ([Feedback.restoredMode]),
+// so the pushback exchanges a thread has already spent are the ones it
+// resumes with and it arbitrates on the round it would have (P6-26).
+//
 // It does write the one status the killed run owed. A run killed between
 // the last verdict comment and the status write leaves a bead bd still
 // holds in in_review although every tester approved it; replaying that
@@ -2254,6 +2443,9 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 		return fmt.Errorf("%w: %s", ErrNoFeedbackThread, bead.ID)
 	}
 	t.restoring = true
+	// The criteria a narrow_scope ruling replaced the bead's with, if the
+	// replay finds one; bd is asked to carry them below (P6-24).
+	var narrowed string
 	for _, m := range msgs {
 		if m.Err != nil {
 			continue
@@ -2270,14 +2462,9 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 			if payload.Round > t.round {
 				t.round = payload.Round
 			}
-			f.applyVerdict(t, lens, agents.TesterModeReview, payload)
+			f.applyVerdict(t, lens, f.restoredMode(t, lens, payload), payload)
 		case []domain.Response:
-			for _, r := range payload {
-				if i := fbFind(t, r.ItemID); i != nil {
-					i.response = r
-				}
-			}
-			t.responses = append(t.responses, payload...)
+			f.applyResponses(t, payload)
 		case domain.Arbitration:
 			if i := fbFind(t, payload.ItemID); i != nil {
 				ruling := payload
@@ -2294,16 +2481,58 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 			if esc.Outcome == domain.EscalationNarrowScope {
 				t.acceptance = fbFirstNonEmpty(esc.NewAcceptance, t.acceptance)
 				t.bead.Acceptance = fbFirstNonEmpty(t.acceptance, t.bead.Acceptance)
+				narrowed = t.acceptance
+				if bead.Acceptance == narrowed {
+					// bd already carries the ruling's criteria (P6-24), so
+					// the resumed thread reads them from the bead itself
+					// and there is nothing to repair.
+					t.storedAcceptance = narrowed
+				}
 			}
 		}
 	}
 	f.mu.Unlock()
+
+	// A run killed between the ruling and the P6-24 write leaves bd holding
+	// the criteria the ruling replaced, which is the one thing a replay
+	// cannot re-derive later: finish that write, the way the replay writes
+	// the status the killed run owed.
+	f.narrowScope(ctx, t, narrowed)
 
 	err := f.plan(ctx, t)
 	f.mu.Lock()
 	t.restoring = false
 	f.mu.Unlock()
 	return err
+}
+
+// restoredMode works out what a replayed verdict was fired as, which the
+// comment does not say (P6-26). The caller holds the lock.
+//
+// The two modes are not interchangeable. An evaluate-pushback firing judges
+// an argument with no diff in front of it, so it neither approves the
+// commit nor counts as this lens's look at it (D-09), and it is the only
+// firing that spends a pushback exchange (D-08). Replaying every verdict as
+// a review credits a lens with code it never saw and restarts the hold
+// count at zero, which buys the engineer an extra exchange before the
+// arbitration the killed run was already owed.
+//
+// The inference is the state the replay is already in: an evaluation is
+// fired for exactly the items that were waiting for one when it ran
+// ([fbItem.evaluatedBy], the same rule the live loop plans from), and the
+// loop always fires the evaluation of a round before its re-review, so by
+// the time a re-review's verdict is replayed those items are held, settled
+// or overruled and no longer await anything.
+func (f *Feedback) restoredMode(t *fbThread, lens domain.Lens, v domain.Verdict) agents.TesterMode {
+	if lens == "" {
+		lens = v.Lens
+	}
+	for _, it := range v.Items {
+		if i := f.itemByOrigin(t, lens, it.ID); i != nil && i.evaluatedBy(lens) {
+			return agents.TesterModeEvaluatePushback
+		}
+	}
+	return agents.TesterModeReview
 }
 
 // post writes one structured message onto the bead (D-06).

@@ -4,11 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/config"
@@ -1314,4 +1320,313 @@ func TestStateResumeAnnouncesOnlyTheTransitionsBdAccepted(t *testing.T) {
 	if _, err := r.Wait(); err != nil {
 		t.Fatalf("Wait: %v", err)
 	}
+}
+
+// ------------------------------------- P6-28: the beads the run passes over
+
+// foreignRecorder is a thread-safe event sink, because a
+// ForeignStatusReporter is shared by every component of a run and its tests
+// drive it from several goroutines.
+type foreignRecorder struct {
+	mu  sync.Mutex
+	evs []events.Event
+}
+
+func (r *foreignRecorder) Publish(ev events.Event) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.evs = append(r.evs, ev)
+}
+
+// warnings returns the Warning events recorded, in order.
+func (r *foreignRecorder) warnings() []events.Warning {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []events.Warning
+	for _, ev := range r.evs {
+		if w, ok := ev.(events.Warning); ok {
+			out = append(out, w)
+		}
+	}
+	return out
+}
+
+// all returns everything recorded.
+func (r *foreignRecorder) all() []events.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]events.Event(nil), r.evs...)
+}
+
+// newForeignHarness builds a reporter over a recorder and a fixed clock.
+func newForeignHarness(t *testing.T, tweak func(*ForeignStatusOptions)) (*ForeignStatusReporter, *foreignRecorder) {
+	t.Helper()
+	rec := &foreignRecorder{}
+	opts := ForeignStatusOptions{
+		Sink:     rec,
+		Run:      "run-1",
+		Statuses: beads.StatusMap{"reviewing": domain.CategoryWIP},
+		Clock:    stateNow,
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	if tweak != nil {
+		tweak(&opts)
+	}
+	return NewForeignStatusReporter(opts), rec
+}
+
+// P6-28: a bead in a status slop-cannon did not register is reported once,
+// however many times the run meets it, and the report is a Warning a reader
+// can find by its Source rather than by its wording.
+func TestForeignStatusReporterReportsEachBeadOnce(t *testing.T) {
+	t.Parallel()
+	r, rec := newForeignHarness(t, nil)
+
+	state, first, err := r.Resolve("sc-1", "reviewing")
+	require.ErrorIs(t, err, ErrForeignStatus)
+	assert.True(t, first, "the first sighting is news")
+	assert.Equal(t, domain.BeadStateBlocked, state, "the state is still SafeState's answer")
+
+	for i := 0; i < 5; i++ {
+		_, again, err := r.Resolve("sc-1", "reviewing")
+		require.ErrorIs(t, err, ErrForeignStatus)
+		assert.False(t, again, "the same bead in the same status is not news again")
+	}
+
+	warns := rec.warnings()
+	require.Len(t, warns, 1, "one Warning per bead, not one per sighting")
+	assert.Equal(t, SourceForeignStatus, warns[0].Source)
+	assert.Equal(t, domain.BeadID("sc-1"), warns[0].Bead)
+	assert.Equal(t, stateClock, warns[0].At())
+	assert.Equal(t, domain.RunID("run-1"), warns[0].RunID())
+	assert.Contains(t, warns[0].Message, `carries the status "reviewing"`)
+	assert.Contains(t, warns[0].Message, "leaving it alone")
+
+	assert.Equal(t, 1, r.Count())
+	require.Len(t, r.Beads(), 1)
+	assert.Equal(t, ForeignStatus{
+		Bead: "sc-1", Status: "reviewing", State: domain.BeadStateBlocked, At: stateClock,
+	}, r.Beads()[0])
+}
+
+// One of bd's own read-only states is reported too, in its own words: the
+// repository did not invent it, so "did not register" would be a lie.
+func TestForeignStatusReporterReportsBDBuiltIns(t *testing.T) {
+	t.Parallel()
+	r, rec := newForeignHarness(t, nil)
+
+	state, first, err := r.Resolve("sc-2", string(domain.BeadStateDeferred))
+
+	require.ErrorIs(t, err, ErrNotWorkflowState)
+	assert.True(t, first)
+	assert.Equal(t, domain.BeadStateDeferred, state)
+	require.Len(t, rec.warnings(), 1)
+	assert.Contains(t, rec.warnings()[0].Message, "sc-2 is deferred, which slop-cannon only reads")
+	require.Len(t, r.Beads(), 1)
+	assert.True(t, r.Beads()[0].BuiltIn, "a bd built-in is not a status the repository invented")
+}
+
+// A bead the cannon owns is silent: the guard's whole point is that it is
+// not news when a run may act on its own bead.
+func TestForeignStatusReporterIsSilentAboutOwnBeads(t *testing.T) {
+	t.Parallel()
+	r, rec := newForeignHarness(t, nil)
+
+	state, first, err := r.Resolve("sc-3", string(domain.BeadStateInReview))
+
+	require.NoError(t, err)
+	assert.False(t, first)
+	assert.Equal(t, domain.BeadStateInReview, state)
+	assert.Empty(t, rec.all())
+	assert.Zero(t, r.Count())
+	assert.Empty(t, r.Beads())
+}
+
+// A bead that moves from one foreign status to another is news again: the
+// key is the bead *and* the status, so a repository that shuffles a bead
+// through its own workflow is reported each time, while a poll that meets
+// the same bead unchanged is not.
+func TestForeignStatusReporterReportsAChangedStatusAgain(t *testing.T) {
+	t.Parallel()
+	r, rec := newForeignHarness(t, func(o *ForeignStatusOptions) {
+		o.Statuses = beads.StatusMap{"reviewing": domain.CategoryWIP, "parked": domain.CategoryFrozen}
+	})
+
+	_, _, err := r.Resolve("sc-1", "reviewing")
+	require.Error(t, err)
+	_, first, err := r.Resolve("sc-1", "parked")
+	require.Error(t, err)
+
+	assert.True(t, first)
+	assert.Len(t, rec.warnings(), 2)
+	assert.Equal(t, 2, r.Count())
+	beadList := r.Beads()
+	require.Len(t, beadList, 2)
+	assert.Equal(t, "parked", beadList[0].Status, "Beads is ordered by bead and then status")
+	assert.Equal(t, "reviewing", beadList[1].Status)
+}
+
+// Observe is the one call a bd listing needs: it reports every bead in it
+// the run may not act on and answers how many of them were news.
+func TestForeignStatusReporterObservesAListing(t *testing.T) {
+	t.Parallel()
+	r, rec := newForeignHarness(t, nil)
+
+	issues := []beads.Issue{
+		{ID: "sc-1", Status: "reviewing"},
+		{ID: "sc-2", Status: string(domain.BeadStateInProgress)},
+		{ID: "sc-3", Status: string(domain.BeadStateBlocked)},
+		{ID: "", Status: "reviewing"},
+	}
+
+	assert.Equal(t, 2, r.Observe(issues...), "the two beads the cannon may not touch")
+	assert.Equal(t, 0, r.Observe(issues...), "and nothing is news the second time round")
+	assert.Equal(t, 2, r.Count())
+	assert.Len(t, rec.warnings(), 2)
+
+	var got []domain.BeadID
+	for _, f := range r.Beads() {
+		got = append(got, f.Bead)
+	}
+	assert.Equal(t, []domain.BeadID{"sc-1", "sc-3"}, got, "a bead with no id is not a report")
+}
+
+// The once-only bookkeeping is bounded, like the gate poller's: an
+// autopilot run never ends, so the map may not grow with the repository.
+// The count stays honest across the reset.
+func TestForeignStatusReporterBookkeepingIsBounded(t *testing.T) {
+	t.Parallel()
+	r, rec := newForeignHarness(t, func(o *ForeignStatusOptions) { o.Limit = 4 })
+
+	for i := 0; i < 10; i++ {
+		_, first, err := r.Resolve(domain.BeadID(fmt.Sprintf("sc-%d", i)), "reviewing")
+		require.Error(t, err)
+		assert.True(t, first)
+	}
+
+	assert.Equal(t, 10, r.Count(), "the count is of beads reported, not of beads remembered")
+	assert.Len(t, rec.warnings(), 10)
+	assert.LessOrEqual(t, len(r.Beads()), 4, "the list is bounded by the limit")
+
+	// A bead reported before the reset may be reported once more; a bead
+	// reported since is still remembered.
+	_, first, err := r.Resolve("sc-9", "reviewing")
+	require.Error(t, err)
+	assert.False(t, first)
+}
+
+// A nil reporter is usable: a component with none configured resolves the
+// status and reports nothing, rather than panicking.
+func TestForeignStatusReporterNilIsUsable(t *testing.T) {
+	t.Parallel()
+	var r *ForeignStatusReporter
+
+	state, first, err := r.Resolve("sc-1", string(domain.BeadStateApproved))
+	require.NoError(t, err)
+	assert.Equal(t, domain.BeadStateApproved, state)
+	assert.False(t, first)
+
+	_, _, err = r.Resolve("sc-2", "reviewing")
+	require.ErrorIs(t, err, ErrForeignStatus)
+	assert.Zero(t, r.Count())
+	assert.Empty(t, r.Beads())
+	assert.Zero(t, r.Observe(beads.Issue{ID: "sc-2", Status: "reviewing"}))
+}
+
+// A reporter with a host publishes through it and takes the run's own
+// header, so the report lands in the run log with every other event.
+func TestForeignStatusReporterPublishesThroughItsHost(t *testing.T) {
+	t.Parallel()
+	host := &foreignHost{meta: events.MetaAt("host-run", stateClock.Add(time.Minute))}
+	r := NewForeignStatusReporter(ForeignStatusOptions{Host: host, Sink: &foreignRecorder{}, Run: "run-1", Clock: stateNow})
+
+	_, _, err := r.Resolve("sc-1", "reviewing")
+
+	require.Error(t, err)
+	require.Len(t, host.evs, 1, "the host is the sink when there is one")
+	w, ok := host.evs[0].(events.Warning)
+	require.True(t, ok)
+	assert.Equal(t, domain.RunID("host-run"), w.RunID())
+	assert.Equal(t, stateClock.Add(time.Minute), w.At())
+}
+
+// foreignHost is an EventHost that records what it is given.
+type foreignHost struct {
+	mu   sync.Mutex
+	meta events.Meta
+	evs  []events.Event
+}
+
+func (h *foreignHost) Publish(ev events.Event) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.evs = append(h.evs, ev)
+}
+func (h *foreignHost) Meta() events.Meta { return h.meta }
+func (h *foreignHost) Log() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
+
+// The reporter is shared by every component of a run, so it has to survive
+// being driven from all of them at once — and still report each bead once.
+func TestForeignStatusReporterIsConcurrencySafe(t *testing.T) {
+	t.Parallel()
+	r, rec := newForeignHarness(t, nil)
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 25; j++ {
+				_, _, _ = r.Resolve(domain.BeadID(fmt.Sprintf("sc-%d", j%5)), "reviewing")
+			}
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, 5, r.Count())
+	assert.Len(t, rec.warnings(), 5)
+	assert.Len(t, r.Beads(), 5)
+}
+
+// P6-28's reader half: `sc status` folds a run log into the beads the run
+// said it was leaving alone, by Source and never by wording.
+func TestForeignStatusBeadsFoldsARunLog(t *testing.T) {
+	t.Parallel()
+	meta := events.MetaAt("run-1", stateClock)
+	evs := []events.Event{
+		events.RunStarted{Meta: meta},
+		events.Warning{Meta: meta, Source: SourceForeignStatus, Bead: "sc-2", Message: "left alone"},
+		events.Warning{Meta: meta, Source: SourceGates, Bead: "sc-9", Message: "gh is unavailable"},
+		events.Warning{Meta: meta, Source: SourceForeignStatus, Bead: "sc-1", Message: "left alone"},
+		events.Warning{Meta: meta, Source: SourceForeignStatus, Bead: "sc-2", Message: "left alone again"},
+		events.Warning{Meta: meta, Source: SourceForeignStatus, Message: "no bead named"},
+		events.Error{Meta: meta, Source: SourceForeignStatus, Bead: "sc-3", Message: "not a warning"},
+	}
+
+	assert.Equal(t, []domain.BeadID{"sc-2", "sc-1"}, ForeignStatusBeads(evs),
+		"distinct beads, in the order they were first reported")
+
+	id, ok := ForeignStatusOf(evs[1])
+	assert.True(t, ok)
+	assert.Equal(t, domain.BeadID("sc-2"), id)
+	_, ok = ForeignStatusOf(evs[2])
+	assert.False(t, ok, "another component's warning is not a foreign-status report")
+	_, ok = ForeignStatusOf(evs[0])
+	assert.False(t, ok)
+	assert.Empty(t, ForeignStatusBeads(nil))
+}
+
+// The live count and the folded count are the same number, which is what
+// lets `sc status` report a finished run off disk and the TUI report a
+// running one from memory.
+func TestForeignStatusCountMatchesTheFoldedLog(t *testing.T) {
+	t.Parallel()
+	r, rec := newForeignHarness(t, nil)
+
+	for _, id := range []domain.BeadID{"sc-1", "sc-2", "sc-1", "sc-3"} {
+		_, _, _ = r.Resolve(id, "reviewing")
+	}
+
+	assert.Equal(t, 3, r.Count())
+	assert.Len(t, ForeignStatusBeads(rec.all()), r.Count())
 }

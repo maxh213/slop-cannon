@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -60,10 +61,38 @@ import (
 // is still assigned to a different agent (bd 1.2.2 refuses a claim
 // otherwise). The lease is renewed every [beads.DefaultRenewInterval] while
 // the agent runs.
+//
+// A demand is re-offered every tick until the work behind it is done, so
+// nothing but the scheduler bounds how often a job that cannot succeed is
+// tried: P6-31's consecutive-failure budget does that. Every firing of one
+// bead's demand that fails without the run being stopped spends a unit of
+// [SchedulerOptions.FailureLimit]; when it runs out the scheduler gives up
+// on the demand for good — it publishes a [events.Warning] naming the last
+// error and takes the bead's D-07 failed edge through
+// [SchedulerOptions.Park] — instead of claiming and firing it again for
+// ever. A firing cancelled by a stop does not count, and a firing that
+// succeeds gives the budget back.
+//
+// The agent events are the scheduler's unless a [Firer] publishes its own,
+// which is what [SchedulerOptions.SuppressAgentEvents] says. Suppression is
+// a promise, not a guarantee: a firer that announced nothing — a planning
+// firer of its own (P6-23), a firing that failed before the supervisor
+// reached a cartridge (P6-31) — would leave the agent out of the run log,
+// `sc status` and the TUI altogether, so the scheduler publishes the pair
+// itself in that case. [Firing.Update] is the signal: a firer that
+// publishes its own agent events records the agent through it at the same
+// moment (the supervisor does both in one step).
 
 // SourceScheduler is the [events.Warning] Source the scheduler
 // stamps on anything it had to skip.
 const SourceScheduler = "scheduler"
+
+// DefaultDemandFailureLimit bounds how many firings of one demand may fail
+// in a row before the scheduler gives up on it and parks its bead (P6-31).
+// Three is the same shape as the supervisor's crash budget: enough for a
+// transient bd or git hiccup, few enough that a job that cannot work costs
+// three sessions and not a run's worth.
+const DefaultDemandFailureLimit = 3
 
 // DefaultTickInterval is how often the loop wakes up when nothing kicks it.
 // The scheduler is event-driven — every finished agent kicks it — so the
@@ -246,9 +275,32 @@ func (d Demand) FiringTask() events.Task {
 
 // Key identifies the work, not the attempt: two demands with the same key
 // are the same job, so the scheduler never has two agents on it at once.
+//
+// The task is deliberately not part of it. One lens can owe two firings in
+// one round (D-08: judge the engineer's pushback, then re-review the fix)
+// and a bead in a conflict round can be offered by two sources at once;
+// keeping the key coarse is what stops either pair running as two agents on
+// one bead. [jobKey] is the finer identity, used only for naming.
+//
+// A disputed item is part of it, though (P6-25): a round can hold two items
+// at once and each is its own arbitration, decided by its own product
+// owner, so two of them are two jobs rather than one job fired twice. The
+// D-05 product-owner cap still bounds how many run together.
 func (d Demand) Key() string {
-	return string(d.Kind) + "|" + string(d.Bead) + "|" + string(d.Lens) + "|" + strconv.Itoa(d.Round)
+	k := string(d.Kind) + "|" + string(d.Bead) + "|" + string(d.Lens) + "|" + strconv.Itoa(d.Round)
+	if w, ok := d.Payload.(FeedbackWork); ok && w.Item != "" {
+		k += "|" + w.Item
+	}
+	return k
 }
+
+// jobKey is the identity the scheduler counts attempts against: the
+// demand's key plus the task it is fired for. The two firings one lens owes
+// in a round that both judges a pushback and re-reviews a fix are different
+// jobs, not a retry of one, so they must not share an attempt counter and
+// be named "-a2" (P6-35). It is never used for the in-flight check, which
+// stays [Demand.Key].
+func jobKey(d Demand) string { return d.Key() + "|" + string(d.FiringTask()) }
 
 // WorkSource reports everything that wants an agent right now. It is
 // consulted once per tick on the loop goroutine, so it need not be safe for
@@ -362,6 +414,19 @@ type ClaimStore interface {
 // *beads.Client is the production ClaimStore.
 var _ ClaimStore = (*beads.Client)(nil)
 
+// BeadParker is the slice of the [StateMachine] the scheduler needs to park
+// a bead whose demand ran out of firings (P6-31): one D-07 transition,
+// applied and persisted like every other. The scheduler asks for the
+// narrowest interface rather than the machine itself so a test can watch
+// exactly the one write it makes.
+type BeadParker interface {
+	// Apply takes the edge the request names, or refuses it.
+	Apply(ctx context.Context, req StateRequest) (StateResult, error)
+}
+
+// *StateMachine is the production BeadParker.
+var _ BeadParker = (*StateMachine)(nil)
+
 // SlotCaps is the D-05 allocation as the scheduler enforces it: one pool
 // per role plus the overall ammo cap.
 type SlotCaps struct {
@@ -430,6 +495,10 @@ type SchedulerStatus struct {
 	// Idle is true when nothing is running and the last dispatch found
 	// nothing to fire: the state a stop condition looks for.
 	Idle bool
+	// Parked is how many demands the scheduler has given up on (P6-31):
+	// their firings failed [SchedulerOptions.FailureLimit] times in a row,
+	// so they are refused a slot however often they are re-offered.
+	Parked int
 	// Quiet is true when the last dispatch fired nothing, whether or not
 	// agents are still running: the ready queue is empty (or every slot it
 	// wanted was taken). A work source that only wants to offer work when
@@ -496,7 +565,24 @@ type SchedulerOptions struct {
 	// SuppressAgentEvents stops the scheduler publishing AgentSpawned,
 	// AgentFinished and AgentFailed, for a [Firer] that publishes richer
 	// ones itself (it knows the pid, the exit code and the retries).
+	//
+	// It only applies to a firing whose firer announced its agent through
+	// [Firing.Update]: one that announced nothing published no agent events
+	// either, so the scheduler publishes the pair rather than leaving the
+	// firing invisible (P6-23, P6-31).
 	SuppressAgentEvents bool
+	// FailureLimit is how many firings of one demand that names a bead may
+	// fail in a row before the scheduler gives up on it (P6-31). Zero means
+	// [DefaultDemandFailureLimit]; negative disables the budget, which is
+	// what a test that wants the old unbounded behaviour asks for. Planning
+	// is not bounded here: it has no bead to park and [Planner] has a
+	// give-up policy of its own (P6-19).
+	FailureLimit int
+	// Park takes the bead of a demand that ran out of firings down the D-07
+	// failed edge. Nil parks the demand anyway — it is never offered an
+	// agent again — but leaves the bead where it is, with the warning as
+	// the only record.
+	Park BeadParker
 }
 
 // liveAgent is one slot in use.
@@ -506,6 +592,11 @@ type liveAgent struct {
 	seq     uint64
 	attempt int
 	cancel  context.CancelFunc
+	// announced is set the first time the firer records the agent through
+	// [Firing.Update], which is the moment a firer that publishes its own
+	// agent events publishes the spawn. A firing that ends with it still
+	// false told nobody about its agent, so the scheduler does.
+	announced bool
 }
 
 // Scheduler is the run's [Loop]: it keeps the ammo full, in D-05 priority
@@ -518,6 +609,7 @@ type Scheduler struct {
 	tick  time.Duration
 	renew time.Duration
 	drain time.Duration
+	limit int
 
 	kickCh chan struct{}
 	wg     sync.WaitGroup
@@ -527,6 +619,8 @@ type Scheduler struct {
 	live     map[domain.AgentID]*liveAgent
 	byKey    map[string]domain.AgentID
 	attempts map[string]int
+	failures map[string]int
+	parked   map[string]bool
 	byRole   map[domain.Role]int
 	ticks    uint64
 	fired    uint64
@@ -541,12 +635,21 @@ func NewScheduler(opts SchedulerOptions) *Scheduler {
 		tick:     opts.Tick,
 		renew:    opts.RenewInterval,
 		drain:    opts.DrainGrace,
+		limit:    opts.FailureLimit,
 		kickCh:   make(chan struct{}, 1),
 		caps:     CapsFor(opts.Allocation),
 		live:     map[domain.AgentID]*liveAgent{},
 		byKey:    map[string]domain.AgentID{},
 		attempts: map[string]int{},
+		failures: map[string]int{},
+		parked:   map[string]bool{},
 		byRole:   map[domain.Role]int{},
+	}
+	if s.limit == 0 {
+		s.limit = DefaultDemandFailureLimit
+	}
+	if s.limit < 0 {
+		s.limit = 0 // the budget is off
 	}
 	if s.clock == nil {
 		s.clock = beads.SystemClock()
@@ -602,6 +705,7 @@ func (s *Scheduler) statusLocked() SchedulerStatus {
 		ByRole: make(map[domain.Role]int, len(s.byRole)),
 		Ticks:  s.ticks,
 		Fired:  s.fired,
+		Parked: len(s.parked),
 		Idle:   s.idle && len(s.live) == 0,
 		Quiet:  s.idle,
 	}
@@ -800,6 +904,12 @@ func (s *Scheduler) reserve(d Demand) bool {
 	if _, busy := s.byKey[d.Key()]; busy {
 		return false
 	}
+	if s.parked[d.Key()] {
+		// The scheduler gave up on this demand (P6-31). The source has no
+		// way of knowing that, so it goes on offering it; refusing it here
+		// silently is what ends the livelock.
+		return false
+	}
 	if len(s.live) >= s.caps.Ammo {
 		return false
 	}
@@ -851,14 +961,15 @@ func (s *Scheduler) plannedAgentID(d Demand) domain.AgentID {
 		return d.Agent
 	}
 	s.mu.Lock()
-	attempt := s.attempts[d.Key()] + 1
+	attempt := s.attempts[jobKey(d)] + 1
 	s.mu.Unlock()
 	return mintAgentID(d, attempt)
 }
 
 // mintAgentID names an agent after its job: "eng-sc-68s-r2",
-// "tester-qa-sc-68s-r2", "po-sc-68s-r3", "po-plan-1". A retry of the same
-// job gets an "-a<attempt>" suffix so no two agents of a run share a name.
+// "tester-qa-sc-68s-r2", "tester-qa-sc-68s-r2-pushback", "po-sc-68s-r3",
+// "po-plan-1". A retry of the same job gets an "-a<attempt>" suffix so no
+// two agents of a run share a name.
 func mintAgentID(d Demand, attempt int) domain.AgentID {
 	var id string
 	switch d.Kind {
@@ -877,10 +988,36 @@ func mintAgentID(d Demand, attempt int) domain.AgentID {
 	if d.Round > 0 {
 		id += "-r" + strconv.Itoa(d.Round)
 	}
+	id += reviewTaskSuffix(d)
 	if attempt > 1 {
 		id += "-a" + strconv.Itoa(attempt)
 	}
 	return domain.AgentID(id)
+}
+
+// reviewTaskSuffix tells the two firings one lens can owe in a single round
+// apart (P6-35). A round that both judges an engineer's pushback and
+// re-reviews the fix fires the same lens twice at the same round number
+// (D-08), and both are the tester's first go at their own job: naming the
+// second one "-a2" would say it was a retry of the first. The re-review
+// keeps the plain name and the pushback judgement is marked, so a reader of
+// the event stream, the TUI or an agent log file can see which is which.
+//
+// Only reviews are marked: an engineer's tasks are already distinct agents
+// by construction (a conflict round names its own agent, P6-06) and the
+// product owner's arbitration ids carry the item they rule on.
+func reviewTaskSuffix(d Demand) string {
+	if d.Kind != DemandReview {
+		return ""
+	}
+	switch task := d.FiringTask(); task {
+	case events.TaskReview, "":
+		return ""
+	case events.TaskEvaluatePushback:
+		return "-pushback"
+	default:
+		return "-" + strings.ReplaceAll(string(task), "_", "-")
+	}
 }
 
 // claim gives the bead to the agent before it is fired (P6-13).
@@ -951,8 +1088,8 @@ func (s *Scheduler) start(ctx context.Context, r *Run, d Demand) {
 	now := s.clock.Now()
 
 	s.mu.Lock()
-	s.attempts[d.Key()]++
-	attempt := s.attempts[d.Key()]
+	s.attempts[jobKey(d)]++
+	attempt := s.attempts[jobKey(d)]
 	s.fired++
 	seq := s.fired
 	id := d.Agent
@@ -1024,20 +1161,55 @@ func (s *Scheduler) fire(ctx context.Context, r *Run, l *liveAgent, startedAt ti
 
 	s.mu.Lock()
 	agent := l.agent
+	announced := l.announced
 	s.mu.Unlock()
 
 	if stopErr := r.AgentStopped(agent.ID); stopErr != nil {
 		r.Warn(SourceScheduler, "could not clear agent "+string(agent.ID), stopErr)
 	}
+
+	killed := err != nil && ctx.Err() != nil && errors.Is(err, context.Canceled)
+	switch {
+	case err == nil:
+		s.clearFailures(l.demand)
+	case ctx.Err() == nil:
+		// A firing that failed on its own spends the demand's budget. One
+		// that ended because the run is stopping says nothing about
+		// whether the work can ever succeed, whichever error it reports,
+		// so it spends nothing (P6-31).
+		s.spendBudget(ctx, r, l, agent.ID, err)
+	}
+
 	if s.opts.SuppressAgentEvents {
-		return
+		if announced {
+			// The firer published its own, richer pair.
+			return
+		}
+		// Nobody announced this agent, so nobody published it either: the
+		// scheduler minted it, recorded it in state.json and is about to
+		// report how it ended, so it publishes the spawn too and the pair
+		// stays balanced (P6-23, P6-31).
+		r.Publish(events.AgentSpawned{
+			Meta:      r.Meta(),
+			Agent:     agent,
+			Task:      l.demand.FiringTask(),
+			BeadTitle: l.demand.BeadTitle,
+			Round:     l.demand.Round,
+			Attempt:   l.attempt,
+		})
 	}
 	if err != nil {
 		failure := res.Failure
 		if failure == "" {
 			failure = events.FailureCrash
+			if s.opts.SuppressAgentEvents && !announced {
+				// The firing never reached a cartridge — it failed before
+				// the firer had an agent to announce — so nothing crashed
+				// but the run's own machinery (P6-31).
+				failure = events.FailureInternal
+			}
 		}
-		if ctx.Err() != nil && errors.Is(err, context.Canceled) {
+		if killed {
 			failure = events.FailureKilled
 		}
 		r.Publish(events.AgentFailed{
@@ -1079,11 +1251,16 @@ func (s *Scheduler) call(ctx context.Context, f Firing) (res FireResult, err err
 	return s.opts.Fire.Fire(ctx, f)
 }
 
-// update records a change to a live agent (its pid, most usefully).
+// update records a change to a live agent (its pid, most usefully). It is
+// also how the scheduler learns that the firer has announced the agent: a
+// firer that publishes its own events.AgentSpawned records the agent
+// through this hook in the same step, so a firing that never calls it never
+// published anything either (P6-23, P6-31).
 func (s *Scheduler) update(l *liveAgent, r *Run, a domain.Agent) {
 	s.mu.Lock()
 	a.ID = l.agent.ID
 	l.agent = a
+	l.announced = true
 	s.mu.Unlock()
 	if err := r.AgentUpdated(a); err != nil {
 		r.Warn(SourceScheduler, "could not record agent "+string(a.ID), err)
@@ -1104,6 +1281,118 @@ func (s *Scheduler) finished(l *liveAgent) {
 	if n := s.byRole[l.demand.Role()]; n > 0 {
 		s.byRole[l.demand.Role()] = n - 1
 	}
+}
+
+// clearFailures forgets a demand's failures once one of its firings has
+// worked: the budget bounds failures in a row, not failures in a run.
+func (s *Scheduler) clearFailures(d Demand) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.failures, d.Key())
+}
+
+// spendBudget charges one failed firing to its demand and parks the demand
+// when the budget is gone (P6-31).
+//
+// Every failure counts, [ErrPostSession] included: that one says the agent
+// answered and the run could not record the result, which firing the same
+// demand again would only repeat — the supervisor refuses to re-run the
+// session, so the demand comes back to the scheduler and is claimed and
+// fired from scratch instead. It is the clearest case of a demand that must
+// not be tried for ever, so the warning names the bookkeeping rather than
+// the cartridge.
+//
+// A demand with no bead is left alone: planning is the only one, it has
+// nothing to park, and P6-19's own give-up policy already bounds a product
+// owner that cannot produce a plan (a shorter budget here would silently
+// override the planner's).
+func (s *Scheduler) spendBudget(ctx context.Context, r *Run, l *liveAgent, agent domain.AgentID, err error) {
+	if s.limit <= 0 || l.demand.Bead == "" {
+		return
+	}
+	key := l.demand.Key()
+	s.mu.Lock()
+	s.failures[key]++
+	n := s.failures[key]
+	spent := n >= s.limit && !s.parked[key]
+	if spent {
+		s.parked[key] = true
+		delete(s.failures, key)
+	}
+	s.mu.Unlock()
+	if !spent {
+		return
+	}
+	s.park(ctx, r, l.demand, agent, n, err)
+}
+
+// park gives up on a demand: it says so, and takes its bead down the D-07
+// failed edge so the run can settle instead of offering work nothing will
+// ever pick up. The bead keeps whatever the last agent left behind — this
+// is an abandonment, not a rollback — and a person reads the warning to
+// find out why. It is only ever reached for a demand that names a bead.
+func (s *Scheduler) park(ctx context.Context, r *Run, d Demand, agent domain.AgentID, n int, err error) {
+	msg := fmt.Sprintf("gave up on the %s of %s after %d firings failed in a row; it will not be offered an agent again",
+		d.Kind, d.Bead, n)
+	if errors.Is(err, ErrPostSession) {
+		msg += " (the last agent answered: it was the run's own bookkeeping afterwards that failed, not the cartridge)"
+	}
+	s.warnAbout(r, d, agent, msg, err)
+
+	if s.opts.Park == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		// The run is stopping; the shutdown release owns the bead now.
+		return
+	}
+	from := parkFrom(d)
+	if from == "" {
+		s.warnAbout(r, d, agent, fmt.Sprintf(
+			"could not park %s: nothing told the scheduler what state it is in", d.Bead), nil)
+		return
+	}
+	if _, aerr := s.opts.Park.Apply(ctx, StateRequest{
+		Bead:   d.Bead,
+		From:   from,
+		Event:  BeadEventFailed,
+		Reason: fmt.Sprintf("%d firings of the %s failed in a row", n, d.Kind),
+		Round:  d.Round,
+	}); aerr != nil {
+		s.warnAbout(r, d, agent, "could not park "+string(d.Bead)+" as failed", aerr)
+	}
+}
+
+// parkFrom is the state the bead of a parked demand is in. A demand that
+// claims its bead moved it to in_progress before the firing (P6-13);
+// anything else is where the work source last saw it. An unknown state is
+// not guessed: the D-07 table is given a real one or nothing happens.
+func parkFrom(d Demand) domain.BeadState {
+	if d.Claim != ClaimNone {
+		return domain.BeadStateInProgress
+	}
+	if d.From.Workflow() {
+		return d.From
+	}
+	return ""
+}
+
+// warnAbout publishes a Warning that names the bead and the agent it is
+// about, which [Run.Warn] does not, and logs it the same way.
+func (s *Scheduler) warnAbout(r *Run, d Demand, agent domain.AgentID, msg string, err error) {
+	w := events.Warning{
+		Meta:    r.Meta(),
+		Source:  SourceScheduler,
+		Message: msg,
+		Bead:    d.Bead,
+		Agent:   agent,
+	}
+	if err != nil {
+		w.Err = err.Error()
+	}
+	r.Log().Warn(msg, slog.String("source", SourceScheduler),
+		slog.String("bead", string(d.Bead)), slog.String("agent", string(agent)), slog.Any("err", err))
+	r.Publish(w)
 }
 
 // renewLease keeps the agent's claim alive while it works (P6-13). A lease

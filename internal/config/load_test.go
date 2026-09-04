@@ -41,6 +41,7 @@ ammo = 8
 safety = false
 vibes = ["global-vibes.md"]
 rules = ["/abs/rules.md"]
+exclude = ["secrets/*.key"]
 check_command = "make check"
 idle_replan_interval = "5m"
 gate_poll_interval = "30s"
@@ -52,6 +53,8 @@ max_pushback_rounds = 1
 agent_timeout = "20m"
 max_tokens = 1000
 max_cost_usd = 2.5
+max_plan_rejections = 3
+max_plan_failures = 7
 
 [cartridges.claude]
 model = "fable"
@@ -68,6 +71,7 @@ ammo = 12
 safety = true
 vibes = ["repo-vibes.md", "global-vibes.md"]
 rules = ["docs/rules.md"]
+exclude = ["private/**", "secrets/*.key"]
 check_command = "go test ./..."
 idle_replan_interval = "1h"
 gate_poll_interval = "2m"
@@ -79,6 +83,8 @@ max_pushback_rounds = 3
 agent_timeout = "45m"
 max_tokens = 2000
 max_cost_usd = 9
+max_plan_rejections = 4
+max_plan_failures = 9
 
 [roles.engineer]
 cartridge = "claude"
@@ -154,7 +160,8 @@ func TestLoadGlobalOnly(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, eff.IdleReplanInterval.Duration())
 	assert.Equal(t, 30*time.Second, eff.GatePollInterval.Duration())
 	assert.Equal(t, 6, eff.MaxBeadsPerPlan)
-	assert.Equal(t, Limits{MaxReviewRounds: 4, MaxPushbackRounds: 1, AgentTimeout: NewDuration(20 * time.Minute), MaxTokens: 1000, MaxCostUSD: 2.5}, eff.Limits)
+	assert.Equal(t, Limits{MaxReviewRounds: 4, MaxPushbackRounds: 1, AgentTimeout: NewDuration(20 * time.Minute),
+		MaxTokens: 1000, MaxCostUSD: 2.5, MaxPlanRejections: 3, MaxPlanFailures: 7}, eff.Limits)
 	assert.Equal(t, map[domain.Role]string{domain.RoleTester: "claude"}, eff.Roles)
 
 	for _, key := range scalarKeys {
@@ -179,7 +186,8 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 	assert.Equal(t, "go test ./...", eff.CheckCommand)
 	assert.Equal(t, time.Hour, eff.IdleReplanInterval.Duration())
 	assert.Equal(t, 2*time.Minute, eff.GatePollInterval.Duration(), "the repo's gate poll interval wins")
-	assert.Equal(t, Limits{MaxReviewRounds: 6, MaxPushbackRounds: 3, AgentTimeout: NewDuration(45 * time.Minute), MaxTokens: 2000, MaxCostUSD: 9}, eff.Limits)
+	assert.Equal(t, Limits{MaxReviewRounds: 6, MaxPushbackRounds: 3, AgentTimeout: NewDuration(45 * time.Minute),
+		MaxTokens: 2000, MaxCostUSD: 9, MaxPlanRejections: 4, MaxPlanFailures: 9}, eff.Limits)
 	// Lists union across layers, global first, deduplicated by absolute path.
 	globalDir, repoDir := filepath.Dir(globalPath), filepath.Dir(repoPath)
 	assert.Equal(t, []string{
@@ -188,6 +196,9 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 		filepath.Join(repoDir, "global-vibes.md"),
 	}, eff.Vibes)
 	assert.Equal(t, []string{"/abs/rules.md", filepath.Join(repoDir, "docs", "rules.md")}, eff.Rules)
+	// exclude patterns are globs, so they union across layers as written,
+	// deduplicated rather than resolved against the config file's directory.
+	assert.Equal(t, []string{"secrets/*.key", "private/**"}, eff.Exclude)
 	// Cartridges stay global.
 	assert.Equal(t, "claude", eff.ActiveCartridge)
 	assert.Equal(t, "fable", eff.Cartridges["claude"].Model)
@@ -196,7 +207,7 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 
 	want := map[string]Source{
 		KeyActiveCartridge: SourceGlobal, KeyCartridges: SourceGlobal,
-		KeyAmmo: SourceRepo, KeySafety: SourceRepo, KeyVibes: SourceMerged, KeyRules: SourceMerged,
+		KeyAmmo: SourceRepo, KeySafety: SourceRepo, KeyVibes: SourceMerged, KeyRules: SourceMerged, KeyExclude: SourceMerged,
 		KeyCheckCommand: SourceRepo, KeyIdleReplanInterval: SourceRepo, KeyGatePollInterval: SourceRepo,
 		KeyMaxReviewRounds: SourceRepo, KeyMaxPushbackRounds: SourceRepo, KeyAgentTimeout: SourceRepo,
 		KeyMaxTokens: SourceRepo, KeyMaxCostUSD: SourceRepo,
@@ -334,6 +345,8 @@ func TestLoadValidation(t *testing.T) {
 		{"zero timeout", "[limits]\nagent_timeout = \"0s\"\n", "", KeyAgentTimeout, "must be a positive duration"},
 		{"negative tokens", "[limits]\nmax_tokens = -5\n", "", KeyMaxTokens, "must not be negative"},
 		{"negative cost", "", "[limits]\nmax_cost_usd = -0.5\n", KeyMaxCostUSD, "must not be negative"},
+		{"no plan rejections", "[limits]\nmax_plan_rejections = 0\n", "", KeyMaxPlanRejections, "must be at least 1"},
+		{"negative plan failures", "", "[limits]\nmax_plan_failures = -1\n", KeyMaxPlanFailures, "must be at least 1"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -479,6 +492,8 @@ func TestEntries(t *testing.T) {
 	assert.Equal(t, "20m", byKey[KeyAgentTimeout].Value)
 	assert.Equal(t, "2.5", byKey[KeyMaxCostUSD].Value)
 	assert.Equal(t, "1000", byKey[KeyMaxTokens].Value)
+	assert.Equal(t, Entry{Key: KeyMaxPlanRejections, Value: "3", Source: SourceGlobal}, byKey[KeyMaxPlanRejections])
+	assert.Equal(t, Entry{Key: KeyMaxPlanFailures, Value: "7", Source: SourceGlobal}, byKey[KeyMaxPlanFailures])
 	assert.Equal(t, Entry{Key: "roles.tester.cartridge", Value: "claude", Source: SourceGlobal}, byKey["roles.tester.cartridge"])
 	assert.Equal(t, Entry{Key: "roles.po.cartridge", Value: "", Source: SourceDefault}, byKey["roles.po.cartridge"])
 	assert.Equal(t, "[/abs/rules.md]", byKey[KeyRules].Value)

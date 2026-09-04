@@ -797,6 +797,8 @@ func TestSupervisorInstallsTheReadOnlyBDShim(t *testing.T) {
 type supBareCartridge struct {
 	mu       sync.Mutex
 	workdirs []string
+	prompts  []string
+	gitErr   string
 	sawGit   bool
 	sawFile  string
 }
@@ -815,8 +817,18 @@ func (c *supBareCartridge) Run(_ context.Context, spec cartridge.RunSpec) (cartr
 	go func() {
 		c.mu.Lock()
 		c.workdirs = append(c.workdirs, spec.Workdir)
+		c.prompts = append(c.prompts, spec.Prompt)
 		if _, err := os.Stat(filepath.Join(spec.Workdir, ".git")); err == nil {
 			c.sawGit = true
+		}
+		// What an agent that ignored the note would hit (P6-30): git is
+		// not usable in the copy, and the failure is recorded so the test
+		// can show the note is telling the truth. A machine with no git at
+		// all fails here too, which is the same answer.
+		gitCmd := exec.Command("git", "status", "--porcelain")
+		gitCmd.Dir = spec.Workdir
+		if out, err := gitCmd.CombinedOutput(); err != nil {
+			c.gitErr = strings.TrimSpace(err.Error() + ": " + string(out))
 		}
 		if b, err := os.ReadFile(filepath.Join(spec.Workdir, "source.txt")); err == nil {
 			c.sawFile = string(b)
@@ -845,6 +857,21 @@ func (c *supBareCartridge) Workdirs() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return append([]string(nil), c.workdirs...)
+}
+
+// Prompts returns the prompt of every session the adapter was handed.
+func (c *supBareCartridge) Prompts() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.prompts...)
+}
+
+// GitError is what `git status` said in the last session's working
+// directory, empty when git worked there.
+func (c *supBareCartridge) GitError() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.gitErr
 }
 
 func TestSupervisorFiresACartridgeWithoutToolControlsInAWorktreeCopy(t *testing.T) {
@@ -885,6 +912,69 @@ func TestSupervisorFiresACartridgeWithoutToolControlsInAWorktreeCopy(t *testing.
 	defer bare.mu.Unlock()
 	assert.Equal(t, "the reviewed code\n", bare.sawFile)
 	assert.False(t, bare.sawGit, ".git must not be copied: it points into the real repository")
+}
+
+// P6-30: the copy has no `.git`, so the session must be told git does not
+// work there rather than be left to discover it by running git.
+func TestASessionInAWorktreeCopyIsToldItHasNoGit(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+	bare := &supBareCartridge{}
+	sel, err := cartridge.NewSelector(
+		config.Config{ActiveCartridge: supBare, Cartridges: map[string]config.Cartridge{supBare: {}}, Roles: map[domain.Role]string{}},
+		map[string]cartridge.Cartridge{supBare: bare},
+	)
+	require.NoError(t, err)
+	sup := f.supervisor(t, func(o *SupervisorOptions) { o.Cartridges = sel })
+	wt := f.worktree(t, "bd-30")
+
+	_, tr, err := FireAgent[domain.Verdict](context.Background(), sup, supTesterFiring("tester-qa-bd-30-r1", "bd-30", wt))
+	require.NoError(t, err)
+	require.Equal(t, agents.EnforceCopiedWorktree, tr.Enforcement.Mode)
+	assert.Contains(t, tr.Enforcement.Detail, "no git",
+		"the enforcement says what the degrade costs, not only that it is in force")
+
+	prompts := bare.Prompts()
+	require.Len(t, prompts, 1)
+	assert.Contains(t, prompts[0], "review the diff", "the builder's own prompt survives")
+	assert.Contains(t, prompts[0], CopiedWorktreeNote, "the firing is told it has no git (P6-30)")
+	assert.Contains(t, CopiedWorktreeNote, "git", "the note has to name git to be worth appending")
+
+	// And the note is telling the truth: git really does not work in the copy.
+	assert.NotEmpty(t, bare.GitError(), "git must fail in the copy, which is why the note exists")
+}
+
+// A firing whose cartridge holds the policy itself runs in the real
+// worktree, where git works, so it gets no note.
+func TestAFiringInItsRealWorktreeIsNotToldAboutTheCopy(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+	sup := f.supervisor(t, nil)
+	wt := f.worktree(t, "bd-31")
+
+	fire := supTesterFiring("tester-qa-bd-31-r1", "bd-31", wt)
+	build := fire.Build
+	fire.Build = func(ctx context.Context, fc FiringContext) (agents.AgentRun, error) {
+		assert.NotEqual(t, agents.EnforceCopiedWorktree, fc.Enforcement.Mode)
+		return build(ctx, fc)
+	}
+	_, tr, err := FireAgent[domain.Verdict](context.Background(), sup, fire)
+	require.NoError(t, err)
+	require.NotEqual(t, agents.EnforceCopiedWorktree, tr.Enforcement.Mode)
+	require.Len(t, tr.Attempts, 1)
+	assert.Contains(t, tr.Attempts[0].Prompt, "review the diff")
+	assert.NotContains(t, tr.Attempts[0].Prompt, CopiedWorktreeNote, "no degrade, no note")
+}
+
+func TestCopiedWorktreeNoteIsAppendedOnce(t *testing.T) {
+	first := noteCopiedWorktree("review the diff")
+	assert.Contains(t, first, "review the diff")
+	assert.Contains(t, first, CopiedWorktreeNote)
+	assert.Equal(t, first, noteCopiedWorktree(first), "a rebuilt prompt is not noted twice")
+	assert.Equal(t, 1, strings.Count(first, CopiedWorktreeNote))
+
+	// An empty prompt is refused by the run spec; the note must not be
+	// what makes it valid.
+	assert.Empty(t, noteCopiedWorktree(""))
+	assert.Equal(t, "  \n", noteCopiedWorktree("  \n"))
 }
 
 func TestCopyWorktreeCopiesTheTreeWithoutGit(t *testing.T) {

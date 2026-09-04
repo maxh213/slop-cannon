@@ -1137,8 +1137,12 @@ func TestDelivererMergeLandedButTheCloseFailed(t *testing.T) {
 	if out.Kind != DeliveryRetryable || out.State != domain.BeadStateDelivering {
 		t.Fatalf("outcome = %s/%s, want retryable/delivering", out.Kind, out.State)
 	}
-	if n := len(h.host.published(events.KindMerged)); n != 1 {
-		t.Errorf("Merged events = %d, want 1: the work did land", n)
+	if n := len(h.host.published(events.KindMerged)); n != 0 {
+		// P6-40: the work did land, but the bead is not closed, so the
+		// merge is not announced yet — the retry that finishes the close
+		// announces it, once. TestDelivererAnnouncesOneMergePerBead drives
+		// that retry.
+		t.Errorf("Merged events = %d, want 0 until the close lands", n)
 	}
 	if got := h.host.states(); !deliveryEqualStrings(got, []string{"approved→delivering"}) {
 		t.Errorf("state changes = %v, want only the delivering transition", got)
@@ -2102,4 +2106,605 @@ func deliveryContains(all []string, sub string) bool {
 		}
 	}
 	return false
+}
+
+// ------------------------------------------- one merge, one event (P6-40)
+
+// TestDelivererAnnouncesOneMergePerBead is P6-40: a merge whose close
+// failed is retried, and the retry must not announce the same commit a
+// second time. Nothing is published until the bead is closed, and a stale
+// caller that delivers the bead again afterwards announces nothing new.
+func TestDelivererAnnouncesOneMergePerBead(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	boom := errors.New("bd: blockers are still open")
+	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+		h.store.failAfter("close", boom)
+	})
+
+	out, err := h.Deliver(ctx, DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
+	if !errors.Is(err, boom) {
+		t.Fatalf("Deliver: err = %v, want the close failure", err)
+	}
+	if out.Kind != DeliveryRetryable {
+		t.Fatalf("outcome = %s, want retryable", out.Kind)
+	}
+	if n := len(h.host.published(events.KindMerged)); n != 0 {
+		t.Fatalf("Merged events after the failed close = %d, want 0: the bead is not closed yet", n)
+	}
+	if h.announced("sc-68s") {
+		t.Error("the merge counts as announced before any event was published")
+	}
+
+	// bd comes back and the caller retries the delivery it was told was
+	// retryable; gitx finds the merge already landed and the close lands.
+	h.store.failAfter("", nil)
+	retry := DeliveryRequest{Bead: deliveryBead(domain.BeadStateDelivering)}
+	out, err = h.Deliver(ctx, retry)
+	if err != nil {
+		t.Fatalf("the retry: %v", err)
+	}
+	if out.Kind != DeliveryMerged || out.State != domain.BeadStateClosed {
+		t.Fatalf("retry outcome = %s/%s, want merged/closed (%s)", out.Kind, out.State, out.Summary())
+	}
+	if n := len(h.host.published(events.KindMerged)); n != 1 {
+		t.Fatalf("Merged events after the retry closed the bead = %d, want exactly 1", n)
+	}
+	if !h.announced("sc-68s") {
+		t.Error("the merge was published but is not recorded as announced")
+	}
+	if !deliveryEventOrder(h.host, events.KindMerged, events.KindBeadStateChanged) {
+		t.Error("Merged was published before the close transition; it must follow it (P6-40)")
+	}
+
+	// A caller still holding its "delivering" view delivers again. The
+	// state machine writes the (idempotent) close a second time — that is
+	// the caller's mistake, not the announcement's — but the merge is
+	// announced only the once.
+	if _, err := h.Deliver(ctx, retry); err != nil {
+		t.Fatalf("the stale retry: %v", err)
+	}
+	if n := len(h.host.published(events.KindMerged)); n != 1 {
+		t.Errorf("Merged events after a stale re-delivery = %d, want 1", n)
+	}
+}
+
+// deliveryEventOrder reports whether the last event of kind a was
+// published after at least one event of kind b.
+func deliveryEventOrder(h *deliveryHostFake, a, b events.Kind) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	last, first := -1, -1
+	for i, ev := range h.events {
+		if ev.Kind() == a {
+			last = i
+		}
+		if ev.Kind() == b && first < 0 {
+			first = i
+		}
+	}
+	return last > first && first >= 0
+}
+
+// ------------------------------- the gate poller ends a delivery (P6-41)
+
+// deliveryGateStore is the [GateStore] the P6-41 test polls: one gh:pr gate
+// that bd reports as resolved.
+type deliveryGateStore struct {
+	gate    beads.Gate
+	results []beads.GateResult
+
+	mu       sync.Mutex
+	checks   int
+	resolved []domain.BeadID
+}
+
+func (s *deliveryGateStore) CheckGates(context.Context, beads.GateCheckOptions) (beads.GateCheck, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.checks++
+	if s.checks > 1 {
+		// bd hands a merge verdict out exactly once; later polls see
+		// nothing.
+		return beads.GateCheck{}, nil
+	}
+	return beads.GateCheck{Checked: len(s.results), Resolved: len(s.results), Results: s.results}, nil
+}
+
+func (s *deliveryGateStore) ShowGate(_ context.Context, id domain.BeadID) (beads.Gate, error) {
+	if id != s.gate.ID {
+		return beads.Gate{}, fmt.Errorf("no such gate %s", id)
+	}
+	return s.gate, nil
+}
+
+func (s *deliveryGateStore) ResolveGate(_ context.Context, id domain.BeadID, _ string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resolved = append(s.resolved, id)
+	return nil
+}
+
+// deliveryBeadStatus is the [GateBeadReader] and [ResumeBeadReader] of
+// these tests: the status bd holds for each bead, and an optional failure.
+type deliveryBeadStatus struct {
+	mu       sync.Mutex
+	statuses map[domain.BeadID]string
+	err      error
+	shown    []domain.BeadID
+}
+
+func (r *deliveryBeadStatus) Show(_ context.Context, ids ...domain.BeadID) ([]beads.Issue, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.shown = append(r.shown, ids...)
+	if r.err != nil {
+		return nil, r.err
+	}
+	out := make([]beads.Issue, 0, len(ids))
+	for _, id := range ids {
+		status, ok := r.statuses[id]
+		if !ok {
+			continue
+		}
+		out = append(out, beads.Issue{ID: id, Status: status})
+	}
+	return out, nil
+}
+
+// deliveryGateClock is a [beads.Clock] that never advances: nothing in a
+// single poll reads the wall clock.
+type deliveryGateClock struct{}
+
+func (deliveryGateClock) Now() time.Time { return deliveryClock }
+
+func (deliveryGateClock) After(time.Duration) <-chan time.Time { return make(chan time.Time) }
+
+// TestDelivererForgetsABeadTheGatePollerClosed is P6-41: a safety-on
+// delivery correctly stops at delivering behind its gh:pr gate, so nothing
+// inside the deliverer ends it. The gate poller that closes the bead is
+// what tells it, through [Deliverer.Observe], and the per-bead bookkeeping
+// of that delivery goes with it.
+func TestDelivererForgetsABeadTheGatePollerClosed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	h := newDeliveryHarness(t, true, func(_ *DeliveryOptions, h *deliveryHarness) {
+		// The first delivery finds the worktree mid-rebase, which is the
+		// one way a safety-on delivery raises a conflict round; the probes
+		// after it are clean.
+		h.git.rebase = []RebaseState{{InProgress: true, Branch: "sc/sc-68s-add-retry", Files: []string{"internal/a.go"}}}
+	})
+
+	first, err := h.Deliver(ctx, DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
+	if err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if first.Kind != DeliveryConflict {
+		t.Fatalf("first outcome = %s, want conflict (%s)", first.Kind, first.Summary())
+	}
+	// The engineer resolves it; with no baseline to measure against D-09
+	// errs on the side of a review, so the bead goes back through one.
+	again, err := h.Resolved(ctx, "sc-68s")
+	if err != nil {
+		t.Fatalf("Resolved: %v", err)
+	}
+	if again.Kind != DeliveryNeedsReview {
+		t.Fatalf("resolution outcome = %s, want needs_review (%s)", again.Kind, again.Summary())
+	}
+	out, err := h.Deliver(ctx, DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)})
+	if err != nil {
+		t.Fatalf("the delivery after the review: %v", err)
+	}
+	if out.Kind != DeliveryPending || out.Gate == "" {
+		t.Fatalf("outcome = %s, gate = %q, want pending behind a gate", out.Kind, out.Gate)
+	}
+	if n := h.tracking(); n != 1 {
+		t.Fatalf("beads tracked after the delivery = %d, want 1 (the conflict round it had)", n)
+	}
+
+	// The human merges the pull request and the gate poller sees it.
+	tee := PublisherFunc(func(ev events.Event) {
+		h.host.Publish(ev)
+		h.Observe(ev)
+	})
+	gates := &deliveryGateStore{
+		gate: beads.Gate{
+			ID: out.Gate, Status: "closed", Type: "gate", AwaitType: beads.GateTypePR,
+			AwaitID: "7", Blocks: "sc-68s",
+		},
+		results: []beads.GateResult{{GateID: out.Gate, Outcome: beads.GateResolved, Detail: "PR 'x' was merged"}},
+	}
+	reader := &deliveryBeadStatus{statuses: map[domain.BeadID]string{"sc-68s": string(domain.BeadStateDelivering)}}
+	poller, err := NewGatePoller(GatePollerOptions{
+		Gates:  gates,
+		Beads:  reader,
+		Sink:   tee,
+		Run:    h.host.ID(),
+		Branch: "main",
+		Clock:  deliveryGateClock{},
+		States: NewStateMachine(&deliveryStoreFake{},
+			WithStatePublisher(tee), WithStateRun(h.host.ID()), WithStateClock(h.host.Now)),
+	})
+	if err != nil {
+		t.Fatalf("NewGatePoller: %v", err)
+	}
+	res, err := poller.Poll(ctx)
+	if err != nil {
+		t.Fatalf("Poll: %v", err)
+	}
+	if got, want := len(res.Closed), 1; got != want {
+		t.Fatalf("beads closed by the poll = %d, want %d (%+v)", got, want, res)
+	}
+	if n := h.tracking(); n != 0 {
+		t.Errorf("beads tracked after the gate poller closed the bead = %d, want 0 (P6-41)", n)
+	}
+	if _, ok := h.PendingFor("sc-68s"); ok {
+		t.Error("a conflict round is still registered for a closed bead")
+	}
+}
+
+// TestDelivererSettleIsSelectiveAndIdempotent covers the rest of the P6-41
+// seam: an escalated bead is still the delivery's business, a bead nobody
+// tracked is a no-op, and Settle can be called twice.
+func TestDelivererSettleIsSelectiveAndIdempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	h := newDeliveryHarness(t, false, func(_ *DeliveryOptions, h *deliveryHarness) {
+		h.merge.errs = []error{deliveryConflictErr("internal/a.go")}
+	})
+	if _, err := h.Deliver(ctx, DeliveryRequest{Bead: deliveryBead(domain.BeadStateApproved)}); err != nil {
+		t.Fatalf("Deliver: %v", err)
+	}
+	if n := h.tracking(); n != 1 {
+		t.Fatalf("beads tracked = %d, want 1", n)
+	}
+	meta := events.MetaAt(h.host.ID(), deliveryClock)
+	h.Observe(events.BeadStateChanged{Meta: meta, Bead: "sc-68s", From: domain.BeadStateInReview, To: domain.BeadStateEscalated})
+	if n := h.tracking(); n != 1 {
+		t.Errorf("beads tracked after an escalation = %d, want 1: the ruling may yet send it back (D-08)", n)
+	}
+	h.Observe(events.BeadStateChanged{Meta: meta, Bead: "", To: domain.BeadStateClosed})
+	h.Observe(events.RunStarted{Meta: meta})
+	if n := h.tracking(); n != 1 {
+		t.Errorf("beads tracked after events naming no bead = %d, want 1", n)
+	}
+	h.Settle("sc-other")
+	if n := h.tracking(); n != 1 {
+		t.Errorf("beads tracked after settling a bead nobody delivered = %d, want 1", n)
+	}
+	h.Observe(events.Merged{Meta: meta, Bead: "sc-68s", SHA: "abcdef1234567"})
+	h.Settle("sc-68s")
+	if n := h.tracking(); n != 0 {
+		t.Errorf("beads tracked after the delivery ended = %d, want 0", n)
+	}
+}
+
+// ------------------------------------------- the resume guard (P6-37)
+
+// deliveryResumeStore is the [gitx.ResumeTracker] the guard writes through
+// once it has allowed a write.
+type deliveryResumeStore struct {
+	mu       sync.Mutex
+	calls    []string
+	statuses map[domain.BeadID]domain.BeadState
+	patches  []beads.Patch
+	err      error
+	closeErr error
+}
+
+func (s *deliveryResumeStore) SetStatus(_ context.Context, id domain.BeadID, state domain.BeadState) (beads.Issue, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "status "+string(id)+" "+string(state))
+	if s.err != nil {
+		return beads.Issue{}, s.err
+	}
+	if s.statuses == nil {
+		s.statuses = map[domain.BeadID]domain.BeadState{}
+	}
+	s.statuses[id] = state
+	return beads.Issue{ID: id, Status: string(state)}, nil
+}
+
+func (s *deliveryResumeStore) Update(_ context.Context, id domain.BeadID, p beads.Patch) (beads.Issue, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "update "+string(id))
+	s.patches = append(s.patches, p)
+	if s.err != nil {
+		return beads.Issue{}, s.err
+	}
+	return beads.Issue{ID: id}, nil
+}
+
+func (s *deliveryResumeStore) Close(_ context.Context, id domain.BeadID, reason string) (beads.Issue, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, "close "+string(id))
+	if s.closeErr != nil {
+		return beads.Issue{}, s.closeErr
+	}
+	if s.err != nil {
+		return beads.Issue{}, s.err
+	}
+	return beads.Issue{ID: id, Status: "closed", CloseReason: reason}, nil
+}
+
+func (s *deliveryResumeStore) recorded() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.calls...)
+}
+
+// newDeliveryResumeTracker builds a guard over a store and a reader that
+// says every named bead is in the given state.
+func newDeliveryResumeTracker(t *testing.T, statuses map[domain.BeadID]string) (*ResumeTracker, *deliveryResumeStore, *deliveryBeadStatus) {
+	t.Helper()
+	store, reader := &deliveryResumeStore{}, &deliveryBeadStatus{statuses: statuses}
+	tr, err := NewResumeTracker(ResumeTrackerOptions{
+		Store: store, Beads: reader,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatalf("NewResumeTracker: %v", err)
+	}
+	return tr, store, reader
+}
+
+// TestNewResumeTrackerNeedsAStoreAndAReader: a guard that cannot read the
+// bead could not check anything, so it is refused rather than built.
+func TestNewResumeTrackerNeedsAStoreAndAReader(t *testing.T) {
+	t.Parallel()
+	if _, err := NewResumeTracker(ResumeTrackerOptions{Beads: &deliveryBeadStatus{}}); !errors.Is(err, ErrNoResumeStore) {
+		t.Errorf("without a store: err = %v, want ErrNoResumeStore", err)
+	}
+	if _, err := NewResumeTracker(ResumeTrackerOptions{Store: &deliveryResumeStore{}}); !errors.Is(err, ErrNoResumeReader) {
+		t.Errorf("without a reader: err = %v, want ErrNoResumeReader", err)
+	}
+}
+
+// TestResumeTrackerChecksEveryEdgeAgainstTheD07Table walks the writes a
+// resume can make: the two it is allowed, the states it may not write at
+// all, a foreign status, an already-applied write and a bd read failure.
+func TestResumeTrackerChecksEveryEdgeAgainstTheD07Table(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	t.Run("a landed delivery closes", func(t *testing.T) {
+		t.Parallel()
+		tr, store, _ := newDeliveryResumeTracker(t, map[domain.BeadID]string{"sc-1": string(domain.BeadStateDelivering)})
+		if _, err := tr.Update(ctx, "sc-1", beads.Patch{Metadata: beads.MergeMetadata("abcdef1234567")}); err != nil {
+			t.Fatalf("Update: %v", err)
+		}
+		if _, err := tr.Close(ctx, "sc-1", "merged on resume"); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		want := []string{"update sc-1", "close sc-1"}
+		if got := store.recorded(); !deliveryEqualStrings(got, want) {
+			t.Errorf("bd calls = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a lost pull request parks the bead", func(t *testing.T) {
+		t.Parallel()
+		tr, store, _ := newDeliveryResumeTracker(t, map[domain.BeadID]string{"sc-1": string(domain.BeadStateDelivering)})
+		if _, err := tr.SetStatus(ctx, "sc-1", domain.BeadStateNeedsHuman); err != nil {
+			t.Fatalf("SetStatus: %v", err)
+		}
+		if got, want := store.recorded(), []string{"status sc-1 needs_human"}; !deliveryEqualStrings(got, want) {
+			t.Errorf("bd calls = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("a state no resume writes is refused", func(t *testing.T) {
+		t.Parallel()
+		tr, store, _ := newDeliveryResumeTracker(t, map[domain.BeadID]string{"sc-1": string(domain.BeadStateDelivering)})
+		_, err := tr.SetStatus(ctx, "sc-1", domain.BeadStateInProgress)
+		if !errors.Is(err, ErrNotAResumeEdge) {
+			t.Errorf("err = %v, want ErrNotAResumeEdge", err)
+		}
+		if got := store.recorded(); len(got) != 0 {
+			t.Errorf("bd calls = %v, want none", got)
+		}
+	})
+
+	t.Run("a bead already in the state is written again", func(t *testing.T) {
+		t.Parallel()
+		tr, store, _ := newDeliveryResumeTracker(t, map[domain.BeadID]string{"sc-1": string(domain.BeadStateNeedsHuman)})
+		if _, err := tr.SetStatus(ctx, "sc-1", domain.BeadStateNeedsHuman); err != nil {
+			t.Fatalf("SetStatus: %v", err)
+		}
+		if got, want := store.recorded(), []string{"status sc-1 needs_human"}; !deliveryEqualStrings(got, want) {
+			t.Errorf("bd calls = %v, want %v (bd is idempotent about a status it holds)", got, want)
+		}
+	})
+
+	t.Run("a foreign status is left alone", func(t *testing.T) {
+		t.Parallel()
+		tr, store, _ := newDeliveryResumeTracker(t, map[domain.BeadID]string{"sc-1": "triaging"})
+		_, err := tr.SetStatus(ctx, "sc-1", domain.BeadStateNeedsHuman)
+		if !errors.Is(err, ErrForeignStatus) {
+			t.Errorf("err = %v, want ErrForeignStatus (P6-12)", err)
+		}
+		if got := store.recorded(); len(got) != 0 {
+			t.Errorf("bd calls = %v, want none", got)
+		}
+	})
+
+	t.Run("a bead bd cannot describe is not written", func(t *testing.T) {
+		t.Parallel()
+		tr, store, reader := newDeliveryResumeTracker(t, nil)
+		_, err := tr.SetStatus(ctx, "sc-1", domain.BeadStateNeedsHuman)
+		if !errors.Is(err, ErrResumeStateUnknown) {
+			t.Errorf("err = %v, want ErrResumeStateUnknown", err)
+		}
+		reader.err = errors.New("bd is down")
+		_, err = tr.Close(ctx, "sc-1", "merged")
+		if !errors.Is(err, ErrResumeStateUnknown) {
+			t.Errorf("with bd down: err = %v, want ErrResumeStateUnknown", err)
+		}
+		if got := store.recorded(); len(got) != 0 {
+			t.Errorf("bd calls = %v, want none", got)
+		}
+	})
+
+	t.Run("a status patch is guarded like a status write", func(t *testing.T) {
+		t.Parallel()
+		tr, store, _ := newDeliveryResumeTracker(t, map[domain.BeadID]string{"sc-1": string(domain.BeadStateFailed)})
+		_, err := tr.Update(ctx, "sc-1", beads.Patch{Status: domain.BeadStateNeedsHuman})
+		if !errors.Is(err, ErrInvalidTransition) {
+			t.Errorf("err = %v, want ErrInvalidTransition", err)
+		}
+		if got := store.recorded(); len(got) != 0 {
+			t.Errorf("bd calls = %v, want none", got)
+		}
+	})
+
+	t.Run("the store's own failures come back unwrapped", func(t *testing.T) {
+		t.Parallel()
+		tr, store, _ := newDeliveryResumeTracker(t, map[domain.BeadID]string{"sc-1": string(domain.BeadStateDelivering)})
+		store.closeErr = fmt.Errorf("beads: close: %w", beads.ErrBlockedOpen)
+		if _, err := tr.Close(ctx, "sc-1", "merged"); !errors.Is(err, beads.ErrBlockedOpen) {
+			t.Errorf("err = %v, want beads.ErrBlockedOpen so gitx leaves the bead to the gate poller", err)
+		}
+	})
+}
+
+// TestResumeEventNamesOnlyTheEdgesAResumeTakes pins the little table the
+// guard picks its event from.
+func TestResumeEventNamesOnlyTheEdgesAResumeTakes(t *testing.T) {
+	t.Parallel()
+	want := map[domain.BeadState]BeadEvent{
+		domain.BeadStateClosed:     BeadEventDelivered,
+		domain.BeadStateNeedsHuman: BeadEventBlocked,
+		domain.BeadStateFailed:     BeadEventFailed,
+	}
+	for _, state := range domain.BeadStates() {
+		ev, ok := ResumeEvent(state)
+		wantEv, wantOK := want[state]
+		if ok != wantOK || ev != wantEv {
+			t.Errorf("ResumeEvent(%s) = %q, %v, want %q, %v", state, ev, ok, wantEv, wantOK)
+		}
+	}
+}
+
+// TestResumeRefusesAnEdgeTheD07TableHasNot is the P6-37 exit criterion,
+// driven through the real gitx.Resumer: a bead somebody failed by hand
+// whose pull request was closed without merging reconciles to needs_human,
+// which D-07 has no edge to from failed, so nothing is written and the
+// entry says why.
+//
+// It cannot run in parallel: the gh shim is installed with t.Setenv.
+func TestResumeRefusesAnEdgeTheD07TableHasNot(t *testing.T) {
+	ctx := context.Background()
+	// gh answers "closed without merging" for pull request 7, which is
+	// what gitx reads as "the recorded pull request is gone".
+	testutil.FakeBin(t, "gh", `
+case "$1 $2" in
+  "pr view") echo '{"number":7,"url":"https://example.test/pull/7","state":"CLOSED","title":"abandoned","headRefName":"sc/sc-68s-add-retry"}' ;;
+  *) echo "gh shim: unexpected command: $*" >&2; exit 1 ;;
+esac
+`)
+	f := testutil.NewFixtureRepo(t, testutil.WithBareRemote())
+	env := map[string]string{}
+	for _, kv := range f.Env() {
+		if k, v, ok := strings.Cut(kv, "="); ok && k != "PATH" {
+			env[k] = v
+		}
+	}
+	repo, err := gitx.Open(ctx, f.Dir, gitx.WithEnv(env))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	m, err := gitx.NewManager(repo, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	tracker, store, _ := newDeliveryResumeTracker(t, map[domain.BeadID]string{"sc-68s": string(domain.BeadStateFailed)})
+	resumer, err := gitx.NewResumer(m, tracker, gitx.WithResumeLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err != nil {
+		t.Fatalf("NewResumer: %v", err)
+	}
+	bead := deliveryBead(domain.BeadStateFailed)
+	bead.PRNumber, bead.PRURL = 7, "https://example.test/pull/7"
+
+	res, err := resumer.Resume(ctx, []domain.Bead{bead})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	if len(res.Entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(res.Entries))
+	}
+	e := res.Entries[0]
+	if e.State != domain.BeadStateNeedsHuman {
+		t.Fatalf("reconciled state = %s, want needs_human (%s)", e.State, e.Reason)
+	}
+	if e.Applied {
+		t.Error("the resume applied an edge the D-07 table has not got")
+	}
+	if !errors.Is(e.Err, ErrInvalidTransition) {
+		t.Errorf("entry error = %v, want ErrInvalidTransition", e.Err)
+	}
+	if got := store.recorded(); len(got) != 0 {
+		t.Errorf("bd calls = %v, want none: nothing may be written", got)
+	}
+	if !strings.Contains(res.Summary(), "not applied") {
+		t.Errorf("summary = %q, want it to say the change was not applied", res.Summary())
+	}
+}
+
+// TestResumeAppliesTheEdgesTheTableHasGot is the other half: the same rig
+// with a delivering bead whose branch landed writes the close it owes, so
+// the guard blocks nothing a resume legitimately does.
+func TestResumeAppliesTheEdgesTheTableHasGot(t *testing.T) {
+	ctx := context.Background()
+	f := testutil.NewFixtureRepo(t)
+	env := map[string]string{}
+	for _, kv := range f.Env() {
+		if k, v, ok := strings.Cut(kv, "="); ok && k != "PATH" {
+			env[k] = v
+		}
+	}
+	repo, err := gitx.Open(ctx, f.Dir, gitx.WithEnv(env))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	m, err := gitx.NewManager(repo, t.TempDir())
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	bead := deliveryBead(domain.BeadStateDelivering)
+	if _, err := m.Create(ctx, bead); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	wt, err := m.Open(ctx, bead.ID)
+	if err != nil {
+		t.Fatalf("Open the worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(wt.Root, "landed.txt"), []byte("done\n"), 0o644); err != nil {
+		t.Fatalf("writing the work: %v", err)
+	}
+	if _, err := wt.CommitAll(ctx, "the work"); err != nil {
+		t.Fatalf("CommitAll: %v", err)
+	}
+	f.Git(t, "merge", "--ff-only", "-q", gitx.BranchName(bead))
+
+	tracker, store, _ := newDeliveryResumeTracker(t, map[domain.BeadID]string{bead.ID: string(domain.BeadStateDelivering)})
+	resumer, err := gitx.NewResumer(m, tracker, gitx.WithoutGH(),
+		gitx.WithResumeLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err != nil {
+		t.Fatalf("NewResumer: %v", err)
+	}
+	res, err := resumer.Resume(ctx, []domain.Bead{bead})
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	e := res.Entries[0]
+	if e.State != domain.BeadStateClosed || !e.Applied {
+		t.Fatalf("entry = %s, applied %v, want closed and applied (%s: %v)", e.State, e.Applied, e.Reason, e.Err)
+	}
+	want := []string{"update " + string(bead.ID), "close " + string(bead.ID)}
+	if got := store.recorded(); !deliveryEqualStrings(got, want) {
+		t.Errorf("bd calls = %v, want %v", got, want)
+	}
 }

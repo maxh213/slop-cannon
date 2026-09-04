@@ -1,0 +1,11 @@
+That was the first sc run in /repo.
+Nothing sc writes lives inside the repository; this is where it all went:
+
+  run log     /state/runs/20260101-120000-abcd/sc.log
+  agent logs  /state/runs/20260101-120000-abcd/agents
+  prompts     /state/runs/20260101-120000-abcd/prompts
+  events      /state/runs/20260101-120000-abcd/events.jsonl
+  worktrees   /state/runs/20260101-120000-abcd/wt
+  config      /config/slop-cannon/config.toml
+
+Read this run back at any time with: sc status --repo /repo

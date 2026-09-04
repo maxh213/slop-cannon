@@ -75,7 +75,11 @@ type Plan struct {
 // present; acceptance criteria non-empty; priorities in range; types
 // Plannable and sizes valid; every dependency naming a key in the plan, no
 // bead depending on itself or listing the same dependency twice; and no
-// dependency cycles. An empty plan is valid (autopilot uses it to mean
+// dependency cycles. The brief and every bead's title, description and
+// acceptance criteria must also be free of control characters (P0-11): a
+// title carrying "\x1b[2J" is rejected here rather than left to repaint a
+// terminal further down the pipe; see CheckText and CheckLine. An empty plan
+// is valid (autopilot uses it to mean
 // "nothing to add", D-18). Every error wraps ErrInvalidPlan. Validate never
 // normalises values: a key with surrounding whitespace is rejected, not
 // trimmed, so the keys the caller sees are the keys bd will see.
@@ -129,6 +133,8 @@ func (p Plan) Validate() error {
 			seen[d] = true
 		}
 	}
+	// Control characters in the brief and in every bead's prose (P0-11).
+	errs = append(errs, planTextProblems(p)...)
 	if len(errs) == 0 {
 		if cycle := p.findCycle(index); cycle != nil {
 			errs = append(errs, fmt.Errorf("dependency cycle: %s", strings.Join(cycle, " -> ")))

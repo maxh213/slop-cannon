@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
@@ -47,6 +48,16 @@ const DefaultStopGrace = 10 * time.Second
 // top of the grace period, so a stopper that honours the grace exactly is
 // not cancelled at the finish line.
 const killSlack = 5 * time.Second
+
+// DefaultAgentBusBuffer is how many events [Run.AgentBus] holds while the
+// run republishes them. One cartridge output line is one event (P5-08), so
+// this is a few seconds of a chatty agent.
+const DefaultAgentBusBuffer = 8192
+
+// agentBusDrain bounds how long the finish waits for the forwarding bus to
+// be drained. It is wall-clock rather than the run's clock on purpose: it
+// bounds a goroutine, not the run's behaviour.
+const agentBusDrain = 5 * time.Second
 
 // Errors returned by the lifecycle.
 var (
@@ -202,7 +213,12 @@ type Options struct {
 	Leases LeaseReleaser
 	// Cleaner prunes worktrees when the run finishes (P4-08, P6-18).
 	Cleaner WorktreeCleaner
-	// Beads lists the run's beads for the resume and cleanup passes.
+	// Beads lists the run's beads for the resume, lease-release and
+	// worktree-cleanup passes. Wire it wherever Leases is wired (P8-17):
+	// without it the shutdown release falls back to the in_progress the
+	// claim set, which is right for an engineer and blind to every bead a
+	// tester or the product owner was holding. [NewConductor] fills it in
+	// for an assembled run ([Run.UseBeads]).
 	Beads BeadSource
 	// Resumer reconciles git state into bead state on --resume (P4-08).
 	Resumer GitResumer
@@ -248,6 +264,10 @@ type Run struct {
 	cancelLoop context.CancelFunc
 	lock       *lockFile
 	resumeRes  *gitx.ResumeResult
+	beadSrc    BeadSource
+	vitals     func() RunVitals
+	agentBus   *events.Bus
+	agentDone  chan struct{}
 	outcome    Outcome
 	err        error
 }
@@ -281,6 +301,7 @@ func New(cfg *config.RunConfig, opts Options) (*Run, error) {
 		log:       opts.Logger,
 		bus:       opts.Bus,
 		stopGrace: opts.StopGrace,
+		beadSrc:   opts.Beads,
 		abort:     make(chan struct{}),
 		done:      make(chan struct{}),
 	}
@@ -426,6 +447,112 @@ func (r *Run) Warn(source, message string, err error) {
 	}
 	r.log.Warn(message, slog.String("source", source), slog.Any("err", err))
 	r.Publish(w)
+}
+
+// AgentBus returns the run's forwarding bus: an [events.Bus] every event of
+// which is republished through [Run.Publish], and so reaches the run log,
+// state.json's sequence number and the live bus like every other event.
+//
+// It exists because two producers can only publish to a concrete
+// *events.Bus — [agents.AgentRun.Bus], which the supervisor fills from
+// [SupervisorOptions.Bus], and [beads.WatcherOptions.Bus] — while
+// everything else in the run publishes through a [Publisher]. Handing them
+// the live bus directly is what P6-27 found: every AgentOutput line went
+// straight past the run, so state.json's LastSeq undercounted the run log
+// by however much the agents said. Hand them this one instead:
+//
+//	sup, err := NewSupervisor(SupervisorOptions{Bus: run.AgentBus(), …})
+//
+// The forwarding is asynchronous (a subscription is the only way to observe
+// a bus), so an event can be dropped when the buffer is full — under a
+// producer faster than the run log for [DefaultAgentBusBuffer] events. A
+// dropped event reaches neither the counter nor the log, so the two still
+// agree; the count is reported once as a warning when the run ends.
+//
+// Never pass the run's own [Options.Bus] to a producer through this: the
+// forwarder would publish into a bus that feeds it.
+func (r *Run) AgentBus() *events.Bus {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.agentBus != nil {
+		return r.agentBus
+	}
+	bus := events.NewBus()
+	sub := bus.Subscribe(context.Background(), DefaultAgentBusBuffer)
+	done := make(chan struct{})
+	r.agentBus, r.agentDone = bus, done
+	go r.forwardAgentBus(sub, done)
+	return bus
+}
+
+// forwardAgentBus republishes everything the forwarding bus receives, until
+// the bus is closed and the buffered events have been drained.
+func (r *Run) forwardAgentBus(sub *events.Subscription, done chan struct{}) {
+	defer close(done)
+	for ev := range sub.Events() {
+		r.Publish(ev)
+	}
+	if n := sub.Dropped(); n > 0 {
+		r.Warn(SourceRun, fmt.Sprintf(
+			"%d agent event(s) were dropped: the run log could not keep up with the agents' output", n), nil)
+	}
+}
+
+// stopAgentBus closes the forwarding bus and waits for the events already
+// in it to be republished, so the sequence number the final state.json
+// records is the whole run. A forwarder that has not drained within
+// [agentBusDrain] is abandoned: a shutdown must end.
+func (r *Run) stopAgentBus() {
+	r.mu.Lock()
+	bus, done := r.agentBus, r.agentDone
+	r.agentBus = nil
+	r.mu.Unlock()
+	if bus == nil {
+		return
+	}
+	bus.Close()
+	select {
+	case <-done:
+	case <-time.After(agentBusDrain):
+		r.log.Warn("the agent event forwarder did not drain in time")
+	}
+}
+
+// removePlanShim deletes <run-dir>/bin/po-plan, the planning product
+// owner's read-only bd shim (D-21, P6-05), when the run ends (P6-34). The
+// per-bead shims are the supervisor's ([Supervisor.RemoveShim], P6-17);
+// this one belongs to the run, lives for the whole of it, and had nothing
+// removing it. A run that never planned has no such directory, and removing
+// a missing one is not an error.
+func (r *Run) removePlanShim() {
+	dir := filepath.Join(r.dirs.Shims, PlanShimDirName)
+	if err := os.RemoveAll(dir); err != nil {
+		r.Warn(SourceRun, "could not remove the planning bd shim at "+dir, err)
+		return
+	}
+	r.log.Debug("planning bd shim removed", slog.String("dir", dir))
+}
+
+// TeeRunLog opens the run log of runDir and puts it in front of bus in
+// opts.Bus, which is the whole of the wiring P8-20 asks for:
+//
+//	log, err := orchestrator.TeeRunLog(&opts, cfg.Run.StateDir, bus)
+//	defer log.Close()
+//
+// The log comes first so an event is durable before any subscriber renders
+// it (P6-08). Without it a real run leaves no events.jsonl behind and
+// `sc status` folds nothing. The caller closes the returned log when the
+// run has finished; a nil opts is refused.
+func TeeRunLog(opts *Options, runDir string, bus Publisher) (*EventLog, error) {
+	if opts == nil {
+		return nil, errors.New("orchestrator: TeeRunLog: nil options")
+	}
+	log, err := OpenEventLog(runDir, opts.Logger)
+	if err != nil {
+		return nil, err
+	}
+	opts.Bus = Tee(log, bus)
+	return log, nil
 }
 
 // Start creates the run directory, takes the repository's run lock, writes
@@ -875,10 +1002,61 @@ func (r *Run) reconcileResume(ctx context.Context) error {
 
 // listBeads asks the bead source for the run's beads.
 func (r *Run) listBeads(ctx context.Context) ([]domain.Bead, error) {
-	if r.opts.Beads == nil {
+	src := r.BeadSource()
+	if src == nil {
 		return nil, nil
 	}
-	return r.opts.Beads(ctx)
+	return src(ctx)
+}
+
+// BeadSource returns the run's bead source: [Options.Beads], or whatever
+// [Run.UseBeads] replaced it with. Nil means the run cannot read bd, and
+// both passes that need the listing — the resume reconciliation and the
+// shutdown lease release — fall back to what they can infer without it.
+func (r *Run) BeadSource() BeadSource {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.beadSrc
+}
+
+// UseBeads gives a run built without one the bead source it needs (P8-17).
+// [Options.Leases] without [Options.Beads] leaves the shutdown release
+// blind: it falls back to the in_progress the claim set, which is right for
+// an engineer and wrong for every bead a tester or the product owner was
+// holding, so whoever assembles a run passes both. [NewConductor] calls
+// this when it is given a run that has no source and a bd client that can
+// be one, which is why an assembled run always has one.
+//
+// It must be called before [Run.Start]: the resume reconciliation reads the
+// listing, and changing the source underneath a live run would mean two
+// passes of one run disagreed about what it owns. A started run returns
+// [ErrAlreadyStarted], a finished one [ErrFinished].
+func (r *Run) UseBeads(src BeadSource) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch {
+	case r.finished:
+		return ErrFinished
+	case r.started:
+		return ErrAlreadyStarted
+	}
+	r.beadSrc = src
+	return nil
+}
+
+// UseVitals names the function that snapshots the run's vitals — what the
+// planner is doing and what the gate poller has seen — for every state.json
+// the run writes (P6-29). It may be set at any time, including after the
+// run has started, because the parts it reads are assembled after the run
+// itself; a nil function leaves State.Vitals absent.
+//
+// The function is called on the run's own goroutine while the run holds its
+// lock, so it must not block or call back into the run. [Vitals] over a
+// *Planner and a *GatePoller does neither.
+func (r *Run) UseVitals(f func() RunVitals) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.vitals = f
 }
 
 // finish performs the shutdown sequence exactly once and closes Done:
@@ -922,6 +1100,11 @@ func (r *Run) finish(out Outcome, loopErr error) {
 	defer cancelShut()
 
 	r.stopAgents(shutCtx, agents)
+	// The agents are gone, so nothing else will publish through the
+	// forwarding bus; draining it now is what makes the sequence number in
+	// the final state.json the whole run (P6-27).
+	r.stopAgentBus()
+	r.removePlanShim()
 	r.releaseLeases(shutCtx, agents)
 	if report := r.cleanupWorktrees(shutCtx); report != "" {
 		out.Summary = joinSummary(out.Summary, report)
@@ -1113,6 +1296,7 @@ func joinSummary(summary, report string) string {
 // that finished has already released it; Close is for a run that was
 // created or started and then abandoned.
 func (r *Run) Close() error {
+	r.stopAgentBus()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.releaseLockLocked()
@@ -1123,6 +1307,10 @@ func (r *Run) Close() error {
 func (r *Run) persistLocked() error {
 	r.st.Version = StateFileVersion
 	r.st.UpdatedAt = r.now()
+	if r.vitals != nil {
+		v := r.vitals()
+		r.st.Vitals = &v
+	}
 	if err := WriteState(r.dirs.Dir, r.st); err != nil {
 		r.log.Error("could not write the run state", slog.Any("err", err))
 		return err
@@ -1272,4 +1460,840 @@ func (l *lockFile) release() error {
 		return err
 	}
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// The conductor: the run-level glue above the scheduler (P8-14)
+// ---------------------------------------------------------------------------
+
+// The scheduler (P6-02) fires whatever the work sources offer, and the
+// feedback loop (P6-04), the planner (P6-05) and the delivery handoff
+// (P6-06) are those sources — but three things happen *between* bd and
+// those parts that none of them owns, and without them an assembled run
+// does nothing at all:
+//
+//   - a bead bd reports ready has to be offered to the feedback loop
+//     ([Feedback.Track]), or no engineer is ever asked for it (D-20 leaves
+//     the blocker filtering to `bd ready`);
+//   - a bead the loop approved has to be handed to the delivery
+//     ([Deliverer.Deliver]), and what the delivery decided has to be routed
+//     back into the loop ([Feedback.CheckFailed], [Feedback.ReviewAgain],
+//     [Feedback.Observe]) and to the gate poller ([GatePoller.Kick]);
+//   - an engineer's uncommitted leftovers have to be committed before the
+//     testers look at the code (D-14), through the [DeliveryGit] seam that
+//     refuses to commit a worktree left mid-rebase (P6-16(b), P8-18).
+//
+// [Conductor] is those three, plus the two things only something above bd
+// can do: rebuild the feedback threads of a resumed run from the bead's own
+// comments ([Feedback.Restore], P8-16) and publish the bead inventory and
+// the dependency graph the run log had neither of ([events.BeadCreated],
+// [events.GraphChanged], P6-32).
+
+// DefaultConductorInterval is how often the conductor syncs with bd when
+// the caller sets no interval. Every pass costs a `bd list` and a `bd
+// ready` (about 0.2 s each, Appendix A), so a second keeps the serialised
+// client free for the agents' own calls.
+const DefaultConductorInterval = time.Second
+
+// SourceConductor is the events.Warning.Source the run-level glue stamps on
+// its own notices.
+const SourceConductor = "conductor"
+
+// ConductorBeads is the bd the glue reads: the run's own beads, the
+// claimable ones, one bead in full, and a bead's structured comments (for
+// [Feedback.Restore] on resume). *beads.Client satisfies it.
+type ConductorBeads interface {
+	// ListRun lists the run's beads, closed ones included (`bd list -l
+	// sc:run:<id>`, P3-14).
+	ListRun(ctx context.Context, run domain.RunID, all bool) ([]beads.Issue, error)
+	// Ready lists the claimable beads under the run's epic (`bd ready`),
+	// which already excludes anything whose blockers are open (D-20).
+	Ready(ctx context.Context, parent domain.BeadID) ([]beads.Issue, error)
+	// Show reads one bead in full, for the prompt context.
+	Show(ctx context.Context, ids ...domain.BeadID) ([]beads.Issue, error)
+	// Messages reads a bead's structured comments (D-06, D-25).
+	Messages(ctx context.Context, id domain.BeadID) ([]beads.Message, error)
+}
+
+// *beads.Client is the production bd of the glue.
+var _ ConductorBeads = (*beads.Client)(nil)
+
+// ConductorFeedback is the slice of [Feedback] the glue drives: what to
+// adopt, what a resumed run must rebuild, and where a delivery outcome
+// goes. *Feedback satisfies it.
+type ConductorFeedback interface {
+	// Track adopts beads into the loop (or refreshes them).
+	Track(bs ...domain.Bead)
+	// Restore rebuilds one bead's thread from its comments (P8-16).
+	Restore(ctx context.Context, bead domain.Bead, msgs []beads.Message) error
+	// Thread reads a thread back, for the round a delivery belongs to.
+	Thread(bead domain.BeadID) (FeedbackThread, bool)
+	// Observe tells the loop where a bead ended up.
+	Observe(bead domain.BeadID, state domain.BeadState)
+	// CheckFailed reopens a bead whose check command failed (P6-06).
+	CheckFailed(ctx context.Context, bead domain.Bead, round int, items []domain.FeedbackItem) error
+	// ReviewAgain sends the testers back to a resolved conflict that moved
+	// more than the D-09 threshold.
+	ReviewAgain(ctx context.Context, bead domain.Bead, round int, reason string) error
+}
+
+// *Feedback is the production feedback loop of the glue.
+var _ ConductorFeedback = (*Feedback)(nil)
+
+// ConductorDelivery is the slice of [Deliverer] the glue drives.
+// *Deliverer satisfies it.
+type ConductorDelivery interface {
+	// Deliver ships one approved bead.
+	Deliver(ctx context.Context, req DeliveryRequest) (*DeliveryOutcome, error)
+	// Resolved is called when the engineer of a conflict round has
+	// finished (D-10).
+	Resolved(ctx context.Context, id domain.BeadID) (*DeliveryOutcome, error)
+}
+
+// *Deliverer is the production delivery handoff of the glue.
+var _ ConductorDelivery = (*Deliverer)(nil)
+
+// GateKicker asks the gate poller to look now rather than at its next tick,
+// for a delivery that just opened a pull request. *GatePoller satisfies it.
+type GateKicker interface {
+	Kick()
+}
+
+// *GatePoller is the production gate poller.
+var _ GateKicker = (*GatePoller)(nil)
+
+// ConductorWorktrees is the worktree management the prompt context needs: a
+// firing runs in the bead's worktree, so one is created on first use.
+// *gitx.Manager satisfies it.
+type ConductorWorktrees interface {
+	// PathFor is where the bead's worktree lives (D-23).
+	PathFor(id domain.BeadID) string
+	// Create makes it if it is not there.
+	Create(ctx context.Context, bead domain.Bead) (*gitx.Worktree, error)
+}
+
+// *gitx.Manager is the production worktree manager.
+var _ ConductorWorktrees = (*gitx.Manager)(nil)
+
+// ConductorOptions configures [NewConductor]. Run and Beads are required;
+// the parts the glue drives may be attached afterwards ([Conductor.Attach]),
+// because the feedback loop is built with [Conductor.BeadContext] and the
+// delivery handoff with the run, so neither exists yet when the conductor
+// is created.
+type ConductorOptions struct {
+	// Run is the run being conducted. Required.
+	Run *Run
+	// Beads is bd. Required.
+	Beads ConductorBeads
+	// Statuses maps bd's registered statuses to the D-07 states, so a
+	// foreign status is never acted on (P6-12). Nil still resolves every
+	// D-07 state.
+	Statuses beads.StatusMap
+
+	// Feedback, Delivery and Gates are the parts the glue drives. Any of
+	// them may be nil here and attached later; a nil one at sync time means
+	// that half of the glue does nothing.
+	Feedback ConductorFeedback
+	Delivery ConductorDelivery
+	Gates    GateKicker
+
+	// Worktrees creates the worktree a firing runs in; nil means the
+	// context carries no worktree, which only a test wants.
+	Worktrees ConductorWorktrees
+	// Git is the delivery's git seam. The leftovers commit of D-14 goes
+	// through it rather than through gitx.Manager directly, because it is
+	// the one that refuses to commit a worktree left mid-rebase
+	// (ErrRebaseInProgress, P6-16(b), P8-18). Nil commits nothing and
+	// measures no diffs.
+	Git DeliveryGit
+
+	// Repo, Brief, Rules, Vibes, Budget and CheckCommand are the parts of
+	// the prompt context that do not change from firing to firing.
+	Repo         prompt.RepoContext
+	Brief        string
+	Rules        []prompt.Doc
+	Vibes        []prompt.Doc
+	Budget       prompt.Budget
+	CheckCommand string
+	// Model, MaxTurns and Timeout are passed to the cartridge; zero values
+	// mean the adapter's (and the supervisor's) defaults.
+	Model    string
+	MaxTurns int
+	Timeout  time.Duration
+	// Env and InheritEnv are passed to the cartridge on top of the
+	// read-only bd shim the supervisor installs (D-21, P6-17).
+	Env        map[string]string
+	InheritEnv []string
+
+	// Foreign reports a bead bd holds in a status this run did not
+	// register, so a repository whose beads all sit in someone else's
+	// status says so once instead of looking like a run doing nothing
+	// (P6-28). Nil builds one over the run, so the report is never lost;
+	// pass the run's own reporter to share the once-per-bead bookkeeping
+	// with the gate poller.
+	Foreign *ForeignStatusReporter
+
+	// Interval is how often [Conductor.Run] syncs; zero means
+	// [DefaultConductorInterval].
+	Interval time.Duration
+	// Restore says whether the first pass rebuilds the feedback threads
+	// from the beads' comments (P8-16). The zero value follows the run:
+	// a resumed run restores, a fresh one does not.
+	Restore *bool
+	// Logger is where the glue logs; nil means the run's logger.
+	Logger *slog.Logger
+}
+
+// ConductorStats is a point-in-time snapshot of what the glue has done.
+type ConductorStats struct {
+	// Passes counts completed syncs and Failures the ones that hit an
+	// error (a pass can do most of its work and still fail).
+	Passes   int
+	Failures int
+	// Tracked is how many beads have been offered to the feedback loop,
+	// Restored how many threads were rebuilt from comments (P8-16).
+	Tracked  int
+	Restored int
+	// Announced counts the beads first seen by the glue (one
+	// events.BeadCreated each) and Graphs the events.GraphChanged
+	// published (P6-32).
+	Announced int
+	Graphs    int
+	// Delivered counts delivery attempts started, Shipped the ones that
+	// merged or opened a pull request.
+	Delivered int
+	Shipped   int
+	// LastError is the most recent pass failure, nil when the last pass
+	// was clean.
+	LastError error
+}
+
+// Conductor is the run-level glue: the loop above the scheduler that keeps
+// bd, the feedback loop and the delivery handoff in step. Create one with
+// [NewConductor], hand [Conductor.BeadContext], [Conductor.ChangeRatio] and
+// [Conductor.ConflictResolved] to [NewFeedback], attach the parts once they
+// exist, and run it beside the scheduler:
+//
+//	go func() { _ = poller.Run(ctx) }()
+//	go func() { _ = conductor.Run(ctx) }()
+//	err := run.Start(ctx)
+//
+// All methods are safe for concurrent use.
+type Conductor struct {
+	run      *Run
+	beads    ConductorBeads
+	statuses beads.StatusMap
+	foreign  *ForeignStatusReporter
+	opts     ConductorOptions
+	interval time.Duration
+	log      *slog.Logger
+	restore  bool
+
+	mu       sync.Mutex
+	feedback ConductorFeedback
+	delivery ConductorDelivery
+	gates    GateKicker
+	inflight map[domain.BeadID]bool
+	restored map[domain.BeadID]bool
+	seen     map[domain.BeadID]bool
+	snapshot []beads.Issue
+	warned   string
+	stats    ConductorStats
+}
+
+// NewConductor builds the glue. It gives the run its bead source when it
+// has none (P8-17), so an assembled run's shutdown release and worktree
+// cleanup always see where bd holds the beads.
+func NewConductor(opts ConductorOptions) (*Conductor, error) {
+	if opts.Run == nil {
+		return nil, errors.New("orchestrator: NewConductor: no run")
+	}
+	if opts.Beads == nil {
+		return nil, errors.New("orchestrator: NewConductor: no beads client")
+	}
+	c := &Conductor{
+		run:      opts.Run,
+		beads:    opts.Beads,
+		statuses: opts.Statuses,
+		foreign:  opts.Foreign,
+		opts:     opts,
+		interval: opts.Interval,
+		log:      opts.Logger,
+		feedback: opts.Feedback,
+		delivery: opts.Delivery,
+		gates:    opts.Gates,
+		inflight: map[domain.BeadID]bool{},
+		restored: map[domain.BeadID]bool{},
+		seen:     map[domain.BeadID]bool{},
+	}
+	if c.interval <= 0 {
+		c.interval = DefaultConductorInterval
+	}
+	if c.log == nil {
+		c.log = opts.Run.Log()
+	}
+	if c.foreign == nil {
+		c.foreign = NewForeignStatusReporter(ForeignStatusOptions{
+			Host: opts.Run, Statuses: opts.Statuses, Logger: c.log,
+		})
+	}
+	c.restore = opts.Run.RunConfig().Resume
+	if opts.Restore != nil {
+		c.restore = *opts.Restore
+	}
+	if c.run.BeadSource() == nil {
+		// P8-17: Options.Beads is wired wherever Options.Leases is, and
+		// this is the assembly point that knows both.
+		if err := c.run.UseBeads(c.BeadSource()); err != nil && !errors.Is(err, ErrAlreadyStarted) {
+			return nil, err
+		}
+	}
+	return c, nil
+}
+
+// ConductorParts are the components the glue drives, for [Conductor.Attach].
+type ConductorParts struct {
+	// Feedback is the feedback loop; nil leaves the one already attached.
+	Feedback ConductorFeedback
+	// Delivery is the delivery handoff; nil leaves the one already attached.
+	Delivery ConductorDelivery
+	// Gates is the gate poller; nil leaves the one already attached.
+	Gates GateKicker
+}
+
+// Attach gives the conductor the parts that could not exist when it was
+// created: the feedback loop takes [Conductor.BeadContext] as its context
+// function, and the delivery handoff takes the run. A nil field leaves what
+// is already attached alone, so Attach can be called more than once.
+func (c *Conductor) Attach(p ConductorParts) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if p.Feedback != nil {
+		c.feedback = p.Feedback
+	}
+	if p.Delivery != nil {
+		c.delivery = p.Delivery
+	}
+	if p.Gates != nil {
+		c.gates = p.Gates
+	}
+}
+
+// parts reads the attached components under the lock.
+func (c *Conductor) parts() (ConductorFeedback, ConductorDelivery, GateKicker) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.feedback, c.delivery, c.gates
+}
+
+// Interval returns the sync period in force.
+func (c *Conductor) Interval() time.Duration { return c.interval }
+
+// Foreign is the reporter that names a bead bd holds in a status this run
+// did not register (P6-28). It is never nil.
+func (c *Conductor) Foreign() *ForeignStatusReporter { return c.foreign }
+
+// Stats returns what the glue has done so far.
+func (c *Conductor) Stats() ConductorStats {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.stats
+}
+
+// BeadSource returns the run's bead listing as a [BeadSource]: the run's own
+// beads with the states bd holds, converted through [beads.SafeBeads] so a
+// status the cannon never registered is reported as it is rather than acted
+// on (P6-12). The planner's stop condition, the shutdown lease release and
+// the worktree cleanup all read it.
+func (c *Conductor) BeadSource() BeadSource {
+	return NewBeadSource(c.beads, c.run.ID(), c.statuses)
+}
+
+// NewBeadSource returns the [BeadSource] of one run over a bd client.
+func NewBeadSource(l BeadLister, run domain.RunID, statuses beads.StatusMap) BeadSource {
+	if l == nil || run == "" {
+		return nil
+	}
+	return func(ctx context.Context) ([]domain.Bead, error) {
+		issues, err := l.ListRun(ctx, run, true)
+		if err != nil {
+			return nil, err
+		}
+		return beads.SafeBeads(issues, statuses), nil
+	}
+}
+
+// BeadLister is the run-scoped listing [NewBeadSource] needs;
+// *beads.Client satisfies it.
+type BeadLister interface {
+	ListRun(ctx context.Context, run domain.RunID, all bool) ([]beads.Issue, error)
+}
+
+// *beads.Client is the production bead lister.
+var _ BeadLister = (*beads.Client)(nil)
+
+// Run syncs until ctx is done or the run has finished, and returns
+// ctx.Err() (nil when the run finished first). It paces itself: the wait
+// between passes is the longer of the interval and the time the last pass
+// took, so a slow bd — every pass spawns subprocesses through one
+// serialised client — makes the glue run less often rather than starving
+// the agents' own calls.
+func (c *Conductor) Run(ctx context.Context) error {
+	for {
+		started := time.Now()
+		if err := c.Sync(ctx); err != nil && ctx.Err() == nil {
+			c.warn(err)
+		}
+		wait := c.interval
+		if spent := time.Since(started); spent > wait {
+			wait = spent
+		}
+		timer := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-c.run.Done():
+			timer.Stop()
+			return nil
+		case <-timer.C:
+		}
+	}
+}
+
+// Sync is one pass: read the run's beads, announce the ones the log has not
+// seen, adopt the ready ones into the feedback loop (rebuilding the threads
+// of a resumed run first), and deliver the approved ones. Every step is
+// attempted even when an earlier one failed — a pass that cannot read the
+// ready set can still ship an approved bead — and the failures come back
+// joined.
+func (c *Conductor) Sync(ctx context.Context) error {
+	issues, err := c.beads.ListRun(ctx, c.run.ID(), true)
+	if err != nil {
+		c.record(false, fmt.Errorf("listing the run's beads: %w", err))
+		return fmt.Errorf("orchestrator: conductor: listing the run's beads: %w", err)
+	}
+	list := beads.SafeBeads(issues, c.statuses)
+	c.announce(issues, list)
+
+	var errs []error
+	if c.restore {
+		if err := c.restoreThreads(ctx, list); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := c.trackReady(ctx); err != nil {
+		errs = append(errs, err)
+	}
+	if err := c.deliverApproved(ctx, list); err != nil {
+		errs = append(errs, err)
+	}
+	joined := errors.Join(errs...)
+	c.record(true, joined)
+	return joined
+}
+
+// trackReady offers the claimable beads to the feedback loop. `bd ready`
+// already leaves out anything whose blockers are open (D-20), so this is
+// the whole of the dependency policy.
+func (c *Conductor) trackReady(ctx context.Context) error {
+	feedback, _, _ := c.parts()
+	epic := c.run.Epic()
+	if feedback == nil || epic == "" {
+		// Nothing has been planned yet, so there is nothing to be ready.
+		return nil
+	}
+	issues, err := c.beads.Ready(ctx, epic)
+	if err != nil {
+		return fmt.Errorf("orchestrator: conductor: listing the ready beads: %w", err)
+	}
+	ready := beads.SafeBeads(issues, c.statuses)
+	feedback.Track(ready...)
+	c.mu.Lock()
+	c.stats.Tracked += len(ready)
+	c.mu.Unlock()
+	return nil
+}
+
+// restoreThreads rebuilds the feedback threads of a resumed run from the
+// beads' own comments (P8-16), once per bead. Without it a resumed run
+// re-fires a changes_requested bead in implement mode and throws its items,
+// responses, holds and rulings away.
+//
+// Only a bead that is past the open state and actually carries structured
+// comments is restored: [Feedback.Restore] concludes the thread it replays,
+// and a bead with nothing to replay would be concluded out of a state it
+// never left. Everything else is adopted the ordinary way.
+func (c *Conductor) restoreThreads(ctx context.Context, list []domain.Bead) error {
+	feedback, _, _ := c.parts()
+	if feedback == nil {
+		return nil
+	}
+	var errs []error
+	for _, b := range list {
+		if b.ID == "" || b.Type == domain.BeadTypeEpic || !conductorRestorable(b) {
+			continue
+		}
+		c.mu.Lock()
+		done := c.restored[b.ID]
+		c.restored[b.ID] = true
+		c.mu.Unlock()
+		if done {
+			continue
+		}
+		msgs, err := c.beads.Messages(ctx, b.ID)
+		if err != nil {
+			c.mu.Lock()
+			delete(c.restored, b.ID)
+			c.mu.Unlock()
+			errs = append(errs, fmt.Errorf("orchestrator: conductor: reading %s's comments: %w", b.ID, err))
+			continue
+		}
+		if len(msgs) == 0 {
+			feedback.Track(b)
+			continue
+		}
+		if err := feedback.Restore(ctx, b, msgs); err != nil {
+			errs = append(errs, fmt.Errorf("orchestrator: conductor: restoring %s's thread: %w", b.ID, err))
+			continue
+		}
+		c.mu.Lock()
+		c.stats.Restored++
+		c.mu.Unlock()
+		c.log.Info("feedback thread restored from the bead's comments",
+			slog.String("bead", b.ID.String()), slog.String("state", string(b.State)),
+			slog.Int("messages", len(msgs)))
+	}
+	return errors.Join(errs...)
+}
+
+// conductorRestorable reports whether a resumed bead has a thread worth
+// rebuilding: it is in one of the states the loop reaches only after an
+// engineer has submitted something, so its comments describe a conversation
+// rather than nothing at all.
+func conductorRestorable(b domain.Bead) bool {
+	switch b.State {
+	case domain.BeadStateInProgress, domain.BeadStateInReview,
+		domain.BeadStateChangesRequested, domain.BeadStateEscalated,
+		domain.BeadStateApproved, domain.BeadStateDelivering:
+		return true
+	default:
+		return false
+	}
+}
+
+// deliverApproved ships every bead the loop approved, at most once at a
+// time per bead.
+func (c *Conductor) deliverApproved(ctx context.Context, list []domain.Bead) error {
+	_, delivery, _ := c.parts()
+	if delivery == nil {
+		return nil
+	}
+	var errs []error
+	for _, b := range list {
+		if b.State != domain.BeadStateApproved || b.Type == domain.BeadTypeEpic {
+			continue
+		}
+		if !c.claim(b.ID) {
+			continue
+		}
+		if err := c.Deliver(ctx, b); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// Deliver ships one bead and routes the outcome back into the loops. The
+// bead is held in flight until an outcome says it may be delivered again,
+// so a pass that overlaps the previous one never ships it twice.
+func (c *Conductor) Deliver(ctx context.Context, b domain.Bead) error {
+	feedback, delivery, _ := c.parts()
+	if delivery == nil {
+		return nil
+	}
+	round := 1
+	if b.Round > 0 {
+		round = b.Round
+	}
+	if feedback != nil {
+		if th, ok := feedback.Thread(b.ID); ok && th.Round > 0 {
+			round = th.Round
+		}
+	}
+	c.mu.Lock()
+	c.stats.Delivered++
+	c.mu.Unlock()
+	out, err := delivery.Deliver(ctx, DeliveryRequest{Bead: b, Round: round})
+	if err != nil {
+		c.release(b.ID)
+		return fmt.Errorf("orchestrator: conductor: delivering %s: %w", b.ID, err)
+	}
+	return c.ApplyOutcome(ctx, b.ID, out)
+}
+
+// ApplyOutcome is the boundary between the delivery handoff and the
+// feedback loop: the deliverer has already written every status, so the
+// loop is only told where the bead went (P6-06). A pull request that is now
+// waiting for its gate kicks the gate poller so the merge is noticed
+// without waiting for its next tick (D-20).
+func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *DeliveryOutcome) error {
+	feedback, _, gates := c.parts()
+	if out == nil {
+		return nil
+	}
+	c.log.Info("delivery outcome", slog.String("bead", id.String()),
+		slog.String("kind", out.Kind.String()), slog.String("state", string(out.State)),
+		slog.String("summary", out.Summary()))
+	bead := domain.Bead{ID: id, State: out.State, Round: out.Round}
+	var err error
+	switch out.Kind {
+	case DeliveryPending:
+		// Safety on: the bead waits in delivering behind its gh:pr gate.
+		c.mu.Lock()
+		c.stats.Shipped++
+		c.mu.Unlock()
+		if gates != nil {
+			gates.Kick()
+		}
+	case DeliveryMerged:
+		c.mu.Lock()
+		c.stats.Shipped++
+		c.mu.Unlock()
+	case DeliveryCheckFailed:
+		c.release(id)
+		if feedback != nil {
+			err = feedback.CheckFailed(ctx, bead, out.Round, out.Items)
+		}
+	case DeliveryNeedsReview:
+		c.release(id)
+		if feedback != nil {
+			err = feedback.ReviewAgain(ctx, bead, out.Round, out.Reason)
+		}
+	case DeliveryConflict, DeliveryRetryable:
+		// The engineer has the bead (D-10), or the attempt may be retried.
+		c.release(id)
+	case DeliveryHandedOff:
+		// A person owns it now; nothing here may pick it back up.
+	}
+	if feedback != nil {
+		feedback.Observe(id, out.State)
+	}
+	if err != nil {
+		return fmt.Errorf("orchestrator: conductor: acting on the delivery of %s: %w", id, err)
+	}
+	return nil
+}
+
+// ConflictResolved is [FeedbackOptions.ConflictResolved]: the engineer of a
+// conflict round has finished, so the delivery handoff decides what happens
+// to the bead next (P6-06) and its outcome is routed like any other.
+func (c *Conductor) ConflictResolved(ctx context.Context, id domain.BeadID) error {
+	_, delivery, _ := c.parts()
+	if delivery == nil {
+		return nil
+	}
+	out, err := delivery.Resolved(ctx, id)
+	if err != nil {
+		return fmt.Errorf("orchestrator: conductor: re-delivering %s after its conflict: %w", id, err)
+	}
+	return c.ApplyOutcome(ctx, id, out)
+}
+
+// ChangeRatio is [FeedbackOptions.Ratio]: the D-09 measurement, taken from
+// the real repository through the delivery's git seam.
+func (c *Conductor) ChangeRatio(ctx context.Context, id domain.BeadID, previous, current *gitx.Diff) (gitx.ChangeRatio, error) {
+	if c.opts.Git == nil {
+		return gitx.ChangeRatio{}, nil
+	}
+	return c.opts.Git.ChangeRatio(ctx, id, previous, current)
+}
+
+// BeadContext is [FeedbackOptions.Context]: everything outside the loop a
+// prompt needs. It makes sure the bead has a worktree, commits whatever the
+// last engineer left uncommitted so the testers always review committed
+// code (D-14), and describes the change set.
+//
+// The leftovers commit goes through [DeliveryGit] rather than straight to
+// gitx (P8-18): a conflict round's prompt is built while the worktree is
+// mid-rebase by construction, and "git add -A" followed by a commit there
+// would stage the conflict markers and destroy the rebase state (P6-16(b)).
+// The adapter refuses that with [ErrRebaseInProgress], which is not a
+// failure of the round — there is simply nothing to commit until the
+// engineer has resolved the conflict, and nothing to diff either, since
+// mid-rebase HEAD is the commit the branch is being rebased onto.
+func (c *Conductor) BeadContext(ctx context.Context, id domain.BeadID) (FeedbackBeadContext, error) {
+	feedback, _, _ := c.parts()
+	issues, err := c.beads.Show(ctx, id)
+	if err != nil {
+		return FeedbackBeadContext{}, fmt.Errorf("orchestrator: conductor: reading %s: %w", id, err)
+	}
+	if len(issues) == 0 {
+		return FeedbackBeadContext{}, fmt.Errorf("orchestrator: conductor: bd knows no bead %s", id)
+	}
+	bead, _ := issues[0].SafeBead(c.statuses)
+	round := 1
+	if feedback != nil {
+		if th, ok := feedback.Thread(id); ok && th.Round > 0 {
+			round = th.Round
+		}
+	}
+
+	worktree := ""
+	if c.opts.Worktrees != nil {
+		worktree = c.opts.Worktrees.PathFor(id)
+		if _, err := os.Stat(worktree); err != nil {
+			if _, err := c.opts.Worktrees.Create(ctx, bead); err != nil {
+				return FeedbackBeadContext{}, fmt.Errorf("orchestrator: conductor: worktree for %s: %w", id, err)
+			}
+		}
+	}
+
+	var (
+		notes     []string
+		midRebase bool
+		diff      *gitx.Diff
+	)
+	if c.opts.Git != nil {
+		switch _, err := c.opts.Git.CommitLeftovers(ctx, bead, round); {
+		case err == nil:
+		case errors.Is(err, ErrRebaseInProgress):
+			midRebase = true
+			notes = append(notes, "this worktree is in the middle of a rebase: "+
+				"nothing was committed and the diff below is the branch as it stood before it")
+		default:
+			return FeedbackBeadContext{}, fmt.Errorf("orchestrator: conductor: committing %s's leftovers: %w", id, err)
+		}
+		if !midRebase {
+			if diff, err = c.opts.Git.Diff(ctx, id); err != nil {
+				return FeedbackBeadContext{}, fmt.Errorf("orchestrator: conductor: diffing %s: %w", id, err)
+			}
+		}
+	}
+
+	return FeedbackBeadContext{
+		Bead: prompt.BeadContext{
+			Bead:     bead,
+			Epic:     c.run.Epic(),
+			Worktree: worktree,
+			Branch:   gitx.BranchName(bead),
+			Round:    round,
+			Notes:    notes,
+		},
+		Repo:         c.opts.Repo,
+		Brief:        c.opts.Brief,
+		Rules:        c.opts.Rules,
+		Vibes:        c.opts.Vibes,
+		Budget:       c.opts.Budget,
+		CheckCommand: c.opts.CheckCommand,
+		Diff:         diff,
+		Model:        c.opts.Model,
+		MaxTurns:     c.opts.MaxTurns,
+		Timeout:      c.opts.Timeout,
+		Env:          c.opts.Env,
+		InheritEnv:   c.opts.InheritEnv,
+		Notes:        notes,
+	}, nil
+}
+
+// announce publishes the bead inventory and the dependency graph (P6-32).
+// Both event kinds existed, round-trip through the codec and are folded by
+// [Summarise], but nothing in a real run emitted either: the run log
+// carried no bead the plan had not named — an external-PR review bead
+// (D-11) never reached `sc status` — and the TUI graph relayed out of
+// nothing. The conductor is already listing the run's beads every pass, so
+// the diff costs nothing extra; [beads.DiffIssues] is the same comparison
+// [beads.Watcher] makes, rather than a second implementation of it.
+func (c *Conductor) announce(issues []beads.Issue, list []domain.Bead) {
+	// P6-28: a bead in a status this run never registered is passed over
+	// everywhere else in silence. The listing is already here, and the
+	// reporter names each such bead once for the whole run.
+	c.foreign.Observe(issues...)
+
+	c.mu.Lock()
+	change := beads.DiffIssues(c.snapshot, issues)
+	c.snapshot = issues
+	added := make([]domain.Bead, 0, len(change.Added))
+	for _, id := range change.Added {
+		if c.seen[id] {
+			continue
+		}
+		c.seen[id] = true
+		for _, b := range list {
+			if b.ID == id && b.Type != domain.BeadTypeEpic {
+				added = append(added, b)
+				break
+			}
+		}
+	}
+	empty := change.Empty()
+	c.stats.Announced += len(added)
+	if !empty {
+		c.stats.Graphs++
+	}
+	c.mu.Unlock()
+
+	for _, b := range added {
+		c.run.Publish(events.BeadCreated{Meta: c.run.Meta(), Bead: b})
+	}
+	if empty {
+		return
+	}
+	work := make([]domain.Bead, 0, len(list))
+	epic := c.run.Epic()
+	for _, b := range list {
+		if b.Type == domain.BeadTypeEpic || b.ID == epic {
+			continue
+		}
+		work = append(work, b)
+	}
+	c.run.Publish(events.GraphChanged{Meta: c.run.Meta(), Epic: epic, Beads: work})
+}
+
+// claim reserves a bead for delivery so two passes never ship one twice.
+func (c *Conductor) claim(id domain.BeadID) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.inflight[id] {
+		return false
+	}
+	c.inflight[id] = true
+	return true
+}
+
+// release lets a bead be delivered again: a retryable failure, a check
+// failure or a conflict, all of which come back through the feedback loop.
+func (c *Conductor) release(id domain.BeadID) {
+	c.mu.Lock()
+	delete(c.inflight, id)
+	c.mu.Unlock()
+}
+
+// record counts a pass and remembers its error.
+func (c *Conductor) record(completed bool, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if completed {
+		c.stats.Passes++
+	}
+	if err != nil {
+		c.stats.Failures++
+	}
+	c.stats.LastError = err
+}
+
+// warn publishes a pass failure, at most once per run of identical ones: bd
+// being down means every pass fails, and one warning per second for an hour
+// is not a report.
+func (c *Conductor) warn(err error) {
+	msg := err.Error()
+	c.mu.Lock()
+	repeat := c.warned == msg
+	c.warned = msg
+	c.mu.Unlock()
+	if repeat {
+		c.log.Debug("the run-level sync is still failing", slog.Any("err", err))
+		return
+	}
+	c.run.Warn(SourceConductor, "a run-level sync with bd failed; the run carries on and retries", err)
 }

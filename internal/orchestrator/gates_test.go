@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -1102,7 +1103,9 @@ func TestGatePollerForgetsAMergedGateThatNamesNoBead(t *testing.T) {
 }
 
 // P3-14/P6-12: a bead carrying the repository's own status, or one of bd's
-// read-only built-ins, is never transitioned.
+// read-only built-ins, is never transitioned — and P6-28: the user is told
+// so once, by a Warning a reader finds by its Source, and the bead is
+// counted so `sc status` can say how many the run is leaving alone.
 func TestGatePollerRefusesForeignAndNonWorkflowBeads(t *testing.T) {
 	t.Parallel()
 	t.Run("foreign status", func(t *testing.T) {
@@ -1112,13 +1115,23 @@ func TestGatePollerRefusesForeignAndNonWorkflowBeads(t *testing.T) {
 		})
 		h.BD.AddGate("fx-qba", "fx-byi", 1)
 		h.BD.AddBead("fx-byi", domain.BeadState("reviewing"), 1)
-		h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+		h.BD.Answer(gateCheck(t, gateOutMerged, ""), gateCheck(t, gateOutMerged, ""))
 
 		res := h.poll()
 		assert.True(t, res.Empty())
 		assert.Empty(t, h.BD.Closed)
 		require.Len(t, h.Rec.warnings(), 1)
+		assert.Equal(t, SourceForeignStatus, h.Rec.warnings()[0].Source,
+			"P6-28: the report is found by its Source, not by its wording")
+		assert.Equal(t, domain.BeadID("fx-byi"), h.Rec.warnings()[0].Bead)
 		assert.Contains(t, h.Rec.warnings()[0].Message, `carries the status "reviewing"`)
+		assert.Equal(t, 1, h.P.Stats().Foreign)
+
+		// bd reports the same merge again: the bead is still not the
+		// poller's, and saying so twice would be noise.
+		assert.True(t, h.poll().Empty())
+		assert.Len(t, h.Rec.warnings(), 1, "one Warning per bead, not one per poll")
+		assert.Equal(t, 1, h.P.Stats().Foreign, "and the count is of beads, not of polls")
 	})
 
 	t.Run("bd built-in", func(t *testing.T) {
@@ -1132,8 +1145,75 @@ func TestGatePollerRefusesForeignAndNonWorkflowBeads(t *testing.T) {
 		assert.True(t, res.Empty())
 		assert.Empty(t, h.BD.Closed)
 		require.Len(t, h.Rec.warnings(), 1)
+		assert.Equal(t, SourceForeignStatus, h.Rec.warnings()[0].Source)
 		assert.Contains(t, h.Rec.warnings()[0].Message, "which slop-cannon only reads")
+		assert.Equal(t, 1, h.P.Stats().Foreign)
 	})
+}
+
+// P6-28: the reporter is the run's, not the poller's, so a bead the
+// scheduler has already reported is not reported a second time when the
+// gate poller meets it. The poller still counts what it passed over.
+func TestGatePollerSharesTheRunsForeignStatusReporter(t *testing.T) {
+	t.Parallel()
+	rec := &gateRecorder{}
+	shared := NewForeignStatusReporter(ForeignStatusOptions{
+		Sink:     rec,
+		Run:      gateRun,
+		Statuses: beads.StatusMap{"reviewing": domain.CategoryWIP},
+		Clock:    func() time.Time { return gateEpoch },
+		Logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	// Somebody else met the bead first.
+	_, first, err := shared.Resolve("fx-byi", "reviewing")
+	require.Error(t, err)
+	require.True(t, first)
+
+	h := newGateHarness(t, func(o *GatePollerOptions) {
+		o.Foreign = shared
+		o.Statuses = beads.StatusMap{"reviewing": domain.CategoryWIP}
+	})
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadState("reviewing"), 1)
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+
+	assert.True(t, h.poll().Empty())
+	assert.Empty(t, h.Rec.warnings(), "the run already told the user about this bead")
+	assert.Len(t, rec.warnings(), 1)
+	assert.Equal(t, 1, shared.Count())
+	assert.Zero(t, h.P.Stats().Foreign, "the poller counts what it was the first to meet")
+}
+
+// P6-29: a reader must be able to say how long `gh` has been away without
+// following the run log back to the Warning.
+func TestGatePollerRecordsWhenGHWentDown(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, nil)
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadStateDelivering, 1)
+	h.BD.Answer(gateCheck(t, gateOutErrors, gateErrMissingGH))
+
+	h.poll()
+	down := h.P.Stats()
+	require.True(t, down.GHDown)
+	assert.Equal(t, gateEpoch, down.GHDownSince)
+
+	h.Clock.Advance(90 * time.Second)
+	h.poll()
+	assert.Equal(t, gateEpoch, h.P.Stats().GHDownSince, "the outage started when it started")
+
+	// gh comes back and the record of the outage goes with it.
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+	h.poll()
+	back := h.P.Stats()
+	assert.False(t, back.GHDown)
+	assert.True(t, back.GHDownSince.IsZero())
+
+	// A second outage is timed from when it started, not from the first.
+	h.Clock.Advance(time.Minute)
+	h.BD.Answer(gateCheck(t, gateOutErrors, gateErrMissingGH))
+	h.poll()
+	assert.Equal(t, gateEpoch.Add(150*time.Second), h.P.Stats().GHDownSince)
 }
 
 // A gate on a bead of another run (or of no run at all) is not this run's
@@ -1781,4 +1861,187 @@ func TestGatePollerDoesNotDoubleWarnOnARefusedTransition(t *testing.T) {
 	assert.Equal(t, SourceState, warns[0].Source)
 	assert.True(t, gateTransitionRefused(fmt.Errorf("wrapped: %w", ErrInvalidTransition)))
 	assert.False(t, gateTransitionRefused(errors.New("bd: exit status 1")))
+}
+
+// ------------------ P6-29: the vitals `sc status` and the TUI header read
+
+// vitalsAt is the instant every vitals test takes its snapshot at.
+var vitalsAt = gateEpoch.Add(time.Hour)
+
+// fakePlanning is a PlanningReporter that returns what it was given.
+type fakePlanning struct{ st PlanningStatus }
+
+func (f fakePlanning) Status() PlanningStatus { return f.st }
+
+// fakeGates is a GateReporter that returns what it was given.
+type fakeGates struct{ st GatePollStats }
+
+func (f fakeGates) Stats() GatePollStats { return f.st }
+
+// P6-29's first question: an idle autopilot run must say when it will plan
+// again, rather than looking like a run that has died.
+func TestRunVitalsReportsTheNextPlanningTime(t *testing.T) {
+	t.Parallel()
+	v := RunVitals{
+		At: vitalsAt,
+		Planning: PlanningStatus{
+			Mode: domain.RunModeAutopilot, Attempts: 4, Plans: 3, Beads: 9, Empty: 1,
+			NextAt: vitalsAt.Add(90 * time.Second),
+		},
+	}
+
+	line := v.PlanningLine()
+
+	assert.Contains(t, line, "planning (autopilot)")
+	assert.Contains(t, line, "4 firings, 3 plans, 9 beads")
+	assert.Contains(t, line, "next in 1m30s")
+	assert.Contains(t, line, gateEpoch.Add(time.Hour+90*time.Second).Format(vitalsTimeFormat),
+		"the absolute time is there for a log a person reads later")
+	assert.Contains(t, line, "1 proposed nothing")
+	assert.Contains(t, v.Header(), "plan in 1m30s")
+}
+
+// The other planning states each say what they are, so "idle" is never
+// guesswork.
+func TestRunVitalsPlanningLineCoversEveryState(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name string
+		st   PlanningStatus
+		want string
+	}{
+		{"nothing yet", PlanningStatus{Mode: domain.RunModeBrief}, "nothing planned yet"},
+		{"running", PlanningStatus{Attempts: 1, Running: true}, "planning now"},
+		{"finished", PlanningStatus{Attempts: 1, Plans: 1, Finished: true}, "finished"},
+		{"waiting", PlanningStatus{Attempts: 1, Plans: 1}, "waiting for the loop"},
+		{"resumed", PlanningStatus{ResumedPlan: true}, "plan resumed"},
+		{"rejections", PlanningStatus{Attempts: 2, Rejections: 2}, "2 rejected in a row"},
+		{"failures", PlanningStatus{Attempts: 3, Failures: 3}, "3 failed in a row"},
+		{"gave up", PlanningStatus{Attempts: 3, GaveUp: 1}, "1 given up"},
+		{"deprioritised", PlanningStatus{Attempts: 1, Deprioritised: 2}, "2 deprioritised"},
+		{"last error", PlanningStatus{Attempts: 1, LastError: "bd is locked"}, "last error: bd is locked"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Contains(t, RunVitals{At: vitalsAt, Planning: c.st}.PlanningLine(), c.want)
+		})
+	}
+}
+
+// P6-29's second question: a gh outage must be visible without reading the
+// log, and it must say how long it has been going on.
+func TestRunVitalsShowsAGHOutage(t *testing.T) {
+	t.Parallel()
+	v := RunVitals{
+		At: vitalsAt,
+		Gates: GatePollStats{
+			Polls: 12, Skipped: 5, Closed: 2, LastAt: vitalsAt.Add(-30 * time.Second),
+			GHDown: true, GHDownSince: vitalsAt.Add(-5 * time.Minute),
+		},
+	}
+
+	line := v.GatesLine()
+
+	assert.Contains(t, line, "12 polls")
+	assert.Contains(t, line, "last 30s ago")
+	assert.Contains(t, line, "2 merged")
+	assert.Contains(t, line, "gh unavailable, 5m0s so far")
+	assert.Contains(t, line, "5 polls skipped")
+	assert.Equal(t, "gh down 5m0s", v.Header())
+}
+
+// P6-29's third question: a merge bd will not let the poller finish has to
+// show as a pending merge, because anything but zero for long means a human
+// is needed.
+func TestRunVitalsShowsAStuckClose(t *testing.T) {
+	t.Parallel()
+	one := RunVitals{At: vitalsAt, Gates: GatePollStats{Polls: 9, Pending: 1, Retries: 4, Failures: 2}}
+	assert.Contains(t, one.GatesLine(), "1 merge pending after 4 retries")
+	assert.Contains(t, one.GatesLine(), "2 failed polls")
+	assert.Contains(t, one.Header(), "1 pending")
+
+	many := RunVitals{At: vitalsAt, Gates: GatePollStats{Polls: 9, Pending: 3}}
+	assert.Contains(t, many.GatesLine(), "3 merges pending")
+	assert.NotContains(t, many.GatesLine(), "after")
+}
+
+// P6-28's count reaches the same report: a run leaving beads alone says so
+// where a person is already looking.
+func TestRunVitalsShowsTheBeadsLeftAlone(t *testing.T) {
+	t.Parallel()
+	assert.Empty(t, RunVitals{At: vitalsAt}.ForeignLine())
+	assert.Equal(t, "beads: 1 left alone, in a status slop-cannon did not register",
+		RunVitals{At: vitalsAt, Foreign: 1}.ForeignLine())
+	assert.Contains(t, RunVitals{At: vitalsAt, Foreign: 4}.ForeignLine(), "4 left alone")
+
+	v := RunVitals{At: vitalsAt, Foreign: 4, Gates: GatePollStats{Polls: 1}}
+	require.Len(t, v.Lines(), 3, "planning, gates and the beads left alone")
+	assert.Contains(t, v.Header(), "4 left alone")
+	assert.Len(t, RunVitals{At: vitalsAt}.Lines(), 2, "and nothing about them when there are none")
+}
+
+// A run nothing has happened in yet reads as one, and says nothing at all
+// in the header — there is no news to put there.
+func TestRunVitalsZeroValueIsQuiet(t *testing.T) {
+	t.Parallel()
+	v := RunVitals{At: vitalsAt}
+
+	assert.Equal(t, []string{"planning: nothing planned yet", "gates: not polled yet"}, v.Lines())
+	assert.Empty(t, v.Header())
+
+	// With no snapshot clock every time is printed absolutely rather than
+	// guessed at.
+	noClock := RunVitals{Planning: PlanningStatus{Attempts: 1, NextAt: gateEpoch}}
+	assert.Contains(t, noClock.PlanningLine(), "next at "+gateEpoch.Format(vitalsTimeFormat))
+	assert.Contains(t, RunVitals{Gates: GatePollStats{GHDown: true, GHDownSince: gateEpoch}}.GatesLine(),
+		"gh unavailable, for an unknown time")
+}
+
+// Vitals reads the live parts, and every one of them is optional: a run
+// with safety off has no gate poller and a run resumed into an already
+// finished plan has no planner to ask.
+func TestVitalsSnapshotsTheLiveParts(t *testing.T) {
+	t.Parallel()
+	h := newGateHarness(t, func(o *GatePollerOptions) {
+		o.Statuses = beads.StatusMap{"reviewing": domain.CategoryWIP}
+	})
+	h.BD.AddGate("fx-qba", "fx-byi", 1)
+	h.BD.AddBead("fx-byi", domain.BeadState("reviewing"), 1)
+	h.BD.Answer(gateCheck(t, gateOutMerged, ""))
+	h.poll()
+
+	plan := fakePlanning{st: PlanningStatus{Mode: domain.RunModeAutopilot, Attempts: 2, Plans: 2}}
+	v := Vitals(vitalsAt, plan, h.P, h.P.Foreign())
+
+	assert.Equal(t, vitalsAt, v.At)
+	assert.Equal(t, 2, v.Planning.Attempts)
+	assert.Equal(t, 1, v.Gates.Polls)
+	assert.Equal(t, 1, v.Foreign, "the run's own reporter, not the poller's counter")
+	assert.Contains(t, strings.Join(v.Lines(), "\n"), "left alone")
+
+	empty := Vitals(vitalsAt, nil, nil, nil)
+	assert.Equal(t, RunVitals{At: vitalsAt}, empty, "every part is optional")
+	assert.Empty(t, empty.Header())
+
+	// And the interfaces are the production types' own.
+	var _ PlanningReporter = fakePlanning{}
+	var _ GateReporter = fakeGates{st: GatePollStats{}}
+}
+
+// The stats are JSON-tagged so state.json and `sc status --json` can carry
+// them without a second shape being defined for them (P6-29, P6-42).
+func TestRunVitalsMarshalsWithSnakeCaseKeys(t *testing.T) {
+	t.Parallel()
+	v := RunVitals{
+		At:    vitalsAt,
+		Gates: GatePollStats{Polls: 3, Pending: 1, Foreign: 2, GHDown: true, GHDownSince: gateEpoch},
+	}
+
+	out, err := json.Marshal(v)
+
+	require.NoError(t, err)
+	for _, want := range []string{`"polls":3`, `"pending":1`, `"foreign":2`, `"gh_down":true`, `"gh_down_since"`} {
+		assert.Contains(t, string(out), want)
+	}
+	assert.NotContains(t, string(out), `"closed"`, "a zero counter is left out")
 }

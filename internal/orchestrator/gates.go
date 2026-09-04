@@ -70,6 +70,10 @@ import (
 // the dependents. [EscalatedGateKeep] is there for a caller that would
 // rather leave the gate for a human to clear by hand.
 //
+// The end of the file is P6-29: [RunVitals], the "why is nothing
+// happening?" snapshot that gathers [GatePollStats] and [PlanningStatus]
+// into the lines `sc status` prints and the one line the TUI header shows.
+//
 // The other half of P6-14 is a delivery retry meeting a gate left over from
 // an earlier pull request, and it belongs to the step that creates the
 // gate: [gitx.PRDeliverer] resolves an open gh:pr gate whose PR number is
@@ -196,6 +200,12 @@ type GatePollerOptions struct {
 	// bead is never transitioned (P3-14, P6-12). Nil still resolves every
 	// D-07 state.
 	Statuses beads.StatusMap
+	// Foreign reports the beads the poller passes over because their status
+	// is not one slop-cannon registered (P6-28). Pass the run's own
+	// reporter, so a bead the scheduler and the poller both meet is
+	// reported once by the run rather than once by each of them; nil makes
+	// the poller build one of its own from Host/Sink, Run and Statuses.
+	Foreign *ForeignStatusReporter
 	// Branch is the default branch name, recorded on [events.Merged].
 	Branch string
 	// Escalated is the P6-14 policy for a pull request closed without
@@ -217,31 +227,43 @@ type GatePollerOptions struct {
 	Logger *slog.Logger
 }
 
-// GatePollStats counts what the poller has done, for `sc status` and tests.
+// GatePollStats counts what the poller has done, for `sc status`, the TUI
+// header (P6-29) and tests. Every field is tagged, so the whole struct can
+// be written into state.json and printed by `sc status --json` without a
+// second shape being defined for it.
 type GatePollStats struct {
 	// Polls counts every `bd gate check` attempt.
-	Polls int
+	Polls int `json:"polls"`
 	// Failures counts the polls where bd itself failed.
-	Failures int
+	Failures int `json:"failures,omitempty"`
 	// Skipped counts the polls skipped because gh was unavailable.
-	Skipped int
+	Skipped int `json:"skipped,omitempty"`
 	// Closed, Blocked and Resolved count the beads closed, the beads moved
 	// to needs_human and the gates resolved by the P6-14 policy.
-	Closed   int
-	Blocked  int
-	Resolved int
+	Closed   int `json:"closed,omitempty"`
+	Blocked  int `json:"blocked,omitempty"`
+	Resolved int `json:"resolved,omitempty"`
 	// Retries counts the close attempts made for a bead whose gate had
 	// already resolved: a bead that bd refused to close first time round.
-	Retries int
+	Retries int `json:"retries,omitempty"`
 	// Pending is how many merges are waiting to be finished right now: a
 	// bead whose close bd refused, or a gate whose read failed. Anything
 	// but zero for long means bd keeps refusing, which the Warnings
 	// explain.
-	Pending int
+	Pending int `json:"pending,omitempty"`
+	// Foreign counts the distinct beads the poller passed over because bd
+	// holds them in a status slop-cannon did not register, or in one of
+	// bd's read-only built-ins (P6-28). It counts a bead once, however many
+	// polls meet it.
+	Foreign int `json:"foreign,omitempty"`
 	// LastAt is the clock time of the last completed poll.
-	LastAt time.Time
+	LastAt time.Time `json:"last_at,omitempty"`
 	// GHDown is true while gh is unavailable and polling is being skipped.
-	GHDown bool
+	GHDown bool `json:"gh_down,omitempty"`
+	// GHDownSince is when the outage in force started, so a reader can say
+	// how long `gh` has been away without following the run log back to the
+	// Warning (P6-29). It is zero whenever GHDown is false.
+	GHDownSince time.Time `json:"gh_down_since,omitempty"`
 }
 
 // GatePollResult is what one poll did.
@@ -299,6 +321,7 @@ type GatePoller struct {
 	run      domain.RunID
 	scope    domain.RunID
 	statuses beads.StatusMap
+	foreign  *ForeignStatusReporter
 	branch   string
 	policy   EscalatedGatePolicy
 	interval time.Duration
@@ -371,6 +394,7 @@ func NewGatePoller(opts GatePollerOptions) (*GatePoller, error) {
 		run:      opts.Run,
 		scope:    opts.Scope,
 		statuses: opts.Statuses,
+		foreign:  opts.Foreign,
 		branch:   opts.Branch,
 		policy:   opts.Escalated,
 		interval: opts.Interval,
@@ -395,6 +419,16 @@ func NewGatePoller(opts GatePollerOptions) (*GatePoller, error) {
 			p.log = slog.Default()
 		}
 	}
+	if p.foreign == nil {
+		p.foreign = NewForeignStatusReporter(ForeignStatusOptions{
+			Host:     opts.Host,
+			Sink:     opts.Sink,
+			Run:      p.run,
+			Statuses: p.statuses,
+			Clock:    p.clock.Now,
+			Logger:   p.log,
+		})
+	}
 	if p.states == nil {
 		// A machine with no store is the documented dry run: it validates
 		// the transition and publishes the event without writing to bd.
@@ -411,6 +445,12 @@ func (p *GatePoller) Interval() time.Duration { return p.interval }
 
 // Policy is the escalated-gate policy in force (P6-14).
 func (p *GatePoller) Policy() EscalatedGatePolicy { return p.policy }
+
+// Foreign is the reporter the poller tells about a bead it may not touch
+// (P6-28): whatever [GatePollerOptions.Foreign] gave it, or the one it
+// built for itself. The run reads it for [RunVitals] when it did not supply
+// one of its own; it is never nil.
+func (p *GatePoller) Foreign() *ForeignStatusReporter { return p.foreign }
 
 // Stats returns a snapshot of the counters.
 func (p *GatePoller) Stats() GatePollStats {
@@ -897,16 +937,18 @@ func (p *GatePoller) bead(ctx context.Context, g beads.Gate) (beads.Issue, domai
 	}
 	// The P6-12 guard lives in state.go and is called, not re-implemented:
 	// a foreign status is refused on its origin even when it maps onto a
-	// workflow state, and bd's read-only built-ins are refused on the state.
-	state, err := ResolveBeadStatus(issue.Status, p.statuses)
-	switch {
-	case errors.Is(err, ErrForeignStatus):
-		p.warnOnce("foreign:"+string(g.Blocks)+":"+issue.Status, g.Blocks,
-			fmt.Sprintf("%s carries the status %q, which slop-cannon did not register; leaving it alone", g.Blocks, issue.Status), nil)
-		return beads.Issue{}, "", gateBeadSkip
-	case err != nil:
-		p.warnOnce("nonworkflow:"+string(g.Blocks)+":"+string(state), g.Blocks,
-			fmt.Sprintf("%s is %s, which slop-cannon only reads; leaving it alone", g.Blocks, state), nil)
+	// workflow state, and bd's read-only built-ins are refused on the
+	// state. The run's [ForeignStatusReporter] publishes the one Warning
+	// the bead owes a human (P6-28) — once per bead, not once per poll —
+	// and says whether this poll was the first to meet it, which is what
+	// keeps [GatePollStats.Foreign] a count of beads rather than of polls.
+	state, first, err := p.foreign.Resolve(g.Blocks, issue.Status)
+	if err != nil {
+		if first {
+			p.mu.Lock()
+			p.stats.Foreign++
+			p.mu.Unlock()
+		}
 		return beads.Issue{}, "", gateBeadSkip
 	}
 	return issue, state, gateBeadAct
@@ -954,6 +996,9 @@ func (p *GatePoller) ghUnavailable(reason string) {
 	p.stats.Skipped++
 	first := !p.stats.GHDown
 	p.stats.GHDown = true
+	if first {
+		p.stats.GHDownSince = p.clock.Now()
+	}
 	p.mu.Unlock()
 	if !first {
 		p.log.Debug("gate polling still skipped: gh is unavailable", slog.String("reason", reason))
@@ -967,6 +1012,7 @@ func (p *GatePoller) ghAvailable() {
 	p.mu.Lock()
 	back := p.stats.GHDown
 	p.stats.GHDown = false
+	p.stats.GHDownSince = time.Time{}
 	p.mu.Unlock()
 	if back {
 		p.log.Info("gh is available again; gate polling resumed")
@@ -1065,4 +1111,249 @@ func gateEscalationReason(pr int, detail string) string {
 		reason += " (" + d + ")"
 	}
 	return reason
+}
+
+// ------------------ P6-29: the vitals `sc status` and the TUI header read
+
+// A run that is doing nothing looks exactly like a run that is stuck, and
+// until P6-29 nothing said which: [Planner.Status] knows when the next
+// planning firing is due and [GatePoller.Stats] knows that `gh` has been
+// unavailable for an hour and that a merge bd keeps refusing to close is
+// still being retried, but neither number left the process. [RunVitals]
+// gathers them — with the count of beads the run is passing over (P6-28) —
+// into one value with one renderer, so `sc status` and the TUI header say
+// the same thing in the same words.
+//
+// It lives beside [GatePollStats] because that is the half of it this file
+// owns; [PlanningStatus] is only read.
+
+// vitalsTimeFormat is how [RunVitals] prints an absolute time: UTC, to the
+// second, the same layout `sc status` uses for its own header.
+const vitalsTimeFormat = "2006-01-02 15:04:05Z"
+
+// PlanningReporter is the slice of [*Planner] the vitals read.
+type PlanningReporter interface {
+	// Status is the planning loop's counters (P6-05).
+	Status() PlanningStatus
+}
+
+// GateReporter is the slice of [*GatePoller] the vitals read.
+type GateReporter interface {
+	// Stats is the gate poller's counters (P6-10).
+	Stats() GatePollStats
+}
+
+// The production reporters.
+var (
+	_ PlanningReporter = (*Planner)(nil)
+	_ GateReporter     = (*GatePoller)(nil)
+)
+
+// RunVitals is why a run looks idle: what the planner is waiting for, what
+// the gate poller is waiting for, and how many beads the run is leaving
+// alone. It is a snapshot with no methods on the live parts, so it can be
+// written into state.json, sent over an event or held by a TUI frame.
+type RunVitals struct {
+	// At is when the snapshot was taken; the renderers phrase a time
+	// relative to it. Zero prints every time absolutely.
+	At time.Time `json:"at,omitempty"`
+	// Planning is the planning loop's counters, zero when the run has no
+	// planner.
+	Planning PlanningStatus `json:"planning"`
+	// Gates is the gate poller's counters, zero when the run has no poller
+	// (safety off never opens a pull request, so it needs none).
+	Gates GatePollStats `json:"gates"`
+	// Foreign is how many beads the run reported it may not touch (P6-28);
+	// it counts every component's reports, not just the gate poller's.
+	Foreign int `json:"foreign,omitempty"`
+}
+
+// Vitals snapshots the run's parts. Every argument is optional: a nil
+// planner, poller or reporter leaves its half of the snapshot zero, which
+// is what a run with no planning loop or with safety off produces.
+func Vitals(at time.Time, plan PlanningReporter, gates GateReporter, foreign *ForeignStatusReporter) RunVitals {
+	v := RunVitals{At: at, Foreign: foreign.Count()}
+	if plan != nil {
+		v.Planning = plan.Status()
+	}
+	if gates != nil {
+		v.Gates = gates.Stats()
+	}
+	return v
+}
+
+// Lines are the vitals as `sc status` prints them: one line for planning,
+// one for the gates, and one for the beads the run is passing over when
+// there are any.
+func (v RunVitals) Lines() []string {
+	out := []string{v.PlanningLine(), v.GatesLine()}
+	if l := v.ForeignLine(); l != "" {
+		out = append(out, l)
+	}
+	return out
+}
+
+// PlanningLine says what the planner has done and what it is waiting for.
+func (v RunVitals) PlanningLine() string {
+	p := v.Planning
+	label := "planning"
+	if p.Mode != "" {
+		label += " (" + string(p.Mode) + ")"
+	}
+	if p.Attempts == 0 && !p.Running && !p.Finished && !p.ResumedPlan {
+		return label + ": nothing planned yet"
+	}
+	parts := []string{fmt.Sprintf("%d firings, %d plans, %d beads", p.Attempts, p.Plans, p.Beads)}
+	switch {
+	case p.Finished:
+		parts = append(parts, "finished")
+	case p.Running:
+		parts = append(parts, "planning now")
+	case !p.NextAt.IsZero():
+		parts = append(parts, "next "+v.when(p.NextAt))
+	default:
+		parts = append(parts, "waiting for the loop")
+	}
+	if p.ResumedPlan {
+		parts = append(parts, "plan resumed")
+	}
+	if p.Empty > 0 {
+		parts = append(parts, fmt.Sprintf("%d proposed nothing", p.Empty))
+	}
+	if p.Rejections > 0 {
+		parts = append(parts, fmt.Sprintf("%d rejected in a row", p.Rejections))
+	}
+	if p.Failures > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed in a row", p.Failures))
+	}
+	if p.GaveUp > 0 {
+		parts = append(parts, fmt.Sprintf("%d given up", p.GaveUp))
+	}
+	if p.Deprioritised > 0 {
+		parts = append(parts, fmt.Sprintf("%d deprioritised", p.Deprioritised))
+	}
+	if p.LastError != "" {
+		parts = append(parts, "last error: "+p.LastError)
+	}
+	return label + ": " + strings.Join(parts, " · ")
+}
+
+// GatesLine says what the gate poller has done and what is holding it up: a
+// `gh` outage, or a merge bd will not let it finish.
+func (v RunVitals) GatesLine() string {
+	g := v.Gates
+	if g.Polls == 0 {
+		if g.GHDown {
+			return "gates: not polled yet · " + v.outage(g)
+		}
+		return "gates: not polled yet"
+	}
+	parts := []string{fmt.Sprintf("%d polls", g.Polls)}
+	if !g.LastAt.IsZero() {
+		parts = append(parts, "last "+v.when(g.LastAt))
+	}
+	if g.Closed > 0 {
+		parts = append(parts, fmt.Sprintf("%d merged", g.Closed))
+	}
+	if g.Blocked > 0 {
+		parts = append(parts, fmt.Sprintf("%d need a human", g.Blocked))
+	}
+	if g.GHDown {
+		parts = append(parts, v.outage(g))
+	}
+	if g.Pending > 0 {
+		pending := fmt.Sprintf("%d merge pending", g.Pending)
+		if g.Pending > 1 {
+			pending = fmt.Sprintf("%d merges pending", g.Pending)
+		}
+		if g.Retries > 0 {
+			pending += fmt.Sprintf(" after %d retries", g.Retries)
+		}
+		parts = append(parts, pending)
+	}
+	if g.Failures > 0 {
+		parts = append(parts, fmt.Sprintf("%d failed polls", g.Failures))
+	}
+	return "gates: " + strings.Join(parts, " · ")
+}
+
+// ForeignLine reports the beads the run is leaving alone (P6-28), or "" if
+// there are none.
+func (v RunVitals) ForeignLine() string {
+	if v.Foreign <= 0 {
+		return ""
+	}
+	if v.Foreign == 1 {
+		return "beads: 1 left alone, in a status slop-cannon did not register"
+	}
+	return fmt.Sprintf("beads: %d left alone, in statuses slop-cannon did not register", v.Foreign)
+}
+
+// Header is the vitals compressed to one line for the TUI header: only what
+// a person needs to see without asking, and nothing when there is nothing
+// to say.
+func (v RunVitals) Header() string {
+	var parts []string
+	switch p := v.Planning; {
+	case p.Running:
+		parts = append(parts, "planning now")
+	case p.Finished:
+		parts = append(parts, "planning done")
+	case !p.NextAt.IsZero():
+		parts = append(parts, "plan "+v.when(p.NextAt))
+	}
+	if v.Gates.GHDown {
+		parts = append(parts, "gh down "+v.since(v.Gates.GHDownSince))
+	}
+	if n := v.Gates.Pending; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d pending", n))
+	}
+	if v.Foreign > 0 {
+		parts = append(parts, fmt.Sprintf("%d left alone", v.Foreign))
+	}
+	return strings.Join(parts, " · ")
+}
+
+// when phrases a time relative to the snapshot: "in 30s", "5m0s ago", or
+// the absolute time when the snapshot carries no clock.
+func (v RunVitals) when(t time.Time) string {
+	stamp := t.UTC().Format(vitalsTimeFormat)
+	if v.At.IsZero() {
+		return "at " + stamp
+	}
+	if d := t.Sub(v.At); d > 0 {
+		return fmt.Sprintf("in %s (%s)", vitalsDuration(d), stamp)
+	}
+	return fmt.Sprintf("%s ago (%s)", vitalsDuration(v.At.Sub(t)), stamp)
+}
+
+// since phrases how long ago something started.
+func (v RunVitals) since(t time.Time) string {
+	if t.IsZero() || v.At.IsZero() {
+		return "for an unknown time"
+	}
+	return vitalsDuration(v.At.Sub(t))
+}
+
+// outage is the `gh` clause of [RunVitals.GatesLine].
+func (v RunVitals) outage(g GatePollStats) string {
+	out := "gh unavailable"
+	if !g.GHDownSince.IsZero() {
+		out += ", " + v.since(g.GHDownSince)
+		if !v.At.IsZero() {
+			out += " so far"
+		}
+	}
+	if g.Skipped > 0 {
+		out += fmt.Sprintf(" (%d polls skipped)", g.Skipped)
+	}
+	return out
+}
+
+// vitalsDuration renders a duration to the second, never negative.
+func vitalsDuration(d time.Duration) string {
+	if d < time.Second {
+		return "0s"
+	}
+	return d.Round(time.Second).String()
 }

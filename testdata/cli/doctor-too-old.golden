@@ -7,6 +7,7 @@ warn  gh                2.98.0 (/fake/bin/gh), not authenticated: You are not lo
 warn  cartridge         no cartridge configured
                         hint: add one with: sc cartridge --add claude --model <model>
 pass  repo              clean working tree at /repo
+pass  .gitignore        ignores .env
 pass  .beads            /repo/.beads present
 
-2 passed, 2 warnings, 2 failed
+3 passed, 2 warnings, 2 failed

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -429,6 +430,47 @@ func (c *schedClaims) Renew(_ context.Context, id domain.BeadID, agent domain.Ag
 // *schedClaims is a ClaimStore, like *beads.Client.
 var _ ClaimStore = (*schedClaims)(nil)
 
+// schedParker records the D-07 transitions the scheduler asks for when it
+// parks a demand it has given up on (P6-31), standing in for the state
+// machine.
+type schedParker struct {
+	mu   sync.Mutex
+	reqs []StateRequest
+	err  error
+}
+
+// Apply implements [BeadParker].
+func (p *schedParker) Apply(_ context.Context, req StateRequest) (StateResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.reqs = append(p.reqs, req)
+	if p.err != nil {
+		return StateResult{From: req.From}, p.err
+	}
+	return StateResult{From: req.From, To: domain.BeadStateFailed, Persisted: true}, nil
+}
+
+// Requests returns the transitions asked for so far, in order.
+func (p *schedParker) Requests() []StateRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]StateRequest(nil), p.reqs...)
+}
+
+// *schedParker is a BeadParker, like *StateMachine.
+var _ BeadParker = (*schedParker)(nil)
+
+// schedFinishWhenIdle stops the run as soon as a dispatch has nothing left
+// to fire, which is what a parked demand leaves behind.
+func schedFinishWhenIdle() StopCondition {
+	return StopConditionFunc(func(_ context.Context, _ *Run, st SchedulerStatus) (Outcome, bool, error) {
+		if st.Idle {
+			return Outcome{Reason: events.FinishCompleted, Summary: "nothing left to fire"}, true, nil
+		}
+		return Outcome{}, false, nil
+	})
+}
+
 // schedOnceSource offers each demand until it has been fired, the way a
 // real source does: work in flight, or done, is not offered again. A source
 // that keeps offering finished work would have the scheduler re-fire it on
@@ -482,6 +524,14 @@ func schedImplement(bead domain.BeadID, round int) Demand {
 // schedReview builds a tester demand for a bead and lens.
 func schedReview(bead domain.BeadID, lens domain.Lens, round int) Demand {
 	return Demand{Kind: DemandReview, Bead: bead, Lens: lens, Round: round}
+}
+
+// schedPushback builds the other tester demand of a round: judging the
+// engineer's pushback on that lens's own item (D-08).
+func schedPushback(bead domain.BeadID, lens domain.Lens, round int) Demand {
+	d := schedReview(bead, lens, round)
+	d.Task = events.TaskEvaluatePushback
+	return d
 }
 
 // --- the D-05 allocation table -------------------------------------------
@@ -939,7 +989,12 @@ func TestSchedulerRecordsAgentsInTheRunState(t *testing.T) {
 		Work: schedStatic(schedReview("sc-1", domain.LensQA, 1)),
 		Fire: gate,
 	})
-	schedEventually(t, "the agent to be recorded", func() bool { return len(f.Run.Agents()) == 1 })
+	// The run records the agent on the loop goroutine, before the agent's
+	// own goroutine reaches the firer, so a test that indexes the firings
+	// has to wait for the firing and not only for the record (P6-43).
+	schedEventually(t, "the agent to be recorded and fired", func() bool {
+		return len(f.Run.Agents()) == 1 && len(gate.Firings()) == 1
+	})
 	recorded := f.Run.Agents()[0]
 	assert.Equal(t, domain.AgentID("tester-qa-sc-1-r1"), recorded.ID)
 	assert.Equal(t, domain.RoleTester, recorded.Role)
@@ -970,14 +1025,17 @@ func TestSchedulerRecordsAgentsInTheRunState(t *testing.T) {
 }
 
 // TestSchedulerSuppressAgentEventsLeavesThemToTheFirer covers the
-// supervisor that publishes its own, richer agent events.
+// supervisor that publishes its own, richer agent events. Announcing the
+// agent through Firing.Update is how a firer says it did (P6-23).
 func TestSchedulerSuppressAgentEventsLeavesThemToTheFirer(t *testing.T) {
 	done := make(chan struct{})
 	var once sync.Once
 	work := schedOnce(schedReview("sc-1", domain.LensQA, 1))
 	f := schedSetup(t, 10, SchedulerOptions{
 		Work: work,
-		Fire: work.Fire(FirerFunc(func(context.Context, Firing) (FireResult, error) {
+		Fire: work.Fire(FirerFunc(func(_ context.Context, fr Firing) (FireResult, error) {
+			// What the supervisor does as it publishes its own AgentSpawned.
+			fr.Update(fr.Agent)
 			once.Do(func() { close(done) })
 			return FireResult{}, nil
 		})),
@@ -994,6 +1052,269 @@ func TestSchedulerSuppressAgentEventsLeavesThemToTheFirer(t *testing.T) {
 			t.Fatalf("the scheduler published %s despite SuppressAgentEvents", ev.Kind())
 		}
 	}
+}
+
+// TestSchedulerPublishesTheEventsAFirerNeverDid is P6-23: a planning firer
+// of its own publishes no agent events, so with the supervisor's suppressed
+// as well the product owner that plans the run would be invisible in the
+// run log, in `sc status`'s agent counts and on the TUI's Agents tab. A
+// firing that announced nothing gets its pair from the scheduler.
+func TestSchedulerPublishesTheEventsAFirerNeverDid(t *testing.T) {
+	plan := Demand{Kind: DemandPlan}
+	work := schedOnce(plan)
+	f := schedSetup(t, 10, SchedulerOptions{
+		Work: work,
+		Fire: work.Fire(FirerFunc(func(context.Context, Firing) (FireResult, error) {
+			// A PlanRunner that is not the supervisor: it publishes nothing
+			// and never records the agent.
+			return FireResult{Produced: domain.MessagePlan}, nil
+		})),
+		SuppressAgentEvents: true,
+	})
+	schedEventually(t, "the planning firing to finish", func() bool { return f.Sched.Status().Fired == 1 })
+	require.NoError(t, f.Run.Stop("test over"))
+	_, err := f.Wait()
+	require.NoError(t, err)
+
+	var (
+		spawned  []events.AgentSpawned
+		finished []events.AgentFinished
+	)
+	for _, ev := range f.events() {
+		switch e := ev.(type) {
+		case events.AgentSpawned:
+			spawned = append(spawned, e)
+		case events.AgentFinished:
+			finished = append(finished, e)
+		case events.AgentFailed:
+			t.Fatalf("the planning firing did not fail: %+v", e)
+		}
+	}
+	require.Len(t, spawned, 1, "one AgentSpawned per planning firing")
+	require.Len(t, finished, 1, "and one AgentFinished")
+	assert.Equal(t, domain.AgentID("po-plan-1"), spawned[0].Agent.ID)
+	assert.Equal(t, domain.RolePO, spawned[0].Agent.Role)
+	assert.Equal(t, events.TaskPlan, spawned[0].Task)
+	assert.Equal(t, 1, spawned[0].Attempt)
+	assert.Equal(t, domain.AgentID("po-plan-1"), finished[0].Agent)
+	assert.Equal(t, domain.MessagePlan, finished[0].Produced)
+}
+
+// TestSchedulerReportsAFiringThatFailedBeforeItsAgentExisted is the second
+// half of P6-31: the supervisor returns a planning error before it registers
+// the agent or publishes anything, so a firing that never reaches a
+// cartridge showed up nowhere at all. It is not a crash — nothing ran — so
+// it is reported as internal.
+func TestSchedulerReportsAFiringThatFailedBeforeItsAgentExisted(t *testing.T) {
+	boom := errors.New("the worktree is locked")
+	work := schedOnce(schedImplement("sc-1", 1))
+	f := schedSetup(t, 10, SchedulerOptions{
+		Work: work,
+		Fire: work.Fire(FirerFunc(func(context.Context, Firing) (FireResult, error) {
+			return FireResult{}, boom
+		})),
+		SuppressAgentEvents: true,
+	})
+	schedEventually(t, "the firing to fail", func() bool { return f.Sched.Status().Fired == 1 })
+	require.NoError(t, f.Run.Stop("test over"))
+	_, err := f.Wait()
+	require.NoError(t, err)
+
+	var (
+		spawned []events.AgentSpawned
+		failed  []events.AgentFailed
+	)
+	for _, ev := range f.events() {
+		switch e := ev.(type) {
+		case events.AgentSpawned:
+			spawned = append(spawned, e)
+		case events.AgentFailed:
+			failed = append(failed, e)
+		}
+	}
+	require.Len(t, spawned, 1)
+	require.Len(t, failed, 1)
+	assert.Equal(t, domain.AgentID("eng-sc-1-r1"), failed[0].Agent)
+	assert.Equal(t, domain.BeadID("sc-1"), failed[0].Bead)
+	assert.Equal(t, events.FailureInternal, failed[0].Failure, "nothing crashed: no cartridge ran")
+	assert.Equal(t, boom.Error(), failed[0].Err)
+}
+
+// --- the demand failure budget (P6-31) -----------------------------------
+
+// TestSchedulerParksADemandWhoseFiringsKeepFailing is P6-31. A work source
+// re-offers a demand every tick until the work behind it is done, so a
+// firing that always fails used to be claimed and fired for ever: the
+// integrator watched 612 attempts in 45 s over a stale .git/index.lock.
+// The budget bounds it, the bead is parked with the reason, and the run
+// finishes instead of spinning.
+func TestSchedulerParksADemandWhoseFiringsKeepFailing(t *testing.T) {
+	boom := errors.New("git: index.lock exists")
+	var fires atomic.Int64
+	claims := newSchedClaims(nil)
+	parker := &schedParker{}
+	f := schedSetup(t, 10, SchedulerOptions{
+		// A source that never gives up, which is what every real one does.
+		Work:   schedStatic(schedImplement("sc-1", 1)),
+		Claims: claims,
+		Fire: FirerFunc(func(context.Context, Firing) (FireResult, error) {
+			fires.Add(1)
+			return FireResult{}, boom
+		}),
+		Park: parker,
+		Stop: schedFinishWhenIdle(),
+	})
+	out, err := f.Wait()
+	require.NoError(t, err)
+	assert.Equal(t, events.FinishCompleted, out.Reason, "the run finished rather than spinning")
+	assert.Equal(t, int64(DefaultDemandFailureLimit), fires.Load(), "the budget bounds the retries")
+	assert.Equal(t, 1, f.Sched.Status().Parked)
+
+	require.Equal(t, []StateRequest{{
+		Bead:   "sc-1",
+		From:   domain.BeadStateInProgress,
+		Event:  BeadEventFailed,
+		Reason: "3 firings of the implement failed in a row",
+		Round:  1,
+	}}, parker.Requests(), "the bead is parked once, through the D-07 table")
+
+	var parked []events.Warning
+	failures := 0
+	for _, ev := range f.events() {
+		switch e := ev.(type) {
+		case events.Warning:
+			if strings.Contains(e.Message, "gave up") {
+				parked = append(parked, e)
+			}
+		case events.AgentFailed:
+			failures++
+		}
+	}
+	require.Len(t, parked, 1, "one warning, not one a tick")
+	assert.Contains(t, parked[0].Message, "3 firings failed in a row")
+	assert.Equal(t, boom.Error(), parked[0].Err, "the warning names the last error")
+	assert.Equal(t, domain.BeadID("sc-1"), parked[0].Bead)
+	assert.Equal(t, domain.AgentID("eng-sc-1-r1-a3"), parked[0].Agent)
+	assert.Equal(t, DefaultDemandFailureLimit, failures, "every failed firing was reported")
+}
+
+// TestSchedulerBudgetCountsFailuresInARowNotInARun checks the budget is
+// consecutive: a firing that works clears what the failures before it
+// spent, so a flaky cartridge is not parked for its history.
+func TestSchedulerBudgetCountsFailuresInARowNotInARun(t *testing.T) {
+	boom := errors.New("bd timed out")
+	var fires atomic.Int64
+	parker := &schedParker{}
+	review := schedReview("sc-1", domain.LensQA, 1)
+	review.From = domain.BeadStateInReview // a tester claims nothing (P6-13)
+	f := schedSetup(t, 10, SchedulerOptions{
+		Work: schedStatic(review),
+		Fire: FirerFunc(func(context.Context, Firing) (FireResult, error) {
+			// fail, fail, work, fail, fail, fail
+			if fires.Add(1) == 3 {
+				return FireResult{Produced: domain.MessageVerdict}, nil
+			}
+			return FireResult{}, boom
+		}),
+		Park: parker,
+		Stop: schedFinishWhenIdle(),
+	})
+	_, err := f.Wait()
+	require.NoError(t, err)
+	assert.Equal(t, int64(6), fires.Load(), "the third firing reset the budget the first two spent")
+	require.Len(t, parker.Requests(), 1)
+	assert.Equal(t, domain.BeadStateInReview, parker.Requests()[0].From,
+		"a demand that claims nothing is parked from where the source said the bead was")
+}
+
+// TestSchedulerParkNamesTheBookkeepingNotTheCartridge covers the round-3
+// widening of P6-31: the supervisor refuses to re-run a session whose
+// Result hook failed, so the demand comes back to the scheduler and is
+// fired from scratch. It spends the budget like any other failure, and the
+// warning says the agent answered.
+func TestSchedulerParkNamesTheBookkeepingNotTheCartridge(t *testing.T) {
+	hook := fmt.Errorf("%w: bd refused the comment", ErrPostSession)
+	parker := &schedParker{}
+	f := schedSetup(t, 10, SchedulerOptions{
+		Work:         schedStatic(schedImplement("sc-1", 2)),
+		Claims:       newSchedClaims(nil),
+		FailureLimit: 1,
+		Fire: FirerFunc(func(context.Context, Firing) (FireResult, error) {
+			return FireResult{Failure: events.FailureInternal}, hook
+		}),
+		Park: parker,
+		Stop: schedFinishWhenIdle(),
+	})
+	_, err := f.Wait()
+	require.NoError(t, err)
+	require.Len(t, parker.Requests(), 1)
+
+	var parked *events.Warning
+	for _, ev := range f.events() {
+		if w, ok := ev.(events.Warning); ok && strings.Contains(w.Message, "gave up") {
+			w := w
+			parked = &w
+		}
+	}
+	require.NotNil(t, parked)
+	assert.Contains(t, parked.Message, "bookkeeping")
+	assert.NotContains(t, parked.Message, "crash")
+	assert.Contains(t, parked.Err, ErrPostSession.Error())
+}
+
+// TestSchedulerDoesNotSpendTheBudgetOnAStoppedFiring keeps a stop from
+// looking like a failure of the work: the agents a stop cancels say nothing
+// about whether their demands can ever succeed, and a resumed run must find
+// its beads where it left them.
+func TestSchedulerDoesNotSpendTheBudgetOnAStoppedFiring(t *testing.T) {
+	gate := newSchedGate()
+	parker := &schedParker{}
+	f := schedSetup(t, 10, SchedulerOptions{
+		Work:         schedStatic(schedImplement("sc-1", 1)),
+		Claims:       newSchedClaims(nil),
+		FailureLimit: 1,
+		Fire:         gate,
+		Park:         parker,
+	})
+	schedEventually(t, "the engineer to fire", func() bool { return len(gate.Firings()) == 1 })
+	require.NoError(t, f.Run.Stop("test over"))
+	_, err := f.Wait()
+	require.NoError(t, err)
+	assert.Empty(t, parker.Requests(), "a cancelled firing is not a failed demand")
+	assert.Zero(t, f.Sched.Status().Parked)
+}
+
+// TestSchedulerBudgetLeavesPlanningToThePlanner keeps the scheduler out of
+// P6-19's way: a product owner that cannot produce a plan is bounded by the
+// planner's own give-up policy (which is longer than this budget), and a
+// planning demand has no bead to park anyway.
+func TestSchedulerBudgetLeavesPlanningToThePlanner(t *testing.T) {
+	var fires atomic.Int64
+	parker := &schedParker{}
+	f := schedSetup(t, 10, SchedulerOptions{
+		Work: schedStatic(Demand{Kind: DemandPlan}),
+		Fire: FirerFunc(func(context.Context, Firing) (FireResult, error) {
+			fires.Add(1)
+			return FireResult{}, errors.New("the product owner cannot plan")
+		}),
+		Park: parker,
+	})
+	schedEventually(t, "more firings than the budget would allow", func() bool {
+		return fires.Load() > int64(DefaultDemandFailureLimit)
+	})
+	require.NoError(t, f.Run.Stop("test over"))
+	_, err := f.Wait()
+	require.NoError(t, err)
+	assert.Empty(t, parker.Requests())
+	assert.Zero(t, f.Sched.Status().Parked)
+}
+
+// TestSchedulerFailureLimitDefaultsAndOff pins the two ends of the option.
+func TestSchedulerFailureLimitDefaultsAndOff(t *testing.T) {
+	t.Parallel()
+	assert.Equal(t, DefaultDemandFailureLimit, NewScheduler(SchedulerOptions{}).limit)
+	assert.Equal(t, 7, NewScheduler(SchedulerOptions{FailureLimit: 7}).limit)
+	assert.Zero(t, NewScheduler(SchedulerOptions{FailureLimit: -1}).limit, "negative turns the budget off")
 }
 
 // --- pause, stop and finish ----------------------------------------------
@@ -1438,6 +1759,16 @@ func TestDemandKeyIdentifiesTheWorkNotTheAttempt(t *testing.T) {
 	assert.NotEqual(t, a.Key(), d.Key())
 	assert.Equal(t, "review|sc-1|qa|1", a.Key())
 	assert.Equal(t, "plan|||0", Demand{Kind: DemandPlan}.Key())
+
+	// The task is not part of the key, so the two firings one lens owes in
+	// a round that judges a pushback and re-reviews the fix (D-08) still
+	// never run as two agents at once. They are two jobs for naming
+	// (P6-35), which is what jobKey separates.
+	pushback := a
+	pushback.Task = events.TaskEvaluatePushback
+	assert.Equal(t, a.Key(), pushback.Key())
+	assert.NotEqual(t, jobKey(a), jobKey(pushback))
+	assert.Equal(t, "review|sc-1|qa|1|review", jobKey(a))
 }
 
 // TestMintAgentIDNamesAgentsAfterTheirJob pins the ids the run log, the
@@ -1457,9 +1788,65 @@ func TestMintAgentIDNamesAgentsAfterTheirJob(t *testing.T) {
 		{Demand{Kind: DemandPlan}, 1, "po-plan-1"},
 		{Demand{Kind: DemandPlan}, 4, "po-plan-4"},
 		{Demand{Kind: DemandKind("nap"), Bead: "sc-1"}, 1, "nap-sc-1"},
+		{schedPushback("sc-68s", domain.LensQA, 2), 1, "tester-qa-sc-68s-r2-pushback"},
+		{schedPushback("sc-68s", domain.LensQA, 2), 2, "tester-qa-sc-68s-r2-pushback-a2"},
 	}
 	for _, tc := range tests {
 		assert.Equal(t, tc.want, mintAgentID(tc.demand, tc.attempt))
+	}
+	// Only reviews are marked: an engineer answering feedback keeps the one
+	// name its bead and round already give it.
+	feedback := schedImplement("sc-68s", 2)
+	feedback.Task = events.TaskAddressFeedback
+	assert.Equal(t, domain.AgentID("eng-sc-68s-r2"), mintAgentID(feedback, 1))
+}
+
+// TestSchedulerNamesBothFiringsOfOneLensInOneRound is P6-35: a round that
+// both judges the engineer's pushback and re-reviews the fix fires the same
+// lens twice at the same round number, and the second one used to be called
+// "-a2" — the suffix that means "a retry of the same job".
+func TestSchedulerNamesBothFiringsOfOneLensInOneRound(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		fired []domain.AgentID
+	)
+	ids := func() []domain.AgentID {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]domain.AgentID(nil), fired...)
+	}
+	// The feedback loop offers the pushback judgement first and the
+	// re-review once it has an answer; both are round 2 of one lens.
+	work := WorkSourceFunc(func(context.Context) ([]Demand, error) {
+		switch len(ids()) {
+		case 0:
+			return []Demand{schedPushback("sc-1", domain.LensQA, 2)}, nil
+		case 1:
+			return []Demand{schedReview("sc-1", domain.LensQA, 2)}, nil
+		default:
+			return nil, nil // the round is answered
+		}
+	})
+	f := schedSetup(t, 10, SchedulerOptions{
+		Work: work,
+		Fire: FirerFunc(func(_ context.Context, fr Firing) (FireResult, error) {
+			mu.Lock()
+			fired = append(fired, fr.Agent.ID)
+			mu.Unlock()
+			return FireResult{Produced: domain.MessageVerdict}, nil
+		}),
+	})
+	schedEventually(t, "both firings", func() bool { return len(ids()) >= 2 })
+	require.NoError(t, f.Run.Stop("test over"))
+	_, err := f.Wait()
+	require.NoError(t, err)
+
+	all := ids()
+	require.GreaterOrEqual(t, len(all), 2)
+	got := all[:2]
+	assert.Equal(t, []domain.AgentID{"tester-qa-sc-1-r2-pushback", "tester-qa-sc-1-r2"}, got)
+	for _, id := range got {
+		assert.NotContains(t, string(id), "-a2", "neither firing is a retry of the other")
 	}
 }
 
@@ -1732,4 +2119,47 @@ func TestSchedulerAnnouncesTheClaimTransition(t *testing.T) {
 	assert.Equal(t, 2, got["sc-2"].Round)
 	assert.NotContains(t, got, domain.BeadID("sc-3"), "a bead already in_progress did not move")
 	assert.NotContains(t, got, domain.BeadID("sc-4"), "a source that does not say where the bead was")
+}
+
+// TestSchedulerTellsTwoHeldItemsOfOneRoundApart is P6-25's exit criterion
+// at the scheduler. A round can hold two items and each is its own dispute
+// with its own product owner, so the two arbitrations are two jobs: a
+// source that tracks what it has already had fired (as the feedback loop
+// does) must still be owed the second after the first goes out, and the
+// same dispute offered twice is still fired once. The D-05 table gives a
+// run one product-owner slot, so the two rulings are made one after the
+// other rather than together.
+func TestSchedulerTellsTwoHeldItemsOfOneRoundApart(t *testing.T) {
+	first := Demand{
+		Kind: DemandArbitrate, Bead: "sc-1", Round: 2, Agent: "po-sc-1-r2-i1",
+		Payload: FeedbackWork{Bead: "sc-1", Round: 2, Item: "i1"},
+	}
+	second := first
+	second.Agent = "po-sc-1-r2-i2"
+	second.Payload = FeedbackWork{Bead: "sc-1", Round: 2, Item: "i2"}
+	require.NotEqual(t, first.Key(), second.Key(), "two disputed items are two jobs")
+
+	// The same dispute is offered twice in one dispatch, as a source that
+	// has not yet seen the firing would offer it.
+	src := schedOnce(first, second, first)
+	var mu sync.Mutex
+	var ids []domain.AgentID
+	record := FirerFunc(func(_ context.Context, fi Firing) (FireResult, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		ids = append(ids, fi.Agent.ID)
+		return FireResult{}, nil
+	})
+	f := schedSetup(t, 10, SchedulerOptions{Work: src, Fire: src.Fire(record)})
+	schedEventually(t, "both arbitrations to fire", func() bool {
+		f.Clock.Advance(2 * DefaultTickInterval)
+		return f.Sched.Status().Fired == 2
+	})
+	for i := 0; i < 10; i++ {
+		f.Clock.Advance(2 * DefaultTickInterval)
+	}
+	assert.Equal(t, uint64(2), f.Sched.Status().Fired, "the same arbitration is never fired twice")
+	mu.Lock()
+	defer mu.Unlock()
+	assert.ElementsMatch(t, []domain.AgentID{"po-sc-1-r2-i1", "po-sc-1-r2-i2"}, ids)
 }

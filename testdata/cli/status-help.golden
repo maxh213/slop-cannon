@@ -6,6 +6,12 @@ across the workflow states, which agents are live, and the last few events.
 Everything comes from the run directory — state.json and events.jsonl — so
 it also works after a crash and while another process holds the run.
 
+The bead states are then reconciled with bd, so a bead a human closed or
+reopened by hand is reported as it stands rather than as the run last left
+it; --live=false skips that and reports the run log alone, which is also
+what happens when the repository has no beads database or bd is not
+installed.
+
 With a bead id it prints that bead's timeline from beads: creation, the
 claim, every structured message sc recorded (verdicts, responses,
 arbitrations, deliveries) and where the bead stands now. This form needs bd
@@ -24,6 +30,7 @@ Examples:
 Flags:
       --events N   how many recent events to print (N, 0 for none) (default 10)
   -h, --help       help for status
+      --live       reconcile the bead states with bd (--live=false reports the run log alone) (default true)
       --run ID     report on run ID instead of the most recent one
 
 Global Flags:

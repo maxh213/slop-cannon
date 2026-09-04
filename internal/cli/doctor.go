@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"slop-cannon/internal/agents"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/proc"
@@ -62,7 +63,7 @@ const (
 // DoctorCheck is one row of the sc doctor report.
 type DoctorCheck struct {
 	// Name identifies the check: "git", "bd", "beads", "gh", "config",
-	// "cartridge", "cartridge:<name>", "repo", or ".beads".
+	// "cartridge", "cartridge:<name>", "repo", ".gitignore", or ".beads".
 	Name string `json:"name"`
 	// Status is pass, warn, or fail.
 	Status DoctorStatus `json:"status"`
@@ -85,6 +86,18 @@ type DoctorReport struct {
 	Failed   int `json:"failed"`
 	// OK is true when no row failed.
 	OK bool `json:"ok"`
+}
+
+// Check returns the row with this name, or nil when the report has none:
+// a row is skipped when the question does not apply (the .gitignore row
+// outside a git repository, the beads row without bd).
+func (r *DoctorReport) Check(name string) *DoctorCheck {
+	for i := range r.Checks {
+		if r.Checks[i].Name == name {
+			return &r.Checks[i]
+		}
+	}
+	return nil
 }
 
 func (r *DoctorReport) add(checks ...DoctorCheck) {
@@ -114,6 +127,7 @@ const doctorLong = `Check that everything a run needs is installed and configure
   cartridge  every configured cartridge CLI is on PATH (failure when the
              active one is missing)
   repo       --repo is a git repository with a clean working tree (warning)
+  .gitignore ignores .env, so an agent cannot commit a credential (warning)
   .beads     present (warning: it is initialised on the first run)
 
 Rows are pass, warn, or fail. The exit status is 1 when any row fails.`
@@ -176,6 +190,9 @@ func RunDoctor(ctx context.Context, repo string) *DoctorReport {
 	report.add(doctorGH(ctx))
 	report.add(doctorCartridges(ctx, repo)...)
 	report.add(doctorRepo(ctx, repo, root, inRepo, gitOK))
+	if inRepo {
+		report.add(doctorGitignore(root))
+	}
 	report.add(doctorBeadsDir(beadsDir, hasBeads))
 	return report
 }
@@ -383,6 +400,25 @@ func doctorBeadsDir(beadsDir string, exists bool) DoctorCheck {
 		return c
 	}
 	c.Status, c.Detail, c.Hint = DoctorWarn, "not initialised: "+beadsDir+" is missing", doctorHintBeads
+	return c
+}
+
+// doctorGitignore warns when the repository's .gitignore does not ignore
+// its dotenv files (P9-05). Excluding them from prompts is only half the
+// job: an agent that commits a .env has leaked the credential whatever the
+// prompt said, and nothing sc does can un-commit it. The row is skipped
+// entirely outside a git repository, where there is nothing to ignore.
+func doctorGitignore(root string) DoctorCheck {
+	c := DoctorCheck{Name: ".gitignore"}
+	covered, err := agents.GitignoreCoversEnv(root)
+	switch {
+	case err != nil:
+		c.Status, c.Detail, c.Hint = DoctorWarn, "could not be read: "+doctorErr(err), agents.GitignoreHint
+	case covered:
+		c.Status, c.Detail = DoctorPass, "ignores .env"
+	default:
+		c.Status, c.Detail, c.Hint = DoctorWarn, "does not ignore .env", agents.GitignoreHint
+	}
 	return c
 }
 

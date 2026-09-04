@@ -25,7 +25,8 @@ import (
 // This file is the agent supervisor (P6-07) and the tasks folded into it:
 // the read-only bd shim every agent worktree gets (P6-17) and the
 // copy-worktree degrade for a cartridge that cannot restrict its own tools
-// (P6-20).
+// (P6-20), whose contained session is told in its prompt that the copy has
+// no git in it ([CopiedWorktreeNote], P6-30).
 //
 // The loops above it never call [agents.RunAgent] directly: they describe
 // an [AgentFiring] and hand it to [FireAgent], and the scheduler (P6-02)
@@ -90,6 +91,27 @@ const (
 	// copies of the P6-20 degrade, one per agent, deleted after the firing.
 	CopiesDirName = "copies"
 )
+
+// CopiedWorktreeNote is the paragraph the supervisor appends to the prompt
+// of every firing that runs under the P6-20 degrade
+// ([agents.EnforceCopiedWorktree]).
+//
+// The copy deliberately has no `.git`: in a git worktree that entry is a
+// file pointing back into the real repository's administrative directory,
+// so copying it would let the very writes the degrade exists to contain
+// reach the repository (see [CopyWorktree]). Every git command therefore
+// fails in the copy, and an agent that does not know it will waste its
+// session on `git diff`, `git log` and `git status` and then report that
+// the repository is broken. No shipping adapter needs the degrade (D-19),
+// so this note — rather than a sanitised standalone clone — is what the
+// first adapter that does gets (P6-30).
+const CopiedWorktreeNote = "Note on this working directory: it is a throwaway copy of the agent worktree, " +
+	"made because the CLI running you cannot restrict its own tools. " +
+	"It has no `.git`, so git is unavailable here: `git diff`, `git log`, `git status`, `git commit` and every " +
+	"other git command will fail, and that is expected — it is not a broken repository. " +
+	"Work from the code in this directory and from what this prompt tells you about the change. " +
+	"Everything you write here is thrown away when the session ends and never reaches the repository, " +
+	"so put your answer in your reply, not in a file."
 
 // Supervisor errors, matched with errors.Is.
 var (
@@ -848,6 +870,14 @@ func (s *Supervisor) stamp(run *agents.AgentRun, f AgentFiring, agent domain.Age
 		// owner, P6-05; the arbitrating product owner, P6-04) keeps the
 		// directory its builder chose — usually the repository itself.
 		run.Spec.Workdir = prep.workdir
+	}
+	if prep.enforcement.Mode == agents.EnforceCopiedWorktree {
+		// P6-30: the session is in a copy with no `.git`, so it is told so
+		// rather than left to discover it by running git. The supervisor
+		// does it here, not the role builders, because the degrade is
+		// decided per attempt (by the cartridge the selector handed out)
+		// and a builder cannot know which attempt it is building for.
+		run.Spec.Prompt = noteCopiedWorktree(run.Spec.Prompt)
 	}
 	if run.Spec.Timeout <= 0 {
 		run.Spec.Timeout = s.Timeout()
@@ -1768,8 +1798,25 @@ func (c *supCopiedCartridge) ToolPolicyEnforcement(p cartridge.ToolPolicy) (agen
 		Cartridge: c.inner.Name(),
 		Policy:    p,
 		Mode:      agents.EnforceCopiedWorktree,
-		Detail:    "no tool controls: the session runs in a throwaway copy of the worktree, discarded afterwards (P6-20)",
+		Detail: "no tool controls: the session runs in a throwaway copy of the worktree, discarded afterwards, " +
+			"with no git in it (P6-20, P6-30)",
 	}, nil
+}
+
+// noteCopiedWorktree appends [CopiedWorktreeNote] to a firing's prompt. It
+// is idempotent: a retry builds the prompt again, and a builder that added
+// the note itself (it can: [FiringContext.Enforcement] says the degrade is
+// in force) is left alone.
+func noteCopiedWorktree(prompt string) string {
+	if strings.Contains(prompt, CopiedWorktreeNote) {
+		return prompt
+	}
+	if strings.TrimSpace(prompt) == "" {
+		// An empty prompt is refused by cartridge.RunSpec.Validate; the
+		// note must not be what makes it pass.
+		return prompt
+	}
+	return strings.TrimRight(prompt, "\n") + "\n\n" + CopiedWorktreeNote + "\n"
 }
 
 // CopyWorktree copies the tree at src to dst, which must not exist. It is

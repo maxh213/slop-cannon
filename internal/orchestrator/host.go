@@ -31,14 +31,27 @@ import (
 //     pass small fakes); it is the one place the whole surface is written
 //     down, and the compile-time assertion that *Run satisfies every slice.
 //
+// The run-level glue above the scheduler ([Conductor], run.go) follows the
+// same rules from the other side: it asks for the narrowest slice of each
+// part it drives ([ConductorBeads], [ConductorFeedback],
+// [ConductorDelivery], [GateKicker], [ConductorWorktrees]), each asserted
+// against the production type where it is declared.
+//
 // Two package-wide conventions hold everything else together. A component
 // names the events.Warning/events.Error Source it stamps in one exported
 // constant beside its own type, all spelled Source<Component>
 // ([SourceRun], [SourceScheduler], [SourcePlanning], [SourceSupervisor],
-// [SourceFeedback], [SourceDelivery], [SourceGates], [SourceState]); and a
+// [SourceFeedback], [SourceDelivery], [SourceGates], [SourceState],
+// [SourceConductor], [SourceRules], [SourceLimits], [SourcePRReview]).
+// [SourceForeignStatus] is the one documented exception: it names a
+// condition rather than a component, because the scheduler, the conductor's
+// listing and the gate poller all raise the same report and Source is the
+// only field a log reader can match on. And a
 // component that reads or writes bd asks for the narrowest interface it
 // uses ([StateStore], [ClaimStore], [LeaseRenewer], [LeaseReleaser],
-// [GateStore], [GateBeadReader], [FeedbackMessageStore], [PlanPrioritiser]),
+// [GateStore], [GateBeadReader] (which the resume guard reuses as
+// [ResumeBeadReader]), [FeedbackMessageStore], [BeadAcceptanceWriter],
+// [PlanPrioritiser], [BeadLister], [BeadParker], [PRReviewStore]),
 // each asserted against *beads.Client where it is declared, so a test can
 // fake one method without standing in for the whole client.
 

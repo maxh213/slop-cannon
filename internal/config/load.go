@@ -40,6 +40,7 @@ const (
 	KeySafety             = "safety"
 	KeyVibes              = "vibes"
 	KeyRules              = "rules"
+	KeyExclude            = "exclude"
 	KeyCheckCommand       = "check_command"
 	KeyIdleReplanInterval = "idle_replan_interval"
 	KeyGatePollInterval   = "gate_poll_interval"
@@ -49,6 +50,8 @@ const (
 	KeyAgentTimeout       = "limits.agent_timeout"
 	KeyMaxTokens          = "limits.max_tokens"
 	KeyMaxCostUSD         = "limits.max_cost_usd"
+	KeyMaxPlanRejections  = "limits.max_plan_rejections"
+	KeyMaxPlanFailures    = "limits.max_plan_failures"
 	KeyRoles              = "roles"
 )
 
@@ -177,9 +180,10 @@ func load(globalPath, repoRoot string) (*Effective, error) {
 
 // scalarKeys are the keys whose source is tracked one by one.
 var scalarKeys = []string{
-	KeyActiveCartridge, KeyAmmo, KeySafety, KeyVibes, KeyRules, KeyCheckCommand, KeyIdleReplanInterval,
+	KeyActiveCartridge, KeyAmmo, KeySafety, KeyVibes, KeyRules, KeyExclude, KeyCheckCommand, KeyIdleReplanInterval,
 	KeyGatePollInterval, KeyMaxBeadsPerPlan,
 	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyAgentTimeout, KeyMaxTokens, KeyMaxCostUSD,
+	KeyMaxPlanRejections, KeyMaxPlanFailures,
 }
 
 // ReadFile parses one config file. exists is false (with a nil File and no
@@ -327,6 +331,13 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 		e.Rules = mergeList(e.Rules, f.Rules, base)
 		e.Sources[KeyRules] = mergedSource(e.Sources[KeyRules], src)
 	}
+	if f.Exclude != nil {
+		// Unioned global-then-repo like Vibes and Rules, and left as written:
+		// the entries are globs, not paths, so they are never resolved
+		// against the config file's directory (P9-05).
+		e.Exclude = MergeExcludes(e.Exclude, f.Exclude)
+		e.Sources[KeyExclude] = mergedSource(e.Sources[KeyExclude], src)
+	}
 	if f.CheckCommand != nil {
 		e.CheckCommand = *f.CheckCommand
 		e.Sources[KeyCheckCommand] = src
@@ -362,6 +373,14 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 	if v := f.Limits.MaxCostUSD; v != nil {
 		e.Limits.MaxCostUSD = *v
 		e.Sources[KeyMaxCostUSD] = src
+	}
+	if v := f.Limits.MaxPlanRejections; v != nil {
+		e.Limits.MaxPlanRejections = *v
+		e.Sources[KeyMaxPlanRejections] = src
+	}
+	if v := f.Limits.MaxPlanFailures; v != nil {
+		e.Limits.MaxPlanFailures = *v
+		e.Sources[KeyMaxPlanFailures] = src
 	}
 	for name, rc := range f.Roles {
 		role, err := domain.ParseRole(name)
@@ -487,6 +506,12 @@ func (e *Effective) validate() error {
 	if e.Limits.MaxCostUSD < 0 {
 		return &ValidationError{Path: e.pathOf(KeyMaxCostUSD), Key: KeyMaxCostUSD, Msg: "must not be negative (0 means unlimited)"}
 	}
+	if e.Limits.MaxPlanRejections < 1 {
+		return &ValidationError{Path: e.pathOf(KeyMaxPlanRejections), Key: KeyMaxPlanRejections, Msg: "must be at least 1"}
+	}
+	if e.Limits.MaxPlanFailures < 1 {
+		return &ValidationError{Path: e.pathOf(KeyMaxPlanFailures), Key: KeyMaxPlanFailures, Msg: "must be at least 1"}
+	}
 	return nil
 }
 
@@ -571,6 +596,7 @@ func (e *Effective) Entries() []Entry {
 	add(KeySafety, strconv.FormatBool(e.Safety), e.Sources[KeySafety])
 	add(KeyVibes, formatList(e.Vibes), e.Sources[KeyVibes])
 	add(KeyRules, formatList(e.Rules), e.Sources[KeyRules])
+	add(KeyExclude, formatList(e.Exclude), e.Sources[KeyExclude])
 	add(KeyCheckCommand, e.CheckCommand, e.Sources[KeyCheckCommand])
 	add(KeyIdleReplanInterval, e.IdleReplanInterval.String(), e.Sources[KeyIdleReplanInterval])
 	add(KeyGatePollInterval, e.GatePollInterval.String(), e.Sources[KeyGatePollInterval])
@@ -580,6 +606,8 @@ func (e *Effective) Entries() []Entry {
 	add(KeyAgentTimeout, e.Limits.AgentTimeout.String(), e.Sources[KeyAgentTimeout])
 	add(KeyMaxTokens, strconv.FormatInt(e.Limits.MaxTokens, 10), e.Sources[KeyMaxTokens])
 	add(KeyMaxCostUSD, strconv.FormatFloat(e.Limits.MaxCostUSD, 'f', -1, 64), e.Sources[KeyMaxCostUSD])
+	add(KeyMaxPlanRejections, strconv.Itoa(e.Limits.MaxPlanRejections), e.Sources[KeyMaxPlanRejections])
+	add(KeyMaxPlanFailures, strconv.Itoa(e.Limits.MaxPlanFailures), e.Sources[KeyMaxPlanFailures])
 	for _, role := range domain.Roles() {
 		key := KeyRoles + "." + role.String() + ".cartridge"
 		if name, ok := e.Roles[role]; ok {

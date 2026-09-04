@@ -1,0 +1,36 @@
+Continue the most recent run of a repository.
+
+This is exactly "sc PATH --resume": the run keeps its id, its brief and the
+configuration it was started with (a config file edited since does not
+change it), its worktrees are reattached, stale leases are recovered and
+the agents that were in flight are fired again.
+
+PATH may be the repository root or any directory inside it; without it the
+--repo directory (the current one by default) is used. --ammo, --safety and
+--cartridge still override the frozen configuration for this invocation and
+say so. There is nothing to resume in a repository sc has never run in.
+
+Usage:
+  sc resume [PATH] [flags]
+
+Examples:
+  sc resume
+  sc resume ./repo-path
+  sc resume --repo ./repo-path --headless
+
+Flags:
+      --ammo N           override ammo for this run (N agents at once, minimum 3)
+      --cartridge NAME   fire cartridge NAME instead of the active one
+      --force            start even though another run holds this repository's lock (only when you know it is gone)
+      --headless         no TUI: render events as log lines (for CI and scripts)
+  -h, --help             help for resume
+      --no-anim          disable the cannon animations in the TUI (also honours SC_NO_ANIM)
+      --review-prs       also review open pull requests sc did not create (needs gh and a remote) (default true)
+      --safety on|off    override safety for this run (on|off): on opens PRs, off merges to the default branch
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

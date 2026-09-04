@@ -1931,3 +1931,117 @@ func TestPlannerPublishesTheDeprioritisationItCarriedOut(t *testing.T) {
 	require.Len(t, plans[0].Plan.Beads, 1, "the announced plan is the one that was applied")
 	assert.Equal(t, "beta", plans[0].Plan.Beads[0].Key)
 }
+
+// --- P6-39: the ErrEmptyPlan branch's brief arm ---------------------------
+
+// TestPlannerBriefModeRefusesAnEmptyPlanRatherThanCallingItAnAnswer pins the
+// upstream contract the brief arm of [Planner.record]'s ErrEmptyPlan branch
+// rests on (P6-39): agents.ValidatePlan refuses a brief-mode plan that
+// proposes nothing with agents.ErrPlanRejected, before
+// agents.CreatePlanBeads can reach its own ErrEmptyPlan. "Nothing worth
+// adding right now" is an autopilot answer (D-18); a brief that cannot be
+// decomposed is a plan the product owner got wrong.
+func TestPlannerBriefModeRefusesAnEmptyPlanRatherThanCallingItAnAnswer(t *testing.T) {
+	rc := planningRunConfig(t, "ship the thing")
+	runner := &planningRunner{}
+	runner.setPlan(domain.Plan{Brief: "nothing worth adding right now"})
+	p, err := NewPlanner(PlannerOptions{
+		Config: rc, Runner: runner, Applier: &planningApplier{}, NoShim: true,
+		Now: newPlanningClock().Now, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	_, err = p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.Error(t, err, "a brief run is never told its brief needs no work")
+	assert.ErrorIs(t, err, agents.ErrPlanRejected)
+	assert.NotErrorIs(t, err, agents.ErrEmptyPlan)
+
+	st := p.Status()
+	assert.Zero(t, st.Empty, "an empty brief plan is a rejection, not an empty plan")
+	assert.Equal(t, 1, st.Rejections)
+	assert.False(t, st.Finished, "one rejection is a retry, not the end of the run")
+}
+
+// TestPlannerBriefModeFinishesIfAnEmptyPlanReachesIt drives the arm P6-39
+// kept as belt and braces. Nothing in production reaches it — the test above
+// says why — but if that contract ever changed, a brief run told its plan
+// was empty would idle for ever: an empty plan resets both P6-19 counters,
+// so neither cap would ever end the run.
+func TestPlannerBriefModeFinishesIfAnEmptyPlanReachesIt(t *testing.T) {
+	p, err := NewPlanner(PlannerOptions{
+		Config: planningRunConfig(t, "ship the thing"), Runner: &planningRunner{},
+		Applier: &planningApplier{}, NoShim: true, Now: newPlanningClock().Now,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+
+	planningApply(p, nil, fmt.Errorf("%w (run 20260903-120000-abcd)", agents.ErrEmptyPlan))
+
+	st := p.Status()
+	assert.True(t, st.Finished, "the brief run ends rather than planning the same brief for ever")
+	assert.Equal(t, 1, st.Empty)
+	assert.Equal(t, 1, st.Plans)
+	assert.Zero(t, st.GaveUp, "it is an answer, not a give-up")
+	assert.Zero(t, st.Rejections)
+}
+
+// --- P1-19: the give-up caps come from the configuration -------------------
+
+// TestPlannerTakesItsGiveUpCapsFromTheConfiguration is P1-19: the P6-19
+// policy is `limits.max_plan_rejections` and `limits.max_plan_failures`, so
+// a flaky cartridge can be given more rope and a short brief run less,
+// without recompiling. An explicit PlannerOptions field still wins, which is
+// what the e2e rigs and the tests above rely on.
+func TestPlannerTakesItsGiveUpCapsFromTheConfiguration(t *testing.T) {
+	rc := planningRunConfig(t, "ship it")
+	rc.Effective.Limits.MaxPlanRejections = 3
+	rc.Effective.Limits.MaxPlanFailures = 4
+	newPlanner := func(t *testing.T, tune func(*PlannerOptions)) *Planner {
+		t.Helper()
+		opts := PlannerOptions{
+			Config: rc, Runner: &planningRunner{}, Applier: &planningApplier{}, NoShim: true,
+			Now: newPlanningClock().Now, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+		if tune != nil {
+			tune(&opts)
+		}
+		p, err := NewPlanner(opts)
+		require.NoError(t, err)
+		return p
+	}
+	rejected := fmt.Errorf("%w: a bead has no acceptance criteria", agents.ErrPlanRejected)
+	crashed := errors.New("the cartridge crashed")
+
+	rej := newPlanner(t, nil)
+	planningApply(rej, nil, rejected)
+	planningApply(rej, nil, rejected)
+	assert.Zero(t, rej.Status().GaveUp, "the configured cap is three, not the built-in two")
+	planningApply(rej, nil, rejected)
+	assert.Equal(t, 1, rej.Status().GaveUp)
+
+	fail := newPlanner(t, nil)
+	for i := 0; i < 3; i++ {
+		planningApply(fail, nil, crashed)
+	}
+	assert.Zero(t, fail.Status().GaveUp, "and four failures, not the built-in five")
+	planningApply(fail, nil, crashed)
+	assert.Equal(t, 1, fail.Status().GaveUp)
+
+	opt := newPlanner(t, func(o *PlannerOptions) { o.RejectionLimit, o.FailureLimit = 1, 1 })
+	planningApply(opt, nil, rejected)
+	assert.Equal(t, 1, opt.Status().GaveUp, "an explicit option still wins over the file")
+
+	defaults := newPlanner(t, func(o *PlannerOptions) {
+		cfg := *rc
+		eff := *rc.Effective
+		eff.Limits.MaxPlanRejections, eff.Limits.MaxPlanFailures = 0, 0
+		cfg.Effective = &eff
+		o.Config = &cfg
+	})
+	for i := 0; i < config.DefaultMaxPlanRejections; i++ {
+		planningApply(defaults, nil, rejected)
+	}
+	assert.Equal(t, 1, defaults.Status().GaveUp, "an unset limit is the built-in default")
+	assert.Equal(t, config.DefaultMaxPlanRejections, DefaultPlanRejectionLimit, "one number, not two")
+	assert.Equal(t, config.DefaultMaxPlanFailures, DefaultPlanFailureLimit)
+}

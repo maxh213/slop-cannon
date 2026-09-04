@@ -13,6 +13,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"slop-cannon/internal/agents"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/testutil"
 )
@@ -51,6 +52,10 @@ func doctorRepoDir(t *testing.T, git, beads bool) string {
 	dir := t.TempDir()
 	if git {
 		require.NoError(t, os.Mkdir(filepath.Join(dir, ".git"), 0o755))
+		// A repository that ignores its dotenv files, which is what the
+		// .gitignore row (P9-05) wants to see; doctorRepoIgnores drops it
+		// for the test that covers the warning.
+		require.NoError(t, os.WriteFile(filepath.Join(dir, ".gitignore"), []byte("*.log\n.env\n"), 0o600))
 	}
 	if beads {
 		require.NoError(t, os.Mkdir(filepath.Join(dir, ".beads"), 0o755))
@@ -195,7 +200,7 @@ func TestDoctorAllPassJSON(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
 	require.True(t, report.OK)
 	require.Equal(t, repo, report.Repo)
-	require.Equal(t, 7, report.Passed)
+	require.Equal(t, 8, report.Passed)
 	require.Zero(t, report.Warnings)
 	require.Zero(t, report.Failed)
 	var names []string
@@ -204,7 +209,7 @@ func TestDoctorAllPassJSON(t *testing.T) {
 		require.Equal(t, DoctorPass, c.Status, c.Name)
 		require.Empty(t, c.Hint, c.Name)
 	}
-	require.Equal(t, []string{"git", "bd", "beads", "gh", "cartridge:claude", "repo", ".beads"}, names)
+	require.Equal(t, []string{"git", "bd", "beads", "gh", "cartridge:claude", "repo", ".gitignore", ".beads"}, names)
 	rootGolden(t, "doctor-pass-json", doctorNormalise(stdout, repo, git, bd, gh, claude))
 }
 
@@ -274,7 +279,7 @@ func TestDoctorWarnings(t *testing.T) {
 	require.Contains(t, stdout, "warn  .beads            not initialised: /repo/.beads is missing")
 	require.Contains(t, stdout, "hint: sc will run bd init --non-interactive --init-if-missing --skip-agents --skip-hooks --setup-exclude on the first run (D-13)")
 	require.Equal(t, [][]string{{"version", "--json"}}, bd.ArgLists(t), "no ping without .beads/")
-	require.Contains(t, stdout, "\n3 passed, 3 warnings, 0 failed\n")
+	require.Contains(t, stdout, "\n4 passed, 3 warnings, 0 failed\n")
 }
 
 func TestDoctorPingFails(t *testing.T) {
@@ -521,4 +526,43 @@ func TestDoctorReportCounts(t *testing.T) {
 		Passed: 1, Failed: 1,
 	}))
 	require.Equal(t, "pass  git               fine\nFAIL  .beads            bad\n                        hint: fix it\n\n1 passed, 0 warnings, 1 failed\n", out.String())
+}
+
+// TestDoctorWarnsWhenTheRepoDoesNotIgnoreDotenv is P9-05's `sc doctor`
+// clause. Keeping a .env out of an agent's prompt is only half the job: an
+// engineer that commits one has leaked the credential whatever the prompt
+// said, so the row asks the repository to ignore it.
+func TestDoctorWarnsWhenTheRepoDoesNotIgnoreDotenv(t *testing.T) {
+	doctorEnv(t)
+	doctorAddCartridge(t, "claude", "fable")
+	repo := doctorRepoDir(t, true, true)
+	require.NoError(t, os.Remove(filepath.Join(repo, ".gitignore")))
+	doctorGitShim(t, "2.55.0", "")
+	testutil.FakeBD(t, testutil.BDSamplesDir(t))
+	doctorGHShim(t, true)
+	doctorClaudeShim(t)
+
+	report := RunDoctor(context.Background(), repo)
+	check := report.Check(".gitignore")
+	require.NotNil(t, check)
+	require.Equal(t, DoctorWarn, check.Status)
+	require.Equal(t, "does not ignore .env", check.Detail)
+	require.Equal(t, agents.GitignoreHint, check.Hint)
+	require.True(t, report.OK, "a missing .gitignore warns, it never fails the run")
+
+	// A .gitignore that un-ignores the file it ignored is not cover.
+	require.NoError(t, os.WriteFile(filepath.Join(repo, ".gitignore"), []byte(".env\n!.env\n"), 0o600))
+	require.Equal(t, DoctorWarn, RunDoctor(context.Background(), repo).Check(".gitignore").Status)
+
+	require.NoError(t, os.WriteFile(filepath.Join(repo, ".gitignore"), []byte(".env*\n"), 0o600))
+	require.Equal(t, DoctorPass, RunDoctor(context.Background(), repo).Check(".gitignore").Status)
+}
+
+// TestDoctorSkipsTheGitignoreRowOutsideARepository keeps the row honest:
+// there is nothing to ignore where there is no repository.
+func TestDoctorSkipsTheGitignoreRowOutsideARepository(t *testing.T) {
+	doctorEnv(t)
+	repo := doctorRepoDir(t, false, false)
+	report := RunDoctor(context.Background(), repo)
+	require.Nil(t, report.Check(".gitignore"))
 }

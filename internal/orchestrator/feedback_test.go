@@ -614,7 +614,7 @@ func TestFeedbackPushbackAccepted(t *testing.T) {
 	}))
 	accepted := item
 	accepted.Status = domain.ItemAccepted
-	fbSay(sc, "tester-qa-sc-fb1-r2", fbSettled("fair enough", accepted))
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbSettled("fair enough", accepted))
 
 	rig := fbSetup(t, sc, nil)
 	rig.pump(t, 10)
@@ -627,8 +627,8 @@ func TestFeedbackPushbackAccepted(t *testing.T) {
 	assert.Zero(t, th.Items[0].Holds)
 
 	// The pushback went to the tester that raised it, in evaluate mode.
-	assert.Contains(t, rig.Fired(), "tester-qa-sc-fb1-r2")
-	assert.Contains(t, rig.Prompt("tester-qa-sc-fb1-r2"), "the caller bounds the retries already")
+	assert.Contains(t, rig.Fired(), "tester-qa-sc-fb1-r2-pushback")
+	assert.Contains(t, rig.Prompt("tester-qa-sc-fb1-r2-pushback"), "the caller bounds the retries already")
 }
 
 // --- (d) the tester holds, the product owner upholds the engineer ------
@@ -646,7 +646,7 @@ func TestFeedbackArbitrationUpholdsEngineer(t *testing.T) {
 	held := item
 	held.Status = domain.ItemHeld
 	held.Detail = "the caller is not the only entry point"
-	fbSay(sc, "tester-qa-sc-fb1-r2", fbChanges("still not convinced", held))
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbChanges("still not convinced", held))
 	fbSay(sc, "po-sc-fb1-r2-qa-r1-1", domain.Arbitration{
 		ItemID: "qa-r1-1", Ruling: domain.RulingUpholdEngineer, Rationale: "the bound is documented and tested",
 	})
@@ -686,7 +686,7 @@ func TestFeedbackArbitrationUpholdsTester(t *testing.T) {
 	held := item
 	held.Status = domain.ItemHeld
 	held.Detail = "the caller is not the only entry point"
-	fbSay(sc, "tester-qa-sc-fb1-r2", fbChanges("still not convinced", held))
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbChanges("still not convinced", held))
 	fbSay(sc, "po-sc-fb1-r2-qa-r1-1", domain.Arbitration{
 		ItemID: "qa-r1-1", Ruling: domain.RulingUpholdTester, Instruction: "bound the loop where it is written",
 	})
@@ -1192,7 +1192,7 @@ func TestFeedbackMixedRoundEvaluatesThePushbackAndReReviewsTheFix(t *testing.T) 
 	))
 	accepted := spin
 	accepted.Status = domain.ItemAccepted
-	fbSayTask(sc, "tester-qa-sc-fb1-r2", events.TaskEvaluatePushback, fbSettled("fair enough", accepted))
+	fbSayTask(sc, "tester-qa-sc-fb1-r2-pushback", events.TaskEvaluatePushback, fbSettled("fair enough", accepted))
 	resolved := leak
 	resolved.Status = domain.ItemResolved
 	fbSayTask(sc, "tester-qa-sc-fb1-r2", events.TaskReview, fbSettled("the token is redacted", resolved))
@@ -1202,7 +1202,7 @@ func TestFeedbackMixedRoundEvaluatesThePushbackAndReReviewsTheFix(t *testing.T) 
 	rig.pump(t, 12)
 
 	// The pushback firing judges the argument and nothing else.
-	pushback := rig.PromptFor("tester-qa-sc-fb1-r2", events.TaskEvaluatePushback)
+	pushback := rig.PromptFor("tester-qa-sc-fb1-r2-pushback", events.TaskEvaluatePushback)
 	disputed := fbSection(t, pushback, "The items the engineer pushed back on")
 	assert.Contains(t, disputed, "qa-r1-1")
 	assert.NotContains(t, disputed, "qa-r1-2",
@@ -1219,7 +1219,7 @@ func TestFeedbackMixedRoundEvaluatesThePushbackAndReReviewsTheFix(t *testing.T) 
 
 	assert.Equal(t, []string{
 		"eng-sc-fb1-r1", "tester-ux-sc-fb1-r1", "tester-qa-sc-fb1-r1", "tester-test-sc-fb1-r1",
-		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2", "tester-qa-sc-fb1-r2",
+		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2-pushback", "tester-qa-sc-fb1-r2",
 	}, rig.Fired())
 
 	th := rig.Thread()
@@ -1249,11 +1249,11 @@ func TestFeedbackMergedItemSpendsOnePushbackRoundPerExchange(t *testing.T) {
 		ItemID: "ux-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
 	})
 	fbSay(sc, "eng-sc-fb1-r2", pushback)
-	fbSay(sc, "tester-ux-sc-fb1-r2", fbChanges("not convinced", uxHeld))
-	fbSay(sc, "tester-qa-sc-fb1-r2", fbChanges("not convinced", qaHeld))
+	fbSay(sc, "tester-ux-sc-fb1-r2-pushback", fbChanges("not convinced", uxHeld))
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbChanges("not convinced", qaHeld))
 	fbSay(sc, "eng-sc-fb1-r3", pushback)
-	fbSay(sc, "tester-ux-sc-fb1-r3", fbChanges("still not convinced", uxHeld))
-	fbSay(sc, "tester-qa-sc-fb1-r3", fbChanges("still not convinced", qaHeld))
+	fbSay(sc, "tester-ux-sc-fb1-r3-pushback", fbChanges("still not convinced", uxHeld))
+	fbSay(sc, "tester-qa-sc-fb1-r3-pushback", fbChanges("still not convinced", qaHeld))
 	fbSay(sc, "po-sc-fb1-r3-ux-r1-1", domain.Arbitration{
 		ItemID: "ux-r1-1", Ruling: domain.RulingUpholdEngineer, Rationale: "the bound is documented and tested",
 	})
@@ -1321,9 +1321,9 @@ func TestFeedbackNarrowedAcceptanceReachesEveryLaterPrompt(t *testing.T) {
 	}
 	require.Equal(t, narrowed, rig.Thread().Escalation.NewAcceptance)
 
-	// The next refresh from bd still carries the criteria the ruling
-	// replaced (P6-24 has not written them back yet); it must not undo the
-	// ruling.
+	// A refresh from a listing that still carries the criteria the ruling
+	// replaced — a `bd list` taken before the P6-24 write, or one that omits
+	// the field — must not undo the ruling.
 	rig.Loop.Track(domain.Bead{
 		ID: fbBead, Title: "make the retry loop terminate",
 		Acceptance: "the loop terminates", State: domain.BeadStateInReview,
@@ -1484,7 +1484,7 @@ func TestFeedbackPushbackOnlyRoundStillReviewsTheNewCommit(t *testing.T) {
 	}))
 	accepted := item
 	accepted.Status = domain.ItemAccepted
-	fbSayTask(sc, "tester-qa-sc-fb1-r2", events.TaskEvaluatePushback, fbSettled("fair enough", accepted))
+	fbSayTask(sc, "tester-qa-sc-fb1-r2-pushback", events.TaskEvaluatePushback, fbSettled("fair enough", accepted))
 	fbSayTask(sc, "tester-qa-sc-fb1-r2", events.TaskReview, fbApprove("the code the round left behind is fine"))
 
 	rig := fbSetup(t, sc, nil)
@@ -1511,11 +1511,11 @@ func TestFeedbackPushbackOnlyRoundStillReviewsTheNewCommit(t *testing.T) {
 
 	assert.Equal(t, []string{
 		"eng-sc-fb1-r1", "tester-ux-sc-fb1-r1", "tester-qa-sc-fb1-r1", "tester-test-sc-fb1-r1",
-		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2", "tester-qa-sc-fb1-r2",
+		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2-pushback", "tester-qa-sc-fb1-r2",
 	}, rig.Fired())
 
 	// The firing that settled the bead is the one that was shown head2.
-	assert.NotContains(t, rig.PromptFor("tester-qa-sc-fb1-r2", events.TaskEvaluatePushback),
+	assert.NotContains(t, rig.PromptFor("tester-qa-sc-fb1-r2-pushback", events.TaskEvaluatePushback),
 		"## The change under review")
 	assert.Contains(t, rig.PromptFor("tester-qa-sc-fb1-r2", events.TaskReview), "## The change under review")
 	rounds := rig.Events(events.KindRoundStarted)
@@ -1547,7 +1547,7 @@ func TestFeedbackBindingRulingCannotBeArguedWithAgain(t *testing.T) {
 	held := item
 	held.Status = domain.ItemHeld
 	held.Detail = "the caller is not the only entry point"
-	fbSay(sc, "tester-qa-sc-fb1-r2", fbChanges("still not convinced", held))
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbChanges("still not convinced", held))
 	fbSay(sc, "po-sc-fb1-r2-qa-r1-1", domain.Arbitration{
 		ItemID: "qa-r1-1", Ruling: domain.RulingUpholdTester, Instruction: "bound the loop where it is written",
 	})
@@ -1574,7 +1574,7 @@ func TestFeedbackBindingRulingCannotBeArguedWithAgain(t *testing.T) {
 	// The refused round judged nothing and arbitrated nothing a second time.
 	assert.Equal(t, []string{
 		"eng-sc-fb1-r1", "tester-ux-sc-fb1-r1", "tester-qa-sc-fb1-r1", "tester-test-sc-fb1-r1",
-		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2", "po-sc-fb1-r2-qa-r1-1",
+		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2-pushback", "po-sc-fb1-r2-qa-r1-1",
 		"eng-sc-fb1-r3", "eng-sc-fb1-r4", "tester-qa-sc-fb1-r4",
 	}, rig.Fired())
 
@@ -1688,4 +1688,514 @@ func TestFeedbackConsolidationDoesNotDependOnTheTesterOrder(t *testing.T) {
 			assert.Equal(t, want[0].Lenses, th.Items[0].Lenses)
 		})
 	}
+}
+
+// --- P6-24: a narrow_scope ruling rewrites the bead's criteria in bd -----
+
+// fbAcceptanceWriter is a fake [BeadAcceptanceWriter]: it records what was
+// written to bd and can refuse the write.
+type fbAcceptanceWriter struct {
+	mu      sync.Mutex
+	written []string
+	err     error
+}
+
+func (w *fbAcceptanceWriter) Update(_ context.Context, id domain.BeadID, patch beads.Patch) (beads.Issue, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.err != nil {
+		return beads.Issue{}, w.err
+	}
+	if patch.Acceptance == nil {
+		return beads.Issue{}, errors.New("the patch for " + id.String() + " sets no acceptance criteria")
+	}
+	w.written = append(w.written, *patch.Acceptance)
+	return beads.Issue{ID: id}, nil
+}
+
+func (w *fbAcceptanceWriter) all() []string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.written...)
+}
+
+// fbCriteria is the acceptance criteria the loop's thread judges the bead
+// by, which is what every prompt it builds carries.
+func fbCriteria(t *testing.T, f *Feedback) string {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	th, ok := f.threads[fbBead]
+	require.True(t, ok, "the loop has no thread for %s", fbBead)
+	return th.bead.Acceptance
+}
+
+// fbNarrowRuling is the ruling these tests drive.
+const fbNarrowRuling = "the loop terminates for the error path only"
+
+// fbNarrowed runs a bead to a narrow_scope ruling with the given acceptance
+// writer wired in.
+func fbNarrowed(t *testing.T, name string, w *fbAcceptanceWriter) *fbRig {
+	t.Helper()
+	sc := fbCapScenario(name, domain.Escalation{
+		Outcome: domain.EscalationNarrowScope, NewAcceptance: fbNarrowRuling,
+	})
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) {
+		o.Limits.MaxReviewRounds = 2
+		o.Acceptance = w
+	})
+	rig.setDiff("head2", 22, 0.1)
+	for i := 0; i < 5; i++ {
+		rig.step(t)
+	}
+	require.NotNil(t, rig.Thread().Escalation)
+	require.Equal(t, fbNarrowRuling, rig.Thread().Escalation.NewAcceptance)
+	return rig
+}
+
+// D-08 says a narrow_scope ruling replaces the bead's acceptance criteria.
+// Recording them on the loop's own thread is not enough: bd is what the bead
+// asks for (D-06), so a reviewer reading the bead — or a resumed run — would
+// otherwise hold the engineer to criteria the product owner has withdrawn.
+func TestFeedbackNarrowScopeRewritesTheAcceptanceCriteriaInBD(t *testing.T) {
+	w := &fbAcceptanceWriter{}
+	rig := fbNarrowed(t, "narrow-writes-bd", w)
+
+	assert.Equal(t, []string{fbNarrowRuling}, w.all(), "the ruling's criteria are written once")
+
+	updates := rig.Events(events.KindBeadUpdated)
+	require.Len(t, updates, 1, "a bd write the cannon makes is never silent")
+	upd, ok := updates[0].(events.BeadUpdated)
+	require.True(t, ok)
+	assert.Equal(t, fbBead, upd.Bead.ID)
+	assert.Equal(t, fbNarrowRuling, upd.Bead.Acceptance)
+	assert.Equal(t, []string{"acceptance"}, upd.Fields)
+
+	// The next round is still judged by them, whatever bd's listing says.
+	require.Equal(t, 3, rig.step(t), "the narrowed bead is reviewed again by every lens")
+	assert.Contains(t, fbAcceptance(t, rig.Prompts("tester-ux-sc-fb1-r1")[1]), fbNarrowRuling)
+}
+
+// A bd that refuses the write must not lose the ruling: the round the
+// product owner opened still runs to the narrowed criteria, the user is told
+// once, and the loop does not fail the bead over it.
+func TestFeedbackNarrowScopeWarnsWhenBDRefusesTheRewrite(t *testing.T) {
+	w := &fbAcceptanceWriter{err: errors.New("bd is down")}
+	rig := fbNarrowed(t, "narrow-write-refused", w)
+
+	assert.Empty(t, w.all())
+	assert.Empty(t, rig.Events(events.KindBeadUpdated), "nothing was written, so nothing is announced")
+	var said bool
+	for _, ev := range rig.Events(events.KindWarning) {
+		if warn, ok := ev.(events.Warning); ok && warn.Source == SourceFeedback &&
+			strings.Contains(warn.Message, "narrowed acceptance criteria") {
+			said = true
+			assert.Equal(t, fbBead, warn.Bead)
+		}
+	}
+	assert.True(t, said, "the user is told the criteria did not reach bd")
+
+	require.Equal(t, 3, rig.step(t), "the ruling still governs this run's rounds")
+	assert.Contains(t, fbAcceptance(t, rig.Prompts("tester-ux-sc-fb1-r1")[1]), fbNarrowRuling)
+}
+
+// The other half of P6-24: a resumed run recovers the narrowed criteria from
+// the bead bd hands back, not from a thread this process no longer has.
+func TestFeedbackRestoreRecoversTheNarrowedCriteriaFromTheBead(t *testing.T) {
+	w := &fbAcceptanceWriter{}
+	rig := fbSetup(t, fbScenario("narrow-restore"), func(o *FeedbackOptions) { o.Acceptance = w })
+	resumed, err := NewFeedback(rig.Opts)
+	require.NoError(t, err)
+
+	msgs := []beads.Message{
+		{Type: domain.MessageImplReport, Payload: fbReport("added the retry")},
+		{Type: domain.MessageEscalation, Payload: domain.Escalation{
+			Outcome: domain.EscalationNarrowScope, NewAcceptance: fbNarrowRuling,
+		}},
+	}
+	// The bead as bd holds it: the ruling was applied before the kill.
+	require.NoError(t, resumed.Restore(context.Background(), domain.Bead{
+		ID: fbBead, Title: "make the retry loop terminate", Acceptance: fbNarrowRuling,
+		State: domain.BeadStateInReview, Round: 2,
+	}, msgs))
+
+	th, ok := resumed.Thread(fbBead)
+	require.True(t, ok)
+	require.NotNil(t, th.Escalation)
+	assert.Equal(t, fbNarrowRuling, fbCriteria(t, resumed), "the resumed thread judges the bead by the ruling")
+	assert.Empty(t, w.all(), "bd already carries them; a replay rewrites nothing")
+	assert.Empty(t, rig.Events(events.KindBeadUpdated), "a restore announces nothing")
+}
+
+// A run killed between the ruling comment and the bd write leaves bd holding
+// the criteria the ruling replaced. The replay finishes the write the killed
+// run owed, the same way it writes the status it owed.
+func TestFeedbackRestoreFinishesTheNarrowingWriteAKilledRunOwed(t *testing.T) {
+	w := &fbAcceptanceWriter{}
+	rig := fbSetup(t, fbScenario("narrow-restore-repair"), func(o *FeedbackOptions) { o.Acceptance = w })
+	resumed, err := NewFeedback(rig.Opts)
+	require.NoError(t, err)
+
+	msgs := []beads.Message{
+		{Type: domain.MessageImplReport, Payload: fbReport("added the retry")},
+		{Type: domain.MessageEscalation, Payload: domain.Escalation{
+			Outcome: domain.EscalationNarrowScope, NewAcceptance: fbNarrowRuling,
+		}},
+	}
+	require.NoError(t, resumed.Restore(context.Background(), domain.Bead{
+		ID: fbBead, Title: "make the retry loop terminate", Acceptance: "the loop terminates",
+		State: domain.BeadStateInReview, Round: 2,
+	}, msgs))
+
+	assert.Equal(t, []string{fbNarrowRuling}, w.all(), "the criteria the killed run owed bd")
+	assert.Equal(t, fbNarrowRuling, fbCriteria(t, resumed))
+	assert.Empty(t, rig.Events(events.KindBeadUpdated), "a replay writes, but announces nothing")
+	assert.Empty(t, rig.Messages.All(), "a restore writes no comments")
+}
+
+// --- P6-25: two disputes on one bead are two independent rulings --------
+
+// One `arbitration` message settles one item, so a round in which the
+// engineer argued with two separate items owes two rulings. They are
+// independent work: the loop offers both at once, each under its own agent
+// id and its own payload, rather than ruling on one and making the other
+// wait a tick for a second product owner firing.
+func TestFeedbackArbitratesEveryHeldItemOfARoundAtOnce(t *testing.T) {
+	spin := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	leak := fbItemAt("qa-r1-2", "the log line leaks the token", "log.go", domain.SeverityMajor, domain.ItemOpen)
+	spinHeld, leakHeld := spin, leak
+	spinHeld.Status, leakHeld.Status = domain.ItemHeld, domain.ItemHeld
+	spinHeld.Detail = "the caller is not the only entry point"
+	leakHeld.Detail = "the error path logs it unredacted"
+
+	sc := fbScenario("two-disputes-one-round")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("two problems", spin, leak))
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(
+		domain.Response{ItemID: "qa-r1-1", Action: domain.ActionPushback,
+			Rationale: "the caller bounds the retries already"},
+		domain.Response{ItemID: "qa-r1-2", Action: domain.ActionWontfix,
+			Rationale: "the token is redacted before it reaches the logger"},
+	))
+	fbSayTask(sc, "tester-qa-sc-fb1-r2-pushback", events.TaskEvaluatePushback,
+		fbChanges("neither argument holds", spinHeld, leakHeld))
+	fbSayTask(sc, "tester-qa-sc-fb1-r2", events.TaskReview, fbApprove("the code the round left behind is fine"))
+	fbSay(sc, "po-sc-fb1-r2-qa-r1-1", domain.Arbitration{
+		ItemID: "qa-r1-1", Ruling: domain.RulingUpholdEngineer, Rationale: "the bound is documented and tested",
+	})
+	fbSay(sc, "po-sc-fb1-r2-qa-r1-2", domain.Arbitration{
+		ItemID: "qa-r1-2", Ruling: domain.RulingUpholdEngineer, Rationale: "the redaction is covered by a test",
+	})
+
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) { o.Limits.MaxPushbackRounds = 1 })
+	ctx := context.Background()
+	require.Equal(t, 1, rig.step(t), "the engineer implements")
+	require.Equal(t, 3, rig.step(t), "three lenses review")
+	rig.setDiff("head2", 22, 0.1)
+	require.Equal(t, 1, rig.step(t), "the engineer argues with both items")
+	require.Equal(t, 1, rig.step(t), "qa judges both arguments in one firing and holds both")
+
+	th := rig.Thread()
+	require.Len(t, th.Items, 2, "two files, so two issues (P6-21 merges neither)")
+	assert.Equal(t, FeedbackArbitrating, th.Phase)
+
+	ds, err := rig.Loop.Demands(ctx)
+	require.NoError(t, err)
+	require.Len(t, ds, 2, "both disputes are owed a ruling now, not one per tick (P6-25)")
+	items := map[string]bool{}
+	for _, d := range ds {
+		assert.Equal(t, DemandArbitrate, d.Kind)
+		assert.Equal(t, domain.RolePO, d.Role())
+		assert.Equal(t, ClaimNone, d.Claim, "the product owner never owns the bead")
+		assert.Equal(t, 2, d.Round, "both rulings belong to the round that raised them")
+		w, ok := d.Payload.(FeedbackWork)
+		require.True(t, ok)
+		require.NotEmpty(t, w.Item, "an arbitration demand names the item it settles")
+		items[w.Item] = true
+		assert.Equal(t, domain.AgentID("po-sc-fb1-r2-"+w.Item), d.Agent,
+			"each ruling is its own agent, so the two are told apart in the event stream")
+	}
+	assert.Equal(t, map[string]bool{"qa-r1-1": true, "qa-r1-2": true}, items)
+
+	// Asking again before either has been fired offers the same two, and
+	// no more: a demand is the work, not a queue entry, so nothing here can
+	// make the scheduler fire one arbitration twice.
+	again, err := rig.Loop.Demands(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, ds, again)
+
+	require.Equal(t, 2, rig.step(t), "both rulings are made in the one dispatch")
+	th = rig.Thread()
+	for _, i := range th.Items {
+		require.NotNilf(t, i.Ruling, "item %s was never ruled on", i.Item.ID)
+		assert.Equal(t, domain.ItemOverruled, i.Status)
+	}
+	left, err := rig.Loop.Demands(ctx)
+	require.NoError(t, err)
+	for _, d := range left {
+		assert.NotEqual(t, DemandArbitrate, d.Kind, "a ruled item is not offered for arbitration again")
+	}
+
+	rig.pump(t, 4)
+	assert.Equal(t, domain.BeadStateApproved, rig.Thread().State)
+	assert.Equal(t, []string{
+		"eng-sc-fb1-r1", "tester-ux-sc-fb1-r1", "tester-qa-sc-fb1-r1", "tester-test-sc-fb1-r1",
+		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2-pushback",
+		"po-sc-fb1-r2-qa-r1-1", "po-sc-fb1-r2-qa-r1-2",
+		"tester-qa-sc-fb1-r2",
+	}, rig.Fired(), "one product owner firing per dispute, both in the same dispatch")
+}
+
+// --- P6-38: an engineer that will not obey a ruling escalates -----------
+
+// D-08 refuses an answer that argues with a binding ruling, which on its own
+// only means the item comes back next round: a model that keeps arguing
+// would spend every remaining review round on rounds that judge nothing
+// before the round cap escalated the bead. The second refusal escalates it
+// instead, with the rest of the budget unspent.
+func TestFeedbackArguingWithABindingRulingTwiceEscalatesTheBead(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	held := item
+	held.Status = domain.ItemHeld
+	held.Detail = "the caller is not the only entry point"
+
+	sc := fbScenario("defiant-engineer")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	argue := fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
+	})
+	fbSay(sc, "eng-sc-fb1-r2", argue)
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbChanges("not convinced", held))
+	fbSay(sc, "po-sc-fb1-r2-qa-r1-1", domain.Arbitration{
+		ItemID: "qa-r1-1", Ruling: domain.RulingUpholdTester, Instruction: "bound the loop where it is written",
+	})
+	fbSay(sc, "eng-sc-fb1-r3", argue)
+	fbSay(sc, "eng-sc-fb1-r4", argue)
+	fbSay(sc, "po-sc-fb1-r4-escalate", domain.Escalation{
+		Outcome: domain.EscalationBlock,
+		Summary: "the engineer will not carry out the ruling; a human should take this one",
+	})
+
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) {
+		o.Limits.MaxPushbackRounds = 1
+		o.Limits.MaxReviewRounds = 8
+	})
+	rig.pump(t, 20)
+
+	th := rig.Thread()
+	assert.Equal(t, FeedbackSettled, th.Phase)
+	assert.Equal(t, domain.BeadStateNeedsHuman, th.State)
+	assert.Equal(t, 4, th.Round, "the bead escalated in the round the second refusal landed in")
+	require.Len(t, th.Items, 1)
+	assert.Equal(t, MaxRulingRefusals, th.Items[0].Refusals)
+	assert.Equal(t, 1, th.Items[0].Holds, "arguing with a ruling spends no pushback exchange")
+	require.NotNil(t, th.Items[0].Ruling, "the ruling survives the engineer arguing with it (D-08)")
+
+	// Four of the eight review rounds are still unspent: the loop gave up
+	// on the engineer rather than buying rounds it knew would be refused.
+	assert.Equal(t, []string{
+		"eng-sc-fb1-r1", "tester-ux-sc-fb1-r1", "tester-qa-sc-fb1-r1", "tester-test-sc-fb1-r1",
+		"eng-sc-fb1-r2", "tester-qa-sc-fb1-r2-pushback", "po-sc-fb1-r2-qa-r1-1",
+		"eng-sc-fb1-r3", "eng-sc-fb1-r4", "po-sc-fb1-r4-escalate",
+	}, rig.Fired())
+	assert.Contains(t, rig.Store.Moves(), "status:escalated")
+	assert.Contains(t, rig.Store.Moves(), "status:needs_human")
+
+	// The product owner is told why it was called, and no tester or
+	// arbitration was fired a second time on the refused rounds.
+	why := fbSection(t, rig.Prompt("po-sc-fb1-r4-escalate"), "Why this reached you")
+	assert.Contains(t, why, "argued with your binding ruling on qa-r1-1 2 times")
+	assert.Contains(t, why, "4 of its 8 review rounds still unspent")
+	w := fbWarning(t, rig, "binding ruling")
+	assert.Equal(t, fbBead, w.Bead)
+}
+
+// A single refusal is still only a refusal: the engineer is asked again with
+// the ruling in front of it, and complying settles the bead the normal way.
+// (TestFeedbackBindingRulingCannotBeArguedWithAgain drives that path; this
+// pins the boundary the escalation sits on.)
+func TestFeedbackOneRefusalDoesNotEscalate(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	held := item
+	held.Status = domain.ItemHeld
+	held.Detail = "the caller is not the only entry point"
+
+	sc := fbScenario("one-refusal")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
+	}))
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbChanges("not convinced", held))
+	fbSay(sc, "po-sc-fb1-r2-qa-r1-1", domain.Arbitration{
+		ItemID: "qa-r1-1", Ruling: domain.RulingUpholdTester, Instruction: "bound the loop where it is written",
+	})
+	fbSay(sc, "eng-sc-fb1-r3", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "I still disagree with the product owner",
+	}))
+	fbSay(sc, "eng-sc-fb1-r4", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionFixed, Rationale: "bounded the loop where it is written",
+	}))
+	resolved := item
+	resolved.Status = domain.ItemResolved
+	fbSay(sc, "tester-qa-sc-fb1-r4", fbSettled("bounded now", resolved))
+
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) { o.Limits.MaxPushbackRounds = 1 })
+	rig.pump(t, 20)
+
+	th := rig.Thread()
+	assert.Equal(t, domain.BeadStateApproved, th.State, "one refusal costs a round, not the bead")
+	require.Len(t, th.Items, 1)
+	assert.Equal(t, 1, th.Items[0].Refusals)
+	assert.NotContains(t, rig.Store.Moves(), "status:escalated")
+}
+
+// --- P6-26: a resumed thread keeps the pushback budget it had -----------
+
+// fbResume replays the comments a killed run left on the bead into a second
+// loop built from the same options, which is what a resumed run does
+// (P8-16 wires it). It returns the resumed loop's thread and how many
+// status writes the replay made.
+func fbResume(t *testing.T, rig *fbRig, state domain.BeadState, round int) (*Feedback, FeedbackThread, int) {
+	t.Helper()
+	before := len(rig.Store.Moves())
+	resumed, err := NewFeedback(rig.Opts)
+	require.NoError(t, err)
+	require.NoError(t, resumed.Restore(context.Background(), domain.Bead{
+		ID: fbBead, Title: "make the retry loop terminate", State: state, Round: round,
+	}, rig.Messages.All()))
+	th, ok := resumed.Thread(fbBead)
+	require.True(t, ok)
+	return resumed, th, len(rig.Store.Moves()) - before
+}
+
+// A run killed between the tester's second hold and the arbitration it owed
+// must resume owing the same arbitration. The hold count is not in any
+// comment — it is the loop's own tally of D-08 exchanges — so the replay has
+// to work out which verdicts were pushback evaluations and count them.
+func TestFeedbackRestoreRecoversThePushbackCount(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	held := item
+	held.Status = domain.ItemHeld
+	held.Detail = "the caller is not the only entry point"
+
+	sc := fbScenario("restore-mid-pushback")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	argue := fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
+	})
+	fbSay(sc, "eng-sc-fb1-r2", argue)
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbChanges("not convinced", held))
+	fbSay(sc, "eng-sc-fb1-r3", argue)
+	fbSay(sc, "tester-qa-sc-fb1-r3-pushback", fbChanges("still not convinced", held))
+
+	rig := fbSetup(t, sc, nil) // the default D-08 budget: max_pushback_rounds = 2
+	require.Equal(t, 1, rig.step(t), "the engineer implements")
+	require.Equal(t, 3, rig.step(t), "three lenses review")
+	require.Equal(t, 1, rig.step(t), "the engineer pushes back")
+	require.Equal(t, 1, rig.step(t), "qa holds: one exchange spent")
+	require.Equal(t, 1, rig.step(t), "the engineer pushes back again")
+	require.Equal(t, 1, rig.step(t), "qa holds again: the budget is spent")
+
+	live := rig.Thread()
+	require.Equal(t, FeedbackArbitrating, live.Phase, "the killed run was about to arbitrate")
+	require.Equal(t, 2, live.Items[0].Holds)
+
+	// ...the run is killed here, and the resumed run reads the bead back.
+	_, th, writes := fbResume(t, rig, rig.Store.State(), live.Round)
+	assert.Equal(t, live.Phase, th.Phase, "the resumed thread owes the same arbitration")
+	assert.Equal(t, live.Round, th.Round, "and owes it in the same round")
+	require.Len(t, th.Items, 1)
+	assert.Equal(t, live.Items[0].Holds, th.Items[0].Holds)
+	assert.Equal(t, 2, th.Items[0].Holds,
+		"both pushback exchanges are recovered, so the engineer does not get a third (D-08)")
+	assert.Equal(t, domain.ItemHeld, th.Items[0].Status)
+	assert.Zero(t, writes, "a replay that re-derives where the bead already is writes nothing")
+}
+
+// The arbitration the resumed thread owes is the same firing the killed run
+// was about to make, item and all.
+func TestFeedbackRestoreOwesTheSameArbitration(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	held := item
+	held.Status = domain.ItemHeld
+	held.Detail = "the caller is not the only entry point"
+
+	sc := fbScenario("restore-owes-arbitration")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
+	}))
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbChanges("not convinced", held))
+
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) { o.Limits.MaxPushbackRounds = 1 })
+	ctx := context.Background()
+	require.Equal(t, 1, rig.step(t), "the engineer implements")
+	require.Equal(t, 3, rig.step(t), "three lenses review")
+	require.Equal(t, 1, rig.step(t), "the engineer pushes back")
+	require.Equal(t, 1, rig.step(t), "qa holds, and the run is killed before the ruling")
+	want, err := rig.Loop.Demands(ctx)
+	require.NoError(t, err)
+	require.Len(t, want, 1)
+
+	resumed, th, _ := fbResume(t, rig, rig.Store.State(), 0)
+	assert.Equal(t, FeedbackArbitrating, th.Phase)
+	got, err := resumed.Demands(ctx)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, want[0].Agent, got[0].Agent)
+	assert.Equal(t, want[0].Payload, got[0].Payload)
+}
+
+// A pushback evaluation judges an argument with no diff in front of it
+// (D-09), so replaying one as a review would credit the tester with code it
+// never saw — and here that would approve the bead nobody has reviewed since
+// the engineer's session moved it (D-14).
+func TestFeedbackRestoreDoesNotCreditAnEvaluationWithTheCommit(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMinor, domain.ItemOpen)
+	accepted := item
+	accepted.Status = domain.ItemAccepted
+
+	sc := fbScenario("restore-evaluation-mode")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
+	}))
+	fbSayTask(sc, "tester-qa-sc-fb1-r2-pushback", events.TaskEvaluatePushback, fbSettled("fair enough", accepted))
+
+	rig := fbSetup(t, sc, nil)
+	require.Equal(t, 1, rig.step(t), "the engineer implements")
+	require.Equal(t, 3, rig.step(t), "three lenses review head1")
+	rig.setDiff("head2", 22, 0.1) // the arguing session still committed (D-14)
+	require.Equal(t, 1, rig.step(t), "the engineer pushes back")
+	require.Equal(t, 1, rig.step(t), "qa accepts the argument")
+
+	live := rig.Thread()
+	require.Equal(t, FeedbackReviewing, live.Phase)
+	require.Equal(t, []domain.Lens{domain.LensQA}, live.Reviewers)
+
+	_, th, writes := fbResume(t, rig, rig.Store.State(), live.Round)
+	assert.Equal(t, FeedbackReviewing, th.Phase, "the resumed run still owes a look at the code")
+	assert.Equal(t, []domain.Lens{domain.LensQA}, th.Reviewers)
+	assert.NotContains(t, th.Approved, domain.LensQA,
+		"an evaluation that showed no diff is not an approval of the commit (D-09)")
+	assert.Equal(t, []domain.Lens{domain.LensUX, domain.LensTest}, th.Approved)
+	assert.Zero(t, writes, "the resumed run approves nothing on the strength of a replay")
+	assert.Equal(t, domain.ItemAccepted, th.Items[0].Status)
 }

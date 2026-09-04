@@ -79,7 +79,22 @@ import (
 // same ones the rest of the orchestrator gets. The one thing written outside
 // it is the sc_merge_sha metadata, which gitx records inside its own merge
 // (before the close, so a crash between the two is recoverable); the close
-// itself is intercepted and applied through the machine.
+// itself is intercepted and applied through the machine. The one bd writer
+// this package does not own at all — gitx's resume reconciliation — is
+// held to the same table by [ResumeTracker] at the bottom of this file
+// (P6-37).
+//
+// Two smaller rules about what a delivery leaves behind:
+//
+//   - [events.Merged] is published after the close, and once per bead
+//     ([Deliverer.announceMerge], P6-40). A merge whose close failed is
+//     retried, and an announcement before the close would be repeated by
+//     every attempt.
+//   - a delivery that ends outside the deliverer — the safety-on one, which
+//     stops at delivering behind its gh:pr gate and is closed a poll later
+//     by [GatePoller] — is told through [Deliverer.Settle] or
+//     [Deliverer.Observe], so nothing stays in the per-bead maps for the
+//     life of the run (P6-41).
 
 // SourceDelivery is the [events.Warning] Source the delivery handoff stamps
 // on anything it had to hand to a human or skip.
@@ -509,6 +524,13 @@ type Deliverer struct {
 	pending  map[domain.BeadID]PendingConflict
 	attempts map[domain.BeadID]int
 	checks   map[domain.BeadID]int
+	// merged records the beads whose merge has been announced, so one
+	// merge is announced exactly once however many attempts it took
+	// (P6-40). It is deliberately not dropped by [Deliverer.forget]: the
+	// point of it is to outlive the delivery that ended. One boolean per
+	// bead the run merged is the smallest thing that can say "this one has
+	// been announced" after the bookkeeping of the delivery is gone.
+	merged map[domain.BeadID]bool
 }
 
 // The Deliverer is a work source (its conflict rounds) and the resume
@@ -540,6 +562,7 @@ func NewDeliverer(opts DeliveryOptions) (*Deliverer, error) {
 		pending:   map[domain.BeadID]PendingConflict{},
 		attempts:  map[domain.BeadID]int{},
 		checks:    map[domain.BeadID]int{},
+		merged:    map[domain.BeadID]bool{},
 	}
 	if d.threshold <= 0 {
 		d.threshold = gitx.DefaultReReviewThreshold
@@ -773,13 +796,6 @@ func (d *Deliverer) deliverMerge(ctx context.Context, req DeliveryRequest, out *
 		return d.retryable(out, "the merge reported neither a result nor an error", errNoMergeResult)
 	}
 	out.Target, out.MergeSHA, out.Pushed, out.Check = res.Target, res.Head, res.Pushed, res.Check
-	d.host.Publish(events.Merged{
-		Meta:   d.meta(),
-		Bead:   req.Bead.ID,
-		SHA:    res.Head,
-		Branch: res.Target,
-		Pushed: res.Pushed,
-	})
 	reason := fmt.Sprintf("merged into %s as %s", res.Target, deliveryShortSHA(res.Head))
 	if _, err := d.states.Apply(ctx, StateRequest{
 		Bead: req.Bead.ID, From: domain.BeadStateDelivering, Event: BeadEventDelivered,
@@ -787,10 +803,16 @@ func (d *Deliverer) deliverMerge(ctx context.Context, req DeliveryRequest, out *
 	}); err != nil {
 		// The work is on the default branch; only the close failed (a
 		// blocker still open, D-20, or bd being unavailable). A retry finds
-		// the merge already landed and finishes the close.
+		// the merge already landed and finishes the close — and announces
+		// the merge then. Nothing is published here (P6-40): an
+		// [events.Merged] published before the close would be published
+		// again by every retry, and everything that counts merges — the
+		// run log fold behind `sc status`, the TUI's PRs view — would see
+		// one bead merged twice.
 		return d.retryable(out, "the merge landed but the bead could not be closed", err)
 	}
 	out.Kind, out.State, out.Reason = DeliveryMerged, domain.BeadStateClosed, reason
+	d.announceMerge(req.Bead.ID, res)
 	d.forget(req.Bead.ID)
 	d.host.Log().Info("delivered", slog.String("bead", string(req.Bead.ID)), slog.String("sha", res.Head))
 	return out, nil
@@ -1139,6 +1161,112 @@ func (d *Deliverer) forget(id domain.BeadID) {
 	delete(d.pending, id)
 	delete(d.attempts, id)
 	delete(d.checks, id)
+}
+
+// announceMerge publishes the [events.Merged] of a safety-off delivery,
+// once per bead (P6-40).
+//
+// It is called after the close, not before it: a merge whose close failed
+// is a [DeliveryRetryable] outcome the caller answers by delivering again,
+// and gitx's already-landed check then finishes the close on the second
+// attempt. Announcing before the close would therefore announce the same
+// commit once per attempt, and everything that counts merges — the run log
+// fold behind `sc status`, the TUI's PRs view — would report one bead
+// merged twice. The ledger is belt and braces on top of that ordering: a
+// caller that re-delivers a bead it still believes is `delivering` after
+// the close landed would otherwise reach here a second time.
+func (d *Deliverer) announceMerge(id domain.BeadID, res *gitx.MergeResult) {
+	d.mu.Lock()
+	announced := d.merged[id]
+	d.merged[id] = true
+	d.mu.Unlock()
+	if announced {
+		d.host.Log().Debug("the merge was already announced; not publishing it again",
+			slog.String("bead", string(id)), slog.String("sha", res.Head))
+		return
+	}
+	d.host.Publish(events.Merged{
+		Meta:   d.meta(),
+		Bead:   id,
+		SHA:    res.Head,
+		Branch: res.Target,
+		Pushed: res.Pushed,
+	})
+}
+
+// announced reports whether the delivery has already published an
+// [events.Merged] for this bead (P6-40).
+func (d *Deliverer) announced(id domain.BeadID) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.merged[id]
+}
+
+// DeliverySettler is what something that ends a delivery elsewhere tells:
+// the delivery is over, so the deliverer may drop what it was keeping for
+// it. *Deliverer satisfies it.
+//
+// Only the safety-off path ends inside the deliverer (the merge closes the
+// bead, the hand-off parks it). A safety-on delivery correctly stops at
+// `delivering` behind its gh:pr gate (D-20), and the thing that ends it is
+// the gate poller closing the bead one poll — or one human merge — later
+// (P6-10). Without this seam the conflict attempts, the check-item counter
+// and any pending conflict of every delivered bead would stay in the
+// deliverer's maps for the life of the run (P6-41).
+type DeliverySettler interface {
+	// Settle is called with the bead whose delivery ended.
+	Settle(id domain.BeadID)
+}
+
+// *Deliverer is the production DeliverySettler.
+var _ DeliverySettler = (*Deliverer)(nil)
+
+// Settle implements [DeliverySettler]: the delivery of this bead ended
+// somewhere else — the gate poller closed it, a human parked it — so the
+// bookkeeping the deliverer kept for it is dropped (P6-41). It is
+// idempotent and safe to call for a bead the deliverer never saw.
+func (d *Deliverer) Settle(id domain.BeadID) { d.forget(id) }
+
+// Observe is [Settle] driven by the run's event stream, for an assembly
+// that would rather subscribe than call: hand it every event (as a
+// [PublisherFunc], or from a bus subscriber) and a bead that reaches a
+// settled state — closed, needs_human, failed (see [BeadStateSettled]) —
+// or whose merge is announced is settled.
+//
+// An escalated bead is not settled: the product owner still owes it a
+// ruling and the delivery may yet be retried (D-08). The deliverer's own
+// events reach it too when it is subscribed to the same bus, which is
+// harmless: it has already forgotten those beads itself.
+func (d *Deliverer) Observe(ev events.Event) {
+	switch e := ev.(type) {
+	case events.BeadStateChanged:
+		if e.Bead != "" && BeadStateSettled(e.To) {
+			d.Settle(e.Bead)
+		}
+	case events.Merged:
+		if e.Bead != "" {
+			d.Settle(e.Bead)
+		}
+	}
+}
+
+// tracking reports how many beads the deliverer is keeping bookkeeping
+// for: a conflict round outstanding, conflict attempts spent, or check
+// items raised. It is what [Deliverer.Settle] empties.
+func (d *Deliverer) tracking() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	ids := map[domain.BeadID]bool{}
+	for id := range d.pending {
+		ids[id] = true
+	}
+	for id := range d.attempts {
+		ids[id] = true
+	}
+	for id := range d.checks {
+		ids[id] = true
+	}
+	return len(ids)
 }
 
 // Pending returns the conflict rounds still outstanding, ordered by bead id.
@@ -1500,6 +1628,224 @@ func (d *Deliverer) ConflictRound(ctx context.Context, e gitx.ResumeEntry) error
 		return fmt.Errorf("orchestrator: resume: %s: %s", bead.ID, res.Reason)
 	}
 	return nil
+}
+
+// ------------------------------------------------- the resume guard (P6-37)
+
+// The resume is the one bead-status writer outside this package: gitx
+// reconciles branch state into bead state after a crash and writes the
+// answer through a [gitx.ResumeTracker], which in production is
+// *beads.Client itself. That made it the second writer that chose its own
+// edges — "the recorded pull request is no longer open or merged" moves a
+// bead to needs_human from every non-closed state, `failed` included, and
+// D-07 has no edge out of failed at all.
+//
+// [ResumeTracker] closes that hole from the orchestrator's side, where the
+// D-07 table lives. It is a [gitx.ResumeTracker] that wraps the real one
+// and refuses to write a status the table has no edge for, reading the
+// state bd has the bead in right now to know where the edge starts (D-06:
+// bd is the source of truth, and the resume's own view of the bead is as
+// old as the crash).
+//
+// It checks rather than applies: [StateMachine.Apply] would publish an
+// [events.BeadStateChanged] of its own, and [Run.reconcileResume] already
+// publishes exactly one per entry gitx marked Applied. Two announcements
+// of one move would be worse than the guard is good.
+
+// ResumeBeadReader is the read the resume guard needs: the status bd has a
+// bead in right now, so the edge a resume wants to take can be checked
+// against the D-07 table before anything is written. That is the same read
+// the gate poller makes, so it is the same interface — one definition per
+// concept — under the name the resume guard's own options use.
+type ResumeBeadReader = GateBeadReader
+
+// *beads.Client is the production bead store and reader of a resume.
+var (
+	_ ResumeBeadReader   = (*beads.Client)(nil)
+	_ gitx.ResumeTracker = (*beads.Client)(nil)
+)
+
+// Resume guard errors, matched with errors.Is.
+var (
+	// ErrNoResumeStore means [NewResumeTracker] was given nothing to write
+	// through.
+	ErrNoResumeStore = errors.New("orchestrator: the resume tracker has no bead store")
+	// ErrNoResumeReader means [NewResumeTracker] was given no bead reader,
+	// so no edge could be checked and the guard would be a lie.
+	ErrNoResumeReader = errors.New("orchestrator: the resume tracker has no bead reader")
+	// ErrNotAResumeEdge means the resume asked for a state no D-07 event
+	// leads to from a resume ([ResumeEvent]).
+	ErrNotAResumeEdge = errors.New("orchestrator: a resume does not write this state")
+	// ErrResumeStateUnknown means bd could not say what state the bead is
+	// in, so the edge could not be checked and nothing was written.
+	ErrResumeStateUnknown = errors.New("orchestrator: the bead's current state could not be read")
+)
+
+// ResumeEvent is the D-07 event a resume raises to reach a state, and
+// whether a resume may write that state at all.
+//
+// A resume reconciles git into bd; the three answers it can reach are:
+//
+//	closed       the branch landed on the default branch before the crash
+//	             (BeadEventDelivered, from delivering)
+//	needs_human  the recorded pull request is gone, or the branch is
+//	             (BeadEventBlocked, from any state still in flight)
+//	failed       nothing writes it today, but the exit exists (D-07)
+//
+// Every other state is somebody's live work and is not a resume's to
+// write, so the guard refuses it with [ErrNotAResumeEdge] rather than
+// guessing an edge.
+func ResumeEvent(to domain.BeadState) (BeadEvent, bool) {
+	switch to {
+	case domain.BeadStateClosed:
+		return BeadEventDelivered, true
+	case domain.BeadStateNeedsHuman:
+		return BeadEventBlocked, true
+	case domain.BeadStateFailed:
+		return BeadEventFailed, true
+	default:
+		return "", false
+	}
+}
+
+// ResumeTrackerOptions configures [NewResumeTracker].
+type ResumeTrackerOptions struct {
+	// Store is the tracker the writes go to once they are allowed.
+	// Required; *beads.Client is the production one.
+	Store gitx.ResumeTracker
+	// Beads reads the state bd has a bead in. Required: without it the
+	// guard could not tell where an edge starts.
+	Beads ResumeBeadReader
+	// Statuses resolves the repository's own custom statuses, so a bead
+	// with a foreign status is never written (P3-14, P6-12). Nil still
+	// resolves every D-07 state.
+	Statuses beads.StatusMap
+	// Logger records the refusals; nil means slog.Default().
+	Logger *slog.Logger
+}
+
+// ResumeTracker is a [gitx.ResumeTracker] that checks every bead-status
+// write of a resume against the D-07 table before letting it through
+// (P6-37). A write the table has no edge for is refused with the same
+// errors [Transition] returns ([ErrInvalidTransition],
+// [ErrNotWorkflowState], [ErrForeignStatus]), which gitx records as the
+// entry's Err and leaves not applied — so [Run.reconcileResume] warns and
+// publishes nothing, exactly as it does for a bd failure.
+type ResumeTracker struct {
+	store    gitx.ResumeTracker
+	beads    ResumeBeadReader
+	statuses beads.StatusMap
+	log      *slog.Logger
+}
+
+// *ResumeTracker is a drop-in for the tracker gitx.NewResumer takes.
+var _ gitx.ResumeTracker = (*ResumeTracker)(nil)
+
+// NewResumeTracker wraps store in the D-07 guard. Pass the result to
+// [gitx.NewResumer] in place of the bead client:
+//
+//	tracker, err := orchestrator.NewResumeTracker(orchestrator.ResumeTrackerOptions{
+//		Store: client, Beads: client, Statuses: statuses,
+//	})
+//	resumer, err := gitx.NewResumer(manager, tracker)
+//
+// It needs no run, so it can be built before the [Run] it belongs to,
+// which is the order the assembly has to use ([Options.Resumer] is set
+// before [New]).
+func NewResumeTracker(opts ResumeTrackerOptions) (*ResumeTracker, error) {
+	if opts.Store == nil {
+		return nil, ErrNoResumeStore
+	}
+	if opts.Beads == nil {
+		return nil, ErrNoResumeReader
+	}
+	log := opts.Logger
+	if log == nil {
+		log = slog.Default()
+	}
+	return &ResumeTracker{store: opts.Store, beads: opts.Beads, statuses: opts.Statuses, log: log}, nil
+}
+
+// SetStatus writes the reconciled status once the edge to it is one the
+// D-07 table has.
+func (t *ResumeTracker) SetStatus(ctx context.Context, id domain.BeadID, state domain.BeadState) (beads.Issue, error) {
+	if err := t.guard(ctx, id, state); err != nil {
+		return beads.Issue{}, err
+	}
+	return t.store.SetStatus(ctx, id, state)
+}
+
+// Update applies the patch. A patch that carries no status — which is all
+// gitx sends, the sc_merge_sha metadata of a merge found on resume — is
+// not a status write and goes straight through; one that does is guarded
+// like [ResumeTracker.SetStatus].
+func (t *ResumeTracker) Update(ctx context.Context, id domain.BeadID, p beads.Patch) (beads.Issue, error) {
+	if p.Status != "" {
+		if err := t.guard(ctx, id, p.Status); err != nil {
+			return beads.Issue{}, err
+		}
+	}
+	return t.store.Update(ctx, id, p)
+}
+
+// Close closes the bead once delivering --delivered--> closed is legal for
+// it. A close bd refuses because a gate still blocks the bead comes back
+// unwrapped, so gitx's [beads.ErrBlockedOpen] check still recognises it
+// and leaves the bead to the gate poller (D-20).
+func (t *ResumeTracker) Close(ctx context.Context, id domain.BeadID, reason string) (beads.Issue, error) {
+	if err := t.guard(ctx, id, domain.BeadStateClosed); err != nil {
+		return beads.Issue{}, err
+	}
+	return t.store.Close(ctx, id, reason)
+}
+
+// guard refuses a write the D-07 table has no edge for.
+//
+// A bead bd already has in the target state is written again rather than
+// refused: the table has no self-edges, but "the bead is already where the
+// resume wants it" is a crash between the write and the record of it, not
+// a violation, and bd is idempotent about a status it already holds.
+func (t *ResumeTracker) guard(ctx context.Context, id domain.BeadID, to domain.BeadState) error {
+	ev, ok := ResumeEvent(to)
+	if !ok {
+		return t.refuse(id, to, fmt.Errorf("%w: %s", ErrNotAResumeEdge, string(to)))
+	}
+	from, err := t.current(ctx, id)
+	if err != nil {
+		return t.refuse(id, to, err)
+	}
+	if from == to {
+		return nil
+	}
+	if _, err := Transition(from, ev); err != nil {
+		return t.refuse(id, to, err)
+	}
+	return nil
+}
+
+// current is the state bd has the bead in, through the P6-12 guard so a
+// foreign or read-only status is refused rather than transitioned.
+func (t *ResumeTracker) current(ctx context.Context, id domain.BeadID) (domain.BeadState, error) {
+	issues, err := t.beads.Show(ctx, id)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s: %w", ErrResumeStateUnknown, id, err)
+	}
+	for _, issue := range issues {
+		if issue.ID != id {
+			continue
+		}
+		return ResolveBeadStatus(issue.Status, t.statuses)
+	}
+	return "", fmt.Errorf("%w: bd returned nothing for %s", ErrResumeStateUnknown, id)
+}
+
+// refuse logs the refusal and hands the error back for gitx to record on
+// the entry. Nothing is published: the run announces what the resume
+// applied, and a write that did not happen is not a transition.
+func (t *ResumeTracker) refuse(id domain.BeadID, to domain.BeadState, err error) error {
+	t.log.Warn("resume: refusing a bead-status write the D-07 table has no edge for",
+		slog.String("bead", string(id)), slog.String("to", string(to)), slog.Any("err", err))
+	return fmt.Errorf("resume: %s: %w", id, err)
 }
 
 // warn publishes an [events.Warning] against the bead and logs it.

@@ -14,6 +14,7 @@ import (
 
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
+	"slop-cannon/internal/textsafe"
 )
 
 // gvGoldenDir is where the graph view's golden frames live.
@@ -1242,9 +1243,9 @@ func TestGraphScrubbers(t *testing.T) {
 	require.Equal(t, "one\ntwo", graphBlock("one\ntwo"), "paragraph breaks survive")
 	require.Equal(t, "one\ntwo", graphBlock("one\r\ntwo"))
 	require.Equal(t, "one\nred", graphBlock("one\n\x1b[31mred\x1b[0m"))
-	require.True(t, graphControl('\x1b'))
-	require.True(t, graphControl(0x9b))
-	require.False(t, graphControl('a'))
+	require.True(t, textsafe.IsControl('\x1b'))
+	require.True(t, textsafe.IsControl(0x9b))
+	require.False(t, textsafe.IsControl('a'))
 }
 
 // gvWideTitle is a bead title made of double-width characters.

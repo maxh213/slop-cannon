@@ -1,0 +1,11 @@
+sc could not start a run in /repo: /repo is not a git repository (no .git in it or any parent directory)
+
+Fix it in this order:
+  1. repo: not a git repository: /repo
+     pass --repo PATH or run sc from inside a git repository
+  2. git: not found on PATH
+     install git 2.30 or newer (https://git-scm.com/downloads)
+  3. bd: not found on PATH
+     install beads 1.2.2 or newer: brew install beads, or the upstream install script (scripts/install.sh at https://github.com/gastownhall/beads); CGO_ENABLED=0 go install builds are server-mode only and cannot run embedded Dolt
+
+Then check everything at once with: sc doctor

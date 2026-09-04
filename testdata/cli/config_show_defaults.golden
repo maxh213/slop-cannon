@@ -3,6 +3,7 @@ ammo                        10    default
 safety                      true  default
 vibes                       []    default
 rules                       []    default
+exclude                     []    default
 check_command                     default
 idle_replan_interval        10m   default
 gate_poll_interval          1m    default
@@ -12,6 +13,8 @@ limits.max_pushback_rounds  2     default
 limits.agent_timeout        30m   default
 limits.max_tokens           0     default
 limits.max_cost_usd         0     default
+limits.max_plan_rejections  2     default
+limits.max_plan_failures    5     default
 roles.po.cartridge                default
 roles.engineer.cartridge          default
 roles.tester.cartridge            default

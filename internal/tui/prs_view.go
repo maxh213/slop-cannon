@@ -237,10 +237,20 @@ func PRRows(s *State) []PRRow {
 }
 
 // prRow derives one row from a delivery and the bead and rounds behind it.
+//
+// The text it copies out of the state is not the cannon's own: a bead title
+// is written by a model through bd, and the pull request URL, branch and
+// merge sha come out of gh and git. All of it is drawn into the frame — the
+// REF column, the detail line, the row's own columns — so it goes through
+// the package's scrubber here, once, where the row is built, rather than at
+// each of the four places that render it (P7-18). An escape sequence would
+// repaint the frame, and Lip Gloss would still measure the row as if the
+// bytes were not there.
 func prRow(s *State, d Delivery) PRRow {
 	r := PRRow{Delivery: d}
+	r.URL, r.Branch, r.Base, r.SHA = rowText(d.URL), rowText(d.Branch), rowText(d.Base), rowText(d.SHA)
 	if b, ok := s.Bead(d.Bead); ok {
-		r.Title, r.BeadState = b.Title, b.State
+		r.Title, r.BeadState = rowText(b.Title), b.State
 	}
 	outcome, in, expected := prReviewProgress(s, d)
 	r.ReviewsIn, r.ReviewsExpected = in, expected
@@ -675,7 +685,9 @@ func (v PRsModel) rowLine(r PRRow, wide bool) string {
 		note = v.theme.Text().Render(prsPad(note, prsNoteWidth))
 	}
 	cols := []string{
-		v.theme.Text().Render(prsPad(orDash(r.Bead.String()), prsBeadWidth)),
+		// The bead id is bd's, not the cannon's: it is scrubbed like any
+		// other borrowed text, and a clean id costs one scan.
+		v.theme.Text().Render(prsPad(orDash(rowText(r.Bead.String())), prsBeadWidth)),
 		v.theme.Muted().Render(prsPad(r.PR(), prsPRWidth)),
 		status,
 		note,
@@ -726,7 +738,7 @@ func (v PRsModel) detail(r PRRow, w int, wide bool) string {
 		tail = append(tail, v.theme.Muted().Render("no URL to open"))
 	}
 
-	head := v.theme.Accent().Render(orDash(r.Bead.String()))
+	head := v.theme.Accent().Render(orDash(rowText(r.Bead.String())))
 	rest := strings.Join(tail, "  ")
 	budget := w - lipgloss.Width(head) - lipgloss.Width(rest) - len("  ")*2 - len(`""`)
 	if r.Title == "" || budget < prsMinTitle {

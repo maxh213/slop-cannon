@@ -12,6 +12,7 @@ import (
 
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
+	"slop-cannon/internal/textsafe"
 )
 
 // Tab is one of the views of the main pane.
@@ -611,7 +612,7 @@ func formatEvent(ev events.Event) string {
 // carries nothing but printable characters is returned unchanged, so a
 // benign line never pays for the walk.
 func logSanitize(s string) string {
-	if !strings.ContainsFunc(s, logIsControl) {
+	if !textsafe.ContainsControl(s) {
 		return s
 	}
 	parts := strings.Split(s, "\n")
@@ -622,13 +623,6 @@ func logSanitize(s string) string {
 		}
 	}
 	return strings.Join(kept, " ")
-}
-
-// logIsControl reports whether r is one of the characters a terminal reads as
-// an instruction rather than as text: a C0 control (ESC, CR, LF and tab
-// included), DEL, or a C1 control.
-func logIsControl(r rune) bool {
-	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
 }
 
 // EventMsg carries one bus event into the Bubble Tea update loop.

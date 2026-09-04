@@ -1,0 +1,205 @@
+{
+  "name": "slop cannon demo: two beads, one misfire, one round of changes",
+  "detect": {
+    "version": "mock/demo",
+    "auth": "ok"
+  },
+  "rules": [
+    {
+      "name": "plan",
+      "match": { "role": "po", "task": "plan" },
+      "steps": [
+        { "kind": "text", "text": "Reading the repository." },
+        { "kind": "text", "delay": "900ms", "text": "Two beads are enough to get started." }
+      ],
+      "result": {
+        "structured": {
+          "brief": "Give the fixture project somewhere to write things down.",
+          "beads": [
+            {
+              "key": "notes",
+              "title": "Add a NOTES file",
+              "description": "Start a notes file so decisions have somewhere to live.",
+              "acceptance": "The notes file exists and names the project.",
+              "type": "task",
+              "priority": 1,
+              "size": "s"
+            },
+            {
+              "key": "checklist",
+              "title": "Add a CHECKLIST file",
+              "description": "Start a checklist file with the release steps.",
+              "acceptance": "The checklist file exists and lists at least one step.",
+              "type": "task",
+              "priority": 2,
+              "size": "s"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "engineer-misfire",
+      "match": { "role": "engineer", "task": "implement", "prompt_contains": "CHECKLIST" },
+      "max_uses": 2,
+      "steps": [
+        { "kind": "text", "text": "Opening the repository." },
+        { "kind": "text", "delay": "900ms", "text": "Writing the checklist." },
+        {
+          "kind": "fail",
+          "delay": "600ms",
+          "failure": { "kind": "malformed", "message": "the reply ended in a broken result block" }
+        }
+      ],
+      "result": {}
+    },
+    {
+      "name": "engineer-checklist",
+      "match": { "role": "engineer", "task": "implement", "prompt_contains": "CHECKLIST" },
+      "steps": [
+        { "kind": "text", "text": "Trying again after the misfire." },
+        {
+          "kind": "write",
+          "delay": "900ms",
+          "path": "docs/CHECKLIST.md",
+          "content": "# Release checklist\n\n- [ ] run the tests\n- [ ] tag the release\n"
+        },
+        { "kind": "text", "delay": "200ms", "text": "Wrote docs/CHECKLIST.md." }
+      ],
+      "result": {
+        "structured": {
+          "summary": "Added docs/CHECKLIST.md with the two release steps.",
+          "files_changed": ["docs/CHECKLIST.md"],
+          "how_to_verify": "cat docs/CHECKLIST.md"
+        }
+      }
+    },
+    {
+      "name": "engineer-notes",
+      "match": { "role": "engineer", "task": "implement", "prompt_contains": "NOTES" },
+      "steps": [
+        { "kind": "text", "text": "Reading the repository layout." },
+        { "kind": "tool_use", "delay": "500ms", "tool": "Read", "tool_id": "t1", "input": "README.md" },
+        { "kind": "tool_result", "delay": "400ms", "tool": "Read", "tool_id": "t1", "output": "# Fixture project" },
+        {
+          "kind": "write",
+          "delay": "900ms",
+          "path": "docs/NOTES.md",
+          "content": "# Notes\n\nDecisions worth remembering.\n"
+        },
+        { "kind": "text", "delay": "200ms", "text": "Wrote docs/NOTES.md." }
+      ],
+      "result": {
+        "structured": {
+          "summary": "Added docs/NOTES.md with a heading and a first line.",
+          "files_changed": ["docs/NOTES.md"],
+          "how_to_verify": "cat docs/NOTES.md"
+        }
+      }
+    },
+    {
+      "name": "engineer-fixes-the-notes",
+      "match": { "role": "engineer", "task": "address_feedback" },
+      "steps": [
+        { "kind": "text", "text": "The QA lens is right: the file does not name the project." },
+        {
+          "kind": "write",
+          "delay": "900ms",
+          "path": "docs/NOTES.md",
+          "append": true,
+          "content": "\nThese notes belong to the fixture project.\n"
+        }
+      ],
+      "result": {
+        "structured": {
+          "responses": [
+            {
+              "item_id": "qa-r1-1",
+              "action": "fixed",
+              "rationale": "docs/NOTES.md now names the fixture project."
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "tester-qa-asks-for-changes",
+      "match": { "role": "tester", "lens": "qa", "round": 1, "prompt_contains": "NOTES" },
+      "steps": [
+        { "kind": "text", "text": "Reading the diff." },
+        { "kind": "text", "delay": "900ms", "text": "The acceptance criterion is not met yet." }
+      ],
+      "result": {
+        "structured": {
+          "outcome": "changes",
+          "summary": "The file exists but does not name the project, which the acceptance criterion asks for.",
+          "items": [
+            {
+              "id": "qa-r1-1",
+              "severity": "major",
+              "category": "correctness",
+              "title": "The notes file does not name the project",
+              "detail": "The acceptance criterion asks for the project name; the file only has a heading.",
+              "file": "docs/NOTES.md",
+              "line": 1,
+              "suggestion": "Add a line naming the fixture project.",
+              "status": "open"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "tester-qa-re-reviews",
+      "match": { "role": "tester", "lens": "qa", "task": "review", "round": 2 },
+      "steps": [
+        { "kind": "text", "text": "Reading the new diff." },
+        { "kind": "text", "delay": "900ms", "text": "That is what I asked for." }
+      ],
+      "result": {
+        "structured": {
+          "outcome": "approve",
+          "summary": "The notes file now names the project; the item is resolved.",
+          "items": [
+            {
+              "id": "qa-r1-1",
+              "severity": "major",
+              "category": "correctness",
+              "title": "The notes file does not name the project",
+              "detail": "The acceptance criterion asks for the project name; the file only has a heading.",
+              "file": "docs/NOTES.md",
+              "line": 1,
+              "suggestion": "Add a line naming the fixture project.",
+              "status": "resolved"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "tester-approves",
+      "match": { "role": "tester", "task": "review" },
+      "steps": [
+        { "kind": "text", "text": "Reading the diff." },
+        { "kind": "text", "delay": "1s", "text": "This does what the bead asked for." }
+      ],
+      "result": {
+        "structured": {
+          "outcome": "approve",
+          "summary": "The change matches the acceptance criteria and touches nothing else."
+        }
+      }
+    }
+  ],
+  "fallback": {
+    "name": "unscripted",
+    "steps": [
+      { "kind": "text", "text": "no rule matched this firing" },
+      {
+        "kind": "fail",
+        "failure": { "kind": "crash", "message": "the demo fired an agent this scenario does not script" }
+      }
+    ],
+    "result": {}
+  }
+}

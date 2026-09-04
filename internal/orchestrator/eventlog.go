@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -32,9 +33,29 @@ import (
 // step. The log comes first in that argument list on purpose: [Tee]
 // forwards in argument order, so the file is written before any subscriber
 // is told, and anything a subscriber renders is already durable.
+// [TeeRunLog] is that wiring as one call, for whoever assembles the run.
+//
+// The file is bounded (P6-33): past [DefaultEventLogMaxBytes] it is rolled
+// into [EventLogRotatedName] and a fresh one is started, so a multi-day
+// autopilot run costs two segments rather than everything it ever said.
+// [ReadEventLog] and [SummariseLog] read across the rotation.
 
 // EventLogName is the run log file inside the run directory.
 const EventLogName = "events.jsonl"
+
+// EventLogRotatedName is the previous segment of the run log, the one
+// [EventLog] rolls the live file into when it passes its size cap (P6-33).
+// Exactly one rotated segment is kept: a run whose log has rolled twice has
+// lost its oldest events, which is the price of a bounded run directory.
+const EventLogRotatedName = EventLogName + ".1"
+
+// DefaultEventLogMaxBytes is the size at which the run log rotates. One
+// [events.AgentOutput] line per cartridge output line (P5-08), and an
+// autopilot run that never stops on its own (D-18), make an uncapped log a
+// disk-filling machine; 64 MiB of JSONL is a few hundred thousand events, far
+// more than any reader needs and small enough to keep. Two segments are kept,
+// so a run directory's log costs at most twice this.
+const DefaultEventLogMaxBytes int64 = 64 << 20
 
 // DefaultRecentEvents is how many recent events [Summarise] keeps, and the
 // number `sc status` prints.
@@ -69,20 +90,51 @@ func EventLogPath(runDir string) string {
 type EventLog struct {
 	path string
 	log  *slog.Logger
+	max  int64
 
-	mu     sync.Mutex
-	f      *os.File
-	w      *events.JSONLWriter
-	err    error
-	warned bool
-	closed bool
+	mu        sync.Mutex
+	f         *os.File
+	cw        *countingWriter
+	w         *events.JSONLWriter
+	size      int64
+	rotations int
+	err       error
+	warned    bool
+	closed    bool
+}
+
+// EventLogOptions configures [OpenEventLogWith]. The zero value is what
+// [OpenEventLog] uses: slog.Default() and [DefaultEventLogMaxBytes].
+type EventLogOptions struct {
+	// Logger receives the one line a write failure and each rotation
+	// produce; nil means slog.Default().
+	Logger *slog.Logger
+	// MaxBytes is the size at which the live file is rolled into
+	// [EventLogRotatedName] (P6-33). Zero means [DefaultEventLogMaxBytes];
+	// a negative value never rotates, which is what a test that wants one
+	// file wants.
+	MaxBytes int64
 }
 
 // OpenEventLog creates runDir if needed and opens <run-dir>/events.jsonl
-// for appending, private to the user (0600). Re-opening an existing log of
-// a resumed run appends to it rather than truncating, so one file holds the
-// whole history of a run across restarts. A nil logger means slog.Default().
+// for appending, private to the user (0600), with the default size cap. Use
+// [OpenEventLogWith] to change the cap.
 func OpenEventLog(runDir string, logger *slog.Logger) (*EventLog, error) {
+	return OpenEventLogWith(runDir, EventLogOptions{Logger: logger})
+}
+
+// OpenEventLogWith opens the run log of runDir, creating the directory if
+// needed. Re-opening an existing log of a resumed run appends to it rather
+// than truncating, so one file holds the whole history of a run across
+// restarts.
+//
+// The file is capped: once it passes MaxBytes the live file is renamed to
+// [EventLogRotatedName] — replacing the previous rotated segment — and a
+// fresh one is started (P6-33). Every reader in this package
+// ([ReadEventLog], [SummariseLog], and so `sc status`) reads the rotated
+// segment before the live one, so a rotation is invisible to them except in
+// the events that fell off the end.
+func OpenEventLogWith(runDir string, opts EventLogOptions) (*EventLog, error) {
 	if runDir == "" {
 		return nil, errors.New("orchestrator: OpenEventLog: empty run directory")
 	}
@@ -91,18 +143,57 @@ func OpenEventLog(runDir string, logger *slog.Logger) (*EventLog, error) {
 		return nil, fmt.Errorf("orchestrator: create run directory: %w", err)
 	}
 	path := EventLogPath(dir)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, runFilePerm) //nolint:gosec // the run directory sc owns (D-23).
+	f, size, err := openEventLogFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("orchestrator: open %s: %w", path, err)
-	}
-	if err := terminateLastLine(path, f); err != nil {
-		_ = f.Close()
 		return nil, err
 	}
+	logger := opts.Logger
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &EventLog{path: path, log: logger, f: f, w: events.NewJSONLWriter(f)}, nil
+	max := opts.MaxBytes
+	if max == 0 {
+		max = DefaultEventLogMaxBytes
+	}
+	cw := &countingWriter{w: f}
+	return &EventLog{
+		path: path, log: logger, max: max,
+		f: f, cw: cw, w: events.NewJSONLWriter(cw), size: size,
+	}, nil
+}
+
+// openEventLogFile opens one segment for appending and returns its size,
+// having closed off a record a previous run was cut short in the middle of.
+func openEventLogFile(path string) (*os.File, int64, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, runFilePerm) //nolint:gosec // the run directory sc owns (D-23).
+	if err != nil {
+		return nil, 0, fmt.Errorf("orchestrator: open %s: %w", path, err)
+	}
+	if err := terminateLastLine(path, f); err != nil {
+		_ = f.Close()
+		return nil, 0, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, 0, fmt.Errorf("orchestrator: stat %s: %w", path, err)
+	}
+	return f, info.Size(), nil
+}
+
+// countingWriter counts the bytes written to the file underneath it, so the
+// log knows its size without stat-ing on every event. The target is swapped
+// on rotation.
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+// Write implements [io.Writer].
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 // terminateLastLine closes off a record the previous run was cut short in
@@ -156,11 +247,75 @@ func (l *EventLog) Write(ev events.Event) error {
 		l.err = fmt.Errorf("orchestrator: write %s: %w", l.path, os.ErrClosed)
 		return l.err
 	}
+	if err := l.rotateLocked(); err != nil {
+		l.err = err
+		return err
+	}
 	if err := l.w.Write(ev); err != nil {
 		l.err = err
 		return err
 	}
+	l.size = l.cw.n
 	return nil
+}
+
+// rotateLocked rolls the live file into [EventLogRotatedName] when it has
+// passed the cap, and starts a fresh one (P6-33). The caller holds l.mu.
+//
+// The rotation happens before the write that would have gone over, so a
+// segment never exceeds the cap by more than the last event that fitted
+// under it, and the reader's "the rotated segment came first" rule holds
+// without any bookkeeping in the file itself.
+func (l *EventLog) rotateLocked() error {
+	if l.max <= 0 || l.size < l.max {
+		return nil
+	}
+	rotated := filepath.Join(filepath.Dir(l.path), EventLogRotatedName)
+	if err := l.f.Sync(); err != nil {
+		return fmt.Errorf("orchestrator: sync %s: %w", l.path, err)
+	}
+	if err := l.f.Close(); err != nil {
+		return fmt.Errorf("orchestrator: close %s: %w", l.path, err)
+	}
+	if err := os.Rename(l.path, rotated); err != nil {
+		// The live file is closed and the rename failed: re-open it so the
+		// run keeps its log rather than losing it to a failed tidy-up.
+		f, size, oerr := openEventLogFile(l.path)
+		if oerr != nil {
+			return fmt.Errorf("orchestrator: rotate %s: %w", l.path, errors.Join(err, oerr))
+		}
+		l.f, l.cw.w, l.cw.n, l.size = f, f, size, size
+		return fmt.Errorf("orchestrator: rotate %s: %w", l.path, err)
+	}
+	f, _, err := openEventLogFile(l.path)
+	if err != nil {
+		return err
+	}
+	l.f, l.cw.w, l.cw.n, l.size = f, f, 0, 0
+	l.rotations++
+	l.log.Info("run log rotated", slog.String("path", l.path),
+		slog.String("rotated", rotated), slog.Int64("bytes", l.max))
+	return nil
+}
+
+// Rotations returns how many times the log has rolled over its cap.
+func (l *EventLog) Rotations() int {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.rotations
+}
+
+// Size returns the size of the live segment in bytes.
+func (l *EventLog) Size() int64 {
+	if l == nil {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.size
 }
 
 // Publish implements [Publisher]: it appends the event and swallows the
@@ -267,16 +422,13 @@ func (m multiPublisher) Publish(ev events.Event) {
 // damage, and is not an error.
 func ReadEventLog(runDir string) ([]events.Event, error) {
 	path := EventLogPath(runDir)
-	f, err := os.Open(path) //nolint:gosec // the run directory sc owns (D-23).
-	if errors.Is(err, os.ErrNotExist) {
-		return nil, fmt.Errorf("%w at %s", ErrNoEventLog, path)
-	}
+	r, closeAll, err := openEventLogStream(runDir)
 	if err != nil {
-		return nil, fmt.Errorf("orchestrator: read %s: %w", path, err)
+		return nil, err
 	}
-	defer func() { _ = f.Close() }()
+	defer closeAll()
 	var evs []events.Event
-	d, err := scanLog(f, func(ev events.Event) { evs = append(evs, ev) })
+	d, err := scanLog(r, func(ev events.Event) { evs = append(evs, ev) })
 	if err != nil {
 		return evs, fmt.Errorf("orchestrator: read %s: %w", path, err)
 	}
@@ -284,6 +436,58 @@ func ReadEventLog(runDir string) ([]events.Event, error) {
 		return evs, fmt.Errorf("orchestrator: read %s: %s", path, note)
 	}
 	return evs, nil
+}
+
+// EventLogSegments returns the run log's files in publication order: the
+// rotated segment (P6-33) first, then the live one, leaving out the ones
+// that do not exist. An empty result means the run has no log at all.
+func EventLogSegments(runDir string) []string {
+	dir := filepath.Clean(runDir)
+	var out []string
+	for _, name := range []string{EventLogRotatedName, EventLogName} {
+		path := filepath.Join(dir, name)
+		if _, err := os.Stat(path); err == nil {
+			out = append(out, path)
+		}
+	}
+	return out
+}
+
+// openEventLogStream opens every segment of the run log and returns them as
+// one stream, oldest first, so a reader sees the run's events in the order
+// they were published whether or not the log has rotated. The returned func
+// closes the files. A run with no log at all is [ErrNoEventLog].
+func openEventLogStream(runDir string) (io.Reader, func(), error) {
+	segments := EventLogSegments(runDir)
+	if len(segments) == 0 {
+		return nil, nil, fmt.Errorf("%w at %s", ErrNoEventLog, EventLogPath(runDir))
+	}
+	files := make([]*os.File, 0, len(segments))
+	readers := make([]io.Reader, 0, len(segments))
+	closeAll := func() {
+		for _, f := range files {
+			_ = f.Close()
+		}
+	}
+	for _, path := range segments {
+		f, err := os.Open(path) //nolint:gosec // the run directory sc owns (D-23).
+		if errors.Is(err, os.ErrNotExist) {
+			// It rotated between the listing and the open; the events are
+			// in the segment we are about to read.
+			continue
+		}
+		if err != nil {
+			closeAll()
+			return nil, nil, fmt.Errorf("orchestrator: read %s: %w", path, err)
+		}
+		files = append(files, f)
+		readers = append(readers, f)
+	}
+	if len(readers) == 0 {
+		closeAll()
+		return nil, nil, fmt.Errorf("%w at %s", ErrNoEventLog, EventLogPath(runDir))
+	}
+	return io.MultiReader(readers...), closeAll, nil
 }
 
 // logDamage is what a run log turned out to be missing: lines that did not
@@ -466,6 +670,11 @@ type RunSummary struct {
 	// Warnings and Errors count Warning and Error events.
 	Warnings int `json:"warnings,omitempty"`
 	Errors   int `json:"errors,omitempty"`
+	// Foreign counts the beads the run passed over because bd holds them
+	// in a status it did not register (P6-12, P6-28). It is folded from
+	// the Warning's Source rather than its wording, and each bead is
+	// counted once however many components met it.
+	Foreign []domain.BeadID `json:"foreign_beads,omitempty"`
 	// Beads are the run's beads in the order the log first mentioned them.
 	Beads []BeadSummary `json:"beads,omitempty"`
 	// Counts is how many beads are in each state, over Beads.
@@ -480,6 +689,15 @@ type RunSummary struct {
 	// report to the events before the damage. `sc status` exists to read
 	// the wreckage.
 	Notes []string `json:"notes,omitempty"`
+	// SkippedLines is how many lines of the log did not parse and were left
+	// out of the fold, SkippedRecords how many parsed as an event but named
+	// no bead, and PartialTail says the last line was cut short mid-write.
+	// They are the machine-readable form of the corresponding [Notes] (a
+	// consumer of `sc status --json` must not have to grep English to learn
+	// that the fold is incomplete, P6-42); the notes stay for the human.
+	SkippedLines   int  `json:"skipped_lines,omitempty"`
+	SkippedRecords int  `json:"skipped_records,omitempty"`
+	PartialTail    bool `json:"partial_tail,omitempty"`
 	// Recent are the last events, AgentOutput excluded, oldest first. They
 	// are not marshalled: an events.Event is an interface, so a caller that
 	// wants them in JSON renders them itself (tui.FormatHeadless) or
@@ -523,19 +741,17 @@ func (s RunSummary) Settled() int {
 // the run — one line per cartridge output line (P5-08), and under D-18 an
 // autopilot run never stops on its own — while `sc status` reads it only to
 // print a fold and the last few events. Nothing but the summary and those
-// few events is ever held in memory. (Trimming or rolling the file itself is
-// P6-33.)
+// few events is ever held in memory. A log that has rotated (P6-33) is read
+// across its segments, oldest first, so the fold does not change shape the
+// moment the file rolls over.
 func SummariseLog(runDir string, recent int) (RunSummary, error) {
 	path := EventLogPath(runDir)
-	f, err := os.Open(path) //nolint:gosec // the run directory sc owns (D-23).
-	if errors.Is(err, os.ErrNotExist) {
-		return RunSummary{}, fmt.Errorf("%w at %s", ErrNoEventLog, path)
-	}
+	r, closeAll, err := openEventLogStream(runDir)
 	if err != nil {
-		return RunSummary{}, fmt.Errorf("orchestrator: read %s: %w", path, err)
+		return RunSummary{}, err
 	}
-	defer func() { _ = f.Close() }()
-	s, err := SummariseReader(f, recent)
+	defer closeAll()
+	s, err := SummariseReader(r, recent)
 	if err != nil {
 		return s, fmt.Errorf("orchestrator: read %s: %w", path, err)
 	}
@@ -851,6 +1067,9 @@ func (f *logFold) add(ev events.Event) {
 		}
 	case events.Warning:
 		s.Warnings++
+		if id, ok := ForeignStatusOf(ev); ok && !slices.Contains(s.Foreign, id) {
+			s.Foreign = append(s.Foreign, id)
+		}
 	case events.Error:
 		s.Errors++
 	}
@@ -882,6 +1101,11 @@ func (f *logFold) done() RunSummary {
 	}
 	if len(s.Agents) == 0 {
 		s.Agents = nil
+	}
+	s.SkippedLines = f.damage.Lines
+	s.PartialTail = f.damage.PartialTail
+	for _, n := range f.noBead {
+		s.SkippedRecords += n
 	}
 	if note := f.damage.Note(); note != "" {
 		s.Notes = append(s.Notes, note)

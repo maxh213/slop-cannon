@@ -1,0 +1,34 @@
+Tail the logs of a run.
+
+Without arguments it prints the orchestrator's own log (sc.log). With an
+agent id it prints that agent's log; with a bead id it prints the log of
+every agent that has worked on that bead, oldest agent first, each under a
+header naming it.
+
+Logs are read straight from the run directory, so this works on a finished
+run, on a crashed one, and while another sc process is still firing —
+nothing here writes anything. --run picks a run other than the most recent
+one; sc status lists what a run has done.
+
+Usage:
+  sc logs [AGENT-ID|BEAD-ID] [flags]
+
+Examples:
+  sc logs
+  sc logs eng-sc-1-r1
+  sc logs sc-1
+  sc logs --repo ./repo-path --lines 200
+  sc logs sc-1 --follow
+
+Flags:
+  -f, --follow    keep printing as the logs grow (until interrupted)
+  -h, --help      help for logs
+  -n, --lines N   print the last N lines of each log (0 for all of it) (default 50)
+      --run ID    read run ID instead of the most recent one
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

@@ -953,3 +953,154 @@ func TestProbeLiveness(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("not json"), 0o600))
 	require.False(t, ProbeLiveness(dir, "20260903-120000-abcd").Held)
 }
+
+// --- the cap and the rotation (P6-33) ------------------------------------
+
+// TestEventLogRotatesPastTheCap: a run log that grows past its cap is
+// rolled into events.jsonl.1 and a fresh file is started, so a multi-day
+// autopilot run costs two segments rather than everything it ever said.
+func TestEventLogRotatesPastTheCap(t *testing.T) {
+	dir := t.TempDir()
+	log, err := OpenEventLogWith(dir, EventLogOptions{MaxBytes: 512})
+	require.NoError(t, err)
+
+	for i := 0; i < 40; i++ {
+		require.NoError(t, log.Write(events.AgentOutput{
+			Meta: elogAt(i), Agent: "eng-sc-1-r1", Stream: events.StreamStdout,
+			Line: "a line of the agent's output that is not especially short",
+		}))
+	}
+	require.Positive(t, log.Rotations(), "the log passed its cap and rolled over")
+	require.Less(t, log.Size(), int64(1024), "the live segment is bounded by the cap")
+	require.NoError(t, log.Close())
+
+	rotated := filepath.Join(dir, EventLogRotatedName)
+	require.FileExists(t, rotated)
+	require.Equal(t, []string{rotated, EventLogPath(dir)}, EventLogSegments(dir),
+		"the rotated segment is read first: it holds the older events")
+
+	info, err := os.Stat(rotated)
+	require.NoError(t, err)
+	require.LessOrEqual(t, info.Size(), int64(1024))
+}
+
+// A rotation is invisible to the readers except in the events that fell off
+// the end: `sc status` folds across the segments.
+func TestSummariseReadsAcrossTheRotation(t *testing.T) {
+	dir := t.TempDir()
+	evs := elogRun()
+	log, err := OpenEventLogWith(dir, EventLogOptions{MaxBytes: 700})
+	require.NoError(t, err)
+	for _, ev := range evs {
+		require.NoError(t, log.Write(ev))
+	}
+	require.NoError(t, log.Close())
+	require.Positive(t, log.Rotations(), "the scripted run is longer than the cap")
+
+	got, err := ReadEventLog(dir)
+	require.NoError(t, err)
+	require.NotEqual(t, len(evs), len(got), "the events before the last rotation are gone")
+	require.Positive(t, len(got))
+
+	s, err := SummariseLog(dir, 0)
+	require.NoError(t, err)
+	require.Equal(t, len(got), s.Events, "the fold spans both segments")
+	require.Equal(t, Summarise(got, 0).Counts, s.Counts)
+	require.Empty(t, s.Notes, "a rotation is not damage")
+}
+
+// The cap can be switched off, which is what a test that wants one file
+// wants; the default is DefaultEventLogMaxBytes.
+func TestEventLogCapDefaults(t *testing.T) {
+	dir := t.TempDir()
+	off, err := OpenEventLogWith(dir, EventLogOptions{MaxBytes: -1})
+	require.NoError(t, err)
+	require.Equal(t, int64(-1), off.max)
+	require.NoError(t, off.Close())
+
+	on, err := OpenEventLog(t.TempDir(), nil)
+	require.NoError(t, err)
+	require.Equal(t, DefaultEventLogMaxBytes, on.max)
+	require.NoError(t, on.Close())
+}
+
+// A resumed run appends to the live segment and leaves the rotated one
+// alone: one log, across restarts and across the rotation.
+func TestEventLogReopenKeepsTheRotatedSegment(t *testing.T) {
+	dir := t.TempDir()
+	log, err := OpenEventLogWith(dir, EventLogOptions{MaxBytes: 512})
+	require.NoError(t, err)
+	for i := 0; i < 40; i++ {
+		require.NoError(t, log.Write(events.AgentOutput{Meta: elogAt(i), Agent: "eng-1", Line: "output line here"}))
+	}
+	require.NoError(t, log.Close())
+	before, err := ReadEventLog(dir)
+	require.NoError(t, err)
+
+	again, err := OpenEventLogWith(dir, EventLogOptions{MaxBytes: 512})
+	require.NoError(t, err)
+	require.NoError(t, again.Write(events.RunFinished{Meta: elogAt(99), Reason: events.FinishCompleted}))
+	require.NoError(t, again.Close())
+
+	after, err := ReadEventLog(dir)
+	require.NoError(t, err)
+	require.Positive(t, len(before))
+	require.Equal(t, events.KindRunFinished, after[len(after)-1].Kind(),
+		"the resumed run appended to the live segment rather than starting a new log")
+	require.FileExists(t, filepath.Join(dir, EventLogRotatedName),
+		"and the rotated segment is still there to be read with it")
+	require.Greater(t, len(after), 1, "the log spans both segments")
+}
+
+// --- the skipped-line counts (P6-42) -------------------------------------
+
+// TestSummariseReportsTheSkippedLinesAsNumbers is P6-42: a machine consumer
+// of `sc status --json` must not have to grep English to learn the fold is
+// incomplete.
+func TestSummariseReportsTheSkippedLinesAsNumbers(t *testing.T) {
+	evs := elogRun()
+
+	t.Run("a torn tail", func(t *testing.T) {
+		var buf bytes.Buffer
+		require.NoError(t, WriteEventLog(&buf, evs[:3]))
+		buf.WriteString(`{"kind":"run_fin`)
+		s, err := SummariseReader(bytes.NewReader(buf.Bytes()), 0)
+		require.NoError(t, err)
+		require.True(t, s.PartialTail)
+		require.Zero(t, s.SkippedLines, "a record still being written is not a skipped line")
+	})
+
+	t.Run("a damaged line", func(t *testing.T) {
+		s, err := SummariseReader(elogDamaged(t, evs, 8), 0)
+		require.NoError(t, err)
+		require.Equal(t, 1, s.SkippedLines)
+		require.False(t, s.PartialTail)
+		require.NotEmpty(t, s.Notes, "the prose stays for the human")
+	})
+
+	t.Run("a record that names no bead", func(t *testing.T) {
+		s := Summarise(elogNoBead(), 0)
+		require.Positive(t, s.SkippedRecords)
+		require.Zero(t, s.SkippedLines)
+	})
+
+	t.Run("a clean log", func(t *testing.T) {
+		s := Summarise(evs, 0)
+		require.Zero(t, s.SkippedLines)
+		require.Zero(t, s.SkippedRecords)
+		require.False(t, s.PartialTail)
+	})
+}
+
+// The numbers survive the JSON `sc status --json` renders.
+func TestRunSummarySkipCountsMarshal(t *testing.T) {
+	s, err := SummariseReader(elogDamaged(t, elogRun(), 8), 0)
+	require.NoError(t, err)
+	data, err := json.Marshal(s)
+	require.NoError(t, err)
+	var back map[string]any
+	require.NoError(t, json.Unmarshal(data, &back))
+	require.Equal(t, float64(1), back["skipped_lines"])
+	_, has := back["partial_tail"]
+	require.False(t, has, "a clean tail is not reported at all")
+}

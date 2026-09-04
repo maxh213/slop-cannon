@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"slop-cannon/internal/beads"
@@ -39,6 +41,13 @@ import (
 // workflow state is still refused, or [ResolveBeadStatus] — the same guard
 // without the edge — when the caller reads the bead before it knows which
 // event it will raise, as the gate poller does.
+//
+// [ForeignStatusReporter] is the same guard with a voice (P6-28): the run
+// shares one, and every component that passes a bead over because bd holds
+// it in a status the cannon did not register reports it through that, so
+// the bead is named once — as a Warning a reader finds by its Source
+// ([SourceForeignStatus], [ForeignStatusBeads]) rather than by its wording
+// — and counted for `sc status`.
 //
 // [StateMachine.ReleaseHeld] is the same rule applied to a shutting-down run:
 // the beads its live agents hold go back to the ready set through the table
@@ -134,16 +143,10 @@ const (
 	// non-terminal state. → needs_human.
 	BeadEventBlocked BeadEvent = "blocked"
 	// BeadEventFailed: the bead is abandoned after unrecoverable errors.
-	// Valid from every non-terminal state. → failed.
-	//
-	// TODO(P6-31): nothing in the assembled cannon raises this yet. The
-	// trigger D-07 wants for it is a demand whose firing keeps failing —
-	// the consecutive-failure budget P6-31 owns — so until that lands the
-	// failed state is reachable only when a person sets it in bd by hand.
-	// The edges are here because P6-05's stop condition and
-	// [BeadStateSettled] already treat failed as terminal, so the day the
-	// budget parks a bead the write must go through this table like every
-	// other.
+	// Valid from every non-terminal state. → failed. The scheduler raises
+	// it through [BeadParker] when a demand's consecutive-failure budget
+	// runs out (P6-31); a person setting the status in bd by hand is the
+	// other way a bead reaches it.
 	BeadEventFailed BeadEvent = "failed"
 )
 
@@ -787,4 +790,327 @@ func joinBeadStates(states []domain.BeadState) string {
 		parts[i] = string(s)
 	}
 	return strings.Join(parts, ", ")
+}
+
+// ------------------------------------- P6-28: the beads the run passes over
+
+// SourceForeignStatus is the [events.Warning] Source of the report a run
+// makes about a bead it may not touch: one whose bd status the repository
+// defined itself, or one of bd's read-only built-ins (P3-14, P6-12).
+//
+// Every other Source in this package names the component that raised the
+// warning (see host.go). This one names the *condition*, on purpose: the
+// scheduler, the conductor's listing and the gate poller all meet the same
+// bead, and Source is the only field of [events.Warning] a reader can match
+// on. Without it `sc status` could not say how many beads a run is passing
+// over without grepping English out of a message, which P6-42 settled is
+// not something a consumer of `--json` should have to do. [ForeignStatusOf]
+// is the reader.
+const SourceForeignStatus = "foreign-status"
+
+// DefaultForeignStatusLimit bounds a [ForeignStatusReporter]'s once-only
+// bookkeeping, for the same reason [gateWarnKeyLimit] bounds the gate
+// poller's: an autopilot run has no end (D-18), and a map keyed by every
+// bead the repository holds would grow with the repository. A run that has
+// reported this many distinct beads starts the bookkeeping again, so a very
+// old bead may be reported a second time — the right way round, since a run
+// passing over hundreds of beads has more to say about it, not less.
+const DefaultForeignStatusLimit = 512
+
+// ForeignStatus is one bead a run read and may not act on, with the status
+// bd holds it in and the state [beads.SafeState] maps that status onto.
+type ForeignStatus struct {
+	// Bead is the bead the run is passing over.
+	Bead domain.BeadID `json:"bead"`
+	// Status is the raw bd status it carries.
+	Status string `json:"status"`
+	// State is what [beads.SafeState] maps Status onto — what the run would
+	// treat the bead as, if it were allowed to treat it as anything.
+	State domain.BeadState `json:"state"`
+	// BuiltIn is true when the status is one of bd's own read-only states
+	// (blocked, hooked, deferred, pinned) rather than one the repository
+	// invented. The cannon leaves both alone; only the wording differs.
+	BuiltIn bool `json:"builtin,omitempty"`
+	// At is when the run first reported it.
+	At time.Time `json:"at,omitempty"`
+}
+
+// Message is the one line a human is told about the bead. The two wordings
+// are the ones the gate poller has always used, so the report reads the
+// same wherever in the run it comes from.
+func (f ForeignStatus) Message() string {
+	if f.BuiltIn {
+		return fmt.Sprintf("%s is %s, which slop-cannon only reads; leaving it alone", f.Bead, f.State)
+	}
+	return fmt.Sprintf("%s carries the status %q, which slop-cannon did not register; leaving it alone", f.Bead, f.Status)
+}
+
+// ForeignStatusOptions configures a [ForeignStatusReporter].
+type ForeignStatusOptions struct {
+	// Host is the run. It receives every event and lends its logger; nil
+	// falls back to Sink, Run and Logger.
+	Host EventHost
+	// Sink receives the events when there is no Host. Nil publishes
+	// nothing, and the reporter is then a counter.
+	Sink Publisher
+	// Run stamps the events when there is no Host.
+	Run domain.RunID
+	// Statuses is the repository's custom status map, so a status the
+	// cannon registered is not mistaken for a foreign one. Nil still
+	// resolves every D-07 state.
+	Statuses beads.StatusMap
+	// Clock is the time source; nil means time.Now.
+	Clock func() time.Time
+	// Logger overrides the host's logger; nil means the host's, else
+	// slog.Default().
+	Logger *slog.Logger
+	// Limit bounds the once-only bookkeeping; zero means
+	// [DefaultForeignStatusLimit].
+	Limit int
+}
+
+// ForeignStatusReporter turns the P6-12 guard from a silent refusal into
+// something a user can see (P6-28).
+//
+// [Transition] and [TransitionStatus] refuse a bead in a status the cannon
+// did not register, and every component that meets one — the scheduler's
+// work source, the conductor's listing, the gate poller — passes over it.
+// A run fired at a repository whose beads all sit in a status of its own
+// therefore used to look like a run doing nothing at all. The reporter
+// publishes one [events.Warning] per bead (Source [SourceForeignStatus]),
+// never one per poll, and counts them so `sc status` can say how many beads
+// the run is leaving alone.
+//
+// One reporter is meant to be shared by every component of a run, so the
+// bead is reported once by the run rather than once by each of them. All
+// methods are safe for concurrent use, and a nil *ForeignStatusReporter is
+// usable: it reports nothing and resolves with no status map, which is what
+// a component with no reporter configured wants.
+type ForeignStatusReporter struct {
+	sink  Publisher
+	host  EventHost
+	run   domain.RunID
+	stats beads.StatusMap
+	now   func() time.Time
+	log   *slog.Logger
+	limit int
+
+	mu     sync.Mutex
+	seen   map[foreignKey]bool
+	beads  []ForeignStatus
+	total  int
+	resets int
+}
+
+// foreignKey identifies one report: the bead *and* the status it carried,
+// so a bead moved from one foreign status to another is reported again
+// (that is news) while the same bead in the same status on every poll is
+// not.
+type foreignKey struct {
+	bead   domain.BeadID
+	status string
+}
+
+// NewForeignStatusReporter returns a reporter configured by opts. It never
+// fails: with no sink and no host it still counts, which is what a dry run
+// and a test that only wants the numbers want.
+func NewForeignStatusReporter(opts ForeignStatusOptions) *ForeignStatusReporter {
+	r := &ForeignStatusReporter{
+		sink:  opts.Sink,
+		host:  opts.Host,
+		run:   opts.Run,
+		stats: opts.Statuses,
+		now:   opts.Clock,
+		log:   opts.Logger,
+		limit: opts.Limit,
+		seen:  map[foreignKey]bool{},
+	}
+	if r.now == nil {
+		r.now = time.Now
+	}
+	if r.limit <= 0 {
+		r.limit = DefaultForeignStatusLimit
+	}
+	if r.log == nil {
+		if opts.Host != nil {
+			r.log = opts.Host.Log()
+		} else {
+			r.log = slog.Default()
+		}
+	}
+	return r
+}
+
+// Resolve is [ResolveBeadStatus] with the report attached: it answers the
+// P6-12 question for a raw bd status and, when the answer is "not yours",
+// publishes the one Warning the bead owes a human.
+//
+// The returned state and error are exactly [ResolveBeadStatus]'s, so this
+// is a drop-in for the bare guard. The bool says whether this call was the
+// first report of this bead in this status, so a caller can count the beads
+// it is passing over without keeping bookkeeping of its own; it is false
+// for a bead the cannon owns and for one already reported.
+func (r *ForeignStatusReporter) Resolve(id domain.BeadID, status string) (domain.BeadState, bool, error) {
+	var m beads.StatusMap
+	if r != nil {
+		m = r.stats
+	}
+	state, err := ResolveBeadStatus(status, m)
+	if err == nil {
+		return state, false, nil
+	}
+	first := r.report(ForeignStatus{
+		Bead:    id,
+		Status:  status,
+		State:   state,
+		BuiltIn: errors.Is(err, ErrNotWorkflowState),
+	})
+	return state, first, err
+}
+
+// Observe reports every issue in a listing the cannon may not act on and
+// returns how many of them were news. It is the one call the run's bead
+// listing needs: `bd list` hands back what the repository holds, and the
+// beads in it that the run will pass over are exactly the ones a user is
+// owed a word about.
+func (r *ForeignStatusReporter) Observe(issues ...beads.Issue) int {
+	n := 0
+	for _, is := range issues {
+		if is.ID == "" {
+			continue
+		}
+		if _, first, err := r.Resolve(is.ID, is.Status); err != nil && first {
+			n++
+		}
+	}
+	return n
+}
+
+// Count is how many beads the run has reported it may not touch: the number
+// `sc status` shows (P6-28). It counts distinct reports, so a bead reported
+// once and then met on a hundred polls counts once, and a bead that moved
+// between two foreign statuses counts twice.
+func (r *ForeignStatusReporter) Count() int {
+	if r == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.total
+}
+
+// Beads returns the reports, in bead-id order. It holds at most
+// [ForeignStatusOptions.Limit] of them — [Count] is the honest total — so a
+// run that meets thousands of foreign beads reports the count truthfully
+// and lists what it can.
+func (r *ForeignStatusReporter) Beads() []ForeignStatus {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := append([]ForeignStatus(nil), r.beads...)
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Bead != out[j].Bead {
+			return out[i].Bead < out[j].Bead
+		}
+		return out[i].Status < out[j].Status
+	})
+	return out
+}
+
+// report publishes the Warning once per bead and status and returns whether
+// it did.
+func (r *ForeignStatusReporter) report(f ForeignStatus) bool {
+	if r == nil {
+		return false
+	}
+	key := foreignKey{bead: f.Bead, status: f.Status}
+	r.mu.Lock()
+	if r.seen[key] {
+		r.mu.Unlock()
+		r.log.Debug("still leaving a bead alone",
+			slog.String("source", SourceForeignStatus),
+			slog.String("bead", string(f.Bead)),
+			slog.String("status", f.Status))
+		return false
+	}
+	if len(r.seen) >= r.limit {
+		// Bounded like the gate poller's warn-once map, and for the same
+		// reason: an autopilot run runs indefinitely.
+		r.seen = make(map[foreignKey]bool, r.limit)
+		r.beads = nil
+		r.resets++
+		r.log.Debug("a run has reported too many beads it may not touch; starting the once-only bookkeeping again",
+			slog.Int("limit", r.limit), slog.Int("resets", r.resets))
+	}
+	r.seen[key] = true
+	r.total++
+	f.At = r.now()
+	if len(r.beads) < r.limit {
+		r.beads = append(r.beads, f)
+	}
+	r.mu.Unlock()
+
+	// The header and the publish are both outside the lock: a host is the
+	// run itself, and nothing this reporter holds may be held while the run
+	// is called into.
+	meta := events.MetaAt(r.run, f.At)
+	if r.host != nil {
+		meta = r.host.Meta()
+	}
+	message := f.Message()
+	r.log.Warn(message,
+		slog.String("source", SourceForeignStatus),
+		slog.String("bead", string(f.Bead)),
+		slog.String("status", f.Status),
+		slog.String("state", string(f.State)))
+	r.publish(events.Warning{
+		Meta:    meta,
+		Source:  SourceForeignStatus,
+		Message: message,
+		Bead:    f.Bead,
+	})
+	return true
+}
+
+// publish sends ev to the host, or to the sink when there is no host.
+func (r *ForeignStatusReporter) publish(ev events.Event) {
+	switch {
+	case r.host != nil:
+		r.host.Publish(ev)
+	case r.sink != nil:
+		r.sink.Publish(ev)
+	}
+}
+
+// ForeignStatusOf reports whether ev is a run's report of a bead it may not
+// touch, and which bead it named. It is the reader's half of
+// [SourceForeignStatus]: `sc status` and the TUI header fold a run log with
+// it rather than matching on the wording of a message.
+func ForeignStatusOf(ev events.Event) (domain.BeadID, bool) {
+	w, ok := ev.(events.Warning)
+	if !ok || w.Source != SourceForeignStatus || w.Bead == "" {
+		return "", false
+	}
+	return w.Bead, true
+}
+
+// ForeignStatusBeads folds a run's events into the distinct beads it
+// reported it may not touch, in the order they were first reported. Its
+// length is the count P6-28 asks `sc status` to show for a run it is
+// reading off disk rather than watching live ([ForeignStatusReporter.Count]
+// is the same number for a live run).
+func ForeignStatusBeads(evs []events.Event) []domain.BeadID {
+	var out []domain.BeadID
+	seen := map[domain.BeadID]bool{}
+	for _, ev := range evs {
+		id, ok := ForeignStatusOf(ev)
+		if !ok || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
 }

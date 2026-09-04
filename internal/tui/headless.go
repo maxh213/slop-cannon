@@ -284,7 +284,13 @@ func RunHeadless(ctx context.Context, opts Options, hopts HeadlessOptions) (int,
 //
 //	12:01:03 ▶ fired engineer(claude/fable) at bd-1a2b "Add retry" [implement, round 1]
 //
-// The line never contains a newline or an ANSI escape.
+// The body is put through the package's scrubber before the stamp and the
+// glyph are prefixed ([headlessText], P7-18), so the line is exactly one line
+// of printable text however hostile the event was: `sc run --headless` writes
+// straight to a terminal, and an agent's output line, a warning's message or
+// a model's summary can carry an escape sequence that would repaint or clear
+// the screen, a carriage return that would erase the stamp, or a newline that
+// would break the one-event-per-line contract a script parses.
 func FormatHeadless(ev events.Event, loc *time.Location) string {
 	if ev == nil {
 		return ""
@@ -294,7 +300,7 @@ func FormatHeadless(ev events.Event, loc *time.Location) string {
 		loc = time.Local
 	}
 	at = at.In(loc)
-	line := strings.ReplaceAll(HeadlessLine(ev), "\n", " ")
+	line := headlessText(HeadlessLine(ev))
 	return at.Format(headlessTimeFormat) + " " + HeadlessGlyph(ev) + " " + line
 }
 

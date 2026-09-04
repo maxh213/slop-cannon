@@ -15,7 +15,7 @@ LDFLAGS := -s -w \
 	-X $(MODULE)/internal/cli.Commit=$(COMMIT) \
 	-X $(MODULE)/internal/cli.Date=$(DATE)
 
-.PHONY: help build test lint fmt check install integration clean tools update-golden update-golden-tui check-golden docs-cli cartridge-conformance
+.PHONY: help build test lint fmt check install integration clean tools update-golden update-golden-tui check-golden docs-cli cartridge-conformance demo
 
 help: ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
@@ -40,6 +40,9 @@ install: ## go install ./cmd/sc with version metadata
 
 integration: ## Run tests tagged `integration` (need real bd/git/gh)
 	go test -race -tags integration ./...
+
+demo: ## Run the deterministic demo: the TUI against the fixture with a mock scenario (P8-07)
+	@scripts/demo/demo.sh $(DEMO_ARGS)
 
 update-golden: ## Regenerate testdata/**/*.golden files (and docs/cli.md) from current output
 	UPDATE_GOLDEN=1 go test -count=1 ./...

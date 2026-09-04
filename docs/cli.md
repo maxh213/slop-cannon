@@ -18,6 +18,8 @@ Every command, flag, and example of the `sc` binary, in the words of
 - [sc config path](#sc-config-path) — Print the global and repo config file paths
 - [sc config show](#sc-config-show) — Print the merged configuration with the source of every value
 - [sc doctor](#sc-doctor) — Check that git, bd, gh, and the cartridge CLIs are ready
+- [sc logs](#sc-logs) — Tail the log of a run, an agent, or a bead
+- [sc resume](#sc-resume) — Continue the most recent run of a repository
 - [sc rules](#sc-rules) — Manage the rule files every agent must follow
 - [sc run](#sc-run) — Fire the cannon at a repository (same as `sc PATH`)
 - [sc safety](#sc-safety) — Open PRs (on, the default) or merge straight to the default branch (off)
@@ -73,6 +75,7 @@ sc safety off
 ```
       --ammo N           override ammo for this run (N agents at once, minimum 3)
       --cartridge NAME   fire cartridge NAME instead of the active one
+      --force            start even though another run holds this repository's lock (only when you know it is gone)
       --global           read and write the global config only, not the repo config
       --headless         no TUI: render events as log lines (for CI and scripts)
   -h, --help             help for sc
@@ -94,6 +97,8 @@ sc safety off
 - [sc completion](#sc-completion) — Print a shell completion script (bash, zsh, or fish)
 - [sc config](#sc-config) — Show, locate, or edit the configuration files
 - [sc doctor](#sc-doctor) — Check that git, bd, gh, and the cartridge CLIs are ready
+- [sc logs](#sc-logs) — Tail the log of a run, an agent, or a bead
+- [sc resume](#sc-resume) — Continue the most recent run of a repository
 - [sc rules](#sc-rules) — Manage the rule files every agent must follow
 - [sc run](#sc-run) — Fire the cannon at a repository (same as `sc PATH`)
 - [sc safety](#sc-safety) — Open PRs (on, the default) or merge straight to the default branch (off)
@@ -469,6 +474,7 @@ Check that everything a run needs is installed and configured:
   cartridge  every configured cartridge CLI is on PATH (failure when the
              active one is missing)
   repo       --repo is a git repository with a clean working tree (warning)
+  .gitignore ignores .env, so an agent cannot commit a credential (warning)
   .beads     present (warning: it is initialised on the first run)
 
 Rows are pass, warn, or fail. The exit status is 1 when any row fails.
@@ -483,6 +489,122 @@ sc doctor [flags]
 
 ```
   -h, --help   help for doctor
+```
+
+### Options inherited from parent commands
+
+```
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging
+```
+
+### See also
+
+- [sc](#sc) — Fire LLM agents at a repository
+
+## sc logs
+
+Tail the log of a run, an agent, or a bead
+
+### Synopsis
+
+Tail the logs of a run.
+
+Without arguments it prints the orchestrator's own log (sc.log). With an
+agent id it prints that agent's log; with a bead id it prints the log of
+every agent that has worked on that bead, oldest agent first, each under a
+header naming it.
+
+Logs are read straight from the run directory, so this works on a finished
+run, on a crashed one, and while another sc process is still firing —
+nothing here writes anything. --run picks a run other than the most recent
+one; sc status lists what a run has done.
+
+### Usage
+
+```
+sc logs [AGENT-ID|BEAD-ID] [flags]
+```
+
+### Examples
+
+```
+sc logs
+sc logs eng-sc-1-r1
+sc logs sc-1
+sc logs --repo ./repo-path --lines 200
+sc logs sc-1 --follow
+```
+
+### Options
+
+```
+  -f, --follow    keep printing as the logs grow (until interrupted)
+  -h, --help      help for logs
+  -n, --lines N   print the last N lines of each log (0 for all of it) (default 50)
+      --run ID    read run ID instead of the most recent one
+```
+
+### Options inherited from parent commands
+
+```
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging
+```
+
+### See also
+
+- [sc](#sc) — Fire LLM agents at a repository
+
+## sc resume
+
+Continue the most recent run of a repository
+
+### Synopsis
+
+Continue the most recent run of a repository.
+
+This is exactly "sc PATH --resume": the run keeps its id, its brief and the
+configuration it was started with (a config file edited since does not
+change it), its worktrees are reattached, stale leases are recovered and
+the agents that were in flight are fired again.
+
+PATH may be the repository root or any directory inside it; without it the
+--repo directory (the current one by default) is used. --ammo, --safety and
+--cartridge still override the frozen configuration for this invocation and
+say so. There is nothing to resume in a repository sc has never run in.
+
+### Usage
+
+```
+sc resume [PATH] [flags]
+```
+
+### Examples
+
+```
+sc resume
+sc resume ./repo-path
+sc resume --repo ./repo-path --headless
+```
+
+### Options
+
+```
+      --ammo N           override ammo for this run (N agents at once, minimum 3)
+      --cartridge NAME   fire cartridge NAME instead of the active one
+      --force            start even though another run holds this repository's lock (only when you know it is gone)
+      --headless         no TUI: render events as log lines (for CI and scripts)
+  -h, --help             help for resume
+      --no-anim          disable the cannon animations in the TUI (also honours SC_NO_ANIM)
+      --review-prs       also review open pull requests sc did not create (needs gh and a remote) (default true)
+      --safety on|off    override safety for this run (on|off): on opens PRs, off merges to the default branch
 ```
 
 ### Options inherited from parent commands
@@ -604,6 +726,7 @@ sc ./repo-path --resume
 ```
       --ammo N           override ammo for this run (N agents at once, minimum 3)
       --cartridge NAME   fire cartridge NAME instead of the active one
+      --force            start even though another run holds this repository's lock (only when you know it is gone)
       --headless         no TUI: render events as log lines (for CI and scripts)
   -h, --help             help for run
   -m, --message BRIEF    start work with this BRIEF; without it the run is full autopilot
@@ -698,6 +821,12 @@ across the workflow states, which agents are live, and the last few events.
 Everything comes from the run directory — state.json and events.jsonl — so
 it also works after a crash and while another process holds the run.
 
+The bead states are then reconciled with bd, so a bead a human closed or
+reopened by hand is reported as it stands rather than as the run last left
+it; --live=false skips that and reports the run log alone, which is also
+what happens when the repository has no beads database or bd is not
+installed.
+
 With a bead id it prints that bead's timeline from beads: creation, the
 claim, every structured message sc recorded (verdicts, responses,
 arbitrations, deliveries) and where the bead stands now. This form needs bd
@@ -724,6 +853,7 @@ sc status --json
 ```
       --events N   how many recent events to print (N, 0 for none) (default 10)
   -h, --help       help for status
+      --live       reconcile the bead states with bd (--live=false reports the run log alone) (default true)
       --run ID     report on run ID instead of the most recent one
 ```
 

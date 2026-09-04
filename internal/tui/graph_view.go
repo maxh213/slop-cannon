@@ -1426,41 +1426,14 @@ func (c *graphCanvas) row(y, offX, w int) string {
 // exactly as untrusted as the transcript lines the Agents view scrubs
 // (P7-03): a newline would split the row and shift the rest of the frame, an
 // escape sequence would repaint it, and Lip Gloss counts both as zero width,
-// so nothing else would notice. It keeps the printable text only — through
-// the transcript's own scrubber, so there is one definition of printable —
-// and turns the line breaks into spaces so the row keeps its width.
-func graphText(s string) string {
-	if !strings.ContainsFunc(s, graphControl) {
-		return s
-	}
-	return agentsSanitize(strings.Map(func(r rune) rune {
-		if r == '\n' || r == '\r' {
-			return ' '
-		}
-		return r
-	}, s))
-}
+// so nothing else would notice. It is [rowText], the one row scrubber the
+// whole TUI shares (P9-10).
+func graphText(s string) string { return rowText(s) }
 
 // graphBlock scrubs a field the detail panel wraps itself, keeping the
 // paragraph breaks its author wrote: every line is [graphText], the newlines
-// between them survive.
-func graphBlock(s string) string {
-	if !strings.ContainsFunc(s, func(r rune) bool { return graphControl(r) && r != '\n' }) {
-		return s
-	}
-	lines := strings.Split(strings.ReplaceAll(s, "\r\n", "\n"), "\n")
-	for i, l := range lines {
-		lines[i] = graphText(l)
-	}
-	return strings.Join(lines, "\n")
-}
-
-// graphControl reports whether a rune is one a frame cannot carry: a C0
-// control (the escape byte, a newline and a tab included), DEL, or one of the
-// C1 controls that a terminal reading UTF-8 still acts on.
-func graphControl(r rune) bool {
-	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
-}
+// between them survive. It is [blockText].
+func graphBlock(s string) string { return blockText(s) }
 
 // graphPlural picks the singular or the plural spelling of a word for a
 // count, so the summary line reads "1 bead · 1 level" rather than "1 beads".

@@ -1348,3 +1348,125 @@ func TestLifecycleCleanupEntryFailuresAreWarnings(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, lifecycleWarnings(f), "could not list the run's beads for the worktree cleanup")
 }
+
+// --- the forwarding bus (P6-27) ------------------------------------------
+
+// TestLifecycleAgentBusCountsEveryEventItForwards is P6-27: the agents
+// layer can only publish to a concrete *events.Bus, so the run offers one
+// that republishes through Run.Publish. Without it the AgentOutput of every
+// session went straight past the run and state.json's LastSeq undercounted
+// the run log by however much the agents said.
+func TestLifecycleAgentBusCountsEveryEventItForwards(t *testing.T) {
+	f := lifecycleSetup(t)
+	r, err := New(f.runConfig(t, config.RunSettings{}), f.options())
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+
+	before := lifecycleRead(t, r).LastSeq
+	require.Same(t, r.AgentBus(), r.AgentBus(), "the run has exactly one forwarding bus")
+	for i := 0; i < 5; i++ {
+		r.AgentBus().Publish(events.AgentOutput{Meta: r.Meta(), Agent: "eng-sc-1-r1",
+			Stream: events.StreamStdout, Line: "working"})
+	}
+	// A nil event is ignored rather than counted.
+	r.AgentBus().Publish(nil)
+
+	require.NoError(t, r.Stop("user"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+
+	st := lifecycleRead(t, r)
+	// state.json is stamped at each transition rather than at each event,
+	// so the file said zero while RunStarted had already been counted: the
+	// run's whole sequence is RunStarted, the five output lines, RunStopped
+	// and RunFinished.
+	require.Equal(t, before+8, st.LastSeq, "every forwarded event is counted")
+
+	output := 0
+	for _, ev := range f.drain() {
+		if ev.Kind() == events.KindAgentOutput {
+			output++
+		}
+	}
+	require.Equal(t, 5, output, "and reaches the live bus through the run")
+}
+
+// The forwarding bus is drained before the run finishes, so an event
+// published just before the end is in the file the final state.json counts.
+func TestLifecycleAgentBusIsDrainedBeforeTheRunFinishes(t *testing.T) {
+	f := lifecycleSetup(t)
+	opts := f.options()
+	opts.Loop = LoopFunc(func(_ context.Context, r *Run) (Outcome, error) {
+		for i := 0; i < 50; i++ {
+			r.AgentBus().Publish(events.AgentOutput{Meta: r.Meta(), Agent: "eng-1", Line: "line"})
+		}
+		return Outcome{Summary: "done"}, nil
+	})
+	r, err := New(f.runConfig(t, config.RunSettings{}), opts)
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	_, err = r.Wait()
+	require.NoError(t, err)
+
+	st := lifecycleRead(t, r)
+	require.Equal(t, uint64(52), st.LastSeq, "RunStarted, fifty output lines and RunFinished")
+}
+
+// Closing an abandoned run releases the forwarder too.
+func TestLifecycleCloseStopsTheForwardingBus(t *testing.T) {
+	f := lifecycleSetup(t)
+	r, err := New(f.runConfig(t, config.RunSettings{}), f.options())
+	require.NoError(t, err)
+	bus := r.AgentBus()
+	bus.Publish(events.AgentOutput{Meta: r.Meta(), Agent: "eng-1", Line: "line"})
+	require.NoError(t, r.Close())
+	require.NoError(t, r.Close(), "closing twice is fine")
+	bus.Publish(events.AgentOutput{Meta: r.Meta(), Agent: "eng-1", Line: "after the close"})
+}
+
+// --- the bead source (P8-17) ---------------------------------------------
+
+func TestLifecycleUseBeadsRefusesAStartedRun(t *testing.T) {
+	f := lifecycleSetup(t)
+	src := BeadSource(func(context.Context) ([]domain.Bead, error) { return nil, nil })
+	r, err := New(f.runConfig(t, config.RunSettings{}), f.options())
+	require.NoError(t, err)
+	require.Nil(t, r.BeadSource())
+	require.NoError(t, r.UseBeads(src))
+	require.NotNil(t, r.BeadSource())
+
+	require.NoError(t, r.Start(context.Background()))
+	require.ErrorIs(t, r.UseBeads(src), ErrAlreadyStarted)
+	require.NoError(t, r.Stop("user"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+	require.ErrorIs(t, r.UseBeads(src), ErrFinished)
+}
+
+// --- the run log wiring (P8-20) ------------------------------------------
+
+func TestLifecycleTeeRunLogPutsTheLogInFrontOfTheBus(t *testing.T) {
+	f := lifecycleSetup(t)
+	rc := f.runConfig(t, config.RunSettings{})
+	opts := f.options()
+	log, err := TeeRunLog(&opts, rc.Run.StateDir, f.Bus)
+	require.NoError(t, err)
+	require.Equal(t, EventLogPath(rc.Run.StateDir), log.Path())
+
+	r, err := New(rc, opts)
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	require.NoError(t, r.Stop("user"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+	require.NoError(t, log.Close())
+
+	s, err := SummariseLog(rc.Run.StateDir, 0)
+	require.NoError(t, err, "a real run leaves a log sc status can fold")
+	require.Equal(t, PhaseFinished, s.Phase)
+	require.Equal(t, events.FinishStopped, s.Finish)
+	require.NotEmpty(t, f.drain(), "and the live bus still sees everything")
+
+	_, err = TeeRunLog(nil, rc.Run.StateDir, f.Bus)
+	require.Error(t, err)
+}

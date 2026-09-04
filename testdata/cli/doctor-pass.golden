@@ -4,6 +4,7 @@ pass  beads             embedded database answered bd ping in 11 ms
 pass  gh                2.98.0 (/fake/bin/gh), authenticated as octocat on github.com
 pass  cartridge:claude  active: 2.1.258 (/fake/bin/claude)
 pass  repo              clean working tree at /repo
+pass  .gitignore        ignores .env
 pass  .beads            /repo/.beads present
 
-7 passed, 0 warnings, 0 failed
+8 passed, 0 warnings, 0 failed

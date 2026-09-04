@@ -24,6 +24,7 @@ Examples:
 Flags:
       --ammo N           override ammo for this run (N agents at once, minimum 3)
       --cartridge NAME   fire cartridge NAME instead of the active one
+      --force            start even though another run holds this repository's lock (only when you know it is gone)
       --headless         no TUI: render events as log lines (for CI and scripts)
   -h, --help             help for run
   -m, --message BRIEF    start work with this BRIEF; without it the run is full autopilot

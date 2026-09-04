@@ -22,7 +22,9 @@
     "limits": {
       "max_review_rounds": 3,
       "max_pushback_rounds": 2,
-      "agent_timeout": "30m"
+      "agent_timeout": "30m",
+      "max_plan_rejections": 2,
+      "max_plan_failures": 5
     },
     "roles": {
       "tester": "claude"
@@ -34,10 +36,13 @@
     "cartridges": "global",
     "cartridges.claude": "global",
     "check_command": "repo",
+    "exclude": "default",
     "gate_poll_interval": "default",
     "idle_replan_interval": "default",
     "limits.agent_timeout": "default",
     "limits.max_cost_usd": "default",
+    "limits.max_plan_failures": "default",
+    "limits.max_plan_rejections": "default",
     "limits.max_pushback_rounds": "default",
     "limits.max_review_rounds": "repo",
     "limits.max_tokens": "default",
@@ -92,6 +97,11 @@
       "source": "global+repo"
     },
     {
+      "key": "exclude",
+      "value": "[]",
+      "source": "default"
+    },
+    {
       "key": "check_command",
       "value": "make check",
       "source": "repo"
@@ -134,6 +144,16 @@
     {
       "key": "limits.max_cost_usd",
       "value": "0",
+      "source": "default"
+    },
+    {
+      "key": "limits.max_plan_rejections",
+      "value": "2",
+      "source": "default"
+    },
+    {
+      "key": "limits.max_plan_failures",
+      "value": "5",
       "source": "default"
     },
     {

@@ -54,6 +54,18 @@ const (
 	DefaultMaxReviewRounds = 5
 	// DefaultMaxPushbackRounds is the pushback cap per feedback item (D-08).
 	DefaultMaxPushbackRounds = 2
+	// DefaultMaxPlanRejections is how many plans in a row the planning
+	// validator may reject before the run gives up on that round of
+	// planning (P6-19, P1-19). One rejection has already cost two plans:
+	// the agent layer retries a rule failure once inside the firing itself.
+	DefaultMaxPlanRejections = 2
+	// DefaultMaxPlanFailures is how many planning firings in a row may fail
+	// for a reason that is not the plan's fault — a cartridge crash, an
+	// agent timeout, an unreadable rules file — before the run gives up on
+	// that round the same way (P6-19, P1-19). It is looser than
+	// DefaultMaxPlanRejections because those failures are the transient
+	// kind and the supervisor has already spent its own retries on them.
+	DefaultMaxPlanFailures = 5
 	// DefaultAgentTimeout is the per-agent session timeout.
 	DefaultAgentTimeout = 30 * time.Minute
 	// MaxPromptFileSize is the largest vibes or rules file accepted (64 KiB).
@@ -166,6 +178,8 @@ type LimitsFile struct {
 	AgentTimeout      *Duration `toml:"agent_timeout,omitempty"`
 	MaxTokens         *int64    `toml:"max_tokens,omitempty"`
 	MaxCostUSD        *float64  `toml:"max_cost_usd,omitempty"`
+	MaxPlanRejections *int      `toml:"max_plan_rejections,omitempty"`
+	MaxPlanFailures   *int      `toml:"max_plan_failures,omitempty"`
 }
 
 // File is the on-disk TOML schema, shared by the global and repo files.
@@ -186,6 +200,13 @@ type File struct {
 	// Rules are hard constraint files, relative to this file's directory or
 	// absolute.
 	Rules []string `toml:"rules,omitempty"`
+	// Exclude lists extra path patterns agents must never be shown, on top
+	// of the built-in ones (agents.DefaultSecretPatterns): dotenv files,
+	// PEM keys and id_* private keys are always excluded (P9-05). Each
+	// entry is a slash-separated glob in the syntax of path.Match, matched
+	// against a path's base name, its whole repository-relative path, and
+	// every one of its parent directory names.
+	Exclude []string `toml:"exclude,omitempty"`
 	// CheckCommand is run before a safety-off merge; empty means autodetect.
 	CheckCommand *string `toml:"check_command,omitempty"`
 	// IdleReplanInterval is the autopilot re-plan delay when idle (D-18).
@@ -224,6 +245,13 @@ type Limits struct {
 	MaxTokens int64 `json:"max_tokens,omitempty"`
 	// MaxCostUSD is an opt-in cost budget; 0 means unlimited (D-18).
 	MaxCostUSD float64 `json:"max_cost_usd,omitempty"`
+	// MaxPlanRejections caps how many plans in a row the planning validator
+	// may reject before the run gives up on that round of planning (P6-19).
+	MaxPlanRejections int `json:"max_plan_rejections"`
+	// MaxPlanFailures caps how many planning firings in a row may fail for
+	// a reason that is not the plan's fault before the run gives up on that
+	// round of planning (P6-19).
+	MaxPlanFailures int `json:"max_plan_failures"`
 }
 
 // Config is the merged, fully resolved configuration. Every field has a
@@ -243,6 +271,12 @@ type Config struct {
 	Vibes []string `json:"vibes"`
 	// Rules are absolute paths of hard constraint files.
 	Rules []string `json:"rules"`
+	// Exclude lists the configured `exclude` patterns: extra paths agents
+	// must never be shown, unioned global-then-repo the way Vibes and Rules
+	// are. The built-in secret patterns apply on top of it, so an empty
+	// list still hides .env*, *.pem and id_* (P9-05). Pass it to
+	// agents.NewSecretFilter, which is what applies it.
+	Exclude []string `json:"exclude,omitempty"`
 	// CheckCommand is the repo's check command; empty means autodetect.
 	CheckCommand string `json:"check_command"`
 	// IdleReplanInterval is the autopilot re-plan delay when idle.
@@ -268,6 +302,7 @@ func Defaults() Config {
 		Safety:             DefaultSafety,
 		Vibes:              []string{},
 		Rules:              []string{},
+		Exclude:            []string{},
 		IdleReplanInterval: NewDuration(DefaultIdleReplanInterval),
 		GatePollInterval:   NewDuration(DefaultGatePollInterval),
 		MaxBeadsPerPlan:    DefaultMaxBeadsPerPlan,
@@ -275,6 +310,8 @@ func Defaults() Config {
 			MaxReviewRounds:   DefaultMaxReviewRounds,
 			MaxPushbackRounds: DefaultMaxPushbackRounds,
 			AgentTimeout:      NewDuration(DefaultAgentTimeout),
+			MaxPlanRejections: DefaultMaxPlanRejections,
+			MaxPlanFailures:   DefaultMaxPlanFailures,
 		},
 		Roles: map[domain.Role]string{},
 	}
@@ -318,6 +355,23 @@ func (c Config) Snapshot() domain.ConfigSnapshot {
 		snap.Rules = append([]string(nil), c.Rules...)
 	}
 	return snap
+}
+
+// MergeExcludes unions two `exclude` lists: cur, then the entries of add
+// that are not already in it, with blanks dropped and order preserved. The
+// list is unioned global-then-repo rather than replaced, exactly like Vibes
+// and Rules (P1-02): a repository must be able to hide one more file
+// without losing what the global config hides.
+func MergeExcludes(cur, add []string) []string {
+	out := append([]string(nil), cur...)
+	for _, p := range add {
+		p = strings.TrimSpace(p)
+		if p == "" || containsString(out, p) {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
 // ErrAmmoTooLow is returned for ammo below MinAmmo.

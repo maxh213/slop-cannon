@@ -19,6 +19,7 @@ import (
 	"slop-cannon/internal/events"
 	"slop-cannon/internal/orchestrator"
 	"slop-cannon/internal/proc"
+	"slop-cannon/internal/textsafe"
 	"slop-cannon/internal/tui"
 )
 
@@ -47,6 +48,7 @@ import (
 const (
 	FlagStatusRun    = "run"
 	FlagStatusEvents = "events"
+	FlagStatusLive   = "live"
 )
 
 // statusLabelWidth is the column the header values start in.
@@ -67,6 +69,12 @@ repository (--run ID picks another): its phase, how its beads are spread
 across the workflow states, which agents are live, and the last few events.
 Everything comes from the run directory — state.json and events.jsonl — so
 it also works after a crash and while another process holds the run.
+
+The bead states are then reconciled with bd, so a bead a human closed or
+reopened by hand is reported as it stands rather than as the run last left
+it; --live=false skips that and reports the run log alone, which is also
+what happens when the repository has no beads database or bd is not
+installed.
 
 With a bead id it prints that bead's timeline from beads: creation, the
 claim, every structured message sc recorded (verdicts, responses,
@@ -92,6 +100,7 @@ func newStatusCommand() *cobra.Command {
 	f := cmd.Flags()
 	f.String(FlagStatusRun, "", "report on run `ID` instead of the most recent one")
 	f.Int(FlagStatusEvents, orchestrator.DefaultRecentEvents, "how many recent events to print (`N`, 0 for none)")
+	f.Bool(FlagStatusLive, true, "reconcile the bead states with bd (--live=false reports the run log alone)")
 	return cmd
 }
 
@@ -144,8 +153,47 @@ type StatusReport struct {
 	// (tui.FormatHeadless, scrubbed); events are an interface, so JSON gets
 	// the rendered lines rather than half-decoded objects.
 	Recent []string `json:"recent_events,omitempty"`
+	// Live is what the reconciliation against bd found (P8-15), absent
+	// when it did not run: --live=false, no beads database, or no bd.
+	Live *StatusLive `json:"live,omitempty"`
 	// Notes explain anything missing or unreadable.
 	Notes []string `json:"notes,omitempty"`
+}
+
+// StatusLive is the result of reconciling the folded run log against bd
+// (P8-15). The fold only knows what the run published, so a bead a human
+// moved with `bd update` — or closed by hand after taking the work over —
+// keeps its last sc-published state for ever. Asking bd for the run's beads
+// fixes that without giving up the log-only path: `sc status` still works
+// with bd absent, on another machine, or against a copied run directory.
+type StatusLive struct {
+	// Checked is how many beads bd answered for.
+	Checked int `json:"checked"`
+	// Changed are the beads whose state in bd differs from the state the
+	// run log recorded; the report already carries the bd state.
+	Changed []StatusLiveChange `json:"changed,omitempty"`
+	// Added are beads bd knows for this run that the run log never
+	// mentioned — one created by hand, or by something that published no
+	// event (P6-32).
+	Added []StatusLiveChange `json:"added,omitempty"`
+}
+
+// StatusLiveChange is one bead the reconciliation corrected.
+type StatusLiveChange struct {
+	// Bead is the bead.
+	Bead domain.BeadID `json:"bead"`
+	// Title is its title as bd holds it.
+	Title string `json:"title,omitempty"`
+	// From is the state the run log recorded, empty for an added bead.
+	From domain.BeadState `json:"from,omitempty"`
+	// To is the state bd holds it in now.
+	To domain.BeadState `json:"to"`
+	// Status is bd's own status name, kept because a repository may use a
+	// custom one that maps onto To (P3-14).
+	Status string `json:"status,omitempty"`
+	// Foreign marks a status the cannon did not register, mapped by its
+	// category rather than by name.
+	Foreign bool `json:"foreign,omitempty"`
 }
 
 // Phase returns the run's lifecycle phase: state.json's when it exists,
@@ -184,6 +232,24 @@ var statusBeads = func(repo string) (statusBeadReader, error) {
 	return beads.New(repo, beads.Options{ReadOnly: true}), nil
 }
 
+// statusLiveReader is the slice of the beads client the P8-15
+// reconciliation needs: the run's beads as bd holds them now, and the
+// repository's status vocabulary so a custom status is mapped rather than
+// misread (P3-14).
+type statusLiveReader interface {
+	ListRun(ctx context.Context, run domain.RunID, all bool) ([]beads.Issue, error)
+	StatusMap(ctx context.Context) (beads.StatusMap, error)
+}
+
+// statusLiveBeads builds the read-only bd client the reconciliation uses.
+// Read-only is the whole contract of this command: `sc status` may run
+// while another sc holds the run lock and is firing, so it must not be able
+// to write to the database that run is using. It is a variable so tests can
+// inject a reader.
+var statusLiveBeads = func(repo string) (statusLiveReader, error) {
+	return beads.New(repo, beads.Options{ReadOnly: true}), nil
+}
+
 // runStatus is the RunE of `sc status`.
 func runStatus(cmd *cobra.Command, args []string) error {
 	opts, err := GlobalOpts(cmd)
@@ -210,9 +276,16 @@ func runStatus(cmd *cobra.Command, args []string) error {
 		// Summarise reads 0 as "the default"; --events 0 means none.
 		recent = -1
 	}
+	live, err := cmd.Flags().GetBool(FlagStatusLive)
+	if err != nil {
+		return err
+	}
 	report, err := RunStatus(repo, domain.RunID(runID), recent)
 	if err != nil {
 		return err
+	}
+	if live {
+		statusReconcile(cmd.Context(), repo, report)
 	}
 	out := cmd.OutOrStdout()
 	if opts.JSON {
@@ -294,6 +367,140 @@ func RunStatus(repo string, runID domain.RunID, recent int) (*StatusReport, erro
 	return rep, nil
 }
 
+// RunStatusLive is [RunStatus] followed by the P8-15 reconciliation
+// against bd: the states in the report are then the ones bd holds now, not
+// only the ones the run got as far as publishing. It never fails for want
+// of bd — a repository with no beads database, a bd that is not installed
+// and a bd call that fails all leave the log-only report standing (the last
+// with a note) — so a caller can use it wherever it used [RunStatus].
+func RunStatusLive(ctx context.Context, repo string, runID domain.RunID, recent int) (*StatusReport, error) {
+	rep, err := RunStatus(repo, runID, recent)
+	if err != nil {
+		return nil, err
+	}
+	statusReconcile(ctx, repo, rep)
+	return rep, nil
+}
+
+// statusReconcile corrects the folded bead states against bd (P8-15).
+//
+// The fold is a record of what the run published, which is the right
+// default — it needs nothing but the run directory — but it is not the
+// truth about the beads: a human who closes a bead with `bd close`, marks
+// one blocked, or reopens one the cannon gave up on changes the database
+// and publishes no event, so `sc status` would go on reporting the state
+// the run last wrote. Asking bd for the run's beads (`bd list -l
+// sc:run:<id> --all`, [beads.Client.ListRun]) reconciles the two.
+//
+// Nothing here is fatal. No beads database means a run that never got as
+// far as creating one; bd missing from PATH means a machine that is only
+// reading the run directory; a failing bd is worth a note but not a refusal
+// to report. In each case the fold stands as it was, which is what keeps
+// the goldens deterministic and the command usable without bd.
+func statusReconcile(ctx context.Context, repo string, rep *StatusReport) {
+	if rep == nil || !rep.Found || rep.Run == "" || rep.Summary == nil {
+		return
+	}
+	if _, err := os.Stat(filepath.Join(repo, statusBeadsDirName)); err != nil {
+		return // no database: the run log is all there is to read
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	client, err := statusLiveBeads(repo)
+	if err != nil || client == nil {
+		if err != nil {
+			rep.Notes = append(rep.Notes, "bead states not reconciled with bd: "+err.Error())
+		}
+		return
+	}
+	issues, err := client.ListRun(ctx, rep.Run, true)
+	if err != nil {
+		if !proc.IsNotFound(err) {
+			rep.Notes = append(rep.Notes, "bead states not reconciled with bd: "+err.Error())
+		}
+		return
+	}
+	// A repository's own statuses are mapped by category, never guessed
+	// (P3-14); without the vocabulary the built-ins still resolve.
+	statuses, err := client.StatusMap(ctx)
+	if err != nil {
+		statuses = nil
+	}
+
+	live := &StatusLive{}
+	byID := make(map[domain.BeadID]beads.Issue, len(issues))
+	for _, is := range issues {
+		if is.IsEpic() {
+			continue // the run's own epic is not one of its beads (D-22)
+		}
+		byID[is.ID] = is
+	}
+	seen := make(map[domain.BeadID]bool, len(rep.Summary.Beads))
+	for i := range rep.Summary.Beads {
+		b := &rep.Summary.Beads[i]
+		seen[b.ID] = true
+		is, ok := byID[b.ID]
+		if !ok {
+			continue
+		}
+		live.Checked++
+		bead, origin := is.SafeBead(statuses)
+		if b.Title == "" {
+			b.Title = bead.Title
+		}
+		if bead.State == b.State {
+			continue
+		}
+		live.Changed = append(live.Changed, StatusLiveChange{
+			Bead: b.ID, Title: bead.Title, From: b.State, To: bead.State,
+			Status: is.Status, Foreign: origin == beads.OriginForeign,
+		})
+		b.State = bead.State
+		if !is.UpdatedAt.IsZero() {
+			b.UpdatedAt = is.UpdatedAt
+		}
+	}
+	// A bead bd knows for this run that no event ever named: created by
+	// hand, or by something that publishes nothing (P6-32).
+	for _, is := range issues {
+		if is.IsEpic() || seen[is.ID] {
+			continue
+		}
+		live.Checked++
+		bead, origin := is.SafeBead(statuses)
+		rep.Summary.Beads = append(rep.Summary.Beads, orchestrator.BeadSummary{
+			ID: is.ID, Title: bead.Title, State: bead.State, UpdatedAt: is.UpdatedAt,
+		})
+		live.Added = append(live.Added, StatusLiveChange{
+			Bead: is.ID, Title: bead.Title, To: bead.State,
+			Status: is.Status, Foreign: origin == beads.OriginForeign,
+		})
+	}
+	if len(live.Changed) > 0 || len(live.Added) > 0 {
+		rep.Summary.Counts = statusCount(rep.Summary.Beads)
+	}
+	rep.Live = live
+}
+
+// statusCount recounts the per-state totals after a reconciliation, the way
+// the fold counts them: a bead no event gave a state to is counted under
+// [orchestrator.BeadStateUnrecorded] so the rows add up to the total.
+func statusCount(beadList []orchestrator.BeadSummary) map[domain.BeadState]int {
+	if len(beadList) == 0 {
+		return nil
+	}
+	counts := make(map[domain.BeadState]int, len(beadList))
+	for _, b := range beadList {
+		state := b.State
+		if state == "" {
+			state = orchestrator.BeadStateUnrecorded
+		}
+		counts[state]++
+	}
+	return counts
+}
+
 // WriteStatus prints a run report as text: an aligned header, the per-state
 // bead counts, the live agents and the last events.
 func WriteStatus(w io.Writer, r *StatusReport) error {
@@ -303,6 +510,7 @@ func WriteStatus(w io.Writer, r *StatusReport) error {
 	}
 	var b strings.Builder
 	statusHeader(&b, r)
+	statusVitalsSection(&b, r)
 	statusBeadsSection(&b, r)
 	statusAgentsSection(&b, r)
 	statusEventsSection(&b, r)
@@ -311,6 +519,25 @@ func WriteStatus(w io.Writer, r *StatusReport) error {
 	}
 	_, err := io.WriteString(w, b.String())
 	return err
+}
+
+// statusVitalsSection prints the run's vitals — what the planner is doing,
+// what the gate poller has seen — from the snapshot state.json carries
+// (P6-29). It is what answers "why is nothing happening?" without reading
+// the run log: an idle autopilot run's next planning time, a gh outage and
+// how long it has lasted, and a merge bd keeps refusing to close.
+func statusVitalsSection(b *strings.Builder, r *StatusReport) {
+	if r.State == nil || r.State.Vitals == nil {
+		return
+	}
+	lines := r.State.Vitals.Lines()
+	if len(lines) == 0 {
+		return
+	}
+	fmt.Fprintf(b, "\n%-*s%s\n", statusLabelWidth, "vitals", statusScrub(lines[0]))
+	for _, l := range lines[1:] {
+		fmt.Fprintf(b, "%-*s%s\n", statusLabelWidth, "", statusScrub(l))
+	}
 }
 
 // statusHeader writes the label/value block that opens the report.
@@ -444,7 +671,7 @@ func statusBeadsSection(b *strings.Builder, r *StatusReport) {
 		return
 	}
 	s := r.Summary
-	fmt.Fprintf(b, "\n%-*s%d\n", statusLabelWidth, "beads", len(s.Beads))
+	fmt.Fprintf(b, "\n%-*s%d%s\n", statusLabelWidth, "beads", len(s.Beads), statusLiveHead(r.Live))
 	if len(s.Beads) == 0 {
 		return
 	}
@@ -463,6 +690,78 @@ func statusBeadsSection(b *strings.Builder, r *StatusReport) {
 	for i, state := range order {
 		fmt.Fprintf(b, "  %-*s  %d\n", width, names[i], s.Counts[state])
 	}
+	statusForeignLine(b, s)
+	statusLiveLines(b, r.Live)
+}
+
+// statusForeignLine names the beads the run passed over because bd holds
+// them in a status it never registered (P6-12, P6-28). A run fired at a
+// repository whose beads all sit in someone else's workflow otherwise looks
+// like a run doing nothing at all.
+func statusForeignLine(b *strings.Builder, s *orchestrator.RunSummary) {
+	if len(s.Foreign) == 0 {
+		return
+	}
+	ids := make([]string, len(s.Foreign))
+	for i, id := range s.Foreign {
+		ids[i] = statusScrub(string(id))
+	}
+	word := "beads"
+	if len(ids) == 1 {
+		word = "bead"
+	}
+	fmt.Fprintf(b, "  %d %s in a status this run does not use: %s\n",
+		len(ids), word, strings.Join(ids, ", "))
+}
+
+// statusLiveHead is what the beads header says about the reconciliation:
+// nothing at all when it did not run, so a report read without bd looks
+// exactly as it always did.
+func statusLiveHead(l *StatusLive) string {
+	if l == nil {
+		return ""
+	}
+	var parts []string
+	if n := len(l.Changed); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d changed in bd", n))
+	}
+	if n := len(l.Added); n > 0 {
+		parts = append(parts, fmt.Sprintf("%d not in the run log", n))
+	}
+	if len(parts) == 0 {
+		return " (checked against bd)"
+	}
+	return " (" + strings.Join(parts, ", ") + ")"
+}
+
+// statusLiveLines names the beads the reconciliation corrected, under the
+// counts they are already part of. A user who sees a count they did not
+// expect wants to know which bead moved and who moved it; "outside the run"
+// is as much as sc can honestly say, since bd records the change but not
+// that it was a person.
+func statusLiveLines(b *strings.Builder, l *StatusLive) {
+	if l == nil {
+		return
+	}
+	for _, c := range l.Changed {
+		fmt.Fprintf(b, "  %s  %s -> %s (changed outside the run%s)\n",
+			statusScrub(string(c.Bead)), statusScrub(string(c.From)),
+			statusScrub(string(c.To)), statusForeignGloss(c))
+	}
+	for _, c := range l.Added {
+		fmt.Fprintf(b, "  %s  %s (created outside the run%s)\n",
+			statusScrub(string(c.Bead)), statusScrub(string(c.To)), statusForeignGloss(c))
+	}
+}
+
+// statusForeignGloss names bd's own status when it is one the cannon did
+// not register, so a reader can tell "blocked" the D-07 state from a
+// repository's custom status that merely maps onto it (P3-14).
+func statusForeignGloss(c StatusLiveChange) string {
+	if !c.Foreign || c.Status == "" {
+		return ""
+	}
+	return ", bd status " + statusScrub(c.Status)
 }
 
 // statusStateOrder lists the states present in counts in D-07 flow order,
@@ -607,88 +906,18 @@ func statusTime(t time.Time) string {
 // control character (C0, DEL and C1) is dropped. Text that carries none of
 // them is returned unchanged, so the common line pays only one scan.
 //
-// tui.FormatHeadless promises a line free of newlines but not of escapes
-// (P7-18 fixes the renderer itself); this is the same guarantee applied at
-// the one place `sc status` prints.
-func statusScrub(s string) string {
-	if !strings.ContainsFunc(s, statusIsControl) {
-		return s
-	}
-	rs := []rune(s)
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(rs); i++ {
-		switch r := rs[i]; {
-		case r == 0x1b:
-			i += statusEscapeRunes(rs[i:]) - 1
-		case r == '\t':
-			b.WriteRune(' ')
-		case statusIsControl(r):
-			// dropped: it is an instruction to the terminal, not text
-		default:
-			b.WriteRune(r)
-		}
-	}
-	return b.String()
-}
+// The scanner is [textsafe.Scrub], the one implementation the whole binary
+// shares (P9-10); `sc status` supplies the line policy — a tab is one space
+// and a carriage return is dropped rather than honoured, so a headless line
+// and a status line read the same.
+func statusScrub(s string) string { return textsafe.ScrubLine(s) }
 
 // statusScrubBlock scrubs a multi-line report — [beads.FormatTimeline]'s
 // output — line by line, keeping the line structure the report laid out and
 // making every line as safe as [statusScrub] makes one. A timeline prints a
 // bead title and the first line of a message's prose, both written by a
 // model into bd, so the same guarantee has to hold there.
-func statusScrubBlock(s string) string {
-	if !strings.ContainsFunc(s, statusIsControlInBlock) {
-		return s
-	}
-	lines := strings.Split(s, "\n")
-	for i, line := range lines {
-		lines[i] = statusScrub(line)
-	}
-	return strings.Join(lines, "\n")
-}
-
-// statusIsControlInBlock is [statusIsControl] minus the newline the block
-// itself is built from.
-func statusIsControlInBlock(r rune) bool { return r != '\n' && statusIsControl(r) }
-
-// statusIsControl reports whether r is read by a terminal as an instruction
-// rather than as text: a C0 control (ESC, CR, LF and tab included), DEL, or
-// a C1 control.
-func statusIsControl(r rune) bool {
-	return r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f)
-}
-
-// statusEscapeRunes returns how many runes the escape sequence starting at
-// rs[0] (an ESC) occupies: a CSI up to its final byte, an OSC up to its
-// terminator, and otherwise the ESC and the one character after it. It is
-// never less than 1, so the caller always makes progress.
-func statusEscapeRunes(rs []rune) int {
-	if len(rs) < 2 {
-		return 1
-	}
-	switch rs[1] {
-	case '[': // CSI: parameters and intermediates, then a final byte.
-		for i := 2; i < len(rs); i++ {
-			if rs[i] >= 0x40 && rs[i] <= 0x7e {
-				return i + 1
-			}
-		}
-		return len(rs)
-	case ']': // OSC: a string terminated by BEL or ESC \.
-		for i := 2; i < len(rs); i++ {
-			if rs[i] == 0x07 {
-				return i + 1
-			}
-			if rs[i] == 0x1b && i+1 < len(rs) && rs[i+1] == '\\' {
-				return i + 2
-			}
-		}
-		return len(rs)
-	default:
-		return 2
-	}
-}
+func statusScrubBlock(s string) string { return textsafe.ScrubBlock(s, textsafe.LinePolicy()) }
 
 // statusBead prints one bead's timeline from beads (P6-15).
 func statusBead(cmd *cobra.Command, repo string, id domain.BeadID, asJSON bool) error {

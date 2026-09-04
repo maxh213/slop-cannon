@@ -71,7 +71,12 @@ const (
 	// every rule failure retryable inside one firing (P5-08 retries once),
 	// so the first rejection that reaches the planner is already the second
 	// plan the product owner got wrong.
-	DefaultPlanRejectionLimit = 2
+	//
+	// It is an alias of the configuration default, so there is one number:
+	// the key is `limits.max_plan_rejections` (P1-19) and a run takes its
+	// cap from [config.Effective] unless [PlannerOptions.RejectionLimit]
+	// overrides it.
+	DefaultPlanRejectionLimit = config.DefaultMaxPlanRejections
 	// DefaultPlanFailureLimit is how many planning firings in a row may
 	// fail for a reason that is not the plan's fault — a cartridge crash,
 	// an agent timeout, a rules file that cannot be read, a repository scan
@@ -85,7 +90,10 @@ const (
 	// transient kind, and a brief run whose product owner cannot be fired
 	// at all still has to end rather than fire every idle interval for
 	// ever.
-	DefaultPlanFailureLimit = 5
+	//
+	// Like [DefaultPlanRejectionLimit] it is an alias of the configuration
+	// default: the key is `limits.max_plan_failures` (P1-19).
+	DefaultPlanFailureLimit = config.DefaultMaxPlanFailures
 	// DefaultMaxPlanBackoff caps the wait an autopilot planner imposes on
 	// itself after it gave up on a round of planning. Autopilot never stops
 	// (D-18), so it must always come back — just not in a hot loop.
@@ -299,13 +307,16 @@ type PlannerOptions struct {
 	// IdleReplanInterval overrides the configured `idle_replan_interval`.
 	IdleReplanInterval time.Duration
 	// RejectionLimit is the P6-19 cap on consecutive rejected plans; zero
-	// means [DefaultPlanRejectionLimit], negative means "never give up".
+	// means the configured `limits.max_plan_rejections` (P1-19), falling
+	// back to [DefaultPlanRejectionLimit], and negative means "never give
+	// up".
 	RejectionLimit int
 	// FailureLimit is the same cap for consecutive planning failures that
 	// are not a rejected plan (a crash, a timeout, an unreadable rules
-	// file); zero means [DefaultPlanFailureLimit], negative means "never
-	// give up", which is what a caller that wants the pre-P6-19 behaviour
-	// of an unbounded retry loop asks for.
+	// file); zero means the configured `limits.max_plan_failures`, falling
+	// back to [DefaultPlanFailureLimit], and negative means "never give
+	// up", which is what a caller that wants the pre-P6-19 behaviour of an
+	// unbounded retry loop asks for.
 	FailureLimit int
 	// MaxBackoff caps the autopilot cool-off; zero means
 	// [DefaultMaxPlanBackoff].
@@ -324,40 +335,40 @@ type PlannerOptions struct {
 // the TUI.
 type PlanningStatus struct {
 	// Mode is the run mode the planner enforces.
-	Mode domain.RunMode
+	Mode domain.RunMode `json:"mode,omitempty"`
 	// Attempts is how many planning firings have been made.
-	Attempts int
+	Attempts int `json:"attempts,omitempty"`
 	// Plans is how many of them produced beads.
-	Plans int
+	Plans int `json:"plans,omitempty"`
 	// Beads is how many beads those plans created.
-	Beads int
+	Beads int `json:"beads,omitempty"`
 	// Empty counts the plans that proposed nothing ("nothing worth adding
 	// right now", D-18).
-	Empty int
+	Empty int `json:"empty,omitempty"`
 	// Rejections is how many plans in a row the validator refused.
-	Rejections int
+	Rejections int `json:"rejections,omitempty"`
 	// Failures is how many planning firings in a row failed for a reason
 	// that was not a rejected plan.
-	Failures int
+	Failures int `json:"failures,omitempty"`
 	// GaveUp counts the times the planner dropped a round of planning under
 	// the P6-19 policy.
-	GaveUp int
+	GaveUp int `json:"gave_up,omitempty"`
 	// Deprioritised counts the open beads the planner made less urgent at
 	// an autopilot product owner's request (Q-04).
-	Deprioritised int
+	Deprioritised int `json:"deprioritised,omitempty"`
 	// Running is true while a product owner is planning.
-	Running bool
+	Running bool `json:"running,omitempty"`
 	// Finished is true when the planner will not fire again.
-	Finished bool
+	Finished bool `json:"finished,omitempty"`
 	// ResumedPlan is true when the plan counted above came back with a
 	// resumed run rather than from a product owner this process fired
 	// (P6-11): the run's epic was already in state.json.
-	ResumedPlan bool
+	ResumedPlan bool `json:"resumed_plan,omitempty"`
 	// NextAt is the earliest time the planner will fire again; zero means
 	// "as soon as the loop asks".
-	NextAt time.Time
+	NextAt time.Time `json:"next_at,omitempty"`
 	// LastError is the last planning failure, if any.
-	LastError string
+	LastError string `json:"last_error,omitempty"`
 }
 
 // Planner is the run's planning loop: a [WorkSource] that asks for a
@@ -461,9 +472,15 @@ func NewPlanner(opts PlannerOptions) (*Planner, error) {
 	}
 	if p.limit == 0 {
 		p.limit = DefaultPlanRejectionLimit
+		if eff := p.cfg.Effective; eff != nil && eff.Limits.MaxPlanRejections > 0 {
+			p.limit = eff.Limits.MaxPlanRejections
+		}
 	}
 	if p.failLimit == 0 {
 		p.failLimit = DefaultPlanFailureLimit
+		if eff := p.cfg.Effective; eff != nil && eff.Limits.MaxPlanFailures > 0 {
+			p.failLimit = eff.Limits.MaxPlanFailures
+		}
 	}
 	if p.maxBack <= 0 {
 		p.maxBack = DefaultMaxPlanBackoff
@@ -1147,6 +1164,17 @@ func (p *Planner) record(f Firing, created map[string]domain.BeadID, err error) 
 		p.rejections = 0
 		p.nextAt = now.Add(p.idle)
 		if p.cfg.Run.Mode == domain.RunModeBrief {
+			// Belt and braces (P6-39): agents.ValidatePlan refuses an empty
+			// brief-mode plan with agents.ErrPlanRejected before
+			// agents.CreatePlanBeads can reach its ErrEmptyPlan, so in
+			// production a brief run is told its plan was rejected, not
+			// that it was empty — which is what
+			// TestPlannerBriefModeRefusesAnEmptyPlanRatherThanCallingItAnAnswer
+			// pins. The arm stays because the alternative, if that contract
+			// ever changes, is a brief run that idles for ever: an empty
+			// plan resets both P6-19 counters, so neither cap would ever
+			// end it. TestPlannerBriefModeFinishesIfAnEmptyPlanReachesIt
+			// drives it.
 			p.finished = true
 		}
 	case errors.Is(err, agents.ErrPlanRejected):

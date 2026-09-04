@@ -5,7 +5,8 @@ warn  gh                2.98.0 (/fake/bin/gh), not authenticated: You are not lo
 pass  cartridge:claude  active: 2.1.258 (/fake/bin/claude)
 warn  repo              2 uncommitted changes in /repo
                         hint: commit or stash first; agents build on whatever is in the tree
+pass  .gitignore        ignores .env
 warn  .beads            not initialised: /repo/.beads is missing
                         hint: sc will run bd init --non-interactive --init-if-missing --skip-agents --skip-hooks --setup-exclude on the first run (D-13)
 
-3 passed, 3 warnings, 0 failed
+4 passed, 3 warnings, 0 failed

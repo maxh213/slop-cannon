@@ -1,0 +1,7 @@
+sc could not start a run in /repo: no cartridge loaded — add one with: sc cartridge --add claude --model <model>
+
+Fix it in this order:
+  1. cartridge: no cartridge configured
+     add one with: sc cartridge --add claude --model <model>
+
+Then check everything at once with: sc doctor
