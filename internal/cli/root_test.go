@@ -127,6 +127,20 @@ func TestVersionLdflagsMatchMakefile(t *testing.T) {
 	var _ = []*string{&Version, &Commit, &Date}
 }
 
+// TestVersionLdflagsMatchGoreleaser guards P10-09: the release build injects
+// the same three variables from .goreleaser.yaml, so a rename that missed the
+// release config would ship a binary that prints "dev" instead of the tag.
+func TestVersionLdflagsMatchGoreleaser(t *testing.T) {
+	gr, err := os.ReadFile("../../.goreleaser.yaml")
+	require.NoError(t, err)
+	for _, name := range []string{"Version", "Commit", "Date"} {
+		flag := "-X slop-cannon/internal/cli." + name + "="
+		require.Contains(t, string(gr), flag, ".goreleaser.yaml no longer injects cli.%s", name)
+	}
+	// The variables the flags name must exist with the type -X can set.
+	var _ = []*string{&Version, &Commit, &Date}
+}
+
 func TestVersionRejectsArgs(t *testing.T) {
 	_, err := rootRun(t, "version", "extra")
 	require.Error(t, err)
