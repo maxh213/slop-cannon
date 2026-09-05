@@ -299,7 +299,12 @@ func (m *Manager) DeliverMerge(ctx context.Context, bead domain.Bead, opts Merge
 	if bead.ID == "" {
 		return nil, stageErr(StagePrepare, errors.New("gitx: DeliverMerge: bead has no id"), "")
 	}
-	branch := BranchName(bead)
+	// The branch the bead's work is on, not the one its current title
+	// spells (P4-12).
+	branch, _, err := m.BranchFor(ctx, bead)
+	if err != nil {
+		return nil, stageErr(StagePrepare, err, "")
+	}
 	wt, err := m.Reattach(ctx, bead.ID)
 	if err != nil {
 		return nil, stageErr(StagePrepare, err, "")

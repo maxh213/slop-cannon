@@ -19,8 +19,10 @@ import (
 // returns, so a script can tell the three interesting outcomes apart.
 const (
 	// ExitOK is the code for a run that ended the way it was asked to:
-	// [events.FinishCompleted], or [events.FinishStopped] after a user stop,
-	// `sc stop` or a signal. Stopping a run is not a failure.
+	// [events.FinishCompleted], [events.FinishStopped] after a user stop,
+	// `sc stop` or a signal, or [events.FinishBudgetReached] after a brief
+	// run reached a cap the user set. Stopping a run is not a failure, and
+	// neither is a budget doing exactly what it was set to do.
 	ExitOK = 0
 	// ExitFailed is the code for [events.FinishFailed], for a finish reason
 	// this build does not know, and for a stream that ended without any
@@ -39,7 +41,7 @@ const headlessTimeFormat = "15:04:05"
 // or empty reason is treated as a failure.
 func ExitCodeFor(reason events.FinishReason) int {
 	switch reason {
-	case events.FinishCompleted, events.FinishStopped:
+	case events.FinishCompleted, events.FinishStopped, events.FinishBudgetReached:
 		return ExitOK
 	case events.FinishCreditsExhausted:
 		return ExitCreditsExhausted
@@ -307,7 +309,16 @@ func FormatHeadless(ev events.Event, loc *time.Location) string {
 // HeadlessGlyph returns the one-column marker that prefixes an event's
 // headless line. It depends on the event's content as well as its kind: an
 // approving verdict and a change request get different glyphs.
-func HeadlessGlyph(ev events.Event) string {
+//
+// Every glyph goes through [PadGlyph] (P7-16). The set below mixes
+// East-Asian-ambiguous characters (◆ ◇ ‖ ▶ § ⤴ ⤵ ·) with unambiguous ones
+// (✔ ✖ ✓ ✗ + │ →), so on a terminal configured for ambiguous-width 2 the
+// text of a line would otherwise start one column further left or right
+// depending on which event it reports.
+func HeadlessGlyph(ev events.Event) string { return PadGlyph(headlessGlyph(ev)) }
+
+// headlessGlyph is the glyph table itself, before the column padding.
+func headlessGlyph(ev events.Event) string {
 	switch e := ev.(type) {
 	case events.RunStarted:
 		return "◆"
@@ -450,10 +461,27 @@ func headlessRunFinished(e events.RunFinished) string {
 		line += " after " + dur(e.Duration)
 	}
 	line += fmt.Sprintf(" (exit %d)", ExitCodeFor(e.Reason))
-	if e.Summary != "" {
-		line += " — " + e.Summary
+	if s := headlessFold(e.Summary); s != "" {
+		line += " — " + s
 	}
 	return line
+}
+
+// headlessFold folds a multi-line report into one sentence (P7-25). A
+// summary is written by whoever produced it, and some of them are little
+// reports rather than sentences: gitx.CleanupResult names every worktree it
+// kept on an indented line of its own, so the newline→space swap
+// [headlessText] does to keep one event on one line used to leave the
+// report's own indentation in the middle of the sentence ("kept 1:   sc-2
+// (in_progress)"). Collapsing the whole run of whitespace is what `sc
+// status`'s header already does with the same text (statusRowLines, P8-05),
+// so the two read the same. Text that is already one sentence comes back
+// unchanged.
+func headlessFold(s string) string {
+	if !strings.ContainsAny(s, "\n\r\t") && !strings.Contains(s, "  ") {
+		return strings.TrimSpace(s)
+	}
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // headlessPlan renders a produced plan with the plan-key to bead-id mapping,
@@ -591,8 +619,8 @@ func headlessVerdict(e events.VerdictReceived) string {
 	if n := len(e.Verdict.Items); n > 0 {
 		line += fmt.Sprintf(" (%s: %s)", headlessCount(n, "item"), headlessSeverities(e.Verdict.Items))
 	}
-	if e.Verdict.Summary != "" {
-		line += " — " + e.Verdict.Summary
+	if s := headlessFold(e.Verdict.Summary); s != "" {
+		line += " — " + s
 	}
 	return line
 }
@@ -690,8 +718,8 @@ func headlessArbitration(e events.ArbitrationReceived) string {
 	}
 	if e.Escalation != nil {
 		esc := "escalation " + orDash(string(e.Escalation.Outcome))
-		if e.Escalation.Summary != "" {
-			esc += " — " + e.Escalation.Summary
+		if s := headlessFold(e.Escalation.Summary); s != "" {
+			esc += " — " + s
 		}
 		parts = append(parts, esc)
 	}

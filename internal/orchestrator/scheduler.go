@@ -1,10 +1,12 @@
 package orchestrator
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -895,26 +897,38 @@ func (s *Scheduler) setIdle(v bool) {
 // sortDemands puts the demands in the order the slots are handed out:
 // the D-05 kind priority first, then the source's own ordering, then
 // unfinished work before fresh work, then a stable tie-break.
+//
+// It sorts in place and allocates nothing (P6-53): this is the hottest loop
+// in the scheduler — every tick orders every outstanding demand before it
+// hands out a single slot — so it uses the generic stable sort rather than
+// [sort.SliceStable], whose reflect-based swapper allocates per call, and
+// [lensRank] reads a table built once rather than calling domain.Lenses per
+// comparison.
 func sortDemands(ds []Demand) {
-	sort.SliceStable(ds, func(i, j int) bool {
-		a, b := ds[i], ds[j]
-		if a.Kind != b.Kind {
-			return a.Kind.Priority() < b.Kind.Priority()
-		}
-		if a.Order != b.Order {
-			return a.Order < b.Order
-		}
-		if ra, rb := taskRank(a.FiringTask()), taskRank(b.FiringTask()); ra != rb {
-			return ra < rb
-		}
-		if a.Bead != b.Bead {
-			return a.Bead < b.Bead
-		}
-		if a.Lens != b.Lens {
-			return lensRank(a.Lens) < lensRank(b.Lens)
-		}
-		return a.Round < b.Round
-	})
+	slices.SortStableFunc(ds, compareDemands)
+}
+
+// compareDemands is [sortDemands]'s ordering, as a cmp function. Two
+// demands whose first differing field ranks equal — two kinds of the same
+// D-05 priority, two lenses of the same rank — compare equal, so the
+// source's own order decides between them, exactly as the "less" form did.
+func compareDemands(a, b Demand) int {
+	if a.Kind != b.Kind {
+		return cmp.Compare(a.Kind.Priority(), b.Kind.Priority())
+	}
+	if a.Order != b.Order {
+		return cmp.Compare(a.Order, b.Order)
+	}
+	if ra, rb := taskRank(a.FiringTask()), taskRank(b.FiringTask()); ra != rb {
+		return cmp.Compare(ra, rb)
+	}
+	if a.Bead != b.Bead {
+		return cmp.Compare(a.Bead, b.Bead)
+	}
+	if a.Lens != b.Lens {
+		return cmp.Compare(lensRank(a.Lens), lensRank(b.Lens))
+	}
+	return cmp.Compare(a.Round, b.Round)
 }
 
 // taskRank prefers finishing a bead over starting one: a conflict blocks a
@@ -933,14 +947,27 @@ func taskRank(t events.Task) int {
 	}
 }
 
-// lensRank orders lenses the way domain.Lenses does.
-func lensRank(l domain.Lens) int {
-	for i, c := range domain.Lenses() {
-		if c == l {
-			return i
-		}
+// lensRanks is [domain.Lenses] as a lookup table, built once. domain.Lenses
+// returns a fresh slice on every call, and lensRank is asked on every
+// comparison between two review demands of one bead, so calling it there
+// allocated once per comparison — 311 allocations to order 300 demands
+// (P6-53).
+var lensRanks = func() map[domain.Lens]int {
+	all := domain.Lenses()
+	m := make(map[domain.Lens]int, len(all))
+	for i, l := range all {
+		m[l] = i
 	}
-	return len(domain.Lenses())
+	return m
+}()
+
+// lensRank orders lenses the way domain.Lenses does; an unknown lens sorts
+// after every known one.
+func lensRank(l domain.Lens) int {
+	if i, ok := lensRanks[l]; ok {
+		return i
+	}
+	return len(lensRanks)
 }
 
 // reserve takes a slot for the demand if the allocation allows one and the

@@ -3,12 +3,14 @@ package orchestrator
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log/slog"
 	"math/rand"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -137,10 +139,11 @@ func schedSetup(t *testing.T, ammo int, opts SchedulerOptions) *schedFixture {
 	require.NoError(t, run.Start(context.Background()))
 	t.Cleanup(func() {
 		_ = run.Stop("test cleanup")
+		budget := schedWait(schedPollBudget)
 		select {
 		case <-run.Done():
-		case <-time.After(5 * time.Second):
-			t.Error("the run did not finish")
+		case <-time.After(budget):
+			t.Errorf("the run did not finish %s", schedContention(budget))
 		}
 	})
 	return f
@@ -151,10 +154,11 @@ func (f *schedFixture) Wait() (Outcome, error) {
 	f.t.Helper()
 	done := make(chan struct{})
 	go func() { defer close(done); _, _ = f.Run.Wait() }()
+	budget := schedWait(schedPollBudget)
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
-		f.t.Fatal("the run did not finish")
+	case <-time.After(budget):
+		f.t.Fatalf("the run did not finish %s", schedContention(budget))
 	}
 	return f.Run.Wait()
 }
@@ -183,19 +187,112 @@ func (f *schedFixture) warnings() []events.Warning {
 	return out
 }
 
+// The load-scaled waits (P6-56).
+//
+// Everything the scheduler itself waits on goes through the fake clock, but
+// a test that watches another goroutine make progress has to wait in real
+// time, and a bare wall-clock deadline there is a statement about how fast
+// the machine is. This package is run several ways at once under -race in
+// the integration wave, where a tick that costs microseconds idle costs
+// tens of milliseconds contended; the arbitration tests failed roughly once
+// in 4000 that way, as "timed out waiting for …" rather than on anything
+// the code did.
+//
+// So no wait in these files is a bare duration: each is written as the
+// budget an idle machine needs and scaled by [schedLoadFactor], which is
+// the -timeout the test binary was given over go test's own 10-minute
+// default. Giving a loaded run more room (`go test -timeout 40m`) therefore
+// gives every wait here four times as long, and an unbounded run (`-timeout
+// 0`), where nothing is going to cut the tests short anyway, gets the
+// maximum. Nothing ever shrinks below the written budget.
+const (
+	// schedBaseTimeout is go test's default -timeout, the machine-speed
+	// assumption the written budgets are calibrated against.
+	schedBaseTimeout = 10 * time.Minute
+	// schedMaxFactor caps the scaling, so a mistyped -timeout cannot turn a
+	// deadlocked test into one that hangs until the whole run is killed.
+	schedMaxFactor = 20.0
+	// schedPollBudget is the written budget for waiting on another
+	// goroutine to make progress. The conditions these tests wait for take
+	// single-digit milliseconds on an idle machine, so this is three orders
+	// of magnitude of headroom: it is a deadlock bound, not a performance
+	// budget, and it costs nothing when the condition holds, because every
+	// wait here returns the moment it does. `make check` passes no -timeout,
+	// so the scaling below leaves it exactly as written there; the size is
+	// what has to carry a contended machine on its own.
+	schedPollBudget = 30 * time.Second
+)
+
+// schedLoadFactor is what every budget in these files is multiplied by. It
+// is resolved on first use rather than at package initialisation: the
+// testing package registers -timeout in testing.Init, which the generated
+// main calls after every package-level variable has been initialised, so a
+// var initialiser here would always find the flag missing and take the
+// unbounded branch.
+var schedLoadFactor = sync.OnceValue(func() float64 { return schedFactorFor(schedFlagTimeout()) })
+
+// schedFlagTimeout is the -timeout the test binary was given: zero when the
+// flag is absent (a caller that built the tests as a library) or when the
+// run is explicitly unbounded.
+func schedFlagTimeout() time.Duration {
+	f := flag.Lookup("test.timeout")
+	if f == nil {
+		return 0
+	}
+	g, ok := f.Value.(flag.Getter)
+	if !ok {
+		return 0
+	}
+	d, _ := g.Get().(time.Duration)
+	return d
+}
+
+// schedFactorFor turns a -timeout into the scaling factor.
+func schedFactorFor(timeout time.Duration) float64 {
+	if timeout <= 0 {
+		return schedMaxFactor
+	}
+	return min(max(float64(timeout)/float64(schedBaseTimeout), 1), schedMaxFactor)
+}
+
+// schedWait scales one written budget.
+func schedWait(d time.Duration) time.Duration {
+	return time.Duration(float64(d) * schedLoadFactor())
+}
+
+// schedPause is the breather a test takes before asserting that something
+// did *not* happen. It scales too: on a loaded machine the thing being
+// ruled out needs longer to fail to happen.
+func schedPause(d time.Duration) { time.Sleep(schedWait(d)) }
+
+// schedContention describes the machine, for a wait that ran out. The whole
+// point of P6-56 is that "timed out waiting for X" says nothing about
+// whether X was slow or the machine was busy, so every timeout here names
+// the budget it actually had and how to give it more.
+func schedContention(budget time.Duration) string {
+	return fmt.Sprintf("(budget %s = %s x %.1f, GOMAXPROCS=%d, NumCPU=%d; "+
+		"the budget scales with -timeout, so a loaded machine wants a larger `go test -timeout`)",
+		budget, time.Duration(float64(budget)/schedLoadFactor()), schedLoadFactor(),
+		runtime.GOMAXPROCS(0), runtime.NumCPU())
+}
+
 // schedEventually polls cond until it holds, so a test never sleeps for a
 // fixed time. A cond that advances the fake clock drives the tick loop from
-// inside the poll.
+// inside the poll. The deadline is load-scaled (P6-56) and a timeout says
+// what the budget was.
 func schedEventually(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
+	budget := schedWait(schedPollBudget)
+	deadline := time.Now().Add(budget)
+	for {
 		if cond() {
 			return
 		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("timed out waiting for %s %s", what, schedContention(budget))
+		}
 		time.Sleep(time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s", what)
 }
 
 // schedGate blocks every agent until the test releases it.
@@ -739,7 +836,7 @@ func TestSchedulerNeverExceedsAmmoUnderRandomEvents(t *testing.T) {
 				for i := 0; i < 300; i++ {
 					require.LessOrEqual(t, f.Sched.Live(), ammo, "live agents must never exceed ammo")
 					f.Clock.Advance(2 * DefaultTickInterval)
-					time.Sleep(50 * time.Microsecond)
+					schedPause(50 * time.Microsecond)
 				}
 				schedEventually(t, "agents to have been fired", func() bool { return f.Sched.Status().Fired > 0 })
 
@@ -2200,4 +2297,27 @@ func TestDispatchDeduplicatesOneBatch(t *testing.T) {
 	clean := []Demand{first, second}
 	assert.Equal(t, clean, dedupeDemands(clean))
 	assert.Nil(t, dedupeDemands(nil))
+}
+
+// TestSchedLoadFactorScalesWithTheTestTimeout pins the P6-56 scaling,
+// including the two ends it is easy to get wrong: the factor never shrinks
+// a written budget, and an unbounded run — where nothing is going to cut
+// the tests short — gets the cap rather than a factor of zero.
+func TestSchedLoadFactorScalesWithTheTestTimeout(t *testing.T) {
+	t.Parallel()
+
+	assert.InDelta(t, 1.0, schedFactorFor(schedBaseTimeout), 0.001, "go test's default changes nothing")
+	assert.InDelta(t, 1.0, schedFactorFor(time.Minute), 0.001, "a shorter run never shrinks a budget")
+	assert.InDelta(t, 4.0, schedFactorFor(40*time.Minute), 0.001, "-timeout 40m gives every wait four times as long")
+	assert.InDelta(t, schedMaxFactor, schedFactorFor(0), 0.001, "-timeout 0 is unbounded")
+	assert.InDelta(t, schedMaxFactor, schedFactorFor(1000*time.Hour), 0.001, "and the scaling is capped")
+
+	// The factor is read lazily, so the flag the binary was actually given
+	// is the one that counts (a var initialiser would run before
+	// testing.Init registers it).
+	assert.GreaterOrEqual(t, schedLoadFactor(), 1.0)
+	assert.Equal(t, schedFactorFor(schedFlagTimeout()), schedLoadFactor())
+	assert.GreaterOrEqual(t, schedWait(schedPollBudget), schedPollBudget, "a budget is never scaled down")
+	assert.Contains(t, schedContention(schedWait(schedPollBudget)), "GOMAXPROCS",
+		"a wait that runs out says what the machine was")
 }

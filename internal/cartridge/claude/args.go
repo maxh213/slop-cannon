@@ -40,8 +40,17 @@ var editTools = []string{"Edit", "Write", "MultiEdit", "NotebookEdit"}
 // when Bash is disallowed (compare the init lines of tool-disallowed.jsonl
 // and shell-denied.jsonl), so with a restricted Bash a planner explores
 // with these commands. Under dontAsk every other shell command is refused
-// without a prompt (fixture shell-denied.jsonl). P5-06 may tune this list;
-// the conformance suite (P2-09) checks that writes are refused.
+// without a prompt (fixture shell-denied.jsonl).
+//
+// Keeping this list rather than dropping the shell altogether
+// (--disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit, which restores
+// Glob and Grep) is the P5-09 decision, recorded in docs/cartridges.md: the
+// product owner is the only role fired under read_only and its job needs bd
+// (through the read-only shim, D-21) and git log/diff/show, which Glob and
+// Grep cannot do, while grep, rg and find here cover what those built-ins
+// offered. The conformance suite (P2-09) checks that writes are refused
+// under either mapping, so it does not decide this; adding a command here
+// means adding it to the docs/cartridges.md table too.
 var ReadOnlyShell = []string{
 	"Bash(ls:*)", "Bash(pwd)", "Bash(tree:*)", "Bash(find:*)", "Bash(fd:*)",
 	"Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(wc:*)", "Bash(file:*)", "Bash(stat:*)",

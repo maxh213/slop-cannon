@@ -71,6 +71,23 @@ func runAddCartridge(t *testing.T, name, model string) {
 	require.NoError(t, doc.Save())
 }
 
+// runWriteRunState records a state.json for run id under repo, which is
+// what makes that run resumable: `--resume` passes over a run directory
+// that never recorded one (P8-31).
+func runWriteRunState(t *testing.T, repo, id string) {
+	t.Helper()
+	dir := config.RunDir(repo, id)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	rc, err := ResolveRun(RunOptions{Path: repo})
+	require.NoError(t, err)
+	rc.Run.ID, rc.Run.StateDir = domain.RunID(id), dir
+	require.NoError(t, orchestrator.WriteState(dir, orchestrator.State{
+		Version: orchestrator.StateFileVersion,
+		Run:     rc.Run,
+		Phase:   orchestrator.PhaseRunning,
+	}))
+}
+
 // runExec runs the command tree the way main does and returns stdout,
 // stderr and the exit code. Other commands' tests use it too, so it adds
 // nothing to the arguments.
@@ -81,8 +98,9 @@ func runExec(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	return out.String(), errOut.String(), code
 }
 
-// runResolve is runExec with the hidden --dry-run, so the run form resolves
-// its configuration and prints it without firing anything (P8-01).
+// runResolve is runExec with --dry-run, so the run form resolves its
+// configuration and prints it without firing anything (P8-01; the flag is
+// documented and no longer hidden, P8-21).
 func runResolve(t *testing.T, args ...string) (stdout, stderr string, code int) {
 	t.Helper()
 	return runExec(t, append(append([]string{}, args...), "--"+FlagRunDryRun)...)
@@ -361,7 +379,7 @@ func TestRunResume(t *testing.T) {
 		filepath.Join(config.StateDir(repo), config.RunsDirName)+")\n", stderr)
 
 	for _, id := range []string{"20260901-000000-1111", "20260902-000000-2222"} {
-		require.NoError(t, os.MkdirAll(config.RunDir(repo, id), 0o755))
+		runWriteRunState(t, repo, id)
 	}
 	rc := runJSON(t, repo, "--resume")
 	require.True(t, rc.Resume)
@@ -825,7 +843,13 @@ func TestRunPassesNoAnimIntoTheTUI(t *testing.T) {
 	t.Cleanup(func() { runTUI = saved })
 	runTUI = func(ctx context.Context, opts tui.Options) error {
 		got = opts
-		<-ctx.Done() // the TUI lives until the run is over
+		// P8-32: the TUI now outlives the run — the finished frame is held
+		// until the user quits — so the stand-in leaves when the run's
+		// event stream ends, which is what pressing `q` then does.
+		sub := opts.Bus.Subscribe(ctx, 64)
+		defer sub.Unsubscribe()
+		for range sub.Events() {
+		}
 		return nil
 	}
 
@@ -835,6 +859,59 @@ func TestRunPassesNoAnimIntoTheTUI(t *testing.T) {
 	require.NotNil(t, got.Bus, "the TUI must watch the run's bus")
 	require.NotNil(t, got.Controller, "a live run wires the P7-10 run controls")
 	require.Equal(t, domain.RunModeBrief, got.Run.Mode)
+	// P6-51: the header reads the same "why is nothing happening?"
+	// snapshot state.json carries, pulled per frame.
+	require.NotNil(t, got.Vitals, "a live run wires the header's vitals")
+	require.NotPanics(t, func() { _ = got.Vitals() })
+}
+
+// TestRunTUIHoldsTheFinishedFrameUntilTheUserQuits is P8-32's Done-when:
+// the TUI used to be cancelled the instant the orchestrator finished, so a
+// run ended with the alt screen already gone — the user never saw the
+// completed graph and `q` was unreachable exactly when there was something
+// to look at. Now the run's event stream ends and the program stays up
+// until the user leaves, with the exit code still the run's own.
+func TestRunTUIHoldsTheFinishedFrameUntilTheUserQuits(t *testing.T) {
+	env := runFireSetup(t, true)
+	runStubTerminal(t, true)
+
+	held, quit := make(chan struct{}), make(chan struct{})
+	saved := runTUI
+	t.Cleanup(func() { runTUI = saved })
+	runTUI = func(ctx context.Context, opts tui.Options) error {
+		sub := opts.Bus.Subscribe(ctx, 64)
+		defer sub.Unsubscribe()
+		finished := false
+		for ev := range sub.Events() {
+			if _, ok := ev.(events.RunFinished); ok {
+				finished = true
+			}
+		}
+		require.True(t, finished, "the run must have finished before the stream ended")
+		// The frame is still standing: nothing took the program down with
+		// the run.
+		require.NoError(t, ctx.Err(), "a finished run must not cancel the TUI (P8-32)")
+		close(held)
+		<-quit // the user is still looking at the graph
+		return nil
+	}
+	// The user quits a moment after the run finished.
+	go func() {
+		select {
+		case <-held:
+		case <-time.After(runFireTimeout):
+		}
+		close(quit)
+	}()
+
+	_, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief)
+	require.Equal(t, 0, code, stderr)
+	select {
+	case <-held:
+	default:
+		t.Fatal("the TUI never saw the run finish")
+	}
+	require.Contains(t, stderr, "run        ", "the summary is printed after the user quits")
 }
 
 // TestRunAddMockCartridgeStillFailsForUsers is the other half of P8-08: the

@@ -18,6 +18,7 @@ import (
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
+	"slop-cannon/internal/testutil"
 )
 
 // The gate poller tests (P6-10, P6-14) feed the poller the exact text bd
@@ -1570,7 +1571,7 @@ func TestGatePollerRunLoopPollsOnTheInterval(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err, "cancellation ends the loop cleanly")
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.Patience(5 * time.Second)):
 		t.Fatal("the gate poller did not stop")
 	}
 }
@@ -1593,7 +1594,7 @@ func TestGatePollerRunLoopWakesOnDemand(t *testing.T) {
 	cancel()
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.Patience(5 * time.Second)):
 		t.Fatal("the gate poller did not stop")
 	}
 }
@@ -1635,7 +1636,7 @@ func TestGatePollerRunLoopSurvivesAClosedWakeChannel(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.Patience(5 * time.Second)):
 		t.Fatal("the gate poller did not stop")
 	}
 }
@@ -1671,7 +1672,7 @@ func TestGatePollerSerialisesConcurrentPolls(t *testing.T) {
 	select {
 	case res := <-done:
 		assert.Equal(t, []domain.BeadID{"fx-byi"}, res.Closed, "and it runs as soon as the lock frees")
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.Patience(5 * time.Second)):
 		t.Fatal("the waiting poll never ran")
 	}
 

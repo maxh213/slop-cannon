@@ -30,9 +30,9 @@ import (
 //
 // Both passes address the branch a bead's work is actually on rather than
 // the one [BranchName] derives from its (mutable) title: git's own
-// worktree registration names it, and it outlives the directory. See
-// resolveBranch; P4-12 records the branch in the bead's metadata and makes
-// the search unnecessary.
+// worktree registration names it, and it outlives the directory. That
+// resolution is [Manager.BranchFor], which every helper in the package
+// now shares (P4-12).
 
 // CleanupAction says what [Manager.Cleanup] did with one bead's worktree.
 type CleanupAction string
@@ -307,30 +307,29 @@ func (m *Manager) Cleanup(ctx context.Context, beadList []domain.Bead, opts Clea
 // cleanupBranch deletes the closed bead's branch when it is fully merged
 // into one of bases and keep is false, recording the outcome on e. names
 // are the short names of bases, used in the reason. The branch is the one
-// the worktree actually held when e.Branch says so, and resolveBranch's
-// answer otherwise: a bead retitled mid-run no longer names its own
-// branch.
+// [Manager.BranchFor] resolves, never one re-derived from the bead's
+// current title: a bead retitled mid-run no longer names its own branch
+// (P4-12). When nothing can be resolved the name the worktree listing gave
+// is kept for the report and the branch is left alone.
 func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domain.Bead, bases, names []string, keep bool) {
-	if e.Branch == "" {
-		branch, _, err := m.resolveBranch(ctx, bead, "")
-		if err != nil {
-			e.Err = err
-			return
-		}
+	// One resolution for the whole pass, the same one DeleteBranch makes
+	// below (P4-12): the registration is already pruned by now, so both
+	// answers come from the sc/<bead-id> namespace and agree.
+	branch, exists, err := m.BranchFor(ctx, bead)
+	if err != nil {
+		e.Err = err
+		return
+	}
+	if exists || e.Branch == "" {
 		e.Branch = branch
 	}
-	branch := e.Branch
+	branch = e.Branch
 	if keep {
 		e.Reason += "; branch kept as requested"
 		return
 	}
 	if len(bases) == 0 {
 		e.Reason += "; branch kept (no default branch to check it against)"
-		return
-	}
-	exists, err := m.repo.BranchExists(ctx, branch)
-	if err != nil {
-		e.Err = err
 		return
 	}
 	if !exists {
@@ -353,23 +352,29 @@ func (m *Manager) cleanupBranch(ctx context.Context, e *CleanupEntry, bead domai
 		e.Reason += fmt.Sprintf("; branch %s kept (not merged into %s)", branch, strings.Join(names, " or "))
 		return
 	}
-	if _, err := m.repo.Git(ctx, "branch", "-D", "--quiet", branch); err != nil {
+	deleted, err := m.DeleteBranch(ctx, bead)
+	if err != nil {
 		e.Err = err
 		return
 	}
+	if deleted == "" {
+		e.Reason += fmt.Sprintf("; branch %s was gone before it could be deleted", branch)
+		return
+	}
 	e.BranchDeleted = true
-	e.Reason += fmt.Sprintf("; branch %s deleted (merged into %s)", branch, mergedInto)
+	e.Reason += fmt.Sprintf("; branch %s deleted (merged into %s)", deleted, mergedInto)
 }
 
-// resolveBranch finds the branch a bead's work is on and whether the
-// repository still has it. BranchName(bead) slugs the bead's title, which
-// the product owner can change mid-run, so on its own it is a guess
-// (P4-12): the branch git records for the bead's worktree is the truth,
-// even when only a stale registration of a vanished directory is left, and
-// wtBranch carries it when there is one. Without it the "sc/<bead-id>"
-// namespace is searched for the single branch the bead can own. The guess
-// is returned with exists false when nothing is found or the namespace
-// holds several candidates, so callers always have a name to report.
+// resolveBranch is [Manager.BranchFor] with the worktree registration
+// already in hand: callers that have just listed the worktrees pass its
+// branch as wtBranch instead of listing them again. BranchName(bead) slugs
+// the bead's title, which the product owner can change mid-run, so on its
+// own it is a guess (P4-12): the branch git records for the bead's
+// worktree is the truth, even when only a stale registration of a vanished
+// directory is left. Without it the "sc/<bead-id>" namespace is searched
+// for the single branch the bead can own. The guess is returned with
+// exists false when nothing is found or the namespace holds several
+// candidates, so callers always have a name to report.
 func (m *Manager) resolveBranch(ctx context.Context, bead domain.Bead, wtBranch string) (branch string, exists bool, err error) {
 	if wtBranch != "" {
 		exists, err = m.repo.BranchExists(ctx, wtBranch)
@@ -407,25 +412,6 @@ func (m *Manager) beadBranches(ctx context.Context, id domain.BeadID) ([]string,
 		}
 	}
 	return names, nil
-}
-
-// beadOnBranch returns a copy of bead for which [BranchName] reports
-// branch, so [Manager.Create] checks out the branch the work is actually
-// on instead of cutting a new one from the default branch. It reports
-// false when no title yields branch; the caller must then refuse rather
-// than orphan committed work. P4-12 removes the need for it by recording
-// the branch in the bead's metadata when the worktree is created.
-func beadOnBranch(bead domain.Bead, branch string) (domain.Bead, bool) {
-	suffix, ok := strings.CutPrefix(branch, BranchPrefix+logging.SafeFileName(string(bead.ID)))
-	if !ok {
-		return bead, false
-	}
-	out := bead
-	out.Title = strings.TrimPrefix(suffix, "-")
-	if BranchName(out) != branch {
-		return bead, false
-	}
-	return out, true
 }
 
 // pruneRun drops the stale registrations of the run's own worktrees and
@@ -567,11 +553,12 @@ type ResumeEntry struct {
 	// default branch because the bead had no branch yet, rather than
 	// checked out from one that already held work.
 	recreatedFresh bool
-	// emptyBranch is true when the branch is an ancestor of the default
-	// branch only because it never received a commit (P4-13): it was cut
-	// and never moved, so nothing of the bead's landed and Landed is left
-	// false.
-	emptyBranch bool
+	// nothingLanded, when set, says why the branch is an ancestor of the
+	// default branch without anything of the bead's having landed on it,
+	// in the words the reason is built from: it was cut and never moved
+	// (P4-13), or its commits were rebased away (P4-16). Landed is left
+	// false in both cases.
+	nothingLanded string
 }
 
 // Changed reports whether reconciliation moved the bead to another state.
@@ -746,6 +733,11 @@ func activeOnResume(state domain.BeadState) bool {
 //     behind a gate is left to the poller as well.
 //   - A bead that recorded a pull request which is no longer open or
 //     merged moves to needs_human: the PR was closed without merging.
+//   - A needs_human bead whose branch now has a pull request it never
+//     recorded goes back to delivering with sc_pr_url and sc_pr_number
+//     written: the delivery could only push and the human it was handed to
+//     opened the pull request themselves (P4-10). The caller re-runs the
+//     PR delivery, which creates the gate.
 //   - A delivering bead whose branch is gone and that has no pull request
 //     left to speak for it moves to needs_human.
 //   - Every other state is left alone; the entry reports the worktree
@@ -956,24 +948,32 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 			e.Err = fmt.Errorf("gitx: unexpected rev-list output %q", out)
 			return e
 		}
-		// P4-13: ancestry alone is not proof that anything landed. An
-		// empty sc/ branch — the worktree was created and the crash came
-		// before the first commit — is trivially an ancestor of the
-		// default branch, and Ahead cannot tell the two apart (a branch
-		// that landed is reachable from the default branch, so it is 0 in
-		// both cases). What separates them is whether the ref ever moved
-		// after it was cut, which git's own reflog records and a crash
-		// cannot erase. A branch that never moved did not land, however
-		// the ancestry reads: closing that bead would record work as
-		// delivered when none exists, and unblock its dependents (D-20).
+		// P4-13 and P4-16: ancestry alone is not proof that anything
+		// landed. An empty sc/ branch — the worktree was created and the
+		// crash came before the first commit — is trivially an ancestor of
+		// the default branch, and so is one whose commits a rebase dropped,
+		// which leaves the branch sitting on an upstream commit. Ahead
+		// cannot tell either of them from a delivery that fast-forwarded (a
+		// branch that landed is reachable from the default branch, so it is
+		// 0 in every case). What separates them is the branch's own reflog,
+		// which a crash cannot erase: whether the ref ever moved after it
+		// was cut, and whether its last rebase left it on the very commit
+		// it was rebased onto. Neither of those landed anything, however
+		// the ancestry reads: closing such a bead would record work as
+		// delivered when none exists and unblock its dependents (D-20).
 		if e.Landed {
-			moved, known, merr := repo.branchMoved(ctx, e.Branch)
+			prog, perr := repo.branchProgress(ctx, e.Branch, e.Head)
 			switch {
-			case merr != nil:
-				e.Err = merr
+			case perr != nil:
+				e.Err = perr
 				return e
-			case known && !moved:
-				e.Landed, e.emptyBranch = false, true
+			case !prog.known:
+				// No reflog to consult, so nothing can be said either way
+				// and the ancestry stands.
+			case !prog.moved:
+				e.Landed, e.nothingLanded = false, "never received a commit"
+			case prog.rebasedAway:
+				e.Landed, e.nothingLanded = false, "had its commits rebased away"
 			}
 		}
 	}
@@ -982,7 +982,15 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 	// branch may well be gone (deleted after the merge, or by hand) while
 	// the pull request it was pushed to is still open or already merged, so
 	// gh is asked either way.
-	if *ghUsable && (bead.State == domain.BeadStateDelivering || bead.PRURL != "" || bead.PRNumber != 0) {
+	//
+	// A needs_human bead with a branch is asked about too (P4-10): that is
+	// where a PRPushOnly or PRNoRemote delivery parks a bead, and the human
+	// it was handed to may well have opened the pull request in the
+	// meantime — or added the remote and pushed. It records no pull request
+	// of its own, so nothing else would ever look.
+	pushedByHand := bead.State == domain.BeadStateNeedsHuman && e.BranchExists &&
+		bead.PRURL == "" && bead.PRNumber == 0
+	if *ghUsable && (bead.State == domain.BeadStateDelivering || pushedByHand || bead.PRURL != "" || bead.PRNumber != 0) {
 		pr, state, err := r.findPR(ctx, bead, e.Branch)
 		if reason, ok := ghUnavailable(err); ok {
 			*ghUsable = false
@@ -999,28 +1007,26 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 	}
 
 	// Recreate a vanished worktree when the bead will be worked on again,
-	// on the branch that holds its work: Manager.Create derives the branch
-	// from the bead's title, so a retitled bead would otherwise get a fresh
-	// branch cut from the default branch and its commits would be orphaned
-	// (P4-12). When no title can name that branch the worktree is left
-	// missing and the entry says why.
+	// on the branch that holds its work: Manager.Create resolves that
+	// branch the same way this does (P4-12), so a bead retitled mid-run is
+	// checked out on its own commits instead of a fresh branch cut from the
+	// default branch. The dirty guard is lifted for this one call: a human's
+	// checkout is normally mid-edit, and that has nothing to do with adding
+	// a linked worktree somewhere else (P4-15).
 	landedForGood := e.Landed && bead.State == domain.BeadStateDelivering
 	if e.WorktreeStatus == WorktreeMissing && activeOnResume(bead.State) && !landedForGood && (exists || bead.State == domain.BeadStateInProgress) {
-		target, ok := beadOnBranch(bead, e.Branch)
-		switch {
-		case !ok:
-			e.Err = fmt.Errorf("recreating the worktree: the work is on branch %s, which the bead's title no longer names (P4-12)", e.Branch)
-		default:
-			wt, err := r.m.Create(ctx, target)
-			if err != nil {
-				e.Err = fmt.Errorf("recreating the worktree: %w", err)
-			} else {
-				e.Worktree, e.WorktreeStatus = wt, WorktreeRecreated
-				e.recreatedFresh = !exists
-				if !exists {
-					e.BranchExists = true
-					e.Head = wt.Head
-				}
+		wt, err := r.m.create(ctx, bead, true)
+		if err != nil {
+			e.Err = fmt.Errorf("recreating the worktree: %w", err)
+		} else {
+			e.Worktree, e.WorktreeStatus = wt, WorktreeRecreated
+			e.recreatedFresh = !exists
+			if !exists {
+				e.BranchExists = true
+				e.Head = wt.Head
+			}
+			if wt.Branch != "" {
+				e.Branch = wt.Branch
 			}
 		}
 	}
@@ -1050,30 +1056,82 @@ func (r *Resumer) inspect(ctx context.Context, bead domain.Bead, bases []string,
 	return e
 }
 
-// branchMoved reports whether a branch has moved since it was created,
-// read from the reflog git keeps for the ref itself.
-//
-// known is false when the repository keeps no reflog for the branch
-// (core.logAllRefUpdates off, or a ref written before it was turned on):
-// nothing can then be said either way, and the caller must not read the
-// silence as an answer. A branch with exactly one entry — the "branch:
-// Created from ..." git writes when the worktree is cut — has never moved;
-// two or more mean a commit, a rebase or a reset advanced it.
-func (r *Repo) branchMoved(ctx context.Context, branch string) (moved, known bool, err error) {
-	out, err := r.Git(ctx, "reflog", "show", "--format=%H", "refs/heads/"+branch)
+// branchProgress is what a branch's own reflog says about the work that
+// reached it.
+type branchProgress struct {
+	// known is false when the repository keeps no reflog for the branch
+	// (core.logAllRefUpdates off, or a ref written before it was turned
+	// on): nothing can then be said either way, and the caller must not
+	// read the silence as an answer.
+	known bool
+	// moved is true when the ref changed after it was cut. A branch with
+	// exactly one entry — the "branch: Created from ..." git writes when
+	// the worktree is cut — has never moved; two or more mean a commit, a
+	// rebase or a reset advanced it (P4-13).
+	moved bool
+	// rebasedAway is true when the last thing that happened to the branch
+	// was a rebase that left it on the very commit it was rebased onto:
+	// every commit it carried was dropped as already applied upstream or
+	// as empty, so the branch now holds nothing of its own (P4-16).
+	rebasedAway bool
+}
+
+// branchProgress reads the reflog git keeps for the branch itself. tip is
+// the branch's current commit, used to recognise a rebase that finished on
+// the commit it was rebasing onto.
+func (r *Repo) branchProgress(ctx context.Context, branch, tip string) (branchProgress, error) {
+	// %gs carries the reflog subject ("commit: …", "rebase (finish):
+	// refs/heads/x onto <sha>"), newest entry first.
+	out, err := r.Git(ctx, "reflog", "show", "--format=%H%x00%gs", "refs/heads/"+branch)
 	if err != nil {
-		return false, false, fmt.Errorf("gitx: reading the reflog of %s: %w", branch, err)
+		return branchProgress{}, fmt.Errorf("gitx: reading the reflog of %s: %w", branch, err)
 	}
+	var p branchProgress
 	entries := 0
 	for _, line := range strings.Split(out, "\n") {
-		if strings.TrimSpace(line) != "" {
-			entries++
+		if strings.TrimSpace(line) == "" {
+			continue
 		}
+		entries++
+		if entries > 1 {
+			continue
+		}
+		sha, subject, _ := strings.Cut(line, "\x00")
+		p.rebasedAway = rebasedOntoItself(subject, sha, tip)
 	}
 	if entries == 0 {
-		return false, false, nil
+		return branchProgress{}, nil
 	}
-	return entries > 1, true, nil
+	p.known, p.moved = true, entries > 1
+	if !p.moved {
+		// A branch that never moved was never rebased either; the one
+		// entry is the "Created from" line.
+		p.rebasedAway = false
+	}
+	return p, nil
+}
+
+// rebasedOntoItself reports whether subject is the reflog subject of a
+// finished rebase ("rebase (finish): refs/heads/<branch> onto <commit>")
+// whose result is the commit it rebased onto — the shape of a branch whose
+// every commit the rebase dropped. sha is the commit that entry left the
+// branch at and tip the branch's current commit; the rebase counts only
+// when it is still where the branch stands.
+func rebasedOntoItself(subject, sha, tip string) bool {
+	if !strings.HasPrefix(subject, "rebase") || sha == "" || sha != tip {
+		return false
+	}
+	_, onto, ok := strings.Cut(subject, " onto ")
+	if !ok {
+		return false
+	}
+	onto = strings.TrimSpace(onto)
+	// git writes the full object name here, but an abbreviation is
+	// accepted so a differently configured or older git still reads.
+	if len(onto) < 7 || len(onto) > len(sha) {
+		return false
+	}
+	return strings.HasPrefix(sha, onto)
 }
 
 // reconcile decides the bead's state from the facts inspect gathered.
@@ -1098,12 +1156,21 @@ func (r *Resumer) reconcile(e *ResumeEntry, def string) {
 	case (bead.PRURL != "" || bead.PRNumber != 0) && e.PR == nil && e.prLookedUp:
 		e.State = domain.BeadStateNeedsHuman
 		e.Reason = fmt.Sprintf("the recorded pull request %s is no longer open or merged", bead.PRURL)
-	case bead.State == domain.BeadStateDelivering && e.emptyBranch:
-		// P4-13: the branch is an ancestor of the default branch only
-		// because it is empty. The bead is left delivering, exactly where
-		// the uninterrupted path leaves it (ErrNothingToDeliver), for the
-		// caller to deliver again.
-		e.Reason = fmt.Sprintf("branch %s never received a commit, so nothing landed on %s; deliver again", e.Branch, def)
+	case bead.State == domain.BeadStateNeedsHuman && e.PRState != "" && bead.PRURL == "" && bead.PRNumber == 0:
+		// P4-10: the delivery could only push (gh missing, unauthenticated,
+		// no GitHub remote, or no remote at all), so the bead was handed to
+		// a human — who opened the pull request. It is a delivery again:
+		// the pull request is recorded on the bead here and the caller
+		// re-runs the (idempotent) PR delivery, which creates the gh:pr
+		// gate that keeps the bead in delivering until the merge (D-20).
+		e.State = domain.BeadStateDelivering
+		e.Reason = fmt.Sprintf("PR #%d was opened by hand for the pushed branch; re-run the PR delivery so its gate exists", e.PR.Number)
+	case bead.State == domain.BeadStateDelivering && e.nothingLanded != "":
+		// P4-13 and P4-16: the branch is an ancestor of the default branch
+		// only because nothing of the bead's is on it. The bead is left
+		// delivering, exactly where the uninterrupted path leaves it
+		// (ErrNothingToDeliver), for the caller to deliver again.
+		e.Reason = fmt.Sprintf("branch %s %s, so nothing landed on %s; deliver again", e.Branch, e.nothingLanded, def)
 	case bead.State == domain.BeadStateDelivering && !e.BranchExists:
 		e.State = domain.BeadStateNeedsHuman
 		e.Reason = fmt.Sprintf("branch %s is gone and nothing landed on %s", e.Branch, def)
@@ -1134,10 +1201,17 @@ func (r *Resumer) apply(ctx context.Context, e *ResumeEntry, def string) {
 	}
 	id := e.Bead.ID
 	var err error
-	switch e.State {
-	case domain.BeadStateClosed:
+	switch {
+	case e.State == domain.BeadStateClosed:
 		if _, err = r.tracker.Update(ctx, id, beads.Patch{Metadata: beads.MergeMetadata(e.MergeSHA)}); err == nil {
 			_, err = r.tracker.Close(ctx, id, fmt.Sprintf("merged into %s as %s (found on resume)", def, shortSHA(e.MergeSHA)))
+		}
+	case e.State == domain.BeadStateDelivering && e.PR != nil && e.Bead.PRURL == "" && e.Bead.PRNumber == 0:
+		// P4-10: record the hand-opened pull request before the bead moves,
+		// so a crash between the two leaves the bead where it was rather
+		// than delivering with nothing to point at.
+		if _, err = r.tracker.Update(ctx, id, beads.Patch{Metadata: beads.PRMetadata(e.PR.URL, e.PR.Number)}); err == nil {
+			_, err = r.tracker.SetStatus(ctx, id, e.State)
 		}
 	default:
 		_, err = r.tracker.SetStatus(ctx, id, e.State)

@@ -34,7 +34,7 @@ Available Commands:
   cartridge   Add, remove, list, or switch the LLM CLI subscriptions
   completion  Print a shell completion script (bash, zsh, or fish)
   config      Show, locate, or edit the configuration files
-  doctor      Check that git, bd, gh, and the cartridge CLIs are ready
+  doctor      Check that git, bd, dolt, gh, the cartridge CLIs and the repository are ready
   help        Help about any command
   logs        Tail the log of a run, an agent, or a bead
   resume      Continue the most recent run of a repository
@@ -42,12 +42,14 @@ Available Commands:
   run         Fire the cannon at a repository (same as `sc PATH`)
   safety      Open PRs (on, the default) or merge straight to the default branch (off)
   status      Show the state of a run, or one bead's timeline
+  stop        Stop the run going in a repository
   version     Print the sc version, commit, and build date
   vibes       Manage the style files every agent is given
 
 Flags:
       --ammo N           override ammo for this run (N agents at once, minimum 3)
       --cartridge NAME   fire cartridge NAME instead of the active one
+      --dry-run          print the run this repository, config and flags add up to, without firing anything
       --force            start even though another run holds this repository's lock (only when you know it is gone)
       --global           read and write the global config only, not the repo config
       --headless         no TUI: render events as log lines (for CI and scripts)

@@ -21,4 +21,4 @@ blocks sc-5e6f ○ open
       [1m![0m Budget leaks between calls
     test         approve tests cover the back-off
 esc close   lines 1-19 of 22
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level

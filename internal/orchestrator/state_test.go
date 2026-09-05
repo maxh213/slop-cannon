@@ -497,24 +497,12 @@ func TestStateBeadEventVocabulary(t *testing.T) {
 		if !ev.Valid() {
 			t.Fatalf("%q is not Valid", ev)
 		}
-		for _, in := range []string{string(ev), " " + string(ev) + " ", strings.ToUpper(string(ev))} {
-			got, err := ParseBeadEvent(in)
-			if err != nil || got != ev {
-				t.Fatalf("ParseBeadEvent(%q) = %q, %v; want %q", in, got, err, ev)
-			}
-		}
 	}
 	for _, bad := range stateBogusEvents {
-		// Valid is exact, so "CLAIMED" is not a BeadEvent even though the
-		// lenient parser accepts the spelling.
+		// Valid is exact: neither a spelling with different case nor one
+		// with space around it is a BeadEvent.
 		if bad.Valid() {
 			t.Fatalf("%q should not be Valid", bad)
-		}
-		if BeadEvent(strings.ToLower(strings.TrimSpace(string(bad)))).Valid() {
-			continue
-		}
-		if _, err := ParseBeadEvent(string(bad)); !errors.Is(err, ErrUnknownBeadEvent) {
-			t.Fatalf("ParseBeadEvent(%q) error = %v, want ErrUnknownBeadEvent", bad, err)
 		}
 	}
 }

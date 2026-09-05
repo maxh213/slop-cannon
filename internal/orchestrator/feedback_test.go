@@ -2268,3 +2268,157 @@ func TestFeedbackRestoreDoesNotCreditAnEvaluationWithTheCommit(t *testing.T) {
 	assert.Zero(t, writes, "the resumed run approves nothing on the strength of a replay")
 	assert.Equal(t, domain.ItemAccepted, th.Items[0].Status)
 }
+
+// --- P6-47: a resumed changes_requested bead does not gain a round ------
+
+// A killed run that had already asked the engineer for another round left
+// bd holding the bead in changes_requested, and its own sc_round says which
+// round it asked for. The replay re-derives the same decision from the
+// comments, so taking the transition again would advance the round a second
+// time: the resumed bead would start a round further on than the run that
+// died and hand back one of its D-08 review rounds for nothing. The bead's
+// status is the evidence that the edge was taken and its round is the
+// record of which round it was taken into.
+func TestFeedbackRestoreResumesTheRoundTheKilledRunAskedFor(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	sc := fbScenario("restore-changes-requested")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+
+	rig := fbSetup(t, sc, nil)
+	require.Equal(t, 1, rig.step(t), "the engineer implements")
+	require.Equal(t, 3, rig.step(t), "three lenses review head1")
+
+	live := rig.Thread()
+	require.Equal(t, FeedbackAddressing, live.Phase, "the killed run had already asked for another round")
+	require.Equal(t, domain.BeadStateChangesRequested, rig.Store.State())
+	require.Equal(t, 2, live.Round)
+
+	// bd names the round the bead is in, and that round is the one it was
+	// killed in: the replay resumes there rather than opening the next one.
+	_, th, writes := fbResume(t, rig, rig.Store.State(), 3)
+	assert.Equal(t, 3, th.Round,
+		"the resumed run picks up the round bd holds the bead in; it does not spend another")
+	assert.Equal(t, FeedbackAddressing, th.Phase)
+	assert.Equal(t, domain.BeadStateChangesRequested, th.State)
+	assert.Zero(t, writes, "the transition the killed run already made is not made again")
+	require.Len(t, th.Items, 1)
+	assert.Equal(t, domain.ItemOpen, th.Items[0].Status, "the engineer still owes the item an answer")
+
+	// The same thread with the round bd's own metadata records today, which
+	// is the round the comments name: still that round, not the next one.
+	_, same, sameWrites := fbResume(t, rig, rig.Store.State(), 1)
+	assert.Equal(t, 1, same.Round, "the round bd holds it in, not the one after")
+	assert.Equal(t, FeedbackAddressing, same.Phase)
+	assert.Zero(t, sameWrites)
+
+	// A bead whose metadata carries no round at all (nothing has written
+	// sc_round on it yet) still resumes where the comments put it, which is
+	// the round after the one the testers judged — the round the killed run
+	// had opened when it died.
+	_, bare, bareWrites := fbResume(t, rig, rig.Store.State(), 0)
+	assert.Equal(t, live.Round, bare.Round, "with no sc_round the comments alone place the thread")
+	assert.Equal(t, FeedbackAddressing, bare.Phase)
+	assert.Zero(t, bareWrites)
+}
+
+// --- P6-48: a replay files each round's notes in its own round ----------
+
+// fbPOPrompt builds the product owner's ruling prompt from a loop's own
+// demands without firing a cartridge, so a resumed loop — which has no
+// supervisor of its own — can be asked what it would say.
+func fbPOPrompt(t *testing.T, rig *fbRig, loop *Feedback) string {
+	t.Helper()
+	ctx := context.Background()
+	ds, err := loop.Demands(ctx)
+	require.NoError(t, err)
+	for _, d := range ds {
+		if d.Kind != DemandArbitrate {
+			continue
+		}
+		agent := d.Agent
+		if agent == "" {
+			agent = mintAgentID(d, 1)
+		}
+		af, err := loop.PlanFiring(ctx, Firing{
+			Agent:  domain.Agent{ID: agent, Role: d.Role(), Bead: d.Bead, State: domain.AgentStatePending},
+			Demand: d,
+			Run:    rig.Run,
+		})
+		require.NoError(t, err)
+		run, err := af.Build(ctx, FiringContext{
+			Run: rig.Run.ID(), Agent: af.Agent, Task: af.Task, Round: af.Round,
+			Workdir: rig.Worktree, Timeout: time.Minute, Attempt: 1,
+		})
+		require.NoError(t, err)
+		return run.Spec.Prompt
+	}
+	t.Fatalf("the loop raised no product owner demand (%d demands)", len(ds))
+	return ""
+}
+
+// The replay folds a whole thread in and plans once, so without a round
+// boundary of its own every round's notes land in the round the replay ends
+// in: an engineer that argued with a binding ruling in two rounds resumed
+// with the same note twice over, in a round only one of them was made in.
+// Each note belongs to the round it was written in, and the prompt the
+// product owner is escalated with has to read the way it would have if the
+// run had never been killed.
+func TestFeedbackRestoreFilesEachRoundsNotesInItsOwnRound(t *testing.T) {
+	item := fbItemAt("qa-r1-1", "retry loop never terminates", "retry.go", domain.SeverityMajor, domain.ItemOpen)
+	held := item
+	held.Status = domain.ItemHeld
+	held.Detail = "the caller is not the only entry point"
+
+	sc := fbScenario("restore-notes-per-round")
+	fbSay(sc, "eng-sc-fb1-r1", fbReport("added the retry"))
+	fbSay(sc, "tester-ux-sc-fb1-r1", fbApprove("reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r1", fbApprove("covered"))
+	fbSay(sc, "tester-qa-sc-fb1-r1", fbChanges("it spins", item))
+	argue := fbResponses(domain.Response{
+		ItemID: "qa-r1-1", Action: domain.ActionPushback, Rationale: "the caller bounds the retries already",
+	})
+	fbSay(sc, "eng-sc-fb1-r2", argue)
+	fbSay(sc, "tester-qa-sc-fb1-r2-pushback", fbChanges("not convinced", held))
+	fbSay(sc, "po-sc-fb1-r2-qa-r1-1", domain.Arbitration{
+		ItemID: "qa-r1-1", Ruling: domain.RulingUpholdTester, Instruction: "bound the loop where it is written",
+	})
+	fbSay(sc, "eng-sc-fb1-r3", argue)
+	fbSay(sc, "eng-sc-fb1-r4", argue)
+
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) {
+		o.Limits.MaxPushbackRounds = 1
+		o.Limits.MaxReviewRounds = 8
+	})
+	for i := 0; i < 7; i++ {
+		require.NotZerof(t, rig.step(t), "step %d fired nobody", i+1)
+	}
+
+	live := rig.Thread()
+	require.Equal(t, FeedbackEscalating, live.Phase, "two refused answers escalate the bead (P6-38)")
+	require.Equal(t, 4, live.Round)
+	require.Equal(t, MaxRulingRefusals, live.Items[0].Refusals)
+
+	const binding = "that ruling is binding"
+	why := fbSection(t, fbPOPrompt(t, rig, rig.Loop), "Why this reached you")
+	require.Equal(t, 1, strings.Count(why, binding),
+		"the run that was never killed tells the product owner about this round's refusal once")
+
+	resumed, th, writes := fbResume(t, rig, rig.Store.State(), live.Round)
+	assert.Equal(t, FeedbackEscalating, th.Phase)
+	assert.Equal(t, live.Round, th.Round)
+	assert.Zero(t, writes, "bd already holds the escalation the replay re-derives")
+
+	got := fbPOPrompt(t, rig, resumed)
+	assert.Equal(t, 1, strings.Count(fbSection(t, got, "Why this reached you"), binding),
+		"each note is filed in the round it was made in, so the open round carries it once")
+	assert.Equal(t, why, fbSection(t, got, "Why this reached you"),
+		"the resumed escalation reads exactly like the one the killed run would have raised")
+
+	// The refusal of the round before is still in the thread — filed under
+	// that round, which is where the history the prompt carries shows it.
+	assert.Equal(t, 2, strings.Count(got, binding),
+		"round three's note is in round three's history and round four's in the open round")
+}

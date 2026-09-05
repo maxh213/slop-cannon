@@ -1,7 +1,11 @@
 package tui
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -949,20 +953,35 @@ func (m Model) header(w int) string {
 // [Model.header] draws the first one that fits the terminal, and clips the
 // last one when even that does not.
 func (m Model) headerVariants() [][]string {
-	used, total := m.state.Ammo()
+	used, _ := m.state.Ammo()
+	// P7-22: ammo and safety come from the control layer, not straight off
+	// the run's opening snapshot, so a cap or a safety flag the orchestrator
+	// has accepted since moves the header instead of being invisible until
+	// the next run. With nothing accepted both are the run's own values, so
+	// this is the snapshot until a control key changes something.
+	total := m.controls.Ammo(m.state)
 	title := m.styles.Title.Render("slop-cannon")
 	id := m.styles.Value.Render(orDash(m.state.Run.ID.String()))
 	mode := m.styles.Value.Render(m.state.Mode().String())
 	ammo := "ammo " + m.styles.Value.Render(fmt.Sprintf("%d/%d", used, total))
-	safety := "safety " + m.styles.Value.Render(onOff(m.state.Run.Config.Safety))
+	safety := "safety " + m.styles.Value.Render(onOff(m.controls.Safety(m.state)))
+	vitals := m.vitals()
 	long, short := m.status()
 	full, brief := "", ""
 	if long != "" {
 		full, brief = m.styles.Status.Render(long), m.styles.Status.Render(short)
 	}
 	return [][]string{
-		headerFields(title, "run "+id, mode, ammo, safety, full),
-		headerFields("run "+id, mode, ammo, safety, full),
+		headerFields(title, "run "+id, mode, ammo, safety, vitals, full),
+		headerFields("run "+id, mode, ammo, safety, vitals, full),
+		headerFields(id, mode, ammo, safety, vitals, full),
+		headerFields(id, mode, ammo, safety, vitals, brief),
+		headerFields(id, ammo, safety, vitals, brief),
+		headerFields(id, safety, vitals, brief),
+		// The vitals go before the mode and the ammo but after the run id
+		// and the safety flag, and only then are dropped altogether: an
+		// outage the reader has to act on outranks two numbers that hardly
+		// move, but a header with no run id names no run.
 		headerFields(id, mode, ammo, safety, full),
 		headerFields(id, mode, ammo, safety, brief),
 		headerFields(id, ammo, safety, brief),
@@ -970,6 +989,27 @@ func (m Model) headerVariants() [][]string {
 		headerFields(id, safety),
 		headerFields(id),
 	}
+}
+
+// vitals is the run's "why is nothing happening?" line in the header
+// (P6-51): the next plan, a `gh` outage, the gates still pending and the
+// foreign pull requests left alone, as [orchestrator.RunVitals.Header]
+// phrases them. It is empty — and so drawn as nothing at all — when the
+// caller wired no source in or the run has nothing to explain, which is why
+// [Options.Vitals] is a plain string function rather than a struct this
+// package would have to import the orchestrator for.
+//
+// It is sanitised like every other line the TUI does not author itself, so a
+// source that hands it an escape sequence cannot repaint the chrome.
+func (m Model) vitals() string {
+	if m.opts.Vitals == nil {
+		return ""
+	}
+	line := strings.TrimSpace(logSanitize(m.opts.Vitals()))
+	if line == "" {
+		return ""
+	}
+	return m.styles.Muted.Render(line)
 }
 
 // headerFields drops the empty fields of a header variant, so a run with no
@@ -1025,27 +1065,266 @@ func (m Model) tabBar(w int) string {
 	return clip(lipgloss.JoinHorizontal(lipgloss.Top, parts...), w)
 }
 
-// footer renders the short keymap plus the dropped-event notice and the
-// result of the last action that had one to report.
+// footerGap separates the keymap from the right-hand side, and the segments
+// of the right-hand side from each other.
+const footerGap = "  "
+
+// footer renders the short keymap — the global bindings and the active
+// view's own (P7-13) — followed by the dropped-event notice, the run's
+// newest warning (P7-19) and the result of the last action that had one to
+// report.
+//
+// The three of them do not fit an 80-column terminal together, so the line
+// is negotiated rather than clipped (P7-21). The global keymap alone is 76
+// columns, so at 80 the whole line used to be cut a character or two into a
+// control's answer: "safety on for future deliveries" and the re-fire
+// refusal never read at all, and a run's warning reached the screen only as
+// a Log row. What the reader is owed is the answer to the key just pressed,
+// the warning the run just raised, and the keys only this view answers; the
+// keymap therefore reserves the narrowest variant that still names one of
+// the view's own bindings, the extras take what is left (the notice in its
+// short form when the long one will not fit), and the flash is never given
+// up for a key that the `?` overlay also lists.
 func (m Model) footer(w int) string {
-	line := m.help.ShortHelpView(m.keys.ShortHelp())
-	if m.state.Dropped > 0 {
-		line += m.styles.Sep.Render("  ") + m.styles.Warn.Render(fmt.Sprintf("missed %d events", m.state.Dropped))
+	if w <= 0 {
+		return ""
 	}
-	flash, flashErr := m.flash, m.flashErr
+	sep := m.styles.Sep.Render(footerGap)
+	sepw := lipgloss.Width(footerGap)
+	variants := m.footerVariants()
+	budget := max(w-m.footerReserve(variants)-sepw, 0)
+
+	// In display order, which is also priority order the other way round: a
+	// segment that does not fit is dropped from the front, so the flash is
+	// the last thing to go.
+	var segs []string
+	add := func(candidates ...string) {
+		for _, c := range candidates {
+			if c == "" {
+				continue
+			}
+			if need := lipgloss.Width(c) + sepw; need <= budget {
+				segs, budget = append(segs, c), budget-need
+				return
+			}
+		}
+	}
+	add(m.footerDropped())
+	add(m.footerNotice(w), m.footerNoticeCount())
+	if f := m.footerFlash(); f != "" {
+		segs = append(segs, f)
+	}
+	tail := strings.Join(segs, sep)
+	// The last segment standing is never dropped, only clipped: the longest
+	// re-fire refusal is 90 columns and cannot be read in full on an
+	// 80-column terminal however the line is arranged, and the first 80 of
+	// it say what happened where nothing at all would not.
+	for len(segs) > 1 && lipgloss.Width(tail) > w {
+		segs = segs[1:]
+		tail = strings.Join(segs, sep)
+	}
+
+	avail := w
+	if tail != "" {
+		avail -= lipgloss.Width(tail) + sepw
+	}
+	keys := m.footerKeys(variants, avail)
+	switch {
+	case keys == "":
+		return clip(tail, w)
+	case tail == "":
+		return clip(keys, w)
+	default:
+		return clip(keys+sep+tail, w)
+	}
+}
+
+// footerReserve is the width the keymap keeps for itself before the right-
+// hand side is allowed any: the narrowest variant that still names one of
+// the active view's own keys.
+func (m Model) footerReserve(variants [][]key.Binding) int {
+	probe := m.help
+	probe.Width = 0
+	return lipgloss.Width(probe.ShortHelpView(variants[len(variants)-3]))
+}
+
+// footerKeys renders the widest keymap variant that fits avail columns,
+// falling back to the narrowest — ellipsised by the help renderer — when
+// none of them do. Below [footerMinKeys] there is no room for a keymap at
+// all and the footer is its right-hand side alone.
+func (m Model) footerKeys(variants [][]key.Binding, avail int) string {
+	if avail < footerMinKeys {
+		return ""
+	}
+	probe := m.help
+	probe.Width = 0
+	for _, bs := range variants {
+		if line := probe.ShortHelpView(bs); lipgloss.Width(line) <= avail {
+			return line
+		}
+	}
+	narrow := m.help
+	narrow.Width = avail
+	return narrow.ShortHelpView(variants[len(variants)-1])
+}
+
+// footerMinKeys is the narrowest keymap worth drawing. Below it the footer
+// is nothing but its right-hand side, which is what the reader is owed when
+// the two cannot both fit.
+const footerMinKeys = 12
+
+// footerVariants lists the footer's keymaps from widest to narrowest, the
+// way [Model.headerVariants] lists the header's. The active view's own
+// bindings go last and are the last to be given up: `o` (open the pull
+// request), `enter` (the bead detail) and the transcript keys exist only
+// while their view is up and are documented nowhere else on screen, while
+// every global binding a reader loses here is still on the `?` overlay —
+// which is why `?` outlives all of them.
+//
+// [Model.footerReserve] takes the third from last, so the narrowest line the
+// extras may squeeze the keymap down to still names `?`, `q` and the view's
+// headline key.
+func (m Model) footerVariants() [][]key.Binding {
+	k := m.keys
+	view := m.viewShortKeys()
+	head := func(n int) []key.Binding {
+		if n > len(view) {
+			n = len(view)
+		}
+		return view[:n]
+	}
+	return [][]key.Binding{
+		append(k.ShortHelp(), view...),
+		append([]key.Binding{k.NextTab, k.SelectTab, k.Help, k.Quit}, view...),
+		append([]key.Binding{k.NextTab, k.Help, k.Quit}, view...),
+		append([]key.Binding{k.Help, k.Quit}, view...),
+		append([]key.Binding{k.Help, k.Quit}, head(1)...),
+		{k.Help, k.Quit},
+		{k.Help},
+	}
+}
+
+// viewShortKeys returns the footer bindings of the active view, so the keys
+// only that view answers are on screen while it is up (P7-13): the Graph
+// view's detail and level keys (P7-02), the Agents view's transcript keys
+// (P7-03), the Feedback view's round keys (P7-04) and the PRs view's `o`
+// (P7-05). The Log view adds none — [Model.view] draws it and it moves under
+// the global cursor keys — so its footer is the global map alone.
+func (m Model) viewShortKeys() []key.Binding {
+	switch m.tab {
+	case TabGraph:
+		return m.graph.Keys().ShortHelp()
+	case TabAgents:
+		return m.agents.Keys().ShortHelp()
+	case TabFeedback:
+		return m.feedback.Keys().ShortHelp()
+	case TabPRs:
+		return m.prs.Keys().ShortHelp()
+	}
+	return nil
+}
+
+// footerDropped reports a subscription that fell behind.
+func (m Model) footerDropped() string {
+	if m.state.Dropped == 0 {
+		return ""
+	}
+	return m.styles.Warn.Render(fmt.Sprintf("missed %d events", m.state.Dropped))
+}
+
+// footerFlash is the result of the last action that had one to report.
+func (m Model) footerFlash() string {
+	flash, flashErr := m.flashText()
+	if flash == "" {
+		return ""
+	}
+	if flashErr {
+		return m.styles.Warn.Render(flash)
+	}
+	return m.styles.Muted.Render(flash)
+}
+
+// flashText is the flash before it is styled, and whether it reports a
+// failure.
+func (m Model) flashText() (string, bool) {
 	// A control's answer outlives a key press, so it wins over the flash the
 	// views set (P7-10).
 	if f, isErr := m.controls.Flash(); f != "" {
-		flash, flashErr = f, isErr
+		return f, isErr
 	}
-	if flash != "" {
-		style := m.styles.Muted
-		if flashErr {
-			style = m.styles.Warn
-		}
-		line += m.styles.Sep.Render("  ") + style.Render(flash)
+	return m.flash, m.flashErr
+}
+
+// footerNotice is the run's newest warning or error, with a count of the
+// ones behind it (P7-19). Until this, a warning reached the screen only as a
+// Log row: a reader on the Graph tab never learnt that a bead update had
+// failed or that `o` could not open a browser, because the footer flash that
+// said so was cleared by the next key press. It is folded out of
+// [State.Notices], so it stays on screen for as long as it is the newest
+// thing the run has to say rather than for one key press.
+//
+// It is given at most a third of the footer, and [Model.footerNoticeCount]
+// is the form that fits when even that is too much. The text is already
+// sanitised and bounded by [State.appendNotice].
+func (m Model) footerNotice(w int) string {
+	text := m.noticeText()
+	if text == "" {
+		return ""
 	}
-	return clip(line, w)
+	// The message is what a third of the footer is spent on; the count of
+	// the ones behind it is short and is never the part that is cut.
+	line := footerTrunc("! "+text, max(w/3, 20))
+	if n := len(m.state.Notices); n > 1 {
+		line += fmt.Sprintf(" (+%d more)", n-1)
+	}
+	return m.styles.Warn.Render(line)
+}
+
+// footerNoticeCount is the notice in the only form a narrow terminal has
+// room for: how many there are, which is enough to send the reader to the
+// Log tab.
+func (m Model) footerNoticeCount() string {
+	n := len(m.state.Notices)
+	if n == 0 || m.noticeText() == "" {
+		return ""
+	}
+	return m.styles.Warn.Render(fmt.Sprintf("! %d %s", n, plural(n, "notice", "notices")))
+}
+
+// noticeText is what the newest notice says, or "" when the footer has no
+// notice to draw.
+func (m Model) noticeText() string {
+	n := len(m.state.Notices)
+	if n == 0 {
+		return ""
+	}
+	last := m.state.Notices[n-1]
+	text := last.Message
+	if text == "" {
+		text = last.Err
+	}
+	if text == "" {
+		text = string(last.Kind)
+	}
+	// The `o` key's failure is both a flash and a notice, and the flash is
+	// the same sentence: say it once, and let the notice take over when the
+	// next key press clears the flash.
+	if flash, _ := m.flashText(); flash == text {
+		return ""
+	}
+	return text
+}
+
+// footerTrunc clips a footer segment to w columns, marking a cut with an
+// ellipsis.
+func footerTrunc(s string, w int) string { return graphTrunc(s, w) }
+
+// plural picks the singular or the plural spelling for a count.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 // opened records the result of the PRs view's `o` key (P7-05): the footer
@@ -1369,4 +1648,112 @@ func beadList(ids []domain.BeadID) string {
 		parts[i] = string(id)
 	}
 	return strings.Join(parts, ",")
+}
+
+// --- P7-12: replaying a recorded run ------------------------------------
+
+// ReplayScript reads a recorded run log — the JSONL `sc run` writes to
+// `<state-dir>/runs/<run-id>/events.jsonl`, or anything else
+// [events.ReadAll] parses, `sc tui-demo --events` included — and returns it
+// as a script [PlayScript] can play. Every event but the first waits delay
+// before it is published; a negative delay means no pause at all, which is
+// what a test wants.
+//
+// A recording is the only stream that shows the TUI what a real run looks
+// like without one running: the scripted demo (P7-01) is written by hand and
+// drifts from what the orchestrator actually publishes.
+func ReplayScript(r io.Reader, delay time.Duration) ([]ScriptedEvent, error) {
+	evs, err := events.ReadAll(r)
+	if err != nil {
+		return nil, fmt.Errorf("tui: reading the recorded run: %w", err)
+	}
+	if len(evs) == 0 {
+		return nil, errors.New("tui: the recorded run has no events")
+	}
+	script := make([]ScriptedEvent, len(evs))
+	for i, ev := range evs {
+		script[i] = ScriptedEvent{Event: ev}
+		if i > 0 && delay > 0 {
+			script[i].Delay = delay
+		}
+	}
+	return script, nil
+}
+
+// ReplayFile is [ReplayScript] over a file.
+func ReplayFile(path string, delay time.Duration) ([]ScriptedEvent, error) {
+	f, err := os.Open(path) //nolint:gosec // the path is the user's own recording
+	if err != nil {
+		return nil, fmt.Errorf("tui: opening the recorded run: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	return ReplayScript(f, delay)
+}
+
+// ReplayEvents returns the events of a script, which is what a test folding
+// a recording into a [State] wants.
+func ReplayEvents(script []ScriptedEvent) []events.Event {
+	out := make([]events.Event, len(script))
+	for i, s := range script {
+		out[i] = s.Event
+	}
+	return out
+}
+
+// ReplayRun is the run a recording describes, taken from its first
+// [events.RunStarted] so the header is populated before the stream is
+// replayed. A recording that never says which run it is gets a run with the
+// id every event carries.
+func ReplayRun(script []ScriptedEvent) domain.Run {
+	var run domain.Run
+	for _, s := range script {
+		if started, ok := s.Event.(events.RunStarted); ok {
+			return started.Info
+		}
+		if run.ID == "" {
+			run.ID = s.Event.RunID()
+		}
+	}
+	return run
+}
+
+// Replay renders a recorded run in the TUI: it is [Demo] with the script
+// read from a file instead of written by hand. opts.Bus, opts.Run and
+// opts.Now are filled in from the recording — the clock follows the
+// recording's own timestamps, so an agent's elapsed time is measured in the
+// run's timeline rather than against today's wall clock — and everything
+// else in opts (output, input, colour, controls) is the caller's.
+func Replay(ctx context.Context, script []ScriptedEvent, opts Options) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	bus := events.NewBus()
+	defer bus.Close()
+	opts.Bus = bus
+	opts.Run = ReplayRun(script)
+	clock := newDemoClock(replayStart(script))
+	if opts.Now == nil {
+		opts.Now = clock.Now
+	}
+	// The program is subscribed before the script starts, or a recording
+	// replayed at full speed would be published into a bus nobody reads.
+	prog := NewProgram(ctx, opts)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = playScript(ctx, bus, script, clock.at)
+	}()
+
+	err := runProgram(ctx, prog)
+	cancel()
+	<-done
+	return err
+}
+
+// replayStart is when the recording begins.
+func replayStart(script []ScriptedEvent) time.Time {
+	if len(script) == 0 {
+		return time.Time{}
+	}
+	return script[0].Event.At()
 }

@@ -205,6 +205,38 @@ func TestCreate(t *testing.T) {
 	assert.Empty(t, testutil.MissingSamples(t, bd))
 }
 
+// TestCreateExternalRef covers P3-19: a review bead of an external pull
+// request (D-11) names the pull request with bd's own `--external-ref`
+// beside the sc_external_ref metadata, and bd echoes it back on the issue.
+// The sample is the real bd 1.2.2 answer (create-external-ref.json).
+func TestCreateExternalRef(t *testing.T) {
+	c, bd := clientFake(t, map[string]string{"create": "create-external-ref"})
+	is, err := c.Create(context.Background(), BeadInput{
+		Title: "Review PR #9: Add Median", Type: domain.BeadTypeTask, Priority: domain.PriorityDefault,
+		Description: "External pull request review",
+		ExternalRef: "gh-9",
+		Labels:      []string{"sc:run:r1", "sc:external-pr"},
+		Metadata:    map[string]any{MetaRun: "r1", MetaKind: "review", "sc_external_ref": "gh-9"},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "gh-9", is.ExternalRef, "bd echoes external_ref on the created issue")
+	ref, ok := is.Metadata.String("sc_external_ref")
+	assert.True(t, ok)
+	assert.Equal(t, "gh-9", ref, "the metadata sc already wrote is unchanged")
+
+	args := clientLastArgs(t, bd)
+	assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "create", "Review PR #9: Add Median", "-t", "task", "-p", "2",
+		"--description", "External pull request review", "--external-ref", "gh-9",
+		"-l", "sc:run:r1,sc:external-pr"}, args[:14])
+	assert.Equal(t, "--json", args[len(args)-1])
+
+	// No reference, no flag.
+	c2, bd2 := clientFake(t, nil)
+	_, err = c2.Create(context.Background(), BeadInput{Title: "X", Priority: domain.PriorityDefault})
+	require.NoError(t, err)
+	assert.NotContains(t, clientLastArgs(t, bd2), "--external-ref")
+}
+
 func TestCreateDefaultsAndValidation(t *testing.T) {
 	c, bd := clientFake(t, nil)
 	_, err := c.Create(context.Background(), BeadInput{Title: "  "})
@@ -432,11 +464,13 @@ func TestUpdateEveryFlag(t *testing.T) {
 	empty := ""
 	prio := domain.PriorityLowest
 	acc := "TestMax passes for negatives"
+	parent := domain.BeadID("fx-nvi")
 	_, err := c.Update(context.Background(), "fx-ctt", Patch{
 		Status:        domain.BeadStateOpen,
 		Assignee:      &empty,
 		Priority:      &prio,
 		Acceptance:    &acc,
+		Parent:        &parent,
 		Metadata:      map[string]any{"sc_pr_number": 7},
 		UnsetMetadata: []string{"sc_lease"},
 		RemoveLabels:  []string{"sc:role:engineer"},
@@ -444,14 +478,21 @@ func TestUpdateEveryFlag(t *testing.T) {
 	require.NoError(t, err)
 	args := clientLastArgs(t, bd)
 	assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "update", "fx-ctt", "-s", "open", "--assignee", "", "-p", "4",
-		"--acceptance", acc, "--metadata"}, args[:13])
-	assert.True(t, strings.HasPrefix(args[13], "@"))
-	assert.Equal(t, []string{"--unset-metadata", "sc_lease", "--remove-label", "sc:role:engineer", "--json"}, args[14:])
+		"--acceptance", acc, "--parent", "fx-nvi", "--metadata"}, args[:15])
+	assert.True(t, strings.HasPrefix(args[15], "@"))
+	assert.Equal(t, []string{"--unset-metadata", "sc_lease", "--remove-label", "sc:role:engineer", "--json"}, args[16:])
+
+	// A pointer to the empty string is how bd 1.2.2 spells "no parent".
+	orphan := domain.BeadID("")
+	_, err = c.Update(context.Background(), "fx-ctt", Patch{Parent: &orphan})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "update", "fx-ctt", "--parent", "", "--json"}, clientLastArgs(t, bd))
 
 	_, err = c.Update(context.Background(), "fx-ctt", Patch{})
 	assert.ErrorIs(t, err, ErrInvalid)
 	assert.True(t, Patch{}.IsEmpty())
 	assert.False(t, Patch{AddLabels: []string{"x"}}.IsEmpty())
+	assert.False(t, Patch{Parent: &orphan}.IsEmpty(), "reparenting is a change")
 }
 
 func TestUpdateReleaseAndAcceptance(t *testing.T) {

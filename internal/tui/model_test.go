@@ -1,9 +1,14 @@
 package tui_test
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -603,4 +608,247 @@ func TestModelHelpOverlayShowsTheActiveViewsKeys(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- P7-13, P7-19, P7-21: what the footer is for ------------------------
+
+// tuiFooterOf returns the footer line of a frame, without escapes.
+func tuiFooterOf(m tui.Model) string {
+	lines := strings.Split(gfPlain(m.View()), "\n")
+	return strings.TrimRight(lines[len(lines)-1], " ")
+}
+
+// TestModelFooterNamesTheActiveViewsKeys pins P7-13. Each view carries its
+// own KeyMap, and until now the footer showed only the global bindings: `o`
+// (open the pull request), `enter` (the bead detail) and the transcript keys
+// were on the `?` overlay and nowhere else, so nothing on screen said they
+// existed. The footer now ends with the active view's own ShortHelp, at 80
+// columns as well as at 120 — which is what the composed goldens pin.
+func TestModelFooterNamesTheActiveViewsKeys(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		tab  tui.Tab
+		key  string
+		want string
+	}{
+		{tui.TabGraph, "1", "bead detail"},
+		{tui.TabAgents, "2", "transcript"},
+		{tui.TabFeedback, "3", "details"},
+		{tui.TabPRs, "4", "open PR"},
+	} {
+		t.Run(tc.tab.String(), func(t *testing.T) {
+			t.Parallel()
+			for _, w := range []int{80, 120, 200} {
+				m := tuiUpdate(tuiFeed(tuiResize(tuiNewModel(t, nil), w, 24)), tuiKey(tc.key))
+				require.Equal(t, tc.tab, m.Tab())
+				require.Containsf(t, tuiFooterOf(m), tc.want,
+					"the %d-column footer does not name the %s view's own keys", w, tc.tab)
+				require.Contains(t, tuiFooterOf(m), "? help", "the help key is the one binding that never goes")
+			}
+		})
+	}
+
+	// The log view is drawn by the model itself and adds no keys, so its
+	// footer keeps the global map alone.
+	m := tuiUpdate(tuiFeed(tuiResize(tuiNewModel(t, nil), 80, 24)), tuiKey("5"))
+	require.Equal(t, tui.TabLog, m.Tab())
+	require.Contains(t, tuiFooterOf(m), "next view")
+}
+
+// TestModelFooterShowsTheRunsNewestNotice pins P7-19: a warning published
+// while the Graph tab is up is visible without switching to the Log tab, and
+// stays visible — the flash that used to carry such news was cleared by the
+// next key press.
+func TestModelFooterShowsTheRunsNewestNotice(t *testing.T) {
+	t.Parallel()
+
+	m := tuiResize(tuiNewModel(t, nil), 100, 24)
+	require.Equal(t, tui.TabGraph, m.Tab())
+	require.NotContains(t, tuiFooterOf(m), "!")
+
+	m = tuiUpdate(m, tui.EventMsg{Event: events.Warning{
+		Meta: events.NewMeta(tui.DemoRunID), Source: "beads", Message: "bd update refused the round",
+	}})
+	require.Contains(t, tuiFooterOf(m), "! bd update refused the round")
+
+	// It outlives a key press, unlike a flash.
+	m = tuiUpdate(m, tuiKey("j"))
+	require.Contains(t, tuiFooterOf(m), "! bd update refused the round")
+
+	// A second notice replaces it and says how many are behind it.
+	m = tuiUpdate(m, tui.EventMsg{Event: events.Error{
+		Meta: events.NewMeta(tui.DemoRunID), Source: "supervisor", Message: "the engineer timed out",
+	}})
+	footer := tuiFooterOf(m)
+	require.Contains(t, footer, "! the engineer timed out")
+	require.Contains(t, footer, "(+1 more)")
+
+	// On a terminal with no room for the sentence, the count still says
+	// there is something to read on the Log tab.
+	narrow := tuiFooterOf(tuiResize(m, 64, 24))
+	require.Contains(t, narrow, "! 2 notices")
+	require.NotContains(t, narrow, "the engineer timed out")
+}
+
+// TestModelFooterGivesTheFlashItsRoom pins P7-21. The short keymap is 76
+// columns, so an 80-column footer used to clip a control's answer after a
+// character or two: the reader saw "m" where the run had said "run paused".
+// The flash is composed first now and the keymap takes what is left.
+func TestModelFooterGivesTheFlashItsRoom(t *testing.T) {
+	t.Parallel()
+
+	c := &cwController{}
+	for _, w := range []int{80, 120} {
+		m := gfSend(gfFeed(tui.New(t.Context(), tui.Options{
+			Run: tui.DemoRun(gfDemo), NoColor: true, Theme: tui.ThemeFor(tui.ProfileNoColor),
+			NoAnim: true, Now: gfClock, Controller: c,
+		}), cwLiveEvents()), tea.WindowSizeMsg{Width: w, Height: 24})
+
+		paused := cwPress(t, m, "p")
+		require.Containsf(t, tuiFooterOf(paused), "run paused",
+			"the %d-column footer clipped the control's answer", w)
+
+		safety := cwPress(t, m, "S", "y")
+		require.Containsf(t, tuiFooterOf(safety), "safety on for future deliveries",
+			"the %d-column footer clipped the control's answer", w)
+		require.LessOrEqual(t, lipgloss.Width(tuiFooterOf(safety)), w)
+	}
+
+	// The longest answer of all — the re-fire refusal — is 90 columns and
+	// cannot be read in full at 80 however the line is arranged. It takes
+	// the whole footer there and is clipped from the right, so the reader
+	// still gets the start of the sentence rather than none of it.
+	m := gfSend(gfFeed(tui.New(t.Context(), tui.Options{
+		Run: tui.DemoRun(gfDemo), NoColor: true, Theme: tui.ThemeFor(tui.ProfileNoColor),
+		NoAnim: true, Now: gfClock, Controller: c,
+	}), cwLiveEvents()), tea.WindowSizeMsg{Width: 80, Height: 24})
+	refused := tuiFooterOf(cwPress(t, m, "g", "r"))
+	require.Regexp(t, `^demo-\d is \S+ — only a failed, needs_human`, refused)
+	require.NotContains(t, refused, "? help", "the refusal takes the whole line")
+	require.LessOrEqual(t, lipgloss.Width(refused), 80)
+}
+
+// tuiFooterGolden is the 80-column frame P7-21 asks for: a control's answer
+// read in full on the terminal size every other composed frame is pinned at.
+// It is registered in golden_test.go's gfViewGoldens like every other
+// per-view golden.
+const tuiFooterGolden = "footer-control-80"
+
+// TestModelFooterControlGoldenFrame pins that frame.
+func TestModelFooterControlGoldenFrame(t *testing.T) {
+	t.Parallel()
+
+	build := func() tui.Model {
+		m := gfSend(gfFeed(tui.New(t.Context(), tui.Options{
+			Run: tui.DemoRun(gfDemo), NoColor: true, Theme: tui.ThemeFor(tui.ProfileNoColor),
+			NoAnim: true, Now: gfClock, Controller: &cwController{},
+		}), cwLiveEvents()), tea.WindowSizeMsg{Width: gfWidth, Height: gfHeight})
+		return cwPress(t, m, "S", "y")
+	}
+	frame := build().View()
+	gfRequireGeometry(t, frame, gfWidth, gfHeight)
+	require.Contains(t, gfPlain(frame), "safety on for future deliveries")
+	require.Equal(t, frame, build().View(), "the frame is not reproducible")
+	gfCompare(t, filepath.Join(gfGoldenDir, tuiFooterGolden+".golden"), frame)
+}
+
+// --- P7-12: replaying a recorded run ------------------------------------
+
+// TestReplayDrivesAFrameFromARecordedRun pins P7-12: a run log written by
+// `sc run` (or by `sc tui-demo --events`) is read back into the same frames
+// the scripted demo draws, so the goldens and P6-08 can be driven from what
+// the orchestrator really published rather than only from a hand-written
+// script.
+func TestReplayDrivesAFrameFromARecordedRun(t *testing.T) {
+	t.Parallel()
+
+	// The recording: the demo run written out as JSONL, exactly as
+	// `sc tui-demo --events` and the run log write it.
+	var buf strings.Builder
+	w := events.NewJSONLWriter(&buf)
+	for _, ev := range tui.DemoEvents(gfDemo) {
+		require.NoError(t, w.Write(ev))
+	}
+	require.NoError(t, w.Err())
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(buf.String()), 0o600))
+
+	script, err := tui.ReplayFile(path, -1)
+	require.NoError(t, err)
+	require.Len(t, script, len(tui.DemoEvents(gfDemo)))
+	for i, s := range script {
+		require.Zerof(t, s.Delay, "event %d of an unpaced replay waits", i)
+	}
+
+	// The run the header is drawn from comes out of the recording itself.
+	run := tui.ReplayRun(script)
+	require.Equal(t, tui.DemoRun(gfDemo).ID, run.ID)
+	require.Equal(t, tui.DemoRun(gfDemo).Config.Ammo, run.Config.Ammo)
+
+	// And the frame is the frame the same events drew when the script was
+	// played from memory: the graph golden of P7-09.
+	m := gfFeed(gfSend(tui.New(t.Context(), tui.Options{
+		Run: run, NoColor: true, Theme: tui.ThemeFor(tui.ProfileNoColor), NoAnim: true, Now: gfClock,
+	}), tea.WindowSizeMsg{Width: gfWidth, Height: gfHeight}), tui.ReplayEvents(script))
+	require.Equal(t, gfLoad(t, "graph"), m.View(),
+		"the recorded run does not draw the frame the scripted one does")
+
+	// Pacing is honoured, and every event but the first waits for it.
+	paced, err := tui.ReplayFile(path, 5*time.Millisecond)
+	require.NoError(t, err)
+	require.Zero(t, paced[0].Delay)
+	require.Equal(t, 5*time.Millisecond, paced[1].Delay)
+}
+
+// TestReplayRejectsWhatItCannotRead covers the two ways a recording is not
+// a recording, both of which `sc tui-demo --replay` reports before it claims
+// the terminal.
+func TestReplayRejectsWhatItCannotRead(t *testing.T) {
+	t.Parallel()
+
+	_, err := tui.ReplayFile(filepath.Join(t.TempDir(), "missing.jsonl"), 0)
+	require.ErrorContains(t, err, "opening the recorded run")
+
+	_, err = tui.ReplayScript(strings.NewReader(""), 0)
+	require.ErrorContains(t, err, "no events")
+
+	_, err = tui.ReplayScript(strings.NewReader("{not json\n"), 0)
+	require.ErrorContains(t, err, "reading the recorded run")
+}
+
+// TestReplayRendersARecordedRunInTheProgram drives the real Bubble Tea
+// program over a recording, which is what `sc tui-demo --replay` does: the
+// frames the user sees come out of the file, and `q` leaves.
+func TestReplayRendersARecordedRunInTheProgram(t *testing.T) {
+	t.Parallel()
+
+	var buf strings.Builder
+	w := events.NewJSONLWriter(&buf)
+	for _, ev := range tui.DemoEvents(gfDemo) {
+		require.NoError(t, w.Write(ev))
+	}
+	require.NoError(t, w.Err())
+	path := filepath.Join(t.TempDir(), "events.jsonl")
+	require.NoError(t, os.WriteFile(path, []byte(buf.String()), 0o600))
+	script, err := tui.ReplayFile(path, -1)
+	require.NoError(t, err)
+
+	var out tuiSyncBuffer
+	in, inWriter := io.Pipe()
+	t.Cleanup(func() { _ = inWriter.Close() })
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- tui.Replay(ctx, script, tui.Options{
+			NoColor: true, Theme: tui.ThemeFor(tui.ProfileNoColor), NoAnim: true,
+			Input: in, Output: &out,
+		})
+	}()
+
+	require.Eventually(t, func() bool {
+		return strings.Contains(gfPlain(out.String()), string(tui.DemoRunID))
+	}, 10*time.Second, 10*time.Millisecond, "the program never drew the recorded run:\n%s", out.String())
+	cancel()
+	require.NoError(t, <-done)
 }

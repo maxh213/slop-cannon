@@ -10,6 +10,11 @@ override the config files for this run only; everything else comes from the
 effective configuration (sc config show). --resume continues the most
 recent run recorded for the repository instead of starting a new one.
 
+The TUI holds the finished run on screen until you press q, so the last
+graph is there to read; --headless ends when the run does, and a reader
+that closes early (sc run --headless | head) stops the run rather than
+killing it. sc stop ends a run from another terminal.
+
 This is the same as the bare form "sc PATH [flags]".
 
 Usage:
@@ -24,6 +29,7 @@ Examples:
 Flags:
       --ammo N           override ammo for this run (N agents at once, minimum 3)
       --cartridge NAME   fire cartridge NAME instead of the active one
+      --dry-run          print the run this repository, config and flags add up to, without firing anything
       --force            start even though another run holds this repository's lock (only when you know it is gone)
       --headless         no TUI: render events as log lines (for CI and scripts)
   -h, --help             help for run

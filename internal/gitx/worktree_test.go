@@ -15,6 +15,14 @@ import (
 	"slop-cannon/internal/testutil"
 )
 
+// requireDeleteBranch deletes the bead's branch and fails the test when
+// git refuses.
+func requireDeleteBranch(t *testing.T, m *Manager, bead domain.Bead, msgAndArgs ...any) {
+	t.Helper()
+	_, err := m.DeleteBranch(context.Background(), bead)
+	require.NoError(t, err, msgAndArgs...)
+}
+
 // wtBead is the bead most worktree tests create a worktree for.
 var wtBead = domain.Bead{ID: "fx-a0u", Title: "Fix the mean() bug!"}
 
@@ -315,11 +323,11 @@ func TestManager_Remove(t *testing.T) {
 		require.NoError(t, err)
 		assert.True(t, ok, "the branch may still be under review or awaiting merge")
 
-		require.NoError(t, f.m.DeleteBranch(ctx, wtBead))
+		requireDeleteBranch(t, f.m, wtBead)
 		ok, err = f.repo.BranchExists(ctx, wt.Branch)
 		require.NoError(t, err)
 		assert.False(t, ok)
-		require.NoError(t, f.m.DeleteBranch(ctx, wtBead), "deleting an absent branch is not an error")
+		requireDeleteBranch(t, f.m, wtBead, "deleting an absent branch is not an error")
 	})
 
 	t.Run("refuses a dirty worktree unless forced", func(t *testing.T) {
@@ -346,7 +354,7 @@ func TestManager_Remove(t *testing.T) {
 		f := wtSetup(t, nil)
 		_, err := f.m.Create(ctx, wtBead)
 		require.NoError(t, err)
-		err = f.m.DeleteBranch(ctx, wtBead)
+		_, err = f.m.DeleteBranch(ctx, wtBead)
 		var ge *GitError
 		require.ErrorAs(t, err, &ge)
 	})

@@ -96,7 +96,8 @@ func TestBuildGraphPlanMatchesCapturedPlan(t *testing.T) {
 		assert.JSONEq(t, planSampleJSON(t, "graph-plan-existing"), string(data))
 		require.Len(t, g.Nodes, 6)
 		for _, n := range g.Nodes {
-			assert.Empty(t, n.ParentKey)
+			assert.Empty(t, n.ParentKey, "%s has no epic node to point at", n.Key)
+			assert.Equal(t, domain.BeadID("px-26w"), n.ParentID, "%s joins the existing epic in the plan itself (P3-18)", n.Key)
 			assert.NotEqual(t, domain.BeadTypeEpic, n.Type)
 		}
 		assert.Len(t, g.Edges, plan.DependencyCount())
@@ -250,12 +251,16 @@ func TestApplyPlanExistingEpic(t *testing.T) {
 	assert.Equal(t, domain.BeadID("px-26w"), res.Epic)
 	assert.Equal(t, domain.BeadID("px-we1"), res.IDs["a"])
 	assert.Len(t, res.Beads, 6)
-	assert.Equal(t, 0, res.DryRun.ParentDeps)
+	assert.Equal(t, len(planDiamond().Beads), res.DryRun.ParentDeps, "every work bead carries parent_id in the plan (P3-18)")
 
 	calls := bd.ArgLists(t)
-	require.Len(t, calls, 9, "show epic, dry run, real run, six finishing updates")
+	require.Len(t, calls, 9, "show epic, dry run, real run, six acceptance updates")
 	assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "show", "px-26w", "--json", "--include-comments"}, calls[0])
-	assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "update", "px-we1", "--acceptance", "acceptance a", "--parent", "px-26w", "--json"}, calls[3], "beads join the existing epic through --parent")
+	assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "update", "px-we1", "--acceptance", "acceptance a", "--json"}, calls[3],
+		"the epic is joined in the create, so the finishing update only writes acceptance criteria (P3-18)")
+	for _, call := range calls {
+		assert.NotContains(t, call, "--parent", "no bead is reparented after the fact")
+	}
 }
 
 func TestApplyPlanRejectsBadEpic(t *testing.T) {

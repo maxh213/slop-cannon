@@ -118,7 +118,7 @@ func (c *Contract) Validate(raw json.RawMessage) error {
 		if !errors.As(err, &ve) {
 			return &ParseError{Reason: ReasonSchema, Contract: c.name, Detail: err.Error(), Cause: err}
 		}
-		problems := leafProblems(ve, nil)
+		problems := leafProblems(ve)
 		return &ParseError{
 			Reason:   ReasonSchema,
 			Contract: c.name,
@@ -131,19 +131,39 @@ func (c *Contract) Validate(raw json.RawMessage) error {
 }
 
 // leafProblems flattens the validation tree into one line per leaf cause,
-// in document order, deduplicated.
-func leafProblems(ve *jsonschema.ValidationError, out []string) []string {
+// deduplicated and sorted.
+//
+// The order is deliberately not the validator's own (P2-12): jsonschema v6
+// walks the schema's keyword maps, so two violations in one document come
+// back in either order from run to run, and every golden, log diff or
+// retry prompt built from Problems would be flaky. Sorting once here is
+// the only place that has to know, and the lines start with the JSON
+// pointer ("at '/a': …"), so lexical order is document order for anything
+// nested under the same parent.
+func leafProblems(ve *jsonschema.ValidationError) []string {
+	out := appendLeaves(ve, nil)
+	sort.Strings(out)
+	return dedupeSorted(out)
+}
+
+// appendLeaves collects the message of every leaf of the validation tree.
+func appendLeaves(ve *jsonschema.ValidationError, out []string) []string {
 	if len(ve.Causes) == 0 {
-		line := ve.Error()
-		for _, x := range out {
-			if x == line {
-				return out
-			}
-		}
-		return append(out, line)
+		return append(out, ve.Error())
 	}
 	for _, cause := range ve.Causes {
-		out = leafProblems(cause, out)
+		out = appendLeaves(cause, out)
+	}
+	return out
+}
+
+// dedupeSorted drops adjacent duplicates from a sorted slice, in place.
+func dedupeSorted(in []string) []string {
+	out := in[:0]
+	for i, s := range in {
+		if i == 0 || s != in[i-1] {
+			out = append(out, s)
+		}
 	}
 	return out
 }

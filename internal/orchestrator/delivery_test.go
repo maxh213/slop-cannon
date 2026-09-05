@@ -1688,7 +1688,7 @@ func TestConflictChangeRatioIgnoresUpstreamDrift(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, ok := conflictChangeRatio(before, c.after)
+			got, ok := gitx.ChangeSetRatio(before, c.after)
 			if ok != c.ok {
 				t.Fatalf("ok = %v, want %v", ok, c.ok)
 			}
@@ -1713,7 +1713,7 @@ func TestConflictChangeRatioIgnoresUpstreamDrift(t *testing.T) {
 		{"a truncated previous diff", truncated, before},
 		{"no diff at all", nil, before},
 	} {
-		if _, ok := conflictChangeRatio(c.previous, c.current); ok {
+		if _, ok := gitx.ChangeSetRatio(c.previous, c.current); ok {
 			t.Errorf("%s: ok = true, want the tip-to-tip fallback", c.name)
 		}
 	}
@@ -1822,7 +1822,7 @@ func TestDelivererResolvesARealRebaseConflict(t *testing.T) {
 		if !tips.Exceeds(gitx.DefaultReReviewThreshold) {
 			t.Fatalf("tip-to-tip ratio = %+v, want it above the threshold: the point of this case is that it misjudges", tips)
 		}
-		sets, ok := conflictChangeRatio(p.Diff, current)
+		sets, ok := gitx.ChangeSetRatio(p.Diff, current)
 		if !ok {
 			t.Fatal("the change sets could not be compared")
 		}

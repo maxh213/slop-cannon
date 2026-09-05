@@ -12,6 +12,11 @@
       "detail": "1.2.2 (build dev, /fake/bin/bd)"
     },
     {
+      "name": "dolt",
+      "status": "pass",
+      "detail": "embedded: bd runs Dolt in-process, so the standalone dolt CLI is not needed"
+    },
+    {
       "name": "beads",
       "status": "pass",
       "detail": "embedded database answered bd ping in 11 ms"
@@ -42,7 +47,7 @@
       "detail": "/repo/.beads present"
     }
   ],
-  "passed": 8,
+  "passed": 9,
   "warnings": 0,
   "failed": 0,
   "ok": true

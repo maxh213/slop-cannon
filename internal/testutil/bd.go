@@ -140,6 +140,83 @@ func StageBDSamples(t testing.TB, overrides map[string]string) string {
 	return dir
 }
 
+// BDVerifyVersion is the bd version a stand-in reports by default. It is
+// the version the samples in testdata/bd were captured from, and it is at
+// or above beads.MinVersion, so a run accepts it.
+const BDVerifyVersion = "1.2.2"
+
+// BDVerifyPrologue returns the shell fragment a stand-in `bd` must run
+// before its own dispatch if `sc` is to drive it end to end (P8-27, D-21).
+//
+// Replacing bd with a stand-in is not just a matter of answering the
+// commands a run makes. Before every agent, the orchestrator writes the
+// read-only bd shim into the agent's PATH and runs beads.Shim.Verify over
+// it, and that self-check reaches past the shim to the binary underneath.
+// Exactly two things are demanded of that binary, and neither of them is
+// ever asked for by the run itself, so a stand-in that answers every
+// command the run makes still fails at the first agent:
+//
+//   - `bd version --json` must print an envelope with a non-empty
+//     "version" — the check refuses to install a shim over something it
+//     cannot identify;
+//   - `bd --readonly update <id> -s open`, run directly (the shim refuses
+//     that write before bd would see it), must fail with bd's own
+//     read-only refusal — D-21's second line of defence, proven rather
+//     than assumed.
+//
+// The fragment below answers both, plus `bd ping --json` for D-13's health
+// check, and refuses every write while --readonly is in force with bd's
+// own wording (beads.ReadOnlyMessage). Put it at the top of the script:
+//
+//	testutil.FakeBin(t, "bd", testutil.BDVerifyPrologue("")+myDispatch)
+//
+// version is what `bd version` reports; empty means [BDVerifyVersion]. The
+// original arguments are left untouched, so whatever follows still sees
+// the whole command line.
+//
+// The one seam that is *not* here is skipping the check altogether:
+// beads.ShimOptions.SkipVerify does that, and internal/cli keeps it in an
+// unexported variable (runShimOptions) so nothing outside the command
+// layer's own tests can turn the read-only guard's self-check off.
+func BDVerifyPrologue(version string) string {
+	if version == "" {
+		version = BDVerifyVersion
+	}
+	var b strings.Builder
+	b.WriteString("_sc_ro=0\n_sc_cmd=''\n_sc_skip=0\n")
+	b.WriteString("for _sc_a in \"$@\"; do\n")
+	b.WriteString("  if [ \"$_sc_skip\" = 1 ]; then _sc_skip=0; continue; fi\n")
+	b.WriteString("  case \"$_sc_a\" in\n")
+	b.WriteString("    --readonly) _sc_ro=1 ;;\n")
+	b.WriteString("    " + shellCasePattern(bdValueFlags) + ") _sc_skip=1 ;;\n")
+	b.WriteString("    -*) ;;\n")
+	b.WriteString("    *) if [ -z \"$_sc_cmd\" ]; then _sc_cmd=$_sc_a; fi ;;\n")
+	b.WriteString("  esac\n")
+	b.WriteString("done\n")
+	b.WriteString("case \"$_sc_cmd\" in\n")
+	b.WriteString("version) echo " + shellQuote(`{"schema_version":1,"data":{"version":"`+version+`"}}`) + "; exit 0 ;;\n")
+	b.WriteString("ping) echo " + shellQuote(`{"schema_version":1,"data":{"status":"ok","total_ms":1}}`) + "; exit 0 ;;\n")
+	b.WriteString("esac\n")
+	b.WriteString("if [ \"$_sc_ro\" = 1 ]; then\n")
+	b.WriteString("  case \"$_sc_cmd\" in\n")
+	b.WriteString("  " + strings.Join(bdReadOnlyCommands, "|") + ") ;;\n")
+	b.WriteString("  *)\n")
+	b.WriteString("    echo \"Error: operation '$_sc_cmd' is not allowed in read-only mode\" >&2\n")
+	b.WriteString("    exit 1 ;;\n")
+	b.WriteString("  esac\n")
+	b.WriteString("fi\n")
+	return b.String()
+}
+
+// bdReadOnlyCommands are the bd commands a stand-in still answers while
+// --readonly is in force: the reads an agent is allowed to make (D-21).
+// Everything else is refused, which is what beads.Shim.Verify checks the
+// binary under the shim does for itself.
+var bdReadOnlyCommands = []string{
+	"ready", "show", "list", "blocked", "comments", "dep", "deps",
+	"gate", "stats", "statuses", "config", "ping", "version",
+}
+
 // FakeBD installs a "bd" shim (see FakeBin) that replays captured output
 // from samplesDir instead of running beads. For each call it derives a key
 // with BDKey and looks for, in order, "<key>.<n>" (n = the 1-based count of

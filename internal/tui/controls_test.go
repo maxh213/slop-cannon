@@ -697,7 +697,7 @@ func TestControlRequestFlashesReadWell(t *testing.T) {
 func TestControlActionVocabulary(t *testing.T) {
 	t.Parallel()
 
-	require.Len(t, ControlActions(), 7)
+	require.Len(t, ControlActions(), 8)
 	confirmed := 0
 	for _, a := range ControlActions() {
 		require.True(t, a.Valid(), "%s must be valid", a)

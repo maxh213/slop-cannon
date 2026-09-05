@@ -22,7 +22,7 @@ frame 000  active 1  queued 0  recoil 2  flash 0
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 
 frame 003  active 1  queued 0  recoil 1  flash -1
 ▄█▓▶   run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
@@ -48,7 +48,7 @@ frame 003  active 1  queued 0  recoil 1  flash -1
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 
 frame 006  active 1  queued 0  recoil 0  flash -1
 ▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
@@ -74,7 +74,7 @@ frame 006  active 1  queued 0  recoil 0  flash -1
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 
 frame 009  active 1  queued 0  recoil 0  flash -1
 ▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
@@ -100,7 +100,7 @@ frame 009  active 1  queued 0  recoil 0  flash -1
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 
 frame 012  active 1  queued 0  recoil 0  flash -1
 ▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
@@ -126,7 +126,7 @@ frame 012  active 1  queued 0  recoil 0  flash -1
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 
 frame 015  active 1  queued 0  recoil 0  flash -1
 ▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
@@ -152,7 +152,7 @@ frame 015  active 1  queued 0  recoil 0  flash -1
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 
 frame 018  active 1  queued 0  recoil 0  flash -1
 ▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
@@ -178,7 +178,7 @@ frame 018  active 1  queued 0  recoil 0  flash -1
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 
 frame 021  active 1  queued 0  recoil 0  flash -1
 ▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
@@ -204,7 +204,7 @@ frame 021  active 1  queued 0  recoil 0  flash -1
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 
 frame 024  active 1  queued 0  recoil 0  flash -1
 ▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
@@ -230,7 +230,7 @@ frame 024  active 1  queued 0  recoil 0  flash -1
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 
 frame 027  active 1  queued 0  recoil 0  flash -1
 ▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
@@ -256,5 +256,5 @@ frame 027  active 1  queued 0  recoil 0  flash -1
 
 
 
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail • ←/h prev level • →/l next level
 

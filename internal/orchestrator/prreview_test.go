@@ -934,7 +934,12 @@ func TestPRReviewRunStopsOnAGitHubProblemAndOtherwiseKeepsPolling(t *testing.T) 
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
 		go func() { done <- rig.review.Run(ctx) }()
-		deadline := time.After(2 * time.Second)
+		// A bare two-second deadline here is a claim about how fast the
+		// machine is, and on a loaded one it expires before the loop has
+		// been scheduled twice (P9-27). The wait is still on the
+		// condition; only how long it is willing to wait scales with the
+		// timeout the binary was given.
+		deadline := time.After(testutil.Patience(2 * time.Second))
 		for rig.watcher.count() < 2 {
 			select {
 			case <-deadline:
@@ -1606,4 +1611,131 @@ func TestReviewedPullRequestsAreNotCountedAsOpened(t *testing.T) {
 	if s.Merges != 0 {
 		t.Errorf("summary.Merges = %d, want 0", s.Merges)
 	}
+}
+
+// prvForeignRun is the run that raised the review bead in the P8-36 test —
+// an earlier run of the cannon, long since finished.
+const prvForeignRun domain.RunID = "20260903-070000-old0"
+
+// prvForeignIssue is prvIssue with an earlier run's label on it, which is
+// exactly what the watcher's unscoped dedupe listing returns for a review
+// bead a previous run raised (gitx.ListFilter{All: true}).
+func prvForeignIssue(pr gitx.PullRequest, status domain.BeadState) beads.Issue {
+	is := prvIssue(pr, status)
+	is.Labels = append(append([]string(nil), is.Labels...), beads.RunLabel(prvForeignRun))
+	return is
+}
+
+// TestPRReviewSettlesAnEarlierRunsReviewBeadOnlyOnceItsPullRequestHasGone
+// pins P8-36's decision.
+//
+// The decision: **a run adopts and settles another run's external review
+// bead exactly as it does its own**, under the same StaleReviewPolicy, and
+// the reason it records says the bead was raised by an earlier run
+// (gitx.StaleReview.ForeignRun). It is never settled while its pull
+// request is still open and external — such a bead is adopted and reviewed
+// instead — so one pull request keeps one review bead for its whole
+// lifetime, across as many runs as it takes.
+//
+// Why that way round rather than "leave another run's bead alone": the
+// watcher's dedupe listing is deliberately unscoped
+// (gitx.ListFilter{All: true, Labels: {sc:external-pr}}) so a pull request
+// never collects a second review bead. Refusing to settle a foreign bead
+// without also scoping that listing would strand it open for ever the
+// moment its run is gone — nothing else in the product settles a review
+// bead — and its pull request could never get a fresh one, because the
+// dedupe would keep matching the stale one. Scoping the listing instead
+// would trade that for a review bead per run per pull request, which is
+// the duplication the unscoped listing exists to prevent. A user who wants
+// the other behaviour has StaleReviewIgnore, which is asserted below.
+func TestPRReviewSettlesAnEarlierRunsReviewBeadOnlyOnceItsPullRequestHasGone(t *testing.T) {
+	t.Parallel()
+	pr := prvPR()
+
+	// An earlier run's review bead, matched to a pull request that is
+	// still open: the watcher reports it as Existing, never as New.
+	open := &gitx.PollResult{
+		External: []gitx.PullRequest{pr},
+		Existing: []gitx.ReviewBead{{Issue: prvForeignIssue(pr, domain.BeadStateOpen), PR: pr}},
+	}
+	stale := func() *gitx.PollResult {
+		return &gitx.PollResult{Stale: []gitx.StaleReview{{
+			Issue: prvForeignIssue(pr, domain.BeadStateOpen), Reason: gitx.StaleClosed, ForeignRun: true,
+		}}}
+	}
+
+	t.Run("it is adopted and reviewed while its pull request is open", func(t *testing.T) {
+		t.Parallel()
+		rig := prvNew(t, []*gitx.PollResult{open, open}, nil)
+		ctx := context.Background()
+		for range 2 {
+			if err := rig.review.Sync(ctx); err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+		}
+		if ds := prvDemands(t, rig.review); len(ds) != len(domain.Lenses()) {
+			t.Fatalf("Demands = %d, want one per lens: another run's bead is still reviewed", len(ds))
+		}
+		if reason, closed := rig.store.closeReason("sc-ext7"); closed {
+			t.Errorf("an earlier run's review bead was settled while its pull request is open: %q", reason)
+		}
+		if st := rig.review.Stats(); st.Stale != 0 || st.Tracked != 1 {
+			t.Errorf("Stats = %+v, want it tracked and not stale", st)
+		}
+	})
+
+	t.Run("it is settled like the run's own once the pull request has gone", func(t *testing.T) {
+		t.Parallel()
+		rig := prvNew(t, []*gitx.PollResult{open, stale()}, nil)
+		ctx := context.Background()
+		for range 2 {
+			if err := rig.review.Sync(ctx); err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+		}
+		reason, closed := rig.store.closeReason("sc-ext7")
+		if !closed {
+			t.Fatal("an earlier run's review bead was left open, so nothing would ever settle it")
+		}
+		if !strings.Contains(reason, "no longer open on GitHub") {
+			t.Errorf("close reason = %q, want the watcher's own reason", reason)
+		}
+		if !strings.Contains(reason, "raised by an earlier run") {
+			t.Errorf("close reason = %q, want it to say whose bead it was", reason)
+		}
+		if ds := prvDemands(t, rig.review); len(ds) != 0 {
+			t.Errorf("Demands after the settle = %+v, want none", ds)
+		}
+		if len(rig.poster.reviews()) != 0 {
+			t.Error("a review was posted on a pull request that is no longer open")
+		}
+	})
+
+	t.Run("StaleReviewIgnore is how a user keeps out of another run's way", func(t *testing.T) {
+		t.Parallel()
+		rig := prvNew(t, []*gitx.PollResult{open, stale()}, func(o *PRReviewOptions) {
+			o.Stale = StaleReviewIgnore
+		})
+		ctx := context.Background()
+		for range 2 {
+			if err := rig.review.Sync(ctx); err != nil {
+				t.Fatalf("Sync: %v", err)
+			}
+		}
+		if reason, closed := rig.store.closeReason("sc-ext7"); closed {
+			t.Errorf("StaleReviewIgnore closed an earlier run's review bead: %q", reason)
+		}
+		if len(rig.parker.calls()) != 0 {
+			t.Error("StaleReviewIgnore parked an earlier run's review bead")
+		}
+		var said bool
+		for _, w := range prvOfKind[events.Warning](rig.sink) {
+			if w.Source == SourcePRReview && strings.Contains(w.Message, "leaving its review bead where it is") {
+				said = true
+			}
+		}
+		if !said {
+			t.Error("the run log never said the bead was left alone")
+		}
+	})
 }

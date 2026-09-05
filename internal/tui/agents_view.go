@@ -651,9 +651,9 @@ const (
 // still be turning (the transcript pane draws the card of whichever agent
 // is selected, ended ones included).
 func (v AgentsModel) cardRight(a AgentView) string {
-	spin := " "
+	spin := PadGlyph(" ")
 	if a.Live() {
-		spin = v.styles.Spinner.Render(agentsSpinner[v.frame])
+		spin = v.styles.Spinner.Render(PadGlyph(agentsSpinner[v.frame]))
 	}
 	return v.styles.Value.Render(v.elapsed(a)) + " " + spin
 }
@@ -810,21 +810,29 @@ func agentsGlyph(a AgentView) string {
 	case domain.AgentStateFinished, domain.AgentStateFailed, domain.AgentStateKilled:
 		return AgentStateGlyph(a.State)
 	}
-	if g := RoleGlyph(a.Role); g != UnknownGlyph {
+	if g := RoleGlyph(a.Role); g != PadGlyph(UnknownGlyph) {
 		return g
 	}
-	return "•"
+	// The neutral dot shares the column with the theme's glyphs, so it is
+	// padded the same way (P7-16): • is East-Asian-ambiguous and ✓, ✗ and !
+	// are not, so an unpadded one would shift the card's first line by a
+	// cell on a terminal configured for ambiguous-width 2.
+	return PadGlyph("•")
 }
 
-// agentsPrefix marks stderr and the view's own notes in a transcript.
+// agentsPrefix marks stderr and the view's own notes in a transcript. The
+// marker is one glyph column wide plus a space, and the blank one is padded
+// to the same width as the two glyphs (P7-16), so a stderr line, a note and
+// an ordinary line still start in the same column on a terminal configured
+// for ambiguous-width 2 — where · is two cells and ! is one.
 func agentsPrefix(k agentsStreamKind) string {
 	switch k {
 	case agentsStderr:
-		return "! "
+		return PadGlyph("!") + " "
 	case agentsMeta:
-		return "· "
+		return PadGlyph("·") + " "
 	default:
-		return "  "
+		return PadGlyph(" ") + " "
 	}
 }
 

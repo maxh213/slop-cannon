@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
 // Reason classifies why an output did not yield a structured result.
@@ -87,7 +89,11 @@ type ParseError struct {
 	// Problems lists schema violations, one per entry, as "at '/path':
 	// message". Empty unless Reason is ReasonSchema.
 	Problems []string
-	// Cause is the underlying decoder or validator error, may be nil.
+	// Cause is the underlying decoder or validator error, may be nil. Its
+	// words are never lost: [ParseError.Error] appends them whenever they
+	// are not already in Detail or Problems (P9-31), so a wrapped sentinel
+	// such as a caller's own rejection error is readable in a log line and
+	// not only matchable with errors.Is.
 	Cause error
 }
 
@@ -96,6 +102,11 @@ type ParseError struct {
 // detail and the problems, one per line: "structured: sc-result block is
 // not valid JSON (impl_report): invalid character 'h'". A Reason with no
 // sentinel falls back to "structured: <reason>".
+//
+// A Cause whose message is not already spelled out by Detail or Problems is
+// appended last as a "cause:" line (P9-31); one that only repeats them is
+// left out, so the common case — Detail built from the cause's own text —
+// is not printed twice.
 func (e *ParseError) Error() string {
 	var b strings.Builder
 	if s := e.Reason.Sentinel(); s != nil {
@@ -115,7 +126,41 @@ func (e *ParseError) Error() string {
 		b.WriteString("\n  - ")
 		b.WriteString(p)
 	}
+	if cause := e.causeWords(b.String()); cause != "" {
+		lines := strings.Split(cause, "\n")
+		b.WriteString("\n  cause: ")
+		b.WriteString(lines[0])
+		for _, l := range lines[1:] {
+			b.WriteString("\n    ")
+			b.WriteString(l)
+		}
+	}
 	return b.String()
+}
+
+// causeWords returns the Cause's message when it carries words rendered
+// does not already contain, and "" when printing it would only repeat them.
+// The validator's own error is always left out: Problems is exactly its
+// leaves (see leafProblems), so repeating it would double every violation
+// and add the internal schema URL to a user-facing line.
+func (e *ParseError) causeWords(rendered string) string {
+	if e.Cause == nil {
+		return ""
+	}
+	var ve *jsonschema.ValidationError
+	if errors.As(e.Cause, &ve) {
+		return ""
+	}
+	msg := strings.TrimSpace(e.Cause.Error())
+	if msg == "" {
+		return ""
+	}
+	for _, line := range strings.Split(msg, "\n") {
+		if l := strings.TrimSpace(line); l != "" && !strings.Contains(rendered, l) {
+			return msg
+		}
+	}
+	return ""
 }
 
 // Unwrap exposes the cause.

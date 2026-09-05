@@ -21,6 +21,7 @@ import (
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
 	"slop-cannon/internal/gitx"
+	"slop-cannon/internal/testutil"
 )
 
 // Tests for the run-level glue (P8-14) and everything wired through it: the
@@ -1050,7 +1051,7 @@ func TestGlueRunStopsWithTheRun(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(testutil.Patience(10 * time.Second)):
 		t.Fatal("the conductor did not stop with the run")
 	}
 }
@@ -1431,7 +1432,7 @@ func TestGlueADeliveryDoesNotHoldThePassUp(t *testing.T) {
 	require.NoError(t, rig.Cond.Sync(context.Background()))
 	select {
 	case <-started:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testutil.Patience(10 * time.Second)):
 		t.Fatal("the delivery never started")
 	}
 
@@ -1442,7 +1443,7 @@ func TestGlueADeliveryDoesNotHoldThePassUp(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(10 * time.Second):
+	case <-time.After(testutil.Patience(10 * time.Second)):
 		t.Fatal("the pass waited for the delivery")
 	}
 	tracked, _, _ := feedback.snapshot()

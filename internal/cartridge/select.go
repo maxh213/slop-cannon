@@ -18,7 +18,7 @@ import (
 var (
 	// ErrNoActiveCartridge is returned by NewSelector when the configuration
 	// names no active cartridge: a run refuses to start without one (D-04).
-	ErrNoActiveCartridge = errors.New("cartridge: no active cartridge configured (add one with: sc cartridge --add claude)")
+	ErrNoActiveCartridge = errors.New("cartridge: no active cartridge configured (add one with: sc cartridge --add claude --model <model>)")
 	// ErrCartridgeNotBuilt is wrapped when the active cartridge or a
 	// per-role override names a cartridge that was not built, so a stale
 	// configuration is caught before the first agent fires.

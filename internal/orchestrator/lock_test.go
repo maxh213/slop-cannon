@@ -1061,16 +1061,18 @@ func TestInspectLockRespectsAnotherUsersRun(t *testing.T) {
 	require.FileExists(t, RepoLockPath(f.State))
 }
 
-// TestLockedErrorOffersRemediesThatExist: the refusal used to say "stop
-// it", and there is no `sc stop` (D-18 names one, but it is not built), so
-// it now names the two things a user can actually do.
+// TestLockedErrorOffersRemediesThatExist: every remedy the refusal names
+// has to be one a user can actually carry out. It used to say "stop it"
+// with no way to do so, then Ctrl-C and a kill; `sc stop` exists now
+// (P9-24), so it is named first — from any terminal, not only the one the
+// run is in.
 func TestLockedErrorOffersRemediesThatExist(t *testing.T) {
 	err := &LockedError{State: LockLive, Record: liveRecord()}
 	msg := err.Error()
 	require.Contains(t, msg, "sc status")
+	require.Contains(t, msg, "sc stop")
 	require.Contains(t, msg, "Ctrl-C")
 	require.Contains(t, msg, "kill 777")
-	require.NotContains(t, msg, "sc stop")
 }
 
 // TestRunRefusesToStartBesideAHalfWrittenLock drives the same rule through

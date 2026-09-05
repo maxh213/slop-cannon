@@ -377,6 +377,134 @@ func (l *EventLog) Close() error {
 	return nil
 }
 
+// DefaultStartupReplay is how many events a [StartupReplay] holds for a
+// subscriber that has not attached yet. A run publishes a handful before
+// anything is watching — [events.RunStarted], the resume reconciliation's
+// notices, the budget's "resumed over its budget" banner — so this is
+// generous rather than tight.
+const DefaultStartupReplay = 256
+
+// StartupReplay is P9-28: the small replay buffer in front of the run's
+// live bus.
+//
+// `sc run` starts the run and only then renders it, because the renderer
+// wants the run's header and the run's header is what [Run.Start] settles.
+// [events.Bus] does not replay — "events published before Subscribe
+// returned are not delivered" — so everything the run published in its
+// first milliseconds reached sc.log, events.jsonl, `sc logs` and `sc
+// status` and never the user's screen. The one that matters is the
+// budget's, because it is about money: a run resumed over
+// `limits.max_tokens` announced its remaining headroom to nobody.
+//
+// A StartupReplay holds those events instead of forwarding them, and
+// releases them in order the moment the bus behind it has a subscriber —
+// checked on each publish, and by [StartupReplay.Flush]. Once released it
+// is a plain forwarder for the rest of the run: the buffer exists for the
+// gap between Start and the first subscriber, not as a general replay.
+//
+// It only holds anything when the publisher behind it can say whether
+// anyone is listening ([events.Bus] can); anything else is forwarded
+// unchanged. [events.RunFinished] is never held, because it is the
+// terminator every renderer ends on.
+type StartupReplay struct {
+	target   Publisher
+	watchers func() int
+	limit    int
+
+	mu       sync.Mutex
+	held     []events.Event
+	dropped  int
+	released bool
+}
+
+// subscriberCounter is the part of *events.Bus a [StartupReplay] needs: how
+// many subscribers it has.
+type subscriberCounter interface {
+	Stats() events.Stats
+}
+
+// NewStartupReplay wraps bus so that the events published before anything
+// subscribes to it are delivered to the first subscriber rather than lost
+// (P9-28). limit is how many are held; zero means [DefaultStartupReplay].
+// A nil bus yields nil, which [Options.Bus] accepts.
+func NewStartupReplay(bus Publisher, limit int) Publisher {
+	if bus == nil {
+		return nil
+	}
+	if limit <= 0 {
+		limit = DefaultStartupReplay
+	}
+	counter, ok := bus.(subscriberCounter)
+	if !ok {
+		// Nothing to wait for: a publisher that cannot say whether anyone
+		// is listening is one that always is (a log, a Tee, a test's sink).
+		return bus
+	}
+	return &StartupReplay{
+		target:   bus,
+		watchers: func() int { return counter.Stats().Subscribers },
+		limit:    limit,
+	}
+}
+
+// Publish forwards ev, or holds it until something is listening.
+func (s *StartupReplay) Publish(ev events.Event) {
+	if ev == nil {
+		return
+	}
+	_, terminal := ev.(events.RunFinished)
+	s.mu.Lock()
+	switch {
+	case s.released:
+	case terminal || s.watchers() > 0:
+		s.releaseLocked()
+	default:
+		if len(s.held) < s.limit {
+			s.held = append(s.held, ev)
+		} else {
+			s.dropped++
+		}
+		s.mu.Unlock()
+		return
+	}
+	s.mu.Unlock()
+	s.target.Publish(ev)
+}
+
+// Flush releases whatever is held, whether or not anything is listening.
+// The run's finish does it through [events.RunFinished]; a caller that
+// tears a run down another way can do it by hand.
+func (s *StartupReplay) Flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.releaseLocked()
+}
+
+// Held reports how many events are still waiting for a subscriber, and how
+// many were dropped because the buffer filled before one arrived. The first
+// is zero once the replay has been released; the second is kept, because a
+// dropped startup event is a real loss and the only place it is countable.
+func (s *StartupReplay) Held() (held, dropped int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.held), s.dropped
+}
+
+// releaseLocked forwards everything held, in order, and turns the replay
+// into a plain forwarder. The caller holds s.mu; the target is published to
+// under it so that nothing published concurrently can overtake the replay.
+func (s *StartupReplay) releaseLocked() {
+	if s.released {
+		return
+	}
+	s.released = true
+	held := s.held
+	s.held = nil
+	for _, ev := range held {
+		s.target.Publish(ev)
+	}
+}
+
 // Tee returns a [Publisher] that forwards every event to each of pubs in
 // order, skipping nil ones. It is how a run reaches both the live bus and
 // the run log. Tee(nil...) and Tee() return nil, which [Options.Bus]

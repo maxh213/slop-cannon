@@ -1,0 +1,35 @@
+Stop the run going in a repository, from anywhere.
+
+PATH may be the repository root or any directory inside it; without it the
+--repo directory (the current one by default) is used.
+
+It reads the repository's run lock, interrupts the sc process holding it —
+the same graceful stop Ctrl-C asks for, so the agents in flight finish,
+their leases are released and the worktrees are tidied — and waits for the
+run to end. --now interrupts twice, which kills the agents where they
+stand; --wait 0 returns as soon as the interrupt is delivered.
+
+A run on another machine (a state directory on a shared file system) cannot
+be signalled from here, and neither can a run that has already gone. Both
+are reported rather than guessed at. Use sc status to see the run first.
+
+Usage:
+  sc stop [PATH] [flags]
+
+Examples:
+  sc stop
+  sc stop ./repo-path
+  sc stop --now
+  sc stop --wait 0
+
+Flags:
+  -h, --help            help for stop
+      --now             stop immediately: interrupt twice, so the agents are killed rather than finished
+      --wait DURATION   wait up to DURATION for the run to finish (0 returns as soon as it is asked to stop) (default 2m0s)
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

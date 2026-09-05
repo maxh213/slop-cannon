@@ -165,3 +165,57 @@ func TestRegisteredInDefaultRegistry(t *testing.T) {
 	_, ok := c.(*Adapter)
 	assert.True(t, ok)
 }
+
+// TestReadOnlyKeepsTheShellAllowList pins the P5-09 decision. The rejected
+// alternative is "--disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit",
+// which restores Claude Code's Glob and Grep but takes away the shell the
+// product owner needs for bd and git. The decision is recorded in
+// docs/cartridges.md; this test fails if the code moves without it.
+func TestReadOnlyKeepsTheShellAllowList(t *testing.T) {
+	t.Parallel()
+	ro := ToolFlags(cartridge.ToolReadOnly)
+
+	allowed, disallowed := "", ""
+	for i, a := range ro {
+		switch a {
+		case flagAllowedTools:
+			require.Less(t, i+1, len(ro))
+			allowed = ro[i+1]
+		case flagDisallowedTools:
+			require.Less(t, i+1, len(ro))
+			disallowed = ro[i+1]
+		}
+	}
+	require.NotEmpty(t, allowed, "read_only must pre-approve a shell allow-list, not remove the shell")
+	assert.Equal(t, strings.Join(ReadOnlyShell, ","), allowed)
+	assert.Equal(t, strings.Join(editTools, ","), disallowed,
+		"the rejected alternative also disallows Bash; this mapping does not")
+	for _, tool := range strings.Split(disallowed, ",") {
+		assert.NotEqual(t, "Bash", tool, "P5-09: read_only never disallows Bash")
+	}
+
+	// The commands the decision rests on: bd (D-21 shim) and git history,
+	// which Glob and Grep cannot replace, plus the search the removed
+	// built-ins would have provided.
+	for _, cmd := range []string{"bd", "git log", "git diff", "git show", "grep", "rg", "find"} {
+		assert.Contains(t, ReadOnlyShell, "Bash("+cmd+":*)", "P5-09 relies on %q being allowed", cmd)
+	}
+	// And the ones a read-only role must never get.
+	for _, rule := range ReadOnlyShell {
+		for _, banned := range []string{"rm", "git commit", "git push", "sed", "tee", "sh", "bash", "go "} {
+			assert.NotEqual(t, "Bash("+banned+":*)", rule, "%q writes; read_only must refuse it", banned)
+		}
+	}
+}
+
+// TestDocsRecordTheReadOnlyDecision is the other half of P5-09's "done
+// when": the choice, and the alternative it rules out, are written down
+// where an adapter author will read them.
+func TestDocsRecordTheReadOnlyDecision(t *testing.T) {
+	t.Parallel()
+	doc := claudeReadDoc(t)
+	assert.Contains(t, doc, "P5-09", "the decision must be attributed to its task")
+	assert.Contains(t, doc, "`--disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit`",
+		"the rejected alternative must be spelled out, so nobody re-opens it blind")
+	assert.Contains(t, doc, "`read_only` keeps the restricted `Bash` allow-list")
+}

@@ -45,6 +45,12 @@ const (
 	doctorHintNoActive = "pick one with: sc cartridge --use NAME"
 	doctorHintRepo     = "pass --repo PATH or run sc from inside a git repository"
 	doctorHintDirty    = "commit or stash first; agents build on whatever is in the tree"
+	// doctorDoltEmbedded is the detail of the passing dolt row (P1-15):
+	// embedded mode links the Dolt engine into bd, so the standalone dolt
+	// CLI on the machine is irrelevant to sc.
+	doctorDoltEmbedded    = "embedded: bd runs Dolt in-process, so the standalone dolt CLI is not needed"
+	doctorHintDoltServer  = "server mode is untested (P3-17); it is the only mode that needs the standalone dolt CLI, which beads pins at 2.2.0"
+	doctorHintDoltUnknown = "run bd context --json in the repository to see which backend beads resolved"
 )
 
 // doctorHintBeads names the exact init command EnsureInitialised runs (D-13).
@@ -62,8 +68,9 @@ const (
 
 // DoctorCheck is one row of the sc doctor report.
 type DoctorCheck struct {
-	// Name identifies the check: "git", "bd", "beads", "gh", "config",
-	// "cartridge", "cartridge:<name>", "repo", ".gitignore", or ".beads".
+	// Name identifies the check: "git", "bd", "dolt", "beads", "gh",
+	// "config", "cartridge", "cartridge:<name>", "repo", ".gitignore", or
+	// ".beads".
 	Name string `json:"name"`
 	// Status is pass, warn, or fail.
 	Status DoctorStatus `json:"status"`
@@ -121,6 +128,9 @@ const doctorLong = `Check that everything a run needs is installed and configure
 
   git        present and at least 2.30
   bd         present and at least 1.2.2 (the beads CLI with embedded Dolt)
+  dolt       the beads project uses the embedded backend (warning in server
+             mode, which sc has not been tested against; the standalone dolt
+             CLI is irrelevant in embedded mode)
   beads      bd ping answers when the repo already has a .beads/ directory
   gh         present and authenticated (warning only; needed for safety-on
              gates and external PR review)
@@ -135,7 +145,7 @@ Rows are pass, warn, or fail. The exit status is 1 when any row fails.`
 func newDoctorCommand() *cobra.Command {
 	return &cobra.Command{
 		Use:   "doctor",
-		Short: "Check that git, bd, gh, and the cartridge CLIs are ready",
+		Short: "Check that git, bd, dolt, gh, the cartridge CLIs and the repository are ready",
 		Long:  doctorLong,
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -184,6 +194,7 @@ func RunDoctor(ctx context.Context, repo string) *DoctorReport {
 	bdCheck, bdOK := doctorBD(ctx)
 	report.add(bdCheck)
 	if bdOK && hasBeads {
+		report.add(doctorDolt(ctx, root, beadsDir))
 		report.add(doctorPing(ctx, root))
 	}
 
@@ -238,6 +249,44 @@ func doctorBD(ctx context.Context) (DoctorCheck, bool) {
 	}
 	c.Status, c.Detail = DoctorPass, info.String()
 	return c, true
+}
+
+// doctorDolt reports which Dolt backend the repository's beads project uses
+// (P1-15), next to the bd version row. It asks bd first
+// (beads.ReadContext), because that is what a run trusts (beads.CheckDolt),
+// and falls back to .beads/metadata.json (beads.ReadProjectMetadata) when
+// bd cannot answer. Embedded mode passes: the engine is linked into bd, so
+// the standalone dolt CLI on the machine has nothing to do with sc. Server
+// mode is a warning rather than a failure — sc continues there, it has just
+// never been tested (P3-17). It runs only when bd is usable and the
+// repository already has a .beads/ directory, like the ping row.
+func doctorDolt(ctx context.Context, root, beadsDir string) DoctorCheck {
+	c := DoctorCheck{Name: "dolt"}
+	bc, err := beads.ReadContext(ctx, root)
+	if err == nil {
+		if bc.Embedded() {
+			c.Status, c.Detail = DoctorPass, doctorDoltEmbedded
+			return c
+		}
+		c.Status, c.Detail, c.Hint = DoctorWarn, beads.ServerModeWarning(bc), doctorHintDoltServer
+		return c
+	}
+	meta, metaErr := beads.ReadProjectMetadata(beadsDir)
+	switch {
+	case metaErr != nil:
+		c.Status = DoctorWarn
+		c.Detail = "backend unknown: bd context failed: " + doctorErr(err)
+		c.Hint = doctorHintDoltUnknown
+	case meta.Embedded():
+		c.Status = DoctorPass
+		c.Detail = doctorDoltEmbedded + " (from " + beads.ProjectMetadataFile + "; bd context failed)"
+	default:
+		c.Status = DoctorWarn
+		c.Detail = fmt.Sprintf("%s reports dolt_mode %q; sc has only been tested against embedded mode and continues anyway",
+			beads.ProjectMetadataFile, meta.DoltMode)
+		c.Hint = doctorHintDoltServer
+	}
+	return c
 }
 
 // doctorPing confirms the embedded database answers `bd ping --json` in

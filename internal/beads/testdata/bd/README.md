@@ -18,6 +18,13 @@ alternative samples under a key (for example `{"close": "error-close-blocked"}`)
 `preamble.txt` is bd's one-time metrics notice, printed to stderr by the shim
 on its first call, which is how the tests prove the stderr parser skips it.
 
+Two later captures were made the same way, against the same bd 1.2.2, in a
+fresh scratch repository of their own (2026-09-05): `create-external-ref`
+(P3-19, prefix `fx`, so its id `fx-c5v` belongs to no earlier sample), and
+the re-capture of `graph-dry-run-existing` after P3-18 put `parent_id` in
+the graph plan — that one was taken with the epic of its own repository and
+the id rewritten to `px-26w`, the epic the other `graph-*` samples use.
+
 ## Command samples
 
 | Sample | Command | Notes |
@@ -36,6 +43,7 @@ on its first call, which is how the tests prove the stderr parser skips it.
 | `create-graph-dry-run-warning` | same with `bogus_field` and node-level `deps` | stderr `warning: graph plan node["a"] has unknown field(s): [bogus_field deps]`, `edge_count: 0` |
 | `create-graph` | `bd create --graph plan.json --json` | `data.ids` maps keys to ids |
 | `create` | `bd create "Add Median" -t task -p 2 --description … --acceptance … -l sc:run:r1,sc:role:engineer --metadata @file --parent fx-nvi --json` | object, not array; metadata keeps JSON types |
+| `create-external-ref` | `bd create "Review PR #9: Add Median" -t task -p 2 --description … --external-ref gh-9 -l sc:run:r1,sc:external-pr --metadata @file --json` | P3-19, captured 2026-09-05: bd echoes `external_ref` on the issue beside the `sc_external_ref` metadata |
 | `create-silent` | `bd create … --silent` | prints only the id |
 | `update-claim`, `update-claim-again` | `bd update fx-so0 --claim --json` as `sc:engineer-1`, twice | atomic claim; idempotent for the same actor |
 | `comment` | `bd comment fx-so0 --stdin --json` | body on stdin; `author` is the actor |
@@ -166,8 +174,8 @@ warned about and dropped), and metadata values must be JSON strings.
 | `graph-create` | `bd create --graph graph-plan.json --json` | key → id map including the epic `px-26w` |
 | `graph-blocked` | `bd blocked --json` afterwards | `blocked_by` of every dependent bead |
 | `graph-show-epic` | `bd show px-26w --json` | the epic with its children |
-| `graph-plan-existing`, `graph-dry-run-existing`, `graph-create-existing` | the same plan joining an existing epic (no epic node) | 6 nodes, 6 edges, `parent_deps: 0`; `bd update --parent` reparents afterwards |
-| `graph-update-finish` | `bd update <id> --acceptance … --parent px-26w --json` | the per-bead finishing call (acceptance criteria cannot be set in the plan) |
+| `graph-plan-existing`, `graph-dry-run-existing`, `graph-create-existing` | the same plan joining an existing epic (no epic node) | 6 nodes, 6 edges, every node carries `parent_id: px-26w`, so `parent_deps: 6` (P3-18; re-captured 2026-09-05, see below) |
+| `graph-update-finish` | `bd update <id> --acceptance … --json` | the per-bead finishing call (acceptance criteria cannot be set in the plan) |
 
 ## Hand-derived samples (P3-03, P3-14)
 

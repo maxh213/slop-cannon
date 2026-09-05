@@ -37,17 +37,21 @@ func (t TesterStatus) Satisfied() bool {
 
 // Glyph returns the one-cell marker of the tester's position: ✓ satisfied,
 // ✗ changes requested, ◐ reviewing, · not asked yet. It is the channel that
-// survives NO_COLOR and colour blindness.
+// survives NO_COLOR and colour blindness. Every one goes through [PadGlyph]
+// (P7-16), because ◐ and · are East-Asian-ambiguous and ✓ and ✗ are not: on
+// a terminal configured for ambiguous-width 2 the lens column would
+// otherwise be a cell wider for a tester that is still reviewing than for
+// one that approved.
 func (t TesterStatus) Glyph() string {
 	switch {
 	case t.Pending:
-		return "◐"
+		return PadGlyph("◐")
 	case t.Outcome == domain.VerdictApprove:
-		return "✓"
+		return PadGlyph("✓")
 	case t.Outcome == domain.VerdictChanges:
-		return "✗"
+		return PadGlyph("✗")
 	default:
-		return "·"
+		return PadGlyph("·")
 	}
 }
 
@@ -821,7 +825,7 @@ func (v FeedbackModel) roundBody(th FeedbackThread, r Round, last bool, w int) [
 	add := func(s string) { out = append(out, clip(s, w)) }
 
 	if r.Report != nil {
-		out = append(out, v.flow("  "+t.Muted().Render("⚙ report")+" ", r.Report.Summary, t.Text(), 6, w)...)
+		out = append(out, v.flow("  "+t.Muted().Render(PadGlyph("⚙")+" report")+" ", r.Report.Summary, t.Text(), 6, w)...)
 		if v.details {
 			if len(r.Report.FilesChanged) > 0 {
 				out = append(out, v.flow("      ", "files: "+strings.Join(r.Report.FilesChanged, ", "), t.Muted(), 6, w)...)
@@ -971,6 +975,9 @@ func (v FeedbackModel) responseLines(th FeedbackThread, round int, r domain.Resp
 	case domain.ActionWontfix:
 		glyph, style = "⊘", t.Muted()
 	}
+	// ⊘ is East-Asian-ambiguous and → and ↩ are not, so the marker column
+	// is padded to the palette's width like every other glyph (P7-16).
+	glyph = PadGlyph(glyph)
 	head := "  " + style.Render(glyph+" "+prsPad(r.Action.String(), 8)) + " " + t.Muted().Render(prsPad(r.ItemID, 9)) + " "
 	out := v.flow(head, r.Rationale, t.Muted(), 6, w)
 	return append(out, v.answerRefs(th.Answered(round, r.ItemID), w)...)
@@ -987,7 +994,7 @@ func (v FeedbackModel) rulingLine(a domain.Arbitration, w int) []string {
 	case domain.RulingUpholdEngineer:
 		style = t.Success()
 	}
-	head := "  " + style.Render("⚖ "+prsPad(a.Ruling.String(), 16)) + " " + t.Muted().Render(prsPad(a.ItemID, 9)) + " "
+	head := "  " + style.Render(PadGlyph("⚖")+" "+prsPad(a.Ruling.String(), 16)) + " " + t.Muted().Render(prsPad(a.ItemID, 9)) + " "
 	tail := a.Instruction
 	if tail == "" {
 		tail = a.Rationale
@@ -1027,7 +1034,7 @@ func (v FeedbackModel) escalationLines(e domain.Escalation, w int) []string {
 	if tail == "" {
 		tail = e.NewAcceptance
 	}
-	out := v.flow("  "+style.Render("▲ escalation "+e.Outcome.String())+" ", tail, t.Muted(), 6, w)
+	out := v.flow("  "+style.Render(PadGlyph("▲")+" escalation "+e.Outcome.String())+" ", tail, t.Muted(), 6, w)
 	if v.details && e.NewAcceptance != "" && tail != e.NewAcceptance {
 		out = append(out, v.flow("      ", "acceptance: "+e.NewAcceptance, t.Muted(), 6, w)...)
 	}

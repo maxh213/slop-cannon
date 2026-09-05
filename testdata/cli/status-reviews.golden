@@ -1,0 +1,29 @@
+run        20260903-120000-abcd
+phase      running
+process    pid <pid> holds the run lock
+mode       brief
+brief      add retries to the client
+epic       sc-0
+repo       <tmp>/repo
+run dir    <state>/runs/20260903-120000-abcd
+started    2026-09-03 12:00:00Z
+last event 2026-09-03 12:01:07Z
+cartridge  claude (model fable)
+ammo       10 → 1 PO, up to 2 engineers, up to 7 testers
+safety     on (pull requests)
+
+beads      5 (2 changed in bd)
+  open       1
+  in_review  1
+  closed     3
+  sc-2  in_review -> closed (changed outside the run)
+  sc-8  in_review -> closed (changed outside the run)
+
+delivery   1 pull request, 1 merge
+
+reviews    2 external pull requests, 1 review posted, 1 still in review
+
+agents     1 live of 10 ammo
+  tester-qa-sc-2-r1  tester/qa  sc-2  running  pid 4243
+
+events     0 of 22 (1 output line, 1 warning)

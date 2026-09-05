@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
@@ -54,9 +55,35 @@ type Controller interface {
 	SetAmmo(ctx context.Context, ammo int) error
 }
 
+// BudgetController is the optional half of [Controller]: a run whose live
+// budget can be raised (P9-14). `sc run` implements it; a recorded run and
+// the demo do not, and the `b` key then reports that this run's budget
+// cannot be changed rather than pretending.
+//
+// The amount is in the unit of the cap that stopped the run — tokens for
+// `limits.max_tokens`, dollars for `limits.max_cost_usd` — and replaces the
+// ceiling rather than adding to it. The orchestrator decides which cap that
+// is and refuses an amount under what the run has already spent; the TUI
+// only asks for the number.
+type BudgetController interface {
+	// SetBudget raises the run's budget to amount and lets it carry on.
+	SetBudget(ctx context.Context, amount float64) error
+}
+
 // ControlReason is the reason string the keys hand the orchestrator, so an
 // event log can tell a pause a human asked for from one a cost cap forced.
 const ControlReason = "user"
+
+// ControlBudgetCostReason is the pause reason a crossed cost cap gives
+// (orchestrator.PauseReasonCostCap), which is how the budget prompt knows
+// whether the number it is asking for is dollars or tokens. It is a string
+// rather than an import because the TUI depends on no orchestrator.
+const ControlBudgetCostReason = "cost_cap"
+
+// ControlMaxBudgetDigits caps what can be typed into the budget prompt: a
+// billion tokens is far past any real budget and well inside a float64's
+// exact range.
+const ControlMaxBudgetDigits = 9
 
 // ControlTimeout bounds one [Controller] call. It is generous because a
 // re-fire writes to bd, and mean because the key must feel like a key: a
@@ -99,12 +126,14 @@ const (
 	ControlSafety ControlAction = "safety"
 	// ControlAmmo changes the ammo of future ticks (`a`, prompted).
 	ControlAmmo ControlAction = "ammo"
+	// ControlBudget raises the run's budget (`b`, prompted).
+	ControlBudget ControlAction = "budget"
 )
 
 // controlActions is every action, in key order.
 var controlActions = []ControlAction{
 	ControlPause, ControlResume, ControlStop, ControlRefire,
-	ControlMarkDone, ControlSafety, ControlAmmo,
+	ControlMarkDone, ControlSafety, ControlAmmo, ControlBudget,
 }
 
 // ControlActions returns every action a control key can request.
@@ -157,6 +186,24 @@ type ControlRequest struct {
 	Safety bool
 	// Ammo is the value ControlAmmo sets.
 	Ammo int
+	// Budget is the ceiling ControlBudget raises the run's budget to, in the
+	// unit of the cap that stopped it. Unit is what to call that in a
+	// footer line ("tokens", "$").
+	Budget float64
+	Unit   string
+}
+
+// budgetText renders a budget request's amount the way its unit asks: "$25"
+// for a cost cap, "200000 tokens" for a token one.
+func (r ControlRequest) budgetText() string {
+	if r.Unit == "$" {
+		return fmt.Sprintf("$%.2f", r.Budget)
+	}
+	unit := r.Unit
+	if unit == "" {
+		unit = "tokens"
+	}
+	return fmt.Sprintf("%d %s", int64(r.Budget), unit)
 }
 
 // Pending is the footer line shown while the call is in flight.
@@ -176,6 +223,8 @@ func (r ControlRequest) Pending() string {
 		return "turning safety " + onOff(r.Safety) + "…"
 	case ControlAmmo:
 		return fmt.Sprintf("setting ammo to %d…", r.Ammo)
+	case ControlBudget:
+		return "raising the budget to " + r.budgetText() + "…"
 	default:
 		return string(r.Action) + "…"
 	}
@@ -200,6 +249,8 @@ func (r ControlRequest) Summary() string {
 		return "safety " + onOff(r.Safety) + " for future deliveries"
 	case ControlAmmo:
 		return fmt.Sprintf("ammo %d for future ticks", r.Ammo)
+	case ControlBudget:
+		return "budget raised to " + r.budgetText()
 	default:
 		return string(r.Action)
 	}
@@ -223,6 +274,8 @@ func (r ControlRequest) Failure() string {
 		return "could not turn safety " + onOff(r.Safety)
 	case ControlAmmo:
 		return fmt.Sprintf("could not set ammo to %d", r.Ammo)
+	case ControlBudget:
+		return "could not raise the budget to " + r.budgetText()
 	default:
 		return "could not " + string(r.Action)
 	}
@@ -263,6 +316,12 @@ func (r ControlRequest) call(ctx context.Context, c Controller) error {
 		return c.SetSafety(ctx, r.Safety)
 	case ControlAmmo:
 		return c.SetAmmo(ctx, r.Ammo)
+	case ControlBudget:
+		bc, ok := c.(BudgetController)
+		if !ok {
+			return errors.New("tui: this run's budget cannot be raised from here")
+		}
+		return bc.SetBudget(ctx, r.Budget)
 	default:
 		return fmt.Errorf("tui: unknown control action %q", r.Action)
 	}
@@ -409,6 +468,8 @@ type ControlsKeyMap struct {
 	Safety key.Binding
 	// Ammo opens the ammo prompt.
 	Ammo key.Binding
+	// Budget opens the budget prompt.
+	Budget key.Binding
 	// Apply submits the ammo prompt.
 	Apply key.Binding
 	// Dismiss closes the ammo prompt without changing anything.
@@ -442,6 +503,10 @@ func DefaultControlsKeyMap() ControlsKeyMap {
 			key.WithKeys("a"),
 			key.WithHelp("a", "change ammo"),
 		),
+		Budget: key.NewBinding(
+			key.WithKeys("b"),
+			key.WithHelp("b", "raise budget"),
+		),
 		Apply: key.NewBinding(
 			key.WithKeys("enter"),
 			key.WithHelp("enter", "apply"),
@@ -459,7 +524,7 @@ func DefaultControlsKeyMap() ControlsKeyMap {
 func (k *ControlsKeyMap) bindings() []*key.Binding {
 	return []*key.Binding{
 		&k.PauseResume, &k.Stop, &k.Refire, &k.MarkDone,
-		&k.Safety, &k.Ammo, &k.Apply, &k.Dismiss,
+		&k.Safety, &k.Ammo, &k.Budget, &k.Apply, &k.Dismiss,
 	}
 }
 
@@ -490,7 +555,7 @@ func (k ControlsKeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.PauseResume, k.Stop},
 		{k.Refire, k.MarkDone},
-		{k.Safety, k.Ammo},
+		{k.Safety, k.Ammo, k.Budget},
 	}
 }
 
@@ -535,10 +600,12 @@ type ControlsModel struct {
 	minAmmo, maxAmmo int
 
 	// pending is the request a confirmation is about; confirming says a
-	// confirmation is up. prompting and buf are the ammo prompt.
+	// confirmation is up. prompting, promptFor and buf are the prompt the
+	// `a` and `b` keys open — one field, two questions.
 	pending    ControlRequest
 	confirming bool
 	prompting  bool
+	promptFor  ControlAction
 	buf        string
 	// bufFresh says buf is still the value openAmmo pre-filled and the
 	// user has not edited it yet, so the first digit typed replaces it
@@ -568,6 +635,14 @@ type ControlsModel struct {
 	// The run still wins the moment it says anything: the override applies
 	// only while the run's own value is the one it was taken against, so an
 	// event that finally moves the snapshot drops it.
+	//
+	// P7-22: the header reads [ControlsModel.Safety] and
+	// [ControlsModel.Ammo] rather than [State.Run] straight, so the two now
+	// agree — an accepted change moves the header on the next frame. These
+	// four fields retire, with no other change to this file, once the
+	// orchestrator publishes a configuration-change event and [State.Apply]
+	// folds it into [State.Run]: both accessors already drop the override
+	// the moment the run's own value moves.
 	safetyKnown bool
 	safetySet   bool
 	safetyBase  bool
@@ -624,10 +699,19 @@ func (v ControlsModel) Confirming() (ControlRequest, bool) {
 	return v.pending, v.confirming
 }
 
-// Prompting reports whether the ammo prompt is up.
+// Prompting reports whether a prompt is up.
 func (v ControlsModel) Prompting() bool { return v.prompting }
 
-// AmmoInput returns what has been typed into the ammo prompt so far.
+// PromptFor is the action the open prompt will request — [ControlAmmo] or
+// [ControlBudget] — and is empty when no prompt is up.
+func (v ControlsModel) PromptFor() ControlAction {
+	if !v.prompting {
+		return ""
+	}
+	return v.promptFor
+}
+
+// AmmoInput returns what has been typed into the open prompt so far.
 func (v ControlsModel) AmmoInput() string { return v.buf }
 
 // AmmoBounds returns the smallest and largest ammo the prompt accepts.
@@ -699,6 +783,8 @@ func (v ControlsModel) Update(msg tea.Msg, st *State, keys KeyMap, target Contro
 	switch {
 	case v.confirming:
 		return v.answer(km, keys)
+	case v.prompting && v.promptFor == ControlBudget:
+		return v.typeBudget(km, st)
 	case v.prompting:
 		return v.typeAmmo(km, st)
 	case v.ctrl == nil:
@@ -717,6 +803,8 @@ func (v ControlsModel) Update(msg tea.Msg, st *State, keys KeyMap, target Contro
 		return v.safety(st)
 	case key.Matches(km, v.keys.Ammo):
 		return v.openAmmo(st)
+	case key.Matches(km, v.keys.Budget):
+		return v.openBudget(st)
 	}
 	return v, nil, false
 }
@@ -805,7 +893,7 @@ func (v ControlsModel) openAmmo(st *State) (ControlsModel, tea.Cmd, bool) {
 	if reason, ok := v.refuse(st); !ok {
 		return v.deny(reason), nil, true
 	}
-	v.prompting, v.buf, v.bufFresh = true, "", false
+	v.prompting, v.promptFor, v.buf, v.bufFresh = true, ControlAmmo, "", false
 	total, ceiling := v.Ammo(st), v.maxAmmoFor(st)
 	v.ammoBase = controlsAmmo(st)
 	if total >= v.minAmmo && total <= ceiling {
@@ -813,6 +901,30 @@ func (v ControlsModel) openAmmo(st *State) (ControlsModel, tea.Cmd, bool) {
 	}
 	v.flash, v.flashErr = "", false
 	return v, nil, true
+}
+
+// openBudget opens the budget prompt (P9-14). Unlike the ammo prompt it
+// starts empty: the run's cap is configuration the events never carry, so
+// the TUI does not know it and must not invent it. The orchestrator refuses
+// a number under what the run has already spent, and the refusal says what
+// that was.
+func (v ControlsModel) openBudget(st *State) (ControlsModel, tea.Cmd, bool) {
+	if reason, ok := v.refuse(st); !ok {
+		return v.deny(reason), nil, true
+	}
+	v.prompting, v.promptFor, v.buf, v.bufFresh = true, ControlBudget, "", false
+	v.flash, v.flashErr = "", false
+	return v, nil, true
+}
+
+// controlsBudgetUnit is what the budget prompt is asking for: dollars when
+// a cost cap is what stopped the run, tokens otherwise. The pause reason is
+// the only thing that says so, and it is in the event stream.
+func controlsBudgetUnit(st *State) string {
+	if st != nil && st.Paused && st.Reason == ControlBudgetCostReason {
+		return "$"
+	}
+	return "tokens"
 }
 
 // controlBeadRequest builds a bead-scoped request with a title that is safe
@@ -874,14 +986,14 @@ func (v ControlsModel) typeAmmo(km tea.KeyMsg, st *State) (ControlsModel, tea.Cm
 			return v, nil, true
 		}
 		if v.Ammo(st) == ammo {
-			v.prompting, v.buf, v.bufFresh = false, "", false
+			v.prompting, v.promptFor, v.buf, v.bufFresh = false, "", "", false
 			v.flash, v.flashErr = fmt.Sprintf("ammo is already %d", ammo), false
 			return v, nil, true
 		}
-		v.prompting, v.buf, v.bufFresh = false, "", false
+		v.prompting, v.promptFor, v.buf, v.bufFresh = false, "", "", false
 		return v.dispatch(ControlRequest{Action: ControlAmmo, Ammo: ammo})
 	case key.Matches(km, v.keys.Dismiss):
-		v.prompting, v.buf, v.bufFresh = false, "", false
+		v.prompting, v.promptFor, v.buf, v.bufFresh = false, "", "", false
 		v.flash, v.flashErr = "cancelled", false
 	case km.Type == tea.KeyBackspace || km.Type == tea.KeyDelete:
 		if v.buf != "" {
@@ -901,10 +1013,42 @@ func (v ControlsModel) typeAmmo(km tea.KeyMsg, st *State) (ControlsModel, tea.Cm
 	return v, nil, true
 }
 
+// typeBudget handles a key while the budget prompt is up. It is the ammo
+// prompt's field with a different question behind it: digits, delete, enter
+// and escape, and nothing else.
+func (v ControlsModel) typeBudget(km tea.KeyMsg, st *State) (ControlsModel, tea.Cmd, bool) {
+	switch {
+	case key.Matches(km, v.keys.Apply):
+		amount, err := strconv.ParseFloat(v.buf, 64)
+		if v.buf == "" || err != nil || amount <= 0 {
+			v.flash, v.flashErr = "a budget must be a number above zero", true
+			return v, nil, true
+		}
+		v.prompting, v.promptFor, v.buf, v.bufFresh = false, "", "", false
+		return v.dispatch(ControlRequest{Action: ControlBudget, Budget: amount, Unit: controlsBudgetUnit(st)})
+	case key.Matches(km, v.keys.Dismiss):
+		v.prompting, v.promptFor, v.buf, v.bufFresh = false, "", "", false
+		v.flash, v.flashErr = "cancelled", false
+	case km.Type == tea.KeyBackspace || km.Type == tea.KeyDelete:
+		if v.buf != "" {
+			v.buf = v.buf[:len(v.buf)-1]
+		}
+		v.flash, v.flashErr = "", false
+	case km.Type == tea.KeyRunes:
+		v.buf, v.flash, v.flashErr = controlAppendUpTo(v.buf, km.Runes, ControlMaxBudgetDigits), "", false
+	}
+	return v, nil, true
+}
+
 // controlAppendDigits appends the digits of runes to buf, up to as many
 // digits as the largest allowed ammo has. Anything else is ignored.
 func controlAppendDigits(buf string, runes []rune, maxAmmo int) string {
-	limit := len(strconv.Itoa(maxAmmo))
+	return controlAppendUpTo(buf, runes, len(strconv.Itoa(maxAmmo)))
+}
+
+// controlAppendUpTo appends the digits of runes to buf, up to limit digits.
+// Anything else is ignored.
+func controlAppendUpTo(buf string, runes []rune, limit int) string {
 	for _, r := range runes {
 		if r < '0' || r > '9' || len(buf) >= limit {
 			continue
@@ -944,6 +1088,8 @@ func (v ControlsModel) Overlay(st *State, w, h int) (string, bool) {
 	switch {
 	case v.confirming:
 		box = v.confirmBox(st, v.pending, w)
+	case v.prompting && v.promptFor == ControlBudget:
+		box = v.budgetBox(st, w)
 	case v.prompting:
 		box = v.ammoBox(st, w)
 	default:
@@ -1008,6 +1154,29 @@ func (v ControlsModel) ammoBox(st *State, w int) string {
 		v.styles.Title.Render(clip("Ammo for future ticks", inner)),
 		clip(v.styles.Muted.Render("› ")+field, inner),
 		v.styles.Text.Render(clip(fmt.Sprintf("%d–%d concurrent agents; the run's cap today is %d.", v.minAmmo, v.maxAmmoFor(st), total), inner)),
+		"",
+		clip(v.styles.Value.Render("enter")+" apply   "+v.styles.Value.Render("esc")+" cancel", inner),
+	}
+	if v.flashErr && v.flash != "" {
+		lines = append(lines, v.styles.Warn.Render(clip(v.flash, inner)))
+	}
+	return v.styles.Box.Render(strings.Join(lines, "\n"))
+}
+
+// budgetBox renders the budget prompt: the field, what the number means,
+// and the keys.
+func (v ControlsModel) budgetBox(st *State, w int) string {
+	inner := max(w-controlsBoxInset, 1)
+	field := v.styles.Value.Render(v.buf) + v.styles.Cursor.Render("▏")
+	what := "Tokens for the whole run (limits.max_tokens)."
+	if controlsBudgetUnit(st) == "$" {
+		what = "Dollars for the whole run (limits.max_cost_usd)."
+	}
+	lines := []string{
+		v.styles.Title.Render(clip("Raise the run's budget", inner)),
+		clip(v.styles.Muted.Render("› ")+field, inner),
+		v.styles.Text.Render(clip(what, inner)),
+		v.styles.Text.Render(clip("It replaces the cap, above what has been spent.", inner)),
 		"",
 		clip(v.styles.Value.Render("enter")+" apply   "+v.styles.Value.Render("esc")+" cancel", inner),
 	}

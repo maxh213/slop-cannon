@@ -85,6 +85,7 @@ func doctorBDVersionShim(t *testing.T, version string) *testutil.Shim {
 	script := fmt.Sprintf(`for a in "$@"; do
   case "$a" in
     version) printf '{"data":{"build":"dev","version":"%s"},"schema_version":1}\n'; exit 0 ;;
+    context) printf '{"data":{"backend":"dolt","dolt_mode":"embedded"},"schema_version":1}\n'; exit 0 ;;
     ping) echo "Error: no beads database found" >&2; exit 1 ;;
   esac
 done
@@ -174,9 +175,11 @@ func TestDoctorAllPass(t *testing.T) {
 	require.Empty(t, stderr)
 	rootGolden(t, "doctor-pass", doctorNormalise(stdout, repo, git, bd, gh, claude))
 
-	// bd was called the D-21 way: version first, then ping inside the repo.
+	// bd was called the D-21 way: version first, then the backend and the
+	// ping inside the repo (P1-15).
 	require.Equal(t, [][]string{
 		{"version", "--json"},
+		{"-C", repo, "context", "--json"},
 		{"-C", repo, "ping", "--json"},
 	}, bd.ArgLists(t))
 	require.Empty(t, testutil.MissingSamples(t, bd))
@@ -200,7 +203,7 @@ func TestDoctorAllPassJSON(t *testing.T) {
 	require.NoError(t, json.Unmarshal([]byte(stdout), &report))
 	require.True(t, report.OK)
 	require.Equal(t, repo, report.Repo)
-	require.Equal(t, 8, report.Passed)
+	require.Equal(t, 9, report.Passed)
 	require.Zero(t, report.Warnings)
 	require.Zero(t, report.Failed)
 	var names []string
@@ -209,7 +212,7 @@ func TestDoctorAllPassJSON(t *testing.T) {
 		require.Equal(t, DoctorPass, c.Status, c.Name)
 		require.Empty(t, c.Hint, c.Name)
 	}
-	require.Equal(t, []string{"git", "bd", "beads", "gh", "cartridge:claude", "repo", ".gitignore", ".beads"}, names)
+	require.Equal(t, []string{"git", "bd", "dolt", "beads", "gh", "cartridge:claude", "repo", ".gitignore", ".beads"}, names)
 	rootGolden(t, "doctor-pass-json", doctorNormalise(stdout, repo, git, bd, gh, claude))
 }
 
@@ -233,7 +236,7 @@ func TestDoctorNothingInstalled(t *testing.T) {
 	require.Contains(t, stdout, "warn  repo")
 	require.Contains(t, stdout, "warn  .beads")
 	require.NotContains(t, stdout, "  beads  ", "bd ping is skipped when bd is unusable")
-	require.NotContains(t, stdout, "dolt", "the standalone dolt binary is never checked")
+	require.NotContains(t, stdout, "dolt", "the backend row is skipped with the ping when bd is unusable, and the standalone dolt binary is never checked")
 	require.Contains(t, stdout, "\n0 passed, 3 warnings, 3 failed\n")
 }
 
@@ -293,29 +296,36 @@ func TestDoctorPingFails(t *testing.T) {
 	require.Equal(t, 1, code)
 	require.Contains(t, stdout, "FAIL  beads             bd ping failed: exit status 1: Error: no beads database found")
 	require.Contains(t, stdout, "hint: embedded Dolt did not answer")
-	require.Equal(t, [][]string{{"version", "--json"}, {"-C", repo, "ping", "--json"}}, bd.ArgLists(t))
+	require.Contains(t, stdout, "pass  dolt              embedded: bd runs Dolt in-process")
+	require.Equal(t, [][]string{
+		{"version", "--json"}, {"-C", repo, "context", "--json"}, {"-C", repo, "ping", "--json"},
+	}, bd.ArgLists(t))
 }
 
 func TestDoctorBDEnvironment(t *testing.T) {
 	doctorEnv(t)
 	repo := doctorRepoDir(t, true, true)
 	bd := testutil.FakeBin(t, "bd", `printf '%s\n' "$BD_JSON_ENVELOPE" "$BD_NON_INTERACTIVE" > "$SC_FAKEBIN_DIR/env.$SC_FAKEBIN_SEQ"
-case "$1" in
-  version) echo '{"data":{"build":"dev","version":"1.2.2"},"schema_version":1}' ;;
-  *) echo '{"data":{"status":"ok","total_ms":3},"schema_version":1}' ;;
-esac`)
+for a in "$@"; do
+  case "$a" in
+    version) echo '{"data":{"build":"dev","version":"1.2.2"},"schema_version":1}'; exit 0 ;;
+    context) echo '{"data":{"backend":"dolt","dolt_mode":"embedded"},"schema_version":1}'; exit 0 ;;
+    ping) echo '{"data":{"status":"ok","total_ms":3},"schema_version":1}'; exit 0 ;;
+  esac
+done
+exit 2`)
 
 	report := RunDoctor(context.Background(), repo)
-	require.Len(t, bd.ArgLists(t), 2)
-	for _, seq := range []string{"1", "2"} {
+	require.Len(t, bd.ArgLists(t), 3)
+	for _, seq := range []string{"1", "2", "3"} {
 		env, err := os.ReadFile(filepath.Join(bd.Dir, "env."+seq))
 		require.NoError(t, err)
 		require.Equal(t, "1\n1\n", string(env), "BD_JSON_ENVELOPE and BD_NON_INTERACTIVE must be set")
 	}
 	require.Equal(t, DoctorPass, report.Checks[1].Status)
-	require.Equal(t, "beads", report.Checks[2].Name)
-	require.Equal(t, DoctorPass, report.Checks[2].Status)
-	require.Equal(t, "embedded database answered bd ping in 3 ms", report.Checks[2].Detail)
+	require.Equal(t, DoctorCheck{Name: "dolt", Status: DoctorPass, Detail: doctorDoltEmbedded}, *report.Check("dolt"))
+	require.Equal(t, DoctorPass, report.Check("beads").Status)
+	require.Equal(t, "embedded database answered bd ping in 3 ms", report.Check("beads").Detail)
 }
 
 func TestDoctorBDToleratesPreambleAndFlatJSON(t *testing.T) {
@@ -323,18 +333,89 @@ func TestDoctorBDToleratesPreambleAndFlatJSON(t *testing.T) {
 	repo := doctorRepoDir(t, true, true)
 	// A metrics notice on stdout before the JSON, and a ping without the
 	// envelope, both decode.
-	testutil.FakeBin(t, "bd", `case "$1" in
-  version) printf '%s\n' "Thanks for using bd! Quick heads-up: bd shares anonymous usage metrics {see bd metrics}" '{"data":{"build":"dev","version":"1.2.2"},"schema_version":1}' ;;
-  *) printf '%s\n' "Checked 1 gates: 0 resolved" '{"status":"ok","total_ms":5}' ;;
-esac`)
+	testutil.FakeBin(t, "bd", `for a in "$@"; do
+  case "$a" in
+    version) printf '%s\n' "Thanks for using bd! Quick heads-up: bd shares anonymous usage metrics {see bd metrics}" '{"data":{"build":"dev","version":"1.2.2"},"schema_version":1}'; exit 0 ;;
+    context) printf '%s\n' "Thanks for using bd!" '{"backend":"dolt","dolt_mode":"embedded"}'; exit 0 ;;
+    ping) printf '%s\n' "Checked 1 gates: 0 resolved" '{"status":"ok","total_ms":5}'; exit 0 ;;
+  esac
+done
+exit 2`)
 
 	report := RunDoctor(context.Background(), repo)
 	require.Equal(t, "bd", report.Checks[1].Name)
 	require.Equal(t, DoctorPass, report.Checks[1].Status, report.Checks[1].Detail)
 	require.True(t, strings.HasPrefix(report.Checks[1].Detail, "1.2.2 (build dev, "), report.Checks[1].Detail)
-	require.Equal(t, "beads", report.Checks[2].Name)
-	require.Equal(t, DoctorPass, report.Checks[2].Status, report.Checks[2].Detail)
-	require.Equal(t, "embedded database answered bd ping in 5 ms", report.Checks[2].Detail)
+	require.Equal(t, DoctorPass, report.Check("dolt").Status, report.Check("dolt").Detail)
+	require.Equal(t, doctorDoltEmbedded, report.Check("dolt").Detail)
+	require.Equal(t, DoctorPass, report.Check("beads").Status, report.Check("beads").Detail)
+	require.Equal(t, "embedded database answered bd ping in 5 ms", report.Check("beads").Detail)
+}
+
+// doctorServerContext is `bd context --json` from a repository whose beads
+// project runs the multi-writer Dolt server backend (Appendix A), staged
+// over the captured embedded sample.
+const doctorServerContext = `{"data":{"beads_dir":"/repo/.beads","repo_root":"/repo","backend":"dolt",` +
+	`"dolt_mode":"server","server_host":"127.0.0.1:3307","database":"fx","role":"maintainer","bd_version":"1.2.2"},"schema_version":1}`
+
+// TestDoctorDoltServerMode is the second half of P1-15's golden coverage:
+// a beads project on the server backend warns and names P3-17, and the run
+// still passes (server mode is untested, not broken).
+func TestDoctorDoltServerMode(t *testing.T) {
+	doctorEnv(t)
+	doctorAddCartridge(t, "claude", "fable")
+	repo := doctorRepoDir(t, true, true)
+	git := doctorGitShim(t, "2.55.0", "")
+	samples := testutil.StageBDSamples(t, nil)
+	require.NoError(t, os.WriteFile(filepath.Join(samples, "context.json"), []byte(doctorServerContext), 0o600))
+	bd := testutil.FakeBD(t, samples)
+	gh := doctorGHShim(t, true)
+	claude := doctorClaudeShim(t)
+
+	stdout, stderr, code := doctorRun(t, "--repo", repo)
+	require.Equal(t, 0, code, stdout+stderr)
+	rootGolden(t, "doctor-dolt-server", doctorNormalise(stdout, repo, git, bd, gh, claude))
+
+	report := RunDoctor(context.Background(), repo)
+	require.Equal(t, DoctorWarn, report.Check("dolt").Status)
+	require.Contains(t, report.Check("dolt").Detail, `Dolt mode "server"`)
+	require.Contains(t, report.Check("dolt").Detail, "127.0.0.1:3307")
+	require.Equal(t, doctorHintDoltServer, report.Check("dolt").Hint)
+	require.True(t, report.OK, "server mode is untested, not broken")
+}
+
+// TestDoctorDoltFallsBackToMetadata covers the path where bd cannot answer
+// `bd context` but .beads/metadata.json can (P1-15).
+func TestDoctorDoltFallsBackToMetadata(t *testing.T) {
+	doctorEnv(t)
+	repo := doctorRepoDir(t, true, true)
+	meta := filepath.Join(repo, ".beads", "metadata.json")
+	testutil.FakeBin(t, "bd", `for a in "$@"; do
+  case "$a" in
+    version) echo '{"data":{"build":"dev","version":"1.2.2"},"schema_version":1}'; exit 0 ;;
+    ping) echo '{"data":{"status":"ok","total_ms":4},"schema_version":1}'; exit 0 ;;
+  esac
+done
+echo "Error: context is not available" >&2
+exit 1`)
+
+	// No metadata either: the backend is unknown, which only warns.
+	report := RunDoctor(context.Background(), repo)
+	require.Equal(t, DoctorWarn, report.Check("dolt").Status)
+	require.Contains(t, report.Check("dolt").Detail, "backend unknown: bd context failed")
+	require.Equal(t, doctorHintDoltUnknown, report.Check("dolt").Hint)
+
+	require.NoError(t, os.WriteFile(meta, []byte(`{"database":"fx","backend":"dolt","dolt_mode":"embedded"}`), 0o600))
+	report = RunDoctor(context.Background(), repo)
+	require.Equal(t, DoctorPass, report.Check("dolt").Status)
+	require.Contains(t, report.Check("dolt").Detail, "embedded")
+	require.Contains(t, report.Check("dolt").Detail, "metadata.json")
+
+	require.NoError(t, os.WriteFile(meta, []byte(`{"database":"fx","backend":"dolt","dolt_mode":"server"}`), 0o600))
+	report = RunDoctor(context.Background(), repo)
+	require.Equal(t, DoctorWarn, report.Check("dolt").Status)
+	require.Contains(t, report.Check("dolt").Detail, `metadata.json reports dolt_mode "server"`)
+	require.Equal(t, doctorHintDoltServer, report.Check("dolt").Hint)
 }
 
 func TestDoctorBDBadOutput(t *testing.T) {
@@ -347,7 +428,8 @@ esac`)
 	report := RunDoctor(context.Background(), repo)
 	require.Equal(t, DoctorFail, report.Checks[1].Status)
 	require.Contains(t, report.Checks[1].Detail, "no JSON object in output")
-	require.NotEqual(t, "beads", report.Checks[2].Name, "no ping after a failed version check")
+	require.Nil(t, report.Check("beads"), "no ping after a failed version check")
+	require.Nil(t, report.Check("dolt"), "no backend row after a failed version check")
 
 	testutil.FakeBin(t, "bd", `case "$1" in
   version) echo '{"data":{"build":"dev","version":"1.2.2"},"schema_version":1}' ;;
@@ -355,9 +437,13 @@ esac`)
 esac`)
 	report = RunDoctor(context.Background(), repo)
 	require.Equal(t, DoctorPass, report.Checks[1].Status)
-	require.Equal(t, "beads", report.Checks[2].Name)
-	require.Equal(t, DoctorFail, report.Checks[2].Status)
-	require.Equal(t, `bd ping reported status "degraded"`, report.Checks[2].Detail)
+	require.Equal(t, DoctorFail, report.Check("beads").Status)
+	require.Equal(t, `bd ping reported status "degraded"`, report.Check("beads").Detail)
+	// bd answered the context call with the same degraded payload, so the
+	// backend is unknown rather than embedded: a warning, never a failure.
+	require.Equal(t, DoctorWarn, report.Check("dolt").Status)
+	require.Contains(t, report.Check("dolt").Detail, `Dolt mode "unknown"`)
+	require.Equal(t, doctorHintDoltServer, report.Check("dolt").Hint)
 }
 
 func TestDoctorCartridges(t *testing.T) {

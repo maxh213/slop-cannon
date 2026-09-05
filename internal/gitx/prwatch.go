@@ -206,43 +206,69 @@ func (g *GH) run(ctx context.Context, stdin string, args ...string) (string, err
 	return strings.TrimRight(res.Stdout, "\r\n"), nil
 }
 
-// ghAuthProblems are stderr fragments that mean gh itself is not usable
-// because nobody is logged in.
-var ghAuthProblems = []string{
-	"gh auth login",
-	"not logged into",
-	"not logged in to",
-	"authentication required",
-	"authentication token",
-	"gh_token",
-	"http 401",
-	"bad credentials",
+// ghProblem is one row of the [ghProblems] table: a lower-case fragment of
+// gh's stderr and the sentinel it means.
+type ghProblem struct {
+	fragment string
+	cause    error
 }
 
-// ghRemoteProblems are stderr fragments that mean the working tree has no
-// usable GitHub remote.
-var ghRemoteProblems = []string{
-	"no git remotes found",
-	"none of the git remotes",
-	"could not determine base repository",
-	"not a git repository",
-	"unable to determine base repository",
+// ghProblems is the single classification table for gh's stderr (P4-09).
+// It is ordered, and the order is the point: gh's message for a repository
+// with no GitHub remote ends "To tell gh about a new GitHub host, please
+// use `gh auth login`", so every fragment that means "no usable GitHub
+// remote" has to be tested before the "gh auth login" hint, or a delivery
+// to a GitLab remote tells the user to log in to a host that has nothing
+// to do with the failure.
+var ghProblems = []ghProblem{
+	// No usable GitHub remote.
+	{"known github host", ErrNoGitHubRemote},
+	{"no git remotes found", ErrNoGitHubRemote},
+	{"none of the git remotes", ErrNoGitHubRemote},
+	{"could not determine base repository", ErrNoGitHubRemote},
+	{"unable to determine base repository", ErrNoGitHubRemote},
+	{"not a git repository", ErrNoGitHubRemote},
+	// Nobody is logged in.
+	{"gh auth login", ErrGHUnauthenticated},
+	{"not logged into", ErrGHUnauthenticated},
+	{"not logged in to", ErrGHUnauthenticated},
+	{"authentication required", ErrGHUnauthenticated},
+	{"authentication token", ErrGHUnauthenticated},
+	{"gh_token", ErrGHUnauthenticated},
+	{"http 401", ErrGHUnauthenticated},
+	{"bad credentials", ErrGHUnauthenticated},
 }
 
-// classifyGH maps gh's stderr onto a sentinel, or nil.
+// classifyGH maps gh's stderr onto a sentinel, or nil when the failure is
+// something else (a network error, a rate limit, a bad argument).
 func classifyGH(stderr string) error {
 	lower := strings.ToLower(stderr)
-	for _, p := range ghAuthProblems {
-		if strings.Contains(lower, p) {
-			return ErrGHUnauthenticated
-		}
-	}
-	for _, p := range ghRemoteProblems {
-		if strings.Contains(lower, p) {
-			return ErrNoGitHubRemote
+	for _, p := range ghProblems {
+		if strings.Contains(lower, p.fragment) {
+			return p.cause
 		}
 	}
 	return nil
+}
+
+// ghUnavailable classifies an error from [GH] as "gh cannot be used here"
+// — not installed, not authenticated, or no GitHub remote — and returns
+// the reason in the words the user reads on a push-only delivery. Other
+// failures (network, rate limits, a bad argument) are not, and the caller
+// must report them. It is the second half of the one classifier [classifyGH]
+// starts: that one names the cause, this one says what it means (P4-09).
+func ghUnavailable(err error) (string, bool) {
+	switch {
+	case err == nil:
+		return "", false
+	case errors.Is(err, ErrGHNotFound) || proc.IsNotFound(err):
+		return "gh is not installed", true
+	case errors.Is(err, ErrNoGitHubRemote):
+		return "the remote is not on a GitHub host gh knows", true
+	case errors.Is(err, ErrGHUnauthenticated):
+		return "gh is not authenticated (run `gh auth login`)", true
+	}
+	return "", false
 }
 
 // Check verifies that gh is installed and logged in (`gh auth status`).
@@ -640,6 +666,10 @@ func ReviewBeadInput(pr PullRequest, run domain.RunID) beads.BeadInput {
 		Type:        domain.BeadTypeTask,
 		Priority:    domain.PriorityDefault,
 		Description: d.String(),
+		// bd's own field for "this bead stands for something outside bd"
+		// (P3-19); the same reference is in the metadata for readers that
+		// only look there.
+		ExternalRef: pr.ExternalRef(),
 		Acceptance: "Every tester lens has reviewed the pull request's diff and a consolidated review " +
 			"(approve or request changes) has been posted on GitHub with gh pr review. " +
 			"The pull request is never merged by slop-cannon.",

@@ -66,12 +66,16 @@ var deliveryGlyphs = map[DeliveryStatus]string{
 }
 
 // Glyph returns the status's one-cell marker, [UnknownGlyph] for anything
-// unrecognised.
+// unrecognised. It goes through [PadGlyph], like every glyph the palette
+// hands out (P7-16): the set above mixes East-Asian-ambiguous characters
+// (○ ⧗ ◍) with unambiguous ones (✓ ✔ ✗ !), so on a terminal configured for
+// ambiguous-width 2 the STATUS column would otherwise shift by a cell
+// depending on which status a delivery happens to be in.
 func (s DeliveryStatus) Glyph() string {
 	if g, ok := deliveryGlyphs[s]; ok {
-		return g
+		return PadGlyph(g)
 	}
-	return UnknownGlyph
+	return PadGlyph(UnknownGlyph)
 }
 
 // style returns the theme style a status is rendered in.

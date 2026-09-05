@@ -18,6 +18,7 @@ import (
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
+	"slop-cannon/internal/testutil"
 )
 
 // Tests for the run log and the run-log fold (P6-08). Every helper here is
@@ -799,7 +800,7 @@ func TestSummariseReaderStopsOnAStreamThatCannotBeRead(t *testing.T) {
 	}()
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(testutil.Patience(10 * time.Second)):
 		t.Fatal("SummariseReader did not return: a read failure must not be retried")
 	}
 	require.ErrorIs(t, err, boom)

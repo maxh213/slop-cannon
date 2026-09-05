@@ -261,15 +261,20 @@ func (c ChangeRatio) Exceeds(threshold float64) bool {
 }
 
 // ChangeRatio computes the D-09 change ratio between the previous round's
-// diff and the current one: the lines changed between their heads,
-// relative to the current diff's changed lines. Both heads must still be
-// reachable in the repository: it fails with [ErrUnknownRevision] when
-// one of them is gone (the previous round was rebased away and its old
-// commit pruned), which callers should read as "everything changed" and
-// send every tester back to review rather than as a failure of the round.
-// When the branch was rebased between rounds and the old commit is still
-// reachable the upstream commits count as movement too, which errs on the
-// same side.
+// diff and the current one from the two branch tips: the lines changed
+// between them, relative to the current diff's changed lines. Both heads
+// must still be reachable in the repository: it fails with
+// [ErrUnknownRevision] when one of them is gone (the previous round was
+// rebased away and its old commit pruned), which callers should read as
+// "everything changed" and send every tester back to review rather than as
+// a failure of the round.
+//
+// It is not rebase-safe: a rebase moves the tip by every upstream commit
+// as well as by the engineer's work, and all of it counts as movement
+// here, so on a busy default branch even a one-line round scores above the
+// threshold. Prefer [Repo.RebaseSafeChangeRatio], which compares the two
+// change sets instead and only falls back to this when a diff is too large
+// to carry its patch (P4-14).
 func (r *Repo) ChangeRatio(ctx context.Context, previous, current *Diff) (ChangeRatio, error) {
 	if previous == nil || current == nil {
 		return ChangeRatio{}, errors.New("gitx: ChangeRatio: both diffs are required")
@@ -284,6 +289,117 @@ func (r *Repo) ChangeRatio(ctx context.Context, previous, current *Diff) (Change
 	}
 	c.Ratio = RatioOf(c.Delta, c.Total)
 	return c, nil
+}
+
+// RebaseSafeChangeRatio is the D-09 measurement to use when the branch may
+// have been rebased between the two rounds — a conflict round always has
+// been, and an ordinary round can be (P4-14).
+//
+// It compares the two change sets with [ChangeSetRatio], each measured
+// against its own merge-base, so the upstream commits the branch was
+// rebased onto are in neither patch and cancel out: a round that only
+// settled a conflict scores near zero even when the default branch moved a
+// long way underneath it. When either diff is too large to carry its patch
+// it falls back to [Repo.ChangeRatio], which over-reports across a rebase
+// and so errs towards a review.
+func (r *Repo) RebaseSafeChangeRatio(ctx context.Context, previous, current *Diff) (ChangeRatio, error) {
+	if previous == nil || current == nil {
+		return ChangeRatio{}, errors.New("gitx: RebaseSafeChangeRatio: both diffs are required")
+	}
+	if c, ok := ChangeSetRatio(previous, current); ok {
+		return c, nil
+	}
+	return r.ChangeRatio(ctx, previous, current)
+}
+
+// ChangeSetRatio measures how far the change set under review moved
+// between two rounds by comparing the patches themselves rather than the
+// branch tips: Delta is the number of added or removed lines that differ
+// between them, Total the current change set's changed lines, and Ratio
+// their quotient (see [RatioOf], so an emptied change set is 1 rather than
+// a division by zero).
+//
+// Both diffs are taken against their own merge-base, so whatever the
+// branch was rebased onto is in neither patch and does not count as the
+// engineer's work (P4-14). It needs no repository and no surviving
+// commits: the patches are the evidence.
+//
+// The second result is false when either diff has no patch to read
+// (gitx truncates an oversized diff to its file list), and the caller must
+// measure some other way — [Repo.ChangeRatio] falls back to the tip-to-tip
+// difference.
+func ChangeSetRatio(previous, current *Diff) (ChangeRatio, bool) {
+	before, ok := patchLines(previous)
+	if !ok {
+		return ChangeRatio{}, false
+	}
+	after, ok := patchLines(current)
+	if !ok {
+		return ChangeRatio{}, false
+	}
+	delta := 0
+	for line, n := range before {
+		delta += absInt(n - after[line])
+	}
+	for line, n := range after {
+		if _, seen := before[line]; !seen {
+			delta += n
+		}
+	}
+	c := ChangeRatio{
+		Previous: previous.Head(), Current: current.Head(),
+		Delta: delta, Total: current.ChangedLines(),
+	}
+	c.Ratio = RatioOf(c.Delta, c.Total)
+	return c, true
+}
+
+// patchLines counts the lines a diff's patch adds and removes, keyed by the
+// file's own "diff --git" header line so that identical lines in different
+// files are told apart. The header is the key rather than a parsed path
+// because it needs to be nothing more than stable between two diffs of the
+// same file, and it changes when the file is renamed — which is a change.
+// Hunk headers, context lines and the extended header before the first hunk
+// are ignored, so upstream commits that move the surrounding code do not
+// count as the engineer's work.
+//
+// The second result is false when there is no patch to read: an empty
+// change set counts as an empty tally, but a truncated diff cannot be
+// compared this way.
+func patchLines(d *Diff) (map[string]int, bool) {
+	if d == nil {
+		return nil, false
+	}
+	lines := map[string]int{}
+	if d.Empty() {
+		return lines, true
+	}
+	if d.Truncated || d.Patch == "" {
+		return nil, false
+	}
+	file, inHunk := "", false
+	for _, line := range strings.Split(d.Patch, "\n") {
+		switch {
+		case strings.HasPrefix(line, "diff --git "):
+			file, inHunk = line, false
+		case strings.HasPrefix(line, "@@"):
+			inHunk = true
+		case !inHunk:
+			// "index", "new file mode", "--- a/x", "+++ b/x" and the rest
+			// of the extended header: not content.
+		case strings.HasPrefix(line, "+"), strings.HasPrefix(line, "-"):
+			lines[file+"\x00"+line]++
+		}
+	}
+	return lines, true
+}
+
+// absInt is the absolute value of an int.
+func absInt(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }
 
 // RatioOf is the D-09 arithmetic on its own: delta lines over total lines.
@@ -318,7 +434,9 @@ type fileStatus struct {
 // diffStatuses classifies every file changed between two commits, keyed
 // by its (new) path.
 func (r *Repo) diffStatuses(ctx context.Context, from, to string) (map[string]fileStatus, error) {
-	out, err := r.Git(ctx, append(diffArgs("--name-status"), "-z", from, to, "--")...)
+	// GitRaw: NUL-terminated fields, one of which may end in a newline
+	// (P4-11).
+	out, err := r.GitRaw(ctx, append(diffArgs("--name-status"), "-z", from, to, "--")...)
 	if err != nil {
 		return nil, err
 	}

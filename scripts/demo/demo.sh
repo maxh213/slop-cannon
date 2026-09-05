@@ -118,8 +118,11 @@ git -C "$repo" push -q -u origin main
 # --- the bd stand-in --------------------------------------------------------
 # The wrapper adds the two things the fake tracker does not implement and the
 # run needs: `bd ping` (the D-13 health check) and `bd version` plus
-# --readonly enforcement (what beads.Shim.Verify probes before every agent,
-# so the read-only shim is installed and checked exactly as in production).
+# --readonly enforcement. Those last two are what beads.Shim.Verify probes
+# before every agent and no run ever asks for otherwise; the requirement is
+# written down beside that method ("What a stand-in bd owes this check",
+# P8-27), and scdemo's own suite holds this script to it with
+# TestTheDemosBDStandInSatisfiesTheShimSelfCheck.
 cat >"$bin/bd" <<EOF
 #!/bin/sh
 SC_E2E_FAKEBD_DIR=$work/bd

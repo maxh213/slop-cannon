@@ -495,9 +495,20 @@ func TestPRsOpenThroughTheModel(t *testing.T) {
 		require.Equal(t, prsAt(20), am.State().Notices[0].At)
 		require.Contains(t, am.State().Notices[0].Err, "xdg-open")
 
-		t.Run("and cleared by the next key press", func(t *testing.T) {
+		// The flash itself is cleared by the next key press (P7-10), but the
+		// failure is not lost with it: it was recorded as a notice, and the
+		// footer keeps the run's newest notice on screen (P7-19). The two say
+		// the same sentence, so only one of them is drawn at a time.
+		before := prsFooter(t, am)
+		require.Equal(t, 1, strings.Count(before, "could not open"),
+			"the flash and the notice both drew the same sentence")
+
+		t.Run("and kept as a notice after the next key press", func(t *testing.T) {
 			cleared, _ := am.Update(prsKey("j"))
-			require.NotContains(t, prsFooter(t, cleared), "could not open")
+			footer := prsFooter(t, cleared)
+			require.Contains(t, footer, "! could not open https://example.invalid/acme/app/pull/42",
+				"the failure vanished with the flash instead of staying as a notice")
+			require.Equal(t, 1, strings.Count(footer, "could not open"))
 		})
 	})
 
@@ -753,5 +764,102 @@ func prsKey(s string) tea.KeyMsg {
 		return tea.KeyMsg{Type: tea.KeyDown}
 	default:
 		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+}
+
+// --- P7-16: the views' own glyphs share the palette's column -----------
+
+// TestGlyphColumnHoldsForEveryViewsOwnGlyphs pins P7-16. The PRs view, the
+// Feedback view, the Agents view and the headless renderer each keep a small
+// glyph set of their own, outside theme.go, and every one of them mixes
+// East-Asian-ambiguous characters (○ ⧗ ◍ ◐ · ⊘ ◆ ▶ §) with unambiguous ones
+// (✓ ✔ ✗ ! → ⤴ │): on a terminal configured for ambiguous-width 2 an
+// unpadded set would move a status column, a lens tick or the body of a
+// headless line by a cell depending on which value it happens to render.
+// [PadGlyph] is exported for exactly this, so every one of those glyphs has
+// to be exactly [GlyphCells] wide.
+//
+// It lives here, in the one package-internal test file of a view that owns
+// such a set, because every set but the headless renderer's is unexported;
+// [TestGlyphColumnUnderEastAsianWidth] re-runs it in the width mode where
+// the assertion has teeth.
+func TestGlyphColumnHoldsForEveryViewsOwnGlyphs(t *testing.T) {
+	t.Parallel()
+
+	cell := GlyphCells()
+	check := func(t *testing.T, what, glyph string) {
+		t.Helper()
+		require.Equalf(t, cell, lipgloss.Width(glyph),
+			"%s renders %q, which is %d cells wide and not the palette's %d: pass it through PadGlyph",
+			what, glyph, lipgloss.Width(glyph), cell)
+	}
+
+	t.Run("prs", func(t *testing.T) {
+		t.Parallel()
+		for _, s := range prsEveryStatus() {
+			check(t, "delivery status "+string(s), s.Glyph())
+		}
+		check(t, "an unknown delivery status", DeliveryStatus("nonsense").Glyph())
+	})
+
+	t.Run("feedback", func(t *testing.T) {
+		t.Parallel()
+		for _, st := range []TesterStatus{
+			{Pending: true},
+			{Outcome: domain.VerdictApprove},
+			{Outcome: domain.VerdictChanges},
+			{},
+		} {
+			check(t, "tester "+st.String(), st.Glyph())
+		}
+		for _, g := range []string{"→", "↩", "⊘", "⚖", "▲", "⚙"} {
+			check(t, "the feedback marker "+g, PadGlyph(g))
+		}
+	})
+
+	t.Run("agents", func(t *testing.T) {
+		t.Parallel()
+		for _, st := range domain.AgentStates() {
+			check(t, "an agent in "+st.String(), agentsGlyph(AgentView{Agent: domain.Agent{State: st}}))
+		}
+		check(t, "an agent with no role yet", agentsGlyph(AgentView{}))
+		for _, r := range domain.Roles() {
+			check(t, "a live "+r.String(),
+				agentsGlyph(AgentView{Agent: domain.Agent{Role: r, State: domain.AgentStateRunning}}))
+		}
+		for _, f := range agentsSpinner {
+			check(t, "the spinner frame "+f, PadGlyph(f))
+		}
+		// The transcript prefixes are a glyph plus one space, so all three
+		// have to be the same width or the lines of one stream start in a
+		// different column from the lines of another.
+		want := lipgloss.Width(agentsPrefix(agentsStdout))
+		for _, k := range []agentsStreamKind{agentsStdout, agentsStderr, agentsMeta} {
+			require.Equalf(t, want, lipgloss.Width(agentsPrefix(k)),
+				"the transcript prefixes are not all %d cells: %q", want, agentsPrefix(k))
+		}
+		require.Equal(t, cell+1, want, "a transcript prefix is one glyph column plus a space")
+	})
+
+	t.Run("headless", func(t *testing.T) {
+		t.Parallel()
+		for _, k := range events.Kinds() {
+			ev, ok := events.New(k)
+			require.Truef(t, ok, "events.New has no zero value for %s", k)
+			check(t, "the headless glyph of "+string(k), HeadlessGlyph(ev))
+		}
+		// The approving verdict takes the other branch of the one glyph
+		// that depends on an event's content rather than its kind.
+		check(t, "the headless glyph of an approval", HeadlessGlyph(events.VerdictReceived{
+			Verdict: domain.Verdict{Outcome: domain.VerdictApprove},
+		}))
+	})
+}
+
+// prsEveryStatus lists the delivery statuses the PRs view can draw.
+func prsEveryStatus() []DeliveryStatus {
+	return []DeliveryStatus{
+		DeliveryOpen, DeliveryAwaitingMerge, DeliveryReviewing, DeliveryReviewed,
+		DeliveryMerged, DeliveryClosed, DeliveryNeedsHuman, DeliveryFailed,
 	}
 }

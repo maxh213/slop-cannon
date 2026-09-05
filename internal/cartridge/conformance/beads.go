@@ -90,7 +90,9 @@ func runBeads(ctx context.Context, e *env) (string, cartridge.Usage, error) {
 	if err != nil {
 		return "", cartridge.Usage{}, fmt.Errorf("install the read-only bd shim: %w", err)
 	}
-	if err := beads.RetryTextBusy(ctx, func() error { return shim.Verify(ctx, spec.Workdir) }); err != nil {
+	// Verify retries its own first probe on ETXTBSY (P3-20, P8-02), so it
+	// needs no wrapper of its own here.
+	if err := shim.Verify(ctx, spec.Workdir); err != nil {
 		return "", cartridge.Usage{}, fmt.Errorf("the shim chain does not hold before any session ran: %w", err)
 	}
 	if spec.Env == nil {

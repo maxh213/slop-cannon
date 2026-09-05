@@ -2,7 +2,9 @@ Report what a run did and is doing.
 
 Without arguments it describes the most recent run recorded for the
 repository (--run ID picks another): its phase, how its beads are spread
-across the workflow states, which agents are live, and the last few events.
+across the workflow states, what it delivered — pull requests, merges, and
+the reviews it posted on pull requests it did not open — which agents are
+live, and the last few events.
 Everything comes from the run directory — state.json and events.jsonl — so
 it also works after a crash and while another process holds the run.
 

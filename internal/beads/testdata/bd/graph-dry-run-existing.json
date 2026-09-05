@@ -3,7 +3,7 @@
     "dry_run": true,
     "node_count": 6,
     "edge_count": 6,
-    "parent_deps": 0,
+    "parent_deps": 6,
     "validation_notes": [
       "dry-run validates the graph structure only; live create may still reject parent-child blocking paths after resolving stored dependencies"
     ],
@@ -12,37 +12,43 @@
         "key": "a",
         "title": "Add stats package",
         "type": "task",
-        "priority": 1
+        "priority": 1,
+        "parent_id": "px-26w"
       },
       {
         "key": "b",
         "title": "Fix Mean",
         "type": "bug",
-        "priority": 1
+        "priority": 1,
+        "parent_id": "px-26w"
       },
       {
         "key": "c",
         "title": "Fix Max",
         "type": "bug",
-        "priority": 2
+        "priority": 2,
+        "parent_id": "px-26w"
       },
       {
         "key": "d",
         "title": "Add Median",
         "type": "feature",
-        "priority": 2
+        "priority": 2,
+        "parent_id": "px-26w"
       },
       {
         "key": "e",
         "title": "Document stats",
         "type": "chore",
-        "priority": 3
+        "priority": 3,
+        "parent_id": "px-26w"
       },
       {
         "key": "f",
         "title": "Benchmark stats",
         "type": "task",
-        "priority": 4
+        "priority": 4,
+        "parent_id": "px-26w"
       }
     ]
   },

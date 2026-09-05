@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -471,6 +472,7 @@ func TestReviewBeadInput(t *testing.T) {
 	assert.Equal(t, 12, in.Metadata[beads.MetaPRNumber])
 	assert.Equal(t, KindExternalPR, in.Metadata[beads.MetaKind])
 	assert.Equal(t, "gh-12", in.Metadata[MetaExternalRef])
+	assert.Equal(t, "gh-12", in.ExternalRef, "bd's own --external-ref flag carries it too (P3-19)")
 	assert.Equal(t, pr.HeadSHA, in.Metadata[MetaPRHead])
 	assert.NotContains(t, in.Metadata, beads.MetaRun)
 	assert.Equal(t, "External pull request #12 by alice: https://github.com/example/fixture/pull/12\n"+
@@ -523,6 +525,7 @@ func TestPRWatcher_Poll(t *testing.T) {
 		require.Len(t, store.created, 2)
 		assert.Equal(t, []string{beads.LabelExternalPR, "sc:run:r1"}, store.created[0].Labels)
 		assert.Equal(t, "gh-12", store.created[0].Metadata[MetaExternalRef])
+		assert.Equal(t, "gh-12", store.created[0].ExternalRef)
 
 		res, err = w.Poll(ctx)
 		require.NoError(t, err)
@@ -733,10 +736,100 @@ func TestPRWatcher_PollWithBD(t *testing.T) {
 	assert.Contains(t, create, beads.LabelExternalPR+",sc:run:r1")
 	assert.Contains(t, create, "--metadata")
 	assert.Equal(t, "--json", create[len(create)-1])
+	// P3-19: bd's own field for the pull request this bead stands for.
+	extRef := slices.Index(create, "--external-ref")
+	require.NotEqual(t, -1, extRef, "the create carries --external-ref: %v", create)
+	assert.Equal(t, "gh-12", create[extRef+1])
 	for i, a := range create {
 		if a == "--metadata" {
 			assert.True(t, strings.HasPrefix(create[i+1], "@"), "metadata goes through @file: %q", create[i+1])
 		}
 	}
 	assert.Equal(t, "Review PR #15: WIP: Sum overflow guard", calls[2][3])
+}
+
+// TestClassifyGH is P4-09's table over the messages gh really prints. The
+// row that matters most is the non-GitHub remote: its message ends with a
+// `gh auth login` hint, which an auth-first classifier reads as "not
+// logged in" and reports to the user as the cause of a push-only
+// delivery.
+func TestClassifyGH(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+		cause  error
+		reason string
+	}{
+		{
+			name:   "no known GitHub host, with gh's auth hint",
+			stderr: "none of the git remotes configured for this repository point to a known GitHub host. To tell gh about a new GitHub host, please use `gh auth login`",
+			cause:  ErrNoGitHubRemote,
+			reason: "the remote is not on a GitHub host gh knows",
+		},
+		{
+			name:   "no remotes at all",
+			stderr: "no git remotes found",
+			cause:  ErrNoGitHubRemote,
+			reason: "the remote is not on a GitHub host gh knows",
+		},
+		{
+			name:   "base repository cannot be determined",
+			stderr: "could not determine base repository: no git remotes found",
+			cause:  ErrNoGitHubRemote,
+			reason: "the remote is not on a GitHub host gh knows",
+		},
+		{
+			name:   "run outside a repository",
+			stderr: "fatal: not a git repository (or any of the parent directories): .git",
+			cause:  ErrNoGitHubRemote,
+			reason: "the remote is not on a GitHub host gh knows",
+		},
+		{
+			name:   "never logged in",
+			stderr: "To get started with GitHub CLI, please run:  gh auth login\nAlternatively, populate the GH_TOKEN environment variable with a GitHub API authentication token.",
+			cause:  ErrGHUnauthenticated,
+			reason: "gh is not authenticated (run `gh auth login`)",
+		},
+		{
+			name:   "logged out",
+			stderr: "You are not logged into any GitHub hosts. To log in, run: gh auth login",
+			cause:  ErrGHUnauthenticated,
+			reason: "gh is not authenticated (run `gh auth login`)",
+		},
+		{
+			name:   "token rejected",
+			stderr: "HTTP 401: Bad credentials (https://api.github.com/graphql)",
+			cause:  ErrGHUnauthenticated,
+			reason: "gh is not authenticated (run `gh auth login`)",
+		},
+		{name: "network", stderr: "HTTP 502: bad gateway"},
+		{name: "rate limited", stderr: "HTTP 403: API rate limit exceeded"},
+		{name: "no such pull request", stderr: `no pull requests found for branch "sc/fx-1"`},
+		{name: "empty", stderr: ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := classifyGH(c.stderr)
+			assert.Equal(t, c.cause, got, "classifyGH(%q)", c.stderr)
+
+			// The same table drives the reason a push-only delivery
+			// reports, through the GHError the runner builds.
+			err := error(&GHError{Args: []string{"pr", "list"}, ExitCode: 1, Stderr: c.stderr, Cause: got})
+			reason, unavailable := ghUnavailable(err)
+			assert.Equal(t, c.reason != "", unavailable)
+			assert.Equal(t, c.reason, reason)
+		})
+	}
+
+	t.Run("a missing binary needs no stderr", func(t *testing.T) {
+		reason, ok := ghUnavailable(&GHError{Args: []string{"pr", "list"}, ExitCode: -1, Cause: ErrGHNotFound})
+		assert.True(t, ok)
+		assert.Equal(t, "gh is not installed", reason)
+	})
+
+	t.Run("no error is not an unavailability", func(t *testing.T) {
+		reason, ok := ghUnavailable(nil)
+		assert.False(t, ok)
+		assert.Empty(t, reason)
+	})
 }

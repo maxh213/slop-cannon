@@ -1,0 +1,25 @@
+run        20260903-120000-abcd
+phase      running (no live process: the run was killed or crashed)
+process    none; pid <pid> took the run lock, and that pid belongs to another program now
+mode       brief
+brief      add retries to the client
+epic       sc-0
+repo       <tmp>/repo
+run dir    <state>/runs/20260903-120000-abcd
+started    2026-09-03 12:00:00Z
+last event 2026-09-03 12:01:01Z
+cartridge  claude (model fable)
+ammo       10 → 1 PO, up to 2 engineers, up to 7 testers
+safety     on (pull requests)
+
+beads      3
+  open       1
+  in_review  1
+  closed     1
+
+delivery   1 pull request, 1 merge
+
+agents     1 last seen of 10 ammo
+  tester-qa-sc-2-r1  tester/qa  sc-2  running  pid 4243
+
+events     0 of 18 (1 output line, 1 warning)

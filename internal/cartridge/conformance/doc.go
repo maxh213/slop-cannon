@@ -13,6 +13,13 @@
 // to the event-stream contract: exactly one terminal event, last, matching
 // Wait's outcome.
 //
+// The kill check uses Session.Kill and never a cancelled context, because
+// an adapter is only required to notice a cancellation while it still has
+// work to do: a CLI whose process exited a moment before the signal
+// reports its result, not a kill. The mock is explicit about the same
+// window (see the mock package doc, P2-11), so a scripted rule that must
+// end with cartridge.ErrKilled always keeps a step in hand.
+//
 // [Run] executes the suite against one cartridge and returns a [Report];
 // [Report.Table] renders it for a terminal. The suite runs against the mock
 // cartridge in the normal test run ([MockScenario] scripts replies for

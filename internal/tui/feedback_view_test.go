@@ -1,12 +1,14 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,8 +17,16 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/stretchr/testify/require"
 
+	"slop-cannon/internal/agents"
+	"slop-cannon/internal/agents/prompt"
+	"slop-cannon/internal/beads"
+	"slop-cannon/internal/cartridge"
+	"slop-cannon/internal/cartridge/mock"
+	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
+	"slop-cannon/internal/gitx"
+	"slop-cannon/internal/orchestrator"
 )
 
 // fbGoldenDir is where the Feedback view's golden frames live.
@@ -89,9 +99,11 @@ func fbReport(summary string) *domain.ImplReport {
 // fbAllLenses is the full tester roster of a first round.
 var fbAllLenses = []domain.Lens{domain.LensUX, domain.LensQA, domain.LensTest}
 
-// fbApprove is a clean approval from one lens.
-func fbApprove(lens domain.Lens, round int, summary string) domain.Verdict {
-	return domain.Verdict{Lens: lens, Round: round, Outcome: domain.VerdictApprove, Summary: summary}
+// fbApprove is a clean approval from one lens. A re-review carries the
+// items it was given forward with their settled status, which is why it
+// takes them too (P5-05 refuses a verdict that drops one).
+func fbApprove(lens domain.Lens, round int, summary string, items ...domain.FeedbackItem) domain.Verdict {
+	return domain.Verdict{Lens: lens, Round: round, Outcome: domain.VerdictApprove, Summary: summary, Items: items}
 }
 
 // fbChanges is a change request with items.
@@ -99,13 +111,23 @@ func fbChanges(lens domain.Lens, round int, summary string, items ...domain.Feed
 	return domain.Verdict{Lens: lens, Round: round, Outcome: domain.VerdictChanges, Summary: summary, Items: items}
 }
 
+// The seven scenarios below are the shape of a real feedback loop, not a
+// sketch of one: each is pinned to a recording of P6-04's own loop running
+// that scenario against the mock cartridge, and
+// [TestFeedbackFixturesMatchTheRecordedLoop] fails when the two disagree
+// (P7-14). Three things follow from that and are easy to get wrong by hand:
+// the engineer's report or answers are published before the round they open,
+// an item is raised `open` and only reaches its settled status when a later
+// verdict carries it forward, and a round that only judges a pushback opens
+// no [events.RoundStarted] of its own.
+
 // fbScenarioA is P6-04 (a): every tester approves in round 1.
 func fbScenarioA(c *fbClock) []events.Event {
 	const bead domain.BeadID = "sc-a1b2"
 	return []events.Event{
 		events.BeadCreated{Meta: c.next(), Bead: fbBead(bead, "Retry failed HTTP requests", domain.BeadStateClosed, 1)},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "eng-1", Report: fbReport("retry 5xx with capped exponential backoff")},
+		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "ux-1", Verdict: fbApprove(domain.LensUX, 1, "the error message still reads well")},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "qa-1", Verdict: fbApprove(domain.LensQA, 1, "reproduced the flake, now green")},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "test-1", Verdict: fbApprove(domain.LensTest, 1, "table test covers the cap")},
@@ -116,60 +138,63 @@ func fbScenarioA(c *fbClock) []events.Event {
 // them, the tester approves in round 2.
 func fbScenarioB(c *fbClock) []events.Event {
 	const bead domain.BeadID = "sc-c3d4"
-	item := fbItem("qa-r1-1", domain.SeverityBlocker, "Retry loops forever on a 500", domain.ItemResolved)
+	item := fbItem("qa-r1-1", domain.SeverityBlocker, "Retry loops forever on a 500", domain.ItemOpen)
+	resolved := item
+	resolved.Status = domain.ItemResolved
 	return []events.Event{
 		events.BeadCreated{Meta: c.next(), Bead: fbBead(bead, "Cache DNS lookups", domain.BeadStateApproved, 2)},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e"},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "eng-2", Report: fbReport("cache lookups for the TTL the resolver reports")},
+		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e"},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "ux-1", Verdict: fbApprove(domain.LensUX, 1, "no user-visible change")},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1, "one blocker", item)},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "test-1", Verdict: fbApprove(domain.LensTest, 1, "coverage is fine")},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 2, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}, Commit: "3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f"},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "eng-2", Responses: []domain.Response{
 			{ItemID: item.ID, Action: domain.ActionFixed, Rationale: "capped the loop at five attempts"},
-		}, Report: fbReport("cap the retry loop")},
-		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "qa-1", Verdict: fbApprove(domain.LensQA, 2, "the cap holds")},
+		}},
+		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 2, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}, Commit: "3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f"},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "qa-1", Verdict: fbApprove(domain.LensQA, 2, "the cap holds", resolved)},
 	}
 }
 
 // fbScenarioC is P6-04 (c): the engineer pushes back and the tester accepts.
+// The evaluation opens no round of its own: it judges the answer to round
+// one's items rather than a new commit.
 func fbScenarioC(c *fbClock) []events.Event {
 	const bead domain.BeadID = "sc-e5f6"
-	item := fbItem("ux-r1-1", domain.SeverityMinor, "Spell the flag --no-cache", domain.ItemAccepted)
-	nit := fbItem("ux-r1-2", domain.SeverityNit, "Capitalise the help text", domain.ItemAccepted)
+	item := fbItem("ux-r1-1", domain.SeverityMinor, "Spell the flag --no-cache", domain.ItemOpen)
+	nit := fbItem("ux-r1-2", domain.SeverityNit, "Capitalise the help text", domain.ItemOpen)
+	accepted, acceptedNit := item, nit
+	accepted.Status, acceptedNit.Status = domain.ItemAccepted, domain.ItemAccepted
 	return []events.Event{
 		events.BeadCreated{Meta: c.next(), Bead: fbBead(bead, "Add a --cache flag", domain.BeadStateApproved, 2)},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70"},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "eng-3", Report: fbReport("add the flag and document it")},
+		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f70"},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "ux-1", Verdict: fbChanges(domain.LensUX, 1, "naming", item, nit)},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "qa-1", Verdict: fbApprove(domain.LensQA, 1, "behaviour is right")},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "test-1", Verdict: fbApprove(domain.LensTest, 1, "covered")},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 2, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensUX}, Commit: "5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081"},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "eng-3", Responses: []domain.Response{
 			{ItemID: item.ID, Action: domain.ActionPushback, Rationale: "every other flag in the CLI is positive; --cache=false already works"},
 			{ItemID: nit.ID, Action: domain.ActionWontfix, Rationale: "cobra lower-cases every other help string"},
 		}},
-		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "ux-1", Verdict: fbApprove(domain.LensUX, 2, "fair, the rationale holds")},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "ux-1", Verdict: fbApprove(domain.LensUX, 2, "fair, the rationale holds", accepted, acceptedNit)},
 	}
 }
 
 // fbScenarioD is P6-04 (d): the pushback is held, the product owner upholds
-// the engineer and the bead is approved.
+// the engineer and the bead is approved on the ruling — the loop opens no
+// further round for a tester that has been overruled.
 func fbScenarioD(c *fbClock) []events.Event {
 	const bead domain.BeadID = "sc-g7h8"
 	raised := fbItem("qa-r1-1", domain.SeverityMajor, "Validate the timeout before use", domain.ItemOpen)
 	held := raised
 	held.Status = domain.ItemHeld
-	settled := raised
-	settled.Status = domain.ItemOverruled
 	return []events.Event{
-		events.BeadCreated{Meta: c.next(), Bead: fbBead(bead, "Bump the client timeout", domain.BeadStateApproved, 3)},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192"},
+		events.BeadCreated{Meta: c.next(), Bead: fbBead(bead, "Bump the client timeout", domain.BeadStateApproved, 2)},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "eng-4", Report: fbReport("raise the timeout to 30s")},
-		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1, "one major", raised)},
+		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192"},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "ux-1", Verdict: fbApprove(domain.LensUX, 1, "fine")},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1, "one major", raised)},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "test-1", Verdict: fbApprove(domain.LensTest, 1, "fine")},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 2, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}, Commit: "708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3"},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "eng-4", Responses: []domain.Response{
 			{ItemID: raised.ID, Action: domain.ActionPushback, Rationale: "the config layer already rejects a negative timeout"},
 		}},
@@ -177,65 +202,66 @@ func fbScenarioD(c *fbClock) []events.Event {
 		events.ArbitrationReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "po-1", Rulings: []domain.Arbitration{
 			{ItemID: raised.ID, Ruling: domain.RulingUpholdEngineer, Rationale: "config validation covers it; a second check is dead code"},
 		}},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 3, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}, Commit: "8192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4"},
-		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 3, Agent: "qa-1", Verdict: domain.Verdict{
-			Lens: domain.LensQA, Round: 3, Outcome: domain.VerdictApprove, Summary: "ruling accepted", Items: []domain.FeedbackItem{settled},
-		}},
 	}
 }
 
 // fbScenarioE is P6-04 (e): the product owner upholds the tester and the
-// engineer fixes the item.
+// engineer fixes the item. A rules violation is always a blocker the
+// engineer has to fix (P5-05 refuses any other answer), so the item the
+// tester holds on to is a plain major beside it.
 func fbScenarioE(c *fbClock) []events.Event {
 	const bead domain.BeadID = "sc-i9j0"
-	raised := fbItem("test-r1-1", domain.SeverityBlocker, "No test for the empty-body case", domain.ItemOpen)
-	raised.Category = domain.CategoryRules
-	held := raised
+	rules := fbItem("test-r1-1", domain.SeverityBlocker, "No test for the empty-body case", domain.ItemOpen)
+	rules.Category = domain.CategoryRules
+	disputed := fbItem("test-r1-2", domain.SeverityMajor, "Name the reader parameter", domain.ItemOpen)
+	rulesFixed, held, fixed := rules, disputed, disputed
+	rulesFixed.Status = domain.ItemResolved
 	held.Status = domain.ItemHeld
-	fixed := raised
 	fixed.Status = domain.ItemResolved
 	return []events.Event{
 		events.BeadCreated{Meta: c.next(), Bead: fbBead(bead, "Stream the response body", domain.BeadStateInReview, 3)},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "92a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5"},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "eng-5", Report: fbReport("stream instead of buffering")},
+		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "92a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5"},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "ux-1", Verdict: fbApprove(domain.LensUX, 1, "no interface change")},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "qa-1", Verdict: fbApprove(domain.LensQA, 1, "streams as advertised")},
-		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "test-1", Verdict: fbChanges(domain.LensTest, 1, "missing coverage", raised)},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 2, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensTest}, Commit: "a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6"},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "test-1", Verdict: fbChanges(domain.LensTest, 1, "missing coverage", rules, disputed)},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "eng-5", Responses: []domain.Response{
-			{ItemID: raised.ID, Action: domain.ActionWontfix, Rationale: "the empty body is unreachable through the public API"},
+			{ItemID: rules.ID, Action: domain.ActionFixed, Rationale: "added TestStreamEmptyBody"},
+			{ItemID: disputed.ID, Action: domain.ActionPushback, Rationale: "the parameter is named after the interface it takes"},
 		}},
-		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "test-1", Verdict: fbChanges(domain.LensTest, 2, "rules say every branch is tested", held)},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "test-1", Verdict: fbChanges(domain.LensTest, 2, "rules say every parameter reads as prose", held)},
 		events.ArbitrationReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "po-1", Rulings: []domain.Arbitration{
-			{ItemID: raised.ID, Ruling: domain.RulingUpholdTester, Instruction: "add the test with a hand-built reader", Rationale: "a rules item is never overruled"},
+			{ItemID: disputed.ID, Ruling: domain.RulingUpholdTester, Instruction: "rename it to body", Rationale: "the reviewer reads the code more often than the author"},
+		}},
+		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 3, Agent: "eng-5", Responses: []domain.Response{
+			{ItemID: disputed.ID, Action: domain.ActionFixed, Rationale: "renamed it to body"},
 		}},
 		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 3, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensTest}, Commit: "b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7"},
-		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 3, Agent: "eng-5", Responses: []domain.Response{
-			{ItemID: raised.ID, Action: domain.ActionFixed, Rationale: "added TestStreamEmptyBody"},
-		}, Report: fbReport("add the empty-body test")},
-		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 3, Agent: "test-1", Verdict: domain.Verdict{
-			Lens: domain.LensTest, Round: 3, Outcome: domain.VerdictApprove, Summary: "covered now", Items: []domain.FeedbackItem{fixed},
-		}},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 3, Agent: "test-1", Verdict: fbApprove(domain.LensTest, 3, "covered and it reads well now", rulesFixed, fixed)},
 	}
 }
 
 // fbScenarioF is P6-04 (f): the round cap is reached and the product owner
-// blocks the bead for a human.
+// blocks the bead for a human. The item is raised once and carried forward
+// with its own id every round; a re-review that renumbered it would be
+// refused by the verdict schema (P5-05).
 func fbScenarioF(c *fbClock) []events.Event {
 	const bead domain.BeadID = "sc-k1l2"
+	item := fbItem("qa-r1-1", domain.SeverityBlocker, "Pool still leaks a connection per retry", domain.ItemOpen)
 	out := []events.Event{
 		events.BeadCreated{Meta: c.next(), Bead: fbBead(bead, "Rewrite the connection pool", domain.BeadStateNeedsHuman, 5)},
+		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "eng-6", Report: fbReport("attempt 1 at the pool")},
+		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: strings.Repeat("a", 40)},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "ux-1", Verdict: fbApprove(domain.LensUX, 1, "nothing user facing")},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1, "still leaking", item)},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "test-1", Verdict: fbApprove(domain.LensTest, 1, "tests cover what there is")},
 	}
-	for round := 1; round <= 5; round++ {
-		item := fbItem(
-			"qa-r"+string(rune('0'+round))+"-1",
-			domain.SeverityBlocker,
-			"Pool still leaks a connection per retry",
-			domain.ItemOpen,
-		)
+	for round := 2; round <= 5; round++ {
 		out = append(out,
+			events.ResponseReceived{Meta: c.next(), Bead: bead, Round: round, Agent: "eng-6", Responses: []domain.Response{
+				{ItemID: item.ID, Action: domain.ActionFixed, Rationale: fmt.Sprintf("attempt %d at the pool", round)},
+			}},
 			events.RoundStarted{Meta: c.next(), Bead: bead, Round: round, RoundKind: events.RoundReview, Lenses: []domain.Lens{domain.LensQA}, Commit: strings.Repeat(string(rune('a'+round-1)), 40)},
-			events.ResponseReceived{Meta: c.next(), Bead: bead, Round: round, Agent: "eng-6", Report: fbReport("attempt " + string(rune('0'+round)) + " at the pool")},
 			events.VerdictReceived{Meta: c.next(), Bead: bead, Round: round, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, round, "still leaking", item)},
 		)
 	}
@@ -246,25 +272,28 @@ func fbScenarioF(c *fbClock) []events.Event {
 }
 
 // fbScenarioG is P6-04 (g): the diff moved enough that every tester
-// re-reviews (D-09), and one of them has not answered yet.
+// re-reviews (D-09). The fixture stops one verdict short of the recording,
+// so the frame it draws is a round still waiting on a tester.
 func fbScenarioG(c *fbClock) []events.Event {
 	const bead domain.BeadID = "sc-m3n4"
-	item := fbItem("qa-r1-1", domain.SeverityMajor, "Rebase dropped the timeout guard", domain.ItemResolved)
+	item := fbItem("qa-r1-1", domain.SeverityMajor, "Rebase dropped the timeout guard", domain.ItemOpen)
+	resolved := item
+	resolved.Status = domain.ItemResolved
 	return []events.Event{
 		events.BeadCreated{Meta: c.next(), Bead: fbBead(bead, "Split the transport package", domain.BeadStateInReview, 2)},
-		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8"},
 		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "eng-7", Report: fbReport("move the transport into its own package")},
+		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 1, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "c5d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f8"},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "ux-1", Verdict: fbApprove(domain.LensUX, 1, "nothing user facing")},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "qa-1", Verdict: fbChanges(domain.LensQA, 1, "one major", item)},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 1, Agent: "test-1", Verdict: fbApprove(domain.LensTest, 1, "tests moved with it")},
+		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "eng-7", Responses: []domain.Response{
+			{ItemID: item.ID, Action: domain.ActionFixed, Rationale: "restored the guard and moved it into the new package"},
+		}},
 		// The fix rewrote more than re_review_threshold of the diff, so all
 		// three lenses look again (D-09).
 		events.RoundStarted{Meta: c.next(), Bead: bead, Round: 2, RoundKind: events.RoundReview, Lenses: fbAllLenses, Commit: "d6e7f8091a2b3c4d5e6f708192a3b4c5d6e7f809"},
-		events.ResponseReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "eng-7", Responses: []domain.Response{
-			{ItemID: item.ID, Action: domain.ActionFixed, Rationale: "restored the guard and moved it into the new package"},
-		}, Report: fbReport("restore the guard")},
 		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "ux-1", Verdict: fbApprove(domain.LensUX, 2, "still nothing user facing")},
-		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "qa-1", Verdict: fbApprove(domain.LensQA, 2, "guard is back")},
+		events.VerdictReceived{Meta: c.next(), Bead: bead, Round: 2, Agent: "qa-1", Verdict: fbApprove(domain.LensQA, 2, "guard is back", resolved)},
 	}
 }
 
@@ -455,11 +484,16 @@ func TestFeedbackThreadsScenarios(t *testing.T) {
 		require.Zero(t, th.Open)
 		item, ok := th.Item("qa-r1-1")
 		require.True(t, ok)
-		require.Equal(t, domain.ItemResolved, item.Status)
-		require.NotNil(t, item.Response)
-		require.Equal(t, domain.ActionFixed, item.Response.Action)
+		require.Equal(t, domain.ItemResolved, item.Status, "the re-review carried it forward as fixed")
+		require.Equal(t, 2, item.Round, "the latest occurrence says where it stands")
 		require.Nil(t, item.Ruling)
-		require.Equal(t, 1, item.Round, "the item belongs to the round it was raised in")
+
+		// The answer stays on the occurrence it answered: the item was
+		// raised in round 1 and fixed in round 2.
+		answered := fbOne(t, th.Answered(2, "qa-r1-1"))
+		require.Equal(t, 1, answered.Round)
+		require.Equal(t, domain.ActionFixed, answered.Response.Action)
+		require.Equal(t, 2, answered.ResponseRound)
 	})
 
 	t.Run("c pushback accepted", func(t *testing.T) {
@@ -467,26 +501,31 @@ func TestFeedbackThreadsScenarios(t *testing.T) {
 		require.True(t, th.Approved)
 		item, ok := th.Item("ux-r1-1")
 		require.True(t, ok)
-		require.Equal(t, domain.ActionPushback, item.Response.Action)
 		require.Equal(t, domain.ItemAccepted, item.Status)
 		require.False(t, item.Blocking())
+		require.Equal(t, domain.ActionPushback, fbOne(t, th.Answered(2, "ux-r1-1")).Response.Action)
 		nit, ok := th.Item("ux-r1-2")
 		require.True(t, ok)
-		require.Equal(t, domain.ActionWontfix, nit.Response.Action)
+		require.Equal(t, domain.ItemAccepted, nit.Status)
 		require.Equal(t, domain.SeverityNit, nit.Severity)
+		require.Equal(t, domain.ActionWontfix, fbOne(t, th.Answered(2, "ux-r1-2")).Response.Action)
 	})
 
 	t.Run("d pushback held then engineer upheld", func(t *testing.T) {
 		th := byBead["sc-g7h8"]
-		require.Len(t, th.Rounds, 3)
-		require.True(t, th.Approved)
-		require.Zero(t, th.Open, "the overruled item no longer counts")
+		require.Len(t, th.Rounds, 2, "the ruling settles the bead; no further round is opened")
+		// The loop approves the bead on the ruling and asks qa nothing more,
+		// so the last thing the lens said is still a change request: the
+		// view reports the bead's own state as approved and the tester as
+		// unsatisfied, which is what the run really looks like.
+		require.Equal(t, domain.BeadStateApproved, th.BeadState)
+		require.False(t, th.Approved, "qa was overruled, not satisfied")
 		item, ok := th.Item("qa-r1-1")
 		require.True(t, ok)
-		require.Equal(t, domain.ItemOverruled, item.Status, "the latest occurrence says where it stands")
-		require.Equal(t, 3, item.Round)
-		require.Nil(t, item.Response, "nothing was said about the occurrence that closed the item")
-		require.Nil(t, item.Ruling)
+		require.Equal(t, domain.ItemHeld, item.Status, "the latest occurrence says where it stands")
+		require.Equal(t, 2, item.Round)
+		require.NotNil(t, item.Ruling, "the ruling is on the occurrence the tester held")
+		require.Equal(t, domain.RulingUpholdEngineer, item.Ruling.Ruling)
 
 		raised := fbOne(t, th.Answered(2, "qa-r1-1"))
 		require.Equal(t, 1, raised.Round, "round 2's response answers the item round 1 raised")
@@ -512,13 +551,16 @@ func TestFeedbackThreadsScenarios(t *testing.T) {
 		// The pushback that caused the arbitration was given in round 2 and
 		// stays on the occurrence it answered: round 3's fix does not
 		// overwrite it.
-		raised := fbOne(t, th.Answered(2, "test-r1-1"))
+		// The rules violation was fixed in round 2, as P5-05 requires; the
+		// item beside it was pushed back, held, and ruled on.
+		require.Equal(t, domain.ActionFixed, fbOne(t, th.Answered(2, "test-r1-1")).Response.Action)
+		raised := fbOne(t, th.Answered(2, "test-r1-2"))
 		require.Equal(t, 1, raised.Round)
-		require.Equal(t, domain.ActionWontfix, raised.Response.Action)
-		require.Equal(t, "the empty body is unreachable through the public API", raised.Response.Rationale)
+		require.Equal(t, domain.ActionPushback, raised.Response.Action)
+		require.Equal(t, "the parameter is named after the interface it takes", raised.Response.Rationale)
 		require.Equal(t, 2, raised.ResponseRound)
 
-		held := fbOne(t, th.Ruled(2, "test-r1-1"))
+		held := fbOne(t, th.Ruled(2, "test-r1-2"))
 		require.Equal(t, 2, held.Round)
 		require.Equal(t, domain.ItemHeld, held.Status)
 		require.Equal(t, domain.RulingUpholdTester, held.Ruling.Ruling)
@@ -537,7 +579,7 @@ func TestFeedbackThreadsScenarios(t *testing.T) {
 		th := byBead["sc-k1l2"]
 		require.Len(t, th.Rounds, 5)
 		require.False(t, th.Approved)
-		require.Equal(t, 5, th.Open, "one open blocker per round")
+		require.Equal(t, 1, th.Open, "the one blocker is carried forward, never renumbered")
 		require.NotNil(t, th.Escalation)
 		require.Equal(t, domain.EscalationBlock, th.Escalation.Outcome)
 		last, ok := th.Latest()
@@ -913,11 +955,11 @@ func TestFeedbackAnswersKeepTheirRound(t *testing.T) {
 	t.Run("e the pushback that caused the arbitration is not overwritten", func(t *testing.T) {
 		v := fbAtCursor(t, fbView(110, 40, FeedbackOptions{}), st, "sc-i9j0")
 		out := v.View(st)
-		require.Contains(t, out, "the empty body is unreachable through the public API",
-			"the round-2 wontfix renders")
-		require.Equal(t, 2, fbRoundOf(out, "⊘ wontfix"), "it was given in round 2")
+		require.Contains(t, out, "the parameter is named after the interface it takes",
+			"the round-2 pushback renders")
+		require.Equal(t, 2, fbRoundOf(out, "↩ pushback"), "it was given in round 2")
 		require.Equal(t, 2, fbRoundOf(out, "⚖ uphold_tester"), "the ruling followed in round 2")
-		require.Equal(t, 3, fbRoundOf(out, "→ fixed"), "the fix came in round 3")
+		require.Equal(t, 3, fbRoundOf(out, "renamed it to body"), "the fix came in round 3")
 		require.Equal(t, 1, fbRoundOf(out, "No test for the empty-body case"),
 			"the item itself is still raised in round 1")
 	})
@@ -935,16 +977,17 @@ func TestFeedbackAnswersKeepTheirRound(t *testing.T) {
 		out := v.View(st)
 		require.Equal(t, 2, fbRoundOf(out, "↩ pushback"))
 		require.Equal(t, 2, fbRoundOf(out, "⚖ uphold_engineer"))
-		require.Equal(t, 3, fbRoundOf(out, "[overruled]"))
+		require.Equal(t, 2, fbRoundOf(out, "[held]"), "the ruling settles the occurrence the tester held")
 	})
 
 	t.Run("the answer names the item it answers", func(t *testing.T) {
 		v := fbAtCursor(t, fbView(110, 40, FeedbackOptions{Details: true}), st, "sc-i9j0")
 		out := v.View(st)
-		require.Contains(t, out, "⊘ wontfix  test-r1-1")
+		require.Contains(t, out, "→ fixed    test-r1-1")
+		require.Contains(t, out, "↩ pushback test-r1-2")
 		require.Contains(t, out, "re: round 1 · test · blocker · No test for the empty-body case",
 			"details spell out the occurrence answered")
-		require.Contains(t, out, "re: round 2 · test · blocker · No test for the empty-body case")
+		require.Contains(t, out, "re: round 2 · test · major · Name the reader parameter")
 	})
 
 	t.Run("an answer to an item no verdict raised still renders", func(t *testing.T) {
@@ -1360,4 +1403,745 @@ func TestFeedbackKeysAreInTheHelpOverlay(t *testing.T) {
 		require.Contains(t, overlay, want, "the ? overlay documents %q", want)
 	}
 	require.Len(t, m.viewKeys(), len(DefaultFeedbackKeyMap().FullHelp()))
+}
+
+// --- P7-14: the fixtures, pinned to a recording of the real loop --------
+//
+// The scenarios above are hand-written, because P6-04's feedback loop did
+// not exist when P7-04 shipped. They are the frames the view is designed
+// against — a long title, a wrapped suggestion, a thread that has to scroll
+// — and they stay. What they lacked was any tie to what the loop actually
+// publishes: a round it stopped opening, a lens it stopped sending back or
+// an item status it stopped setting would have left the fixtures, and so the
+// goldens, describing a run that no longer happens. It had already happened
+// three times over by the time this was written (a round opened for a
+// pushback evaluation, a fourth round after a ruling, an item renumbered on
+// every re-review and a rules violation pushed back, none of which the loop
+// or the P5-05 schemas allow).
+//
+// So the seven P6-04 scenarios are run here for real — the real Feedback
+// loop, the real supervisor, the real prompts and the mock cartridge, the
+// rig internal/orchestrator/feedback_test.go drives them with — recorded as
+// JSONL under testdata/tui/recorded (the run-log shape `sc tui-demo
+// --replay` reads, P7-12), and both the recording and the hand-written
+// fixture are reduced to the same trace and required to agree.
+
+// fbrCartridge is the mock cartridge the recordings are fired at. It has its
+// own registry name so the enforcement registered for it cannot collide with
+// another package's.
+const fbrCartridge = "tui-fb-mock"
+
+// fbrBead is the bead every recorded scenario runs on.
+const fbrBead = domain.BeadID("sc-fb1")
+
+// fbrEpoch is the fixed clock the recordings are stamped with, so a
+// recording is byte-for-byte reproducible.
+var fbrEpoch = time.Date(2026, 3, 5, 11, 0, 0, 0, time.UTC)
+
+// fbrDir is where the recordings live, beside the golden frames.
+const fbrDir = fbGoldenDir + "/recorded"
+
+// The mock holds its tool policy in-process and says so, rather than making
+// every tester firing fall back to a copy of the worktree (P6-20).
+func init() {
+	err := agents.RegisterEnforcement(fbrCartridge, func(name string, p cartridge.ToolPolicy) (agents.Enforcement, error) {
+		return agents.Enforcement{
+			Cartridge: name, Policy: p, Mode: agents.EnforceNative,
+			Detail: "the mock refuses forbidden steps in-process",
+		}, nil
+	})
+	if err != nil && !strings.Contains(err.Error(), "already registered") {
+		panic(err)
+	}
+}
+
+// fbrStore is the bd the state machine writes through: it keeps the status
+// and hands it back, which is all the loop reads.
+type fbrStore struct {
+	mu    sync.Mutex
+	state domain.BeadState
+}
+
+func (s *fbrStore) set(to domain.BeadState) (beads.Issue, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.state = to
+	return beads.Issue{ID: fbrBead, Status: to.String()}, nil
+}
+
+func (s *fbrStore) SetStatus(_ context.Context, _ domain.BeadID, st domain.BeadState) (beads.Issue, error) {
+	return s.set(st)
+}
+
+func (s *fbrStore) ClaimFor(_ context.Context, _ domain.BeadID, _ domain.AgentID) (beads.Issue, error) {
+	return s.set(domain.BeadStateInProgress)
+}
+
+func (s *fbrStore) Reclaim(_ context.Context, _ domain.BeadID, _ domain.AgentID) (beads.Issue, error) {
+	return s.set(domain.BeadStateInProgress)
+}
+
+func (s *fbrStore) Release(_ context.Context, _ domain.BeadID) (beads.Issue, error) {
+	return s.set(domain.BeadStateOpen)
+}
+
+func (s *fbrStore) Close(_ context.Context, _ domain.BeadID, _ string) (beads.Issue, error) {
+	return s.set(domain.BeadStateClosed)
+}
+
+// fbrMessages accepts the bead comments the loop writes (D-06) and keeps
+// none of them: the recording is of the event stream, not of bd.
+type fbrMessages struct{}
+
+func (fbrMessages) PostMessage(_ context.Context, id domain.BeadID, actor string, msg any) (beads.Message, error) {
+	t, err := beads.MessageTypeOf(msg)
+	if err != nil {
+		return beads.Message{}, err
+	}
+	return beads.Message{Type: t, IssueID: id, Author: actor, Payload: msg}, nil
+}
+
+// fbrRig is one hermetic run of the real feedback loop against the mock.
+type fbrRig struct {
+	loop *orchestrator.Feedback
+	sup  *orchestrator.Supervisor
+	run  *orchestrator.Run
+	sub  *events.Subscription
+	home string
+
+	mu    sync.Mutex
+	diff  *gitx.Diff
+	ratio float64
+	seen  []events.Event
+}
+
+// fbrSetup builds the rig: a run, the state machine, the feedback loop and a
+// supervisor firing the mock cartridge. It is internal/orchestrator's own
+// fbSetup with the assertions dropped and the events kept.
+func fbrSetup(t *testing.T, sc *mock.Scenario, tweak func(*orchestrator.FeedbackOptions)) *fbrRig {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
+	repo := filepath.Join(home, "repo")
+	require.NoError(t, os.MkdirAll(repo, 0o755))
+
+	bus := events.NewBus()
+	sub := bus.Subscribe(context.Background(), 4096)
+	t.Cleanup(func() { sub.Unsubscribe(); bus.Close() })
+
+	cfg := config.Defaults()
+	cfg.ActiveCartridge = fbrCartridge
+	cfg.Cartridges = map[string]config.Cartridge{fbrCartridge: {}}
+	adapter, err := mock.NewAdapter(fbrCartridge, sc)
+	require.NoError(t, err)
+	eff := &config.Effective{Config: cfg, Sources: map[string]config.Source{}}
+	rc, err := config.NewRunConfig(repo, eff, config.RunSettings{
+		ID: "20260305-110000-fb00", Brief: "fix the retry bugs", StartedAt: fbrEpoch, Headless: true,
+	})
+	require.NoError(t, err)
+
+	now := func() time.Time { return fbrEpoch }
+	sel, err := cartridge.NewSelector(cfg, map[string]cartridge.Cartridge{fbrCartridge: adapter}, cartridge.WithClock(now))
+	require.NoError(t, err)
+
+	run, err := orchestrator.New(rc, orchestrator.Options{Bus: bus, Now: now, SkipLock: true})
+	require.NoError(t, err)
+	require.NoError(t, run.Start(context.Background()))
+	t.Cleanup(func() { _ = run.Stop("the recording is over"); _, _ = run.Wait() })
+
+	wt := filepath.Join(run.Dirs().Worktrees, fbrBead.String())
+	require.NoError(t, os.MkdirAll(wt, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(wt, "retry.go"), []byte("package http\n"), 0o600))
+
+	rig := &fbrRig{run: run, sub: sub, home: home, diff: fbrDiff("1a2b3c4d", 20)}
+	states := orchestrator.NewStateMachine(&fbrStore{state: domain.BeadStateOpen},
+		orchestrator.WithStatePublisher(bus), orchestrator.WithStateRun(run.ID()), orchestrator.WithStateClock(now))
+	opts := orchestrator.FeedbackOptions{
+		Context:  rig.contextFor(wt),
+		States:   states,
+		Messages: fbrMessages{},
+		Bus:      bus,
+		Run:      run.ID(),
+		Now:      now,
+		Limits:   config.Limits{MaxReviewRounds: 5, MaxPushbackRounds: 2},
+		Ratio:    rig.changeRatio,
+	}
+	if tweak != nil {
+		tweak(&opts)
+	}
+	loop, err := orchestrator.NewFeedback(opts)
+	require.NoError(t, err)
+	rig.loop = loop
+
+	sup, err := orchestrator.NewSupervisor(orchestrator.SupervisorOptions{
+		Cartridges: sel, Planner: loop, Bus: bus, Timeout: time.Minute, Now: now, NoShims: true,
+	})
+	require.NoError(t, err)
+	sup.Attach(run)
+	t.Cleanup(func() { _ = sup.Close() })
+	rig.sup = sup
+
+	loop.Track(domain.Bead{
+		ID: fbrBead, Title: "Retry failed HTTP requests", Type: domain.BeadTypeTask,
+		Priority: domain.PriorityDefault, State: domain.BeadStateOpen,
+	})
+	return rig
+}
+
+// fbrDiff is a hand-built change set: no git runs in these recordings.
+func fbrDiff(head string, lines int) *gitx.Diff {
+	return &gitx.Diff{
+		Stats: gitx.DiffStats{
+			Base: "base0", Head: head, Files: 1, Insertions: lines, Deletions: 0,
+			Changed: []gitx.FileStat{{Path: "internal/http/retry.go", Insertions: lines}},
+		},
+		Files: []gitx.DiffFile{{FileStat: gitx.FileStat{Path: "internal/http/retry.go", Insertions: lines}, Status: gitx.DiffModified}},
+		Patch: "--- a/internal/http/retry.go\n+++ b/internal/http/retry.go\n@@\n+for {\n+  break\n+}\n",
+	}
+}
+
+// contextFor is the loop's FeedbackContextFunc: the bead, the worktree and
+// the diff every firing is given.
+func (r *fbrRig) contextFor(worktree string) func(context.Context, domain.BeadID) (orchestrator.FeedbackBeadContext, error) {
+	return func(_ context.Context, bead domain.BeadID) (orchestrator.FeedbackBeadContext, error) {
+		r.mu.Lock()
+		diff := r.diff
+		r.mu.Unlock()
+		return orchestrator.FeedbackBeadContext{
+			Bead: prompt.BeadContext{
+				Bead: domain.Bead{
+					ID: bead, Title: "Retry failed HTTP requests", Type: domain.BeadTypeTask,
+					Description: "the client gives up on the first 5xx",
+					Acceptance:  "a 5xx is retried with capped exponential backoff",
+					Priority:    domain.PriorityDefault,
+				},
+				Worktree: worktree,
+				Branch:   "sc/" + bead.String(),
+			},
+			Repo:    prompt.RepoContext{Root: worktree, DefaultBranch: "main", CheckCommand: "go test ./..."},
+			Brief:   "fix the retry bugs",
+			Diff:    diff,
+			Timeout: time.Minute,
+		}, nil
+	}
+}
+
+// changeRatio is the D-09 measurement the scenarios set.
+func (r *fbrRig) changeRatio(_ context.Context, _ domain.BeadID, _, cur *gitx.Diff) (gitx.ChangeRatio, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return gitx.ChangeRatio{Current: cur.Head(), Total: cur.ChangedLines(), Ratio: r.ratio}, nil
+}
+
+// setDiff replaces the change set the next round reviews and how far the
+// round moved it.
+func (r *fbrRig) setDiff(head string, lines int, ratio float64) {
+	r.mu.Lock()
+	r.diff, r.ratio = fbrDiff(head, lines), ratio
+	r.mu.Unlock()
+}
+
+// step fires every demand the loop raises right now — the calls
+// Scheduler.dispatch makes, without the timers — and reports whether there
+// was any.
+func (r *fbrRig) step(t *testing.T) bool {
+	t.Helper()
+	ctx := context.Background()
+	ds, err := r.loop.Demands(ctx)
+	require.NoError(t, err)
+	for _, d := range ds {
+		agent := d.Agent
+		if agent == "" {
+			agent = fbrAgentID(d)
+		}
+		_, err := r.sup.Fire(ctx, orchestrator.Firing{
+			Agent: domain.Agent{
+				ID: agent, Role: d.Role(), Lens: d.Lens, Bead: d.Bead,
+				Cartridge: fbrCartridge, State: domain.AgentStateRunning, StartedAt: fbrEpoch,
+			},
+			Demand: d,
+			Run:    r.run,
+		})
+		require.NoErrorf(t, err, "firing %s for %s", agent, d.Kind)
+	}
+	return len(ds) > 0
+}
+
+// fbrAgentID names an agent the scheduler would have named itself. The mock
+// is scripted by role, lens, round and task rather than by id, so no
+// recording depends on the spelling.
+func fbrAgentID(d orchestrator.Demand) domain.AgentID {
+	id := string(d.Kind) + "-" + string(d.Bead)
+	if d.Lens != "" {
+		id = string(d.Kind) + "-" + string(d.Lens) + "-" + string(d.Bead)
+	}
+	if d.Round > 0 {
+		id += "-r" + strconv.Itoa(d.Round)
+	}
+	return domain.AgentID(id + "-" + string(d.FiringTask()))
+}
+
+// events drains the subscription and returns everything the run published,
+// in order.
+func (r *fbrRig) events() []events.Event {
+	for {
+		select {
+		case ev, ok := <-r.sub.Events():
+			if !ok {
+				return r.drained()
+			}
+			r.mu.Lock()
+			r.seen = append(r.seen, ev)
+			r.mu.Unlock()
+		default:
+			return r.drained()
+		}
+	}
+}
+
+func (r *fbrRig) drained() []events.Event {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]events.Event(nil), r.seen...)
+}
+
+// --- the seven P6-04 scenarios, scripted for the mock -------------------
+
+// fbrScenario is one P6-04 scenario as this package records it: the mock
+// script, the D-09 measurement it needs and the letter P6-04 gives it.
+type fbrScenario struct {
+	// letter is the scenario's name in P6-04's "Done when" list.
+	letter string
+	// what it exercises, for the failure message.
+	what string
+	// script builds the mock scenario.
+	script func() *mock.Scenario
+	// tweak changes the loop's limits (D-08) before it is built.
+	tweak func(*orchestrator.FeedbackOptions)
+	// rounds are the D-09 measurements to apply before each pump step,
+	// indexed by step; a step past the end keeps the last one.
+	diffs []fbrDiffStep
+	// steps is the pump budget.
+	steps int
+	// fixture is the hand-written event sequence the recording is compared
+	// with.
+	fixture func(*fbClock) []events.Event
+}
+
+// fbrDiffStep is a change set and how far the round moved it (D-09).
+type fbrDiffStep struct {
+	head  string
+	lines int
+	ratio float64
+}
+
+// fbrItem is one feedback item of a script, spelled the way the fixtures
+// spell it so the two traces can be compared item by item.
+func fbrItem(id string, sev domain.Severity, title string, status domain.ItemStatus) domain.FeedbackItem {
+	return domain.FeedbackItem{
+		ID: id, Severity: sev, Title: title, Status: status,
+		Detail: "seen while exercising " + title,
+		File:   "internal/http/retry.go", Line: 42,
+	}
+}
+
+// fbrScript starts a script whose unmatched firings fail loudly, so a
+// scenario that fires an agent it did not plan for is a test failure rather
+// than a mystery.
+func fbrScript(name string) *mock.Scenario {
+	sc := mock.NewScenario(name)
+	sc.Otherwise("unscripted").Say("no rule matched this firing").
+		Fail(mock.FailCrash, "the feedback loop fired an agent the scenario does not script")
+	return sc
+}
+
+// fbrSay scripts one reply. The match is by role, lens, round and task
+// rather than by agent id: the ids are the scheduler's to mint, and a
+// recording must not depend on their spelling.
+func fbrSay(sc *mock.Scenario, name string, m mock.Match, payload any) {
+	sc.Rule(name, m).Say("working on " + name).Structured(payload)
+}
+
+// fbrReport is an engineer's implementation report.
+func fbrReport(summary string) domain.ImplReport {
+	return domain.ImplReport{
+		Summary: summary, FilesChanged: []string{"internal/http/retry.go"},
+		HowToVerify: "go test ./internal/http/...",
+	}
+}
+
+// fbrApprove and fbrChanges are a tester's two verdicts.
+func fbrApprove(summary string, items ...domain.FeedbackItem) domain.Verdict {
+	return domain.Verdict{Outcome: domain.VerdictApprove, Summary: summary, Items: items}
+}
+
+func fbrChanges(summary string, items ...domain.FeedbackItem) domain.Verdict {
+	return domain.Verdict{Outcome: domain.VerdictChanges, Summary: summary, Items: items}
+}
+
+// fbrEngineer scripts the engineer's reply for one round.
+func fbrEngineer(sc *mock.Scenario, round int, payload any) {
+	fbrSay(sc, fmt.Sprintf("eng-r%d", round), mock.Match{Role: "engineer", Round: round}, payload)
+}
+
+// fbrTester scripts one lens's reply for one round and task.
+func fbrTester(sc *mock.Scenario, lens domain.Lens, round int, task events.Task, v domain.Verdict) {
+	fbrSay(sc, fmt.Sprintf("%s-r%d-%s", lens, round, task),
+		mock.Match{Role: "tester", Lens: lens.String(), Round: round, Task: task.String()}, v)
+}
+
+// fbrPO scripts the product owner's ruling.
+func fbrPO(sc *mock.Scenario, name string, task events.Task, payload any) {
+	fbrSay(sc, name, mock.Match{Role: "po", Task: task.String()}, payload)
+}
+
+// fbrScenarios is P6-04's "Done when" list, each one scripted for the mock
+// and paired with the hand-written fixture above that stands for it.
+func fbrScenarios() []fbrScenario {
+	return []fbrScenario{{
+		letter: "a",
+		what:   "all three testers approve in round one",
+		script: func() *mock.Scenario {
+			sc := fbrScript("all-approve")
+			fbrEngineer(sc, 1, fbrReport("retry 5xx with capped exponential backoff"))
+			for _, l := range domain.Lenses() {
+				fbrTester(sc, l, 1, events.TaskReview, fbrApprove(l.String()+" is happy"))
+			}
+			return sc
+		},
+		steps:   8,
+		fixture: fbScenarioA,
+	}, {
+		letter: "b",
+		what:   "one tester requests changes, the engineer fixes them, round two approves",
+		script: func() *mock.Scenario {
+			item := fbrItem("qa-r1-1", domain.SeverityBlocker, "Retry loops forever on a 500", domain.ItemOpen)
+			resolved := item
+			resolved.Status = domain.ItemResolved
+			sc := fbrScript("changes-then-approved")
+			fbrEngineer(sc, 1, fbrReport("cache lookups for the TTL the resolver reports"))
+			fbrTester(sc, domain.LensUX, 1, events.TaskReview, fbrApprove("no user-visible change"))
+			fbrTester(sc, domain.LensQA, 1, events.TaskReview, fbrChanges("one blocker", item))
+			fbrTester(sc, domain.LensTest, 1, events.TaskReview, fbrApprove("coverage is fine"))
+			fbrEngineer(sc, 2, agents.ResponseSet{Responses: []domain.Response{
+				{ItemID: item.ID, Action: domain.ActionFixed, Rationale: "capped the loop at five attempts"},
+			}})
+			fbrTester(sc, domain.LensQA, 2, events.TaskReview, fbrApprove("the cap holds", resolved))
+			return sc
+		},
+		diffs:   []fbrDiffStep{{}, {"2b3c4d5e", 24, 0.1}},
+		steps:   10,
+		fixture: fbScenarioB,
+	}, {
+		letter: "c",
+		what:   "the engineer pushes back and the tester accepts",
+		script: func() *mock.Scenario {
+			item := fbrItem("ux-r1-1", domain.SeverityMinor, "Spell the flag --no-cache", domain.ItemOpen)
+			nit := fbrItem("ux-r1-2", domain.SeverityNit, "Capitalise the help text", domain.ItemOpen)
+			accepted, acceptedNit := item, nit
+			accepted.Status, acceptedNit.Status = domain.ItemAccepted, domain.ItemAccepted
+			sc := fbrScript("pushback-accepted")
+			fbrEngineer(sc, 1, fbrReport("add the flag and document it"))
+			fbrTester(sc, domain.LensUX, 1, events.TaskReview, fbrChanges("naming", item, nit))
+			fbrTester(sc, domain.LensQA, 1, events.TaskReview, fbrApprove("behaviour is right"))
+			fbrTester(sc, domain.LensTest, 1, events.TaskReview, fbrApprove("covered"))
+			fbrEngineer(sc, 2, agents.ResponseSet{Responses: []domain.Response{
+				{ItemID: item.ID, Action: domain.ActionPushback, Rationale: "every other flag in the CLI is positive; --cache=false already works"},
+				{ItemID: nit.ID, Action: domain.ActionWontfix, Rationale: "cobra lower-cases every other help string"},
+			}})
+			fbrTester(sc, domain.LensUX, 2, events.TaskEvaluatePushback, fbrApprove("fair, the rationale holds", accepted, acceptedNit))
+			return sc
+		},
+		steps:   10,
+		fixture: fbScenarioC,
+	}, {
+		letter: "d",
+		what:   "the tester holds, the product owner upholds the engineer",
+		script: func() *mock.Scenario {
+			item := fbrItem("qa-r1-1", domain.SeverityMajor, "Validate the timeout before use", domain.ItemOpen)
+			held := item
+			held.Status = domain.ItemHeld
+			sc := fbrScript("arbitration-upholds-engineer")
+			fbrEngineer(sc, 1, fbrReport("raise the timeout to 30s"))
+			fbrTester(sc, domain.LensUX, 1, events.TaskReview, fbrApprove("fine"))
+			fbrTester(sc, domain.LensQA, 1, events.TaskReview, fbrChanges("one major", item))
+			fbrTester(sc, domain.LensTest, 1, events.TaskReview, fbrApprove("fine"))
+			fbrEngineer(sc, 2, agents.ResponseSet{Responses: []domain.Response{
+				{ItemID: item.ID, Action: domain.ActionPushback, Rationale: "the config layer already rejects a negative timeout"},
+			}})
+			fbrTester(sc, domain.LensQA, 2, events.TaskEvaluatePushback, fbrChanges("still want the guard", held))
+			fbrPO(sc, "po-uphold-engineer", events.TaskArbitrate, domain.Arbitration{
+				ItemID: item.ID, Ruling: domain.RulingUpholdEngineer,
+				Rationale: "config validation covers it; a second check is dead code",
+			})
+			return sc
+		},
+		tweak:   func(o *orchestrator.FeedbackOptions) { o.Limits.MaxPushbackRounds = 1 },
+		steps:   12,
+		fixture: fbScenarioD,
+	}, {
+		letter: "e",
+		what:   "the product owner upholds the tester and the engineer fixes the item",
+		script: func() *mock.Scenario {
+			// A rules violation is always a blocker the engineer has to fix
+			// (P5-05 refuses any other answer), so the item the tester holds
+			// on to and the product owner rules on is a plain major beside
+			// it. Answering one item with a fix and the other with a
+			// pushback is what makes round two fire the test lens twice:
+			// once to judge the pushback, once to re-review the fix (P6-04).
+			rules := fbrItem("test-r1-1", domain.SeverityBlocker, "No test for the empty-body case", domain.ItemOpen)
+			rules.Category = domain.CategoryRules
+			disputed := fbrItem("test-r1-2", domain.SeverityMajor, "Name the reader parameter", domain.ItemOpen)
+			rulesFixed, held, fixed := rules, disputed, disputed
+			rulesFixed.Status = domain.ItemResolved
+			held.Status = domain.ItemHeld
+			fixed.Status = domain.ItemResolved
+			sc := fbrScript("arbitration-upholds-tester")
+			fbrEngineer(sc, 1, fbrReport("stream instead of buffering"))
+			fbrTester(sc, domain.LensUX, 1, events.TaskReview, fbrApprove("no interface change"))
+			fbrTester(sc, domain.LensQA, 1, events.TaskReview, fbrApprove("streams as advertised"))
+			fbrTester(sc, domain.LensTest, 1, events.TaskReview, fbrChanges("missing coverage", rules, disputed))
+			fbrEngineer(sc, 2, agents.ResponseSet{Responses: []domain.Response{
+				{ItemID: rules.ID, Action: domain.ActionFixed, Rationale: "added TestStreamEmptyBody"},
+				{ItemID: disputed.ID, Action: domain.ActionPushback, Rationale: "the parameter is named after the interface it takes"},
+			}})
+			fbrTester(sc, domain.LensTest, 2, events.TaskEvaluatePushback, fbrChanges("rules say every parameter reads as prose", held))
+			fbrTester(sc, domain.LensTest, 2, events.TaskReview, fbrApprove("the empty-body test is there", rulesFixed))
+			fbrPO(sc, "po-uphold-tester", events.TaskArbitrate, domain.Arbitration{
+				ItemID: disputed.ID, Ruling: domain.RulingUpholdTester,
+				Instruction: "rename it to body", Rationale: "the reviewer reads the code more often than the author",
+			})
+			fbrEngineer(sc, 3, agents.ResponseSet{Responses: []domain.Response{
+				{ItemID: disputed.ID, Action: domain.ActionFixed, Rationale: "renamed it to body"},
+			}})
+			fbrTester(sc, domain.LensTest, 3, events.TaskReview, fbrApprove("reads well now", rulesFixed, fixed))
+			return sc
+		},
+		tweak:   func(o *orchestrator.FeedbackOptions) { o.Limits.MaxPushbackRounds = 1 },
+		diffs:   []fbrDiffStep{{}, {}, {}, {"b4c5d6e7", 24, 0.1}},
+		steps:   14,
+		fixture: fbScenarioE,
+	}, {
+		letter: "f",
+		what:   "the round cap escalates and the product owner blocks the bead",
+		script: func() *mock.Scenario {
+			sc := fbrScript("round-cap")
+			// The item is raised once and carried forward with its own id
+			// every round: a re-review that renumbered it would be refused
+			// by the verdict schema (P5-05).
+			item := fbrItem("qa-r1-1", domain.SeverityBlocker,
+				"Pool still leaks a connection per retry", domain.ItemOpen)
+			for round := 1; round <= 5; round++ {
+				if round == 1 {
+					fbrEngineer(sc, round, fbrReport("attempt 1 at the pool"))
+				} else {
+					fbrEngineer(sc, round, agents.ResponseSet{Responses: []domain.Response{
+						{ItemID: item.ID, Action: domain.ActionFixed,
+							Rationale: fmt.Sprintf("attempt %d at the pool", round)},
+					}})
+				}
+				for _, l := range domain.Lenses() {
+					v := fbrApprove(l.String() + " is happy")
+					if l == domain.LensQA {
+						v = fbrChanges("still leaking", item)
+					}
+					fbrTester(sc, l, round, events.TaskReview, v)
+				}
+			}
+			fbrPO(sc, "po-escalate", events.TaskEscalate, domain.Escalation{
+				Outcome: domain.EscalationBlock,
+				Summary: "five rounds without a fix; the pool needs a design a human signs off",
+			})
+			return sc
+		},
+		diffs: []fbrDiffStep{
+			{}, {"b2b2b2b2", 22, 0.1}, {"c3c3c3c3", 22, 0.1}, {"d4d4d4d4", 22, 0.1}, {"e5e5e5e5", 22, 0.1},
+		},
+		steps:   16,
+		fixture: fbScenarioF,
+	}, {
+		letter: "g",
+		what:   "the diff moved enough that every tester re-reviews (D-09)",
+		script: func() *mock.Scenario {
+			item := fbrItem("qa-r1-1", domain.SeverityMajor, "Rebase dropped the timeout guard", domain.ItemOpen)
+			resolved := item
+			resolved.Status = domain.ItemResolved
+			sc := fbrScript("full-re-review")
+			fbrEngineer(sc, 1, fbrReport("move the transport into its own package"))
+			fbrTester(sc, domain.LensUX, 1, events.TaskReview, fbrApprove("nothing user facing"))
+			fbrTester(sc, domain.LensQA, 1, events.TaskReview, fbrChanges("one major", item))
+			fbrTester(sc, domain.LensTest, 1, events.TaskReview, fbrApprove("tests moved with it"))
+			fbrEngineer(sc, 2, agents.ResponseSet{Responses: []domain.Response{
+				{ItemID: item.ID, Action: domain.ActionFixed, Rationale: "restored the guard and moved it into the new package"},
+			}})
+			fbrTester(sc, domain.LensQA, 2, events.TaskReview, fbrApprove("guard is back", resolved))
+			fbrTester(sc, domain.LensUX, 2, events.TaskReview, fbrApprove("still nothing user facing"))
+			fbrTester(sc, domain.LensTest, 2, events.TaskReview, fbrApprove("the rewrite is still covered"))
+			return sc
+		},
+		diffs:   []fbrDiffStep{{}, {"d6e7f809", 400, 0.9}},
+		steps:   12,
+		fixture: fbScenarioG,
+	}}
+}
+
+// fbrRecord runs one scenario and returns the rig and everything the run
+// published, in order.
+func fbrRecord(t *testing.T, s fbrScenario) (*fbrRig, []events.Event) {
+	t.Helper()
+	rig := fbrSetup(t, s.script(), s.tweak)
+	for step := range s.steps {
+		if step < len(s.diffs) {
+			if d := s.diffs[step]; d.head != "" {
+				rig.setDiff(d.head, d.lines, d.ratio)
+			}
+		}
+		if !rig.step(t) {
+			return rig, rig.events()
+		}
+	}
+	t.Fatalf("scenario (%s) did not settle in %d steps", s.letter, s.steps)
+	return nil, nil
+}
+
+// --- the trace: what a scenario's events say, without the prose ---------
+
+// fbrTrace reduces an event stream to the shape the Feedback view draws: the
+// rounds that were opened and with which lenses, the reports and answers the
+// engineer gave, the verdicts each lens returned with the id, severity and
+// status of every item in them, and the product owner's rulings. Titles,
+// summaries, rationales, commit shas, agent ids and timestamps are left out
+// — they are the fixture's to choose, and the recording's to prove nothing
+// about. What is left is exactly what would change if the loop stopped
+// opening a round, stopped sending a lens back or stopped settling an item.
+func fbrTrace(evs []events.Event) []string {
+	var out []string
+	for _, ev := range evs {
+		switch e := ev.(type) {
+		case events.RoundStarted:
+			out = append(out, fmt.Sprintf("round %d %s lenses %s", e.Round, e.RoundKind, lensList(e.Lenses)))
+		case events.ResponseReceived:
+			if e.Report != nil {
+				out = append(out, fmt.Sprintf("round %d report", e.Round))
+			}
+			for _, r := range e.Responses {
+				out = append(out, fmt.Sprintf("round %d answer %s %s", e.Round, r.ItemID, r.Action))
+			}
+		case events.VerdictReceived:
+			line := fmt.Sprintf("round %d verdict %s %s", e.Round, orDash(string(e.Verdict.Lens)), e.Verdict.Outcome)
+			for _, it := range e.Verdict.Items {
+				line += fmt.Sprintf(" [%s %s %s]", it.ID, it.Severity, orDash(string(it.Status)))
+			}
+			out = append(out, line)
+		case events.ArbitrationReceived:
+			for _, r := range e.Rulings {
+				out = append(out, fmt.Sprintf("round %d ruling %s %s", e.Round, r.ItemID, r.Ruling))
+			}
+			if e.Escalation != nil {
+				out = append(out, fmt.Sprintf("round %d escalation %s", e.Round, e.Escalation.Outcome))
+			}
+		}
+	}
+	return out
+}
+
+// --- the recording, and what it is compared with ------------------------
+
+// fbrRecording renders a scenario's events as the JSONL of a run log.
+//
+// Two things in a real stream are not reproducible and are dealt with here.
+// [events.AgentOutput] is stamped by the agents layer with the wall clock
+// rather than with the run's, so the transcript lines are left out — the
+// Feedback view does not read them, and a recording has to be byte-for-byte
+// the same on every machine. And the run's own paths are temporary
+// directories, so the home the run was recorded under and the hash bd
+// derives from it are replaced with fixed text.
+func fbrRecording(t *testing.T, home string, evs []events.Event) string {
+	t.Helper()
+	var b strings.Builder
+	w := events.NewJSONLWriter(&b)
+	for _, ev := range evs {
+		if ev.Kind() == events.KindAgentOutput {
+			continue
+		}
+		require.NoError(t, w.Write(ev))
+	}
+	require.NoError(t, w.Err())
+	out := strings.ReplaceAll(b.String(), home, "/recorded")
+	return fbrRepoHash.ReplaceAllString(out, "repo-000000000000")
+}
+
+// fbrRepoHash matches the repository id bd derives from a repository's path.
+var fbrRepoHash = regexp.MustCompile(`repo-[0-9a-f]{12}`)
+
+// fbrPath is where a scenario's recording lives. The name ends in
+// `.golden.jsonl` so `make check-golden` polices it like every other
+// generated fixture (its pathspec is `*.golden` `*.golden.*`).
+func fbrPath(letter string) string {
+	return filepath.Join(fbrDir, "feedback-"+letter+".golden.jsonl")
+}
+
+// fbrGolden compares a recording with the committed one; UPDATE_GOLDEN=1
+// (make update-golden) rewrites it instead.
+func fbrGolden(t *testing.T, letter, got string) {
+	t.Helper()
+	path := fbrPath(letter)
+	if os.Getenv("UPDATE_GOLDEN") != "" {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(got), 0o644))
+		return
+	}
+	want, err := os.ReadFile(path)
+	require.NoError(t, err, "missing recording %s; run `make update-golden`", path)
+	require.Equal(t, string(want), got,
+		"the feedback loop no longer publishes what %s recorded; run `make update-golden` if the change is intended", path)
+}
+
+// TestFeedbackFixturesMatchTheRecordedLoop is P7-14's acceptance test. Each
+// P6-04 scenario is run against the real loop, its events are recorded, and
+// the recording is required to be both what the committed one holds and the
+// shape the hand-written fixture describes.
+//
+// A fixture may stop short of its recording — a frame is often drawn while a
+// round is still waiting on a tester, which is exactly what (g) pins — so
+// the rule is that the fixture's trace is a prefix of the recording's. It
+// may never invent a round, a lens or an item status the loop does not
+// produce.
+func TestFeedbackFixturesMatchTheRecordedLoop(t *testing.T) {
+	for _, s := range fbrScenarios() {
+		t.Run(s.letter, func(t *testing.T) {
+			rig, evs := fbrRecord(t, s)
+			fbrGolden(t, s.letter, fbrRecording(t, rig.home, evs))
+
+			got, want := fbrTrace(evs), fbrTrace(s.fixture(&fbClock{}))
+			require.NotEmpty(t, want, "scenario (%s) has no fixture", s.letter)
+			require.LessOrEqualf(t, len(want), len(got),
+				"the (%s) fixture — %s — has more in it than the loop produced:\n%s\nrecorded:\n%s",
+				s.letter, s.what, strings.Join(want, "\n"), strings.Join(got, "\n"))
+			require.Equalf(t, want, got[:len(want)],
+				"the (%s) fixture — %s — is not what the feedback loop publishes", s.letter, s.what)
+		})
+	}
+}
+
+// TestFeedbackGoldenFromTheRecordedLoop renders a frame from a recording
+// rather than from a fixture: the file is read back with [ReplayFile], the
+// stream is folded into a [State] and the view draws it. It is the (e)
+// scenario — a rules violation fixed, a pushback held, a ruling and a
+// re-review, which is every part of the pane at once.
+func TestFeedbackGoldenFromTheRecordedLoop(t *testing.T) {
+	script, err := ReplayFile(fbrPath("e"), -1)
+	require.NoError(t, err, "run `make update-golden` to record the scenarios")
+	st := NewState(ReplayRun(script))
+	for _, ev := range ReplayEvents(script) {
+		st.Apply(ev)
+	}
+	threads := FeedbackThreads(st)
+	require.Len(t, threads, 1, "the recording is one bead's thread")
+	require.Equal(t, fbrBead, threads[0].Bead)
+
+	v := fbView(110, 26, FeedbackOptions{})
+	fbGolden(t, "feedback-recorded", fbFrame(t, v, st, 110, 26))
 }

@@ -218,6 +218,13 @@ func (a *Adapter) Detect(ctx context.Context) (cartridge.Status, error) {
 // Run implements cartridge.Cartridge: it validates spec, records the call,
 // picks the first matching rule with budget left (or the fallback) and
 // plays it in a goroutine.
+//
+// Cancelling ctx (like [cartridge.Session.Kill]) is observed at step
+// boundaries only, so a rule that has no steps left to play finishes with
+// its scripted result even when ctx is already cancelled — see the note on
+// [session.wait]. A test that wants a cancellation to surface as
+// cartridge.ErrKilled must give the rule at least one step still to come,
+// which [Rule.Sleep] guarantees under a [FakeClock].
 func (a *Adapter) Run(ctx context.Context, spec cartridge.RunSpec) (cartridge.Session, error) {
 	if err := spec.Validate(); err != nil {
 		return nil, err
@@ -338,6 +345,14 @@ func (a *Adapter) play(ctx context.Context, spec cartridge.RunSpec, rule *Rule, 
 
 // wait pauses for d on the clock, returning early when the timeout, a kill
 // or the context fires. A zero d still polls those without blocking.
+//
+// It is the only place a cancellation is noticed, and play calls it once
+// before each step, never after the last one (P2-11). A rule with no steps,
+// or one whose last step has just run, therefore finishes with Done even
+// when ctx was cancelled while it played — deliberately, because that is
+// what a real CLI does when its process exits before the signal reaches it.
+// Adapters are not expected to lose a completed result to a late kill, and
+// the conformance suite does not ask them to.
 func (s *session) wait(d time.Duration) stop {
 	var after <-chan time.Time
 	if d > 0 {

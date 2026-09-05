@@ -12,11 +12,12 @@
         "sc:role:po"
       ],
       "metadata": {
-        "sc_run": "r1",
         "sc_kind": "work",
         "sc_round": "0",
+        "sc_run": "r1",
         "sc_size": "s"
-      }
+      },
+      "parent_id": "px-26w"
     },
     {
       "key": "b",
@@ -29,11 +30,12 @@
         "sc:role:po"
       ],
       "metadata": {
-        "sc_run": "r1",
         "sc_kind": "work",
         "sc_round": "0",
+        "sc_run": "r1",
         "sc_size": "s"
-      }
+      },
+      "parent_id": "px-26w"
     },
     {
       "key": "c",
@@ -46,11 +48,12 @@
         "sc:role:po"
       ],
       "metadata": {
-        "sc_run": "r1",
         "sc_kind": "work",
         "sc_round": "0",
+        "sc_run": "r1",
         "sc_size": "m"
-      }
+      },
+      "parent_id": "px-26w"
     },
     {
       "key": "d",
@@ -63,11 +66,12 @@
         "sc:role:po"
       ],
       "metadata": {
-        "sc_run": "r1",
         "sc_kind": "work",
         "sc_round": "0",
+        "sc_run": "r1",
         "sc_size": "m"
-      }
+      },
+      "parent_id": "px-26w"
     },
     {
       "key": "e",
@@ -80,11 +84,12 @@
         "sc:role:po"
       ],
       "metadata": {
-        "sc_run": "r1",
         "sc_kind": "work",
         "sc_round": "0",
+        "sc_run": "r1",
         "sc_size": "s"
-      }
+      },
+      "parent_id": "px-26w"
     },
     {
       "key": "f",
@@ -97,11 +102,12 @@
         "sc:role:po"
       ],
       "metadata": {
-        "sc_run": "r1",
         "sc_kind": "work",
         "sc_round": "0",
+        "sc_run": "r1",
         "sc_size": "l"
-      }
+      },
+      "parent_id": "px-26w"
     }
   ],
   "edges": [

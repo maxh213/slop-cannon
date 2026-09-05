@@ -12,6 +12,8 @@ beads      3
   in_review  1
   closed     1
 
+delivery   1 pull request, 1 merge
+
 agents     1 last seen
   tester-qa-sc-2-r1  tester/qa  sc-2  running  pid 4243
 

@@ -25,6 +25,7 @@ const (
 	FlagDemoAmmo      = "ammo"
 	FlagDemoAltScreen = "alt-screen"
 	FlagDemoNoAnim    = "no-anim"
+	FlagDemoReplay    = "replay"
 )
 
 const tuiDemoLong = `Render the TUI against a scripted event stream instead of a real run.
@@ -34,12 +35,18 @@ loop (change request, pushback, arbitration, approval, delivery), a failing
 agent, an escalation, and a pause/resume/stop. It touches no repository, no
 configuration and no network, so TUI work never needs a live cannon.
 
+With --replay it renders a recorded run instead of the script: any JSONL run
+log, such as the events.jsonl of a run directory or the output of sc run
+--headless --json, which is how a real run can be watched again without
+firing one.
+
 The command is hidden: it is a development tool, not part of the interface.`
 
 const tuiDemoExamples = `sc tui-demo
 sc tui-demo --delay 0 --safety
 sc tui-demo --no-anim
-sc tui-demo --events`
+sc tui-demo --events
+sc tui-demo --replay ~/.local/state/slop-cannon/<repo>/runs/<run-id>/events.jsonl`
 
 func init() { register(newTUIDemoCommand) }
 
@@ -63,6 +70,7 @@ func newTUIDemoCommand() *cobra.Command {
 	f.Int(FlagDemoAmmo, tui.DemoAmmo, "ammo shown in the header (`N` agents at once)")
 	f.Bool(FlagDemoAltScreen, true, "draw on the alternate screen buffer")
 	f.Bool(FlagDemoNoAnim, false, "disable the cannon animations (also honours SC_NO_ANIM), like `sc run --no-anim`")
+	f.String(FlagDemoReplay, "", "render the recorded run in this JSONL `FILE` instead of the scripted stream (paced by --"+FlagDemoDelay+")")
 	return cmd
 }
 
@@ -77,12 +85,27 @@ func runTUIDemo(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 	f := cmd.Flags()
+	replay, err := f.GetString(FlagDemoReplay)
+	if err != nil {
+		return err
+	}
 	listOnly, err := f.GetBool(FlagDemoEvents)
 	if err != nil {
 		return err
 	}
 	if listOnly {
+		if replay != "" {
+			return fmt.Errorf("--%s prints the scripted stream; a recording is already JSONL, so read the file itself", FlagDemoEvents)
+		}
 		return writeDemoEvents(cmd, demo)
+	}
+	// A recording is read before the terminal is claimed, so a missing or
+	// damaged file is an ordinary error rather than a blank alternate screen.
+	var script []tui.ScriptedEvent
+	if replay != "" {
+		if script, err = replayScript(replay, demo.Delay); err != nil {
+			return err
+		}
 	}
 	alt, err := f.GetBool(FlagDemoAltScreen)
 	if err != nil {
@@ -98,13 +121,22 @@ func runTUIDemo(cmd *cobra.Command, _ []string) error {
 
 	stopped := false
 	ctrl := &demoController{}
-	err = demoTUI(cmd.Context(), demo, tui.Options{
+	tuiOpts := tui.Options{
 		NoColor:    opts.NoColor,
 		NoAnim:     noAnim,
 		AltScreen:  alt,
 		OnStop:     func() { stopped = true },
 		Controller: ctrl,
-	})
+	}
+	if replay != "" {
+		// A recording has its own run, clock and controls: nothing here can
+		// pause or re-fire a run that has already happened, so the keys stay
+		// disabled rather than reporting a call that means nothing.
+		tuiOpts.Controller = nil
+		err = replayTUI(cmd.Context(), script, tuiOpts)
+	} else {
+		err = demoTUI(cmd.Context(), demo, tuiOpts)
+	}
 	if err != nil {
 		return err
 	}
@@ -180,8 +212,10 @@ func (c *demoController) SetAmmo(_ context.Context, ammo int) error {
 // terminal. They are variables so a test can drive the command's TUI branch,
 // which otherwise needs a real terminal to reach at all.
 var (
-	demoTUI    = tui.Demo
-	isTerminal = func(f *os.File) bool { return term.IsTerminal(f.Fd()) }
+	demoTUI      = tui.Demo
+	replayTUI    = tui.Replay
+	replayScript = tui.ReplayFile
+	isTerminal   = func(f *os.File) bool { return term.IsTerminal(f.Fd()) }
 )
 
 // requireTerminal refuses to start a Bubble Tea program when stdin or stdout

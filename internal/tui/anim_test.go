@@ -1124,3 +1124,120 @@ func animBoxAround(row []rune, col int) (left, right int) {
 	}
 	return left, right
 }
+
+// --- P7-15: a queued animation aims where it was fired ---------------------
+
+// animImpactOf returns the cell an animation's last frame draws at. Every
+// animation ends on its target — a shot's impact spark, a burst's check mark
+// — so it is where the sprite landed.
+func animImpactOf(t *testing.T, a Animator, bead domain.BeadID) Target {
+	t.Helper()
+	for _, an := range a.active {
+		if an.bead != bead {
+			continue
+		}
+		require.NotEmpty(t, an.frames, "the animation has no frames")
+		f := an.frames[len(an.frames)-1]
+		require.NotEmpty(t, f, "the last frame draws nothing")
+		return Target{Row: f[0].Row, Col: f[0].Col}
+	}
+	t.Fatalf("no animation for %s is playing", bead)
+	return Target{}
+}
+
+// animDrainQueue advances until the queue has emptied into the active set.
+func animDrainQueue(t *testing.T, a Animator) Animator {
+	t.Helper()
+	for i := 0; a.Queued() > 0; i++ {
+		require.Less(t, i, 400, "the queue never drained")
+		a = a.Advance()
+	}
+	return a
+}
+
+// TestAnimQueuedAnimationKeepsItsFiringTimeTarget is P7-15 at the layer
+// itself: the target is resolved when the event arrives, so replacing the
+// resolver while the animation waits for a slot cannot move it.
+func TestAnimQueuedAnimationKeepsItsFiringTimeTarget(t *testing.T) {
+	t.Parallel()
+	fired := Target{Row: 5, Col: 40}
+	moved := Target{Row: 7, Col: 12}
+	a := animNewAnimator(AnimOptions{
+		Tab:     TabGraph,
+		Max:     1,
+		Targets: func(domain.BeadID) (Target, bool) { return fired, true },
+	})
+	a, _ = a.Fire(AnimShot, "sc-aaaa") // takes the only slot
+	a, _ = a.Fire(AnimShot, animTargetBead)
+	require.Equal(t, 1, a.Queued(), "the second shot has to wait for a slot")
+
+	// The viewer scrolls the graph: the same bead is drawn somewhere else.
+	a = a.SetTargets(func(domain.BeadID) (Target, bool) { return moved, true })
+	a = animDrainQueue(t, a)
+
+	require.Equal(t, fired, animImpactOf(t, a, animTargetBead),
+		"the queued shot was re-aimed at the cell the bead moved to")
+	require.NotEqual(t, moved, animImpactOf(t, a, animTargetBead))
+}
+
+// TestAnimQueuedShotSurvivesATabChange is the other half: a shot fired while
+// the graph was up must still land on the node, not on the tab indicator the
+// resolver would give once another view is on screen.
+func TestAnimQueuedShotSurvivesATabChange(t *testing.T) {
+	t.Parallel()
+	a := animNewAnimator(AnimOptions{Tab: TabGraph, Max: 1})
+	a, _ = a.Fire(AnimShot, "sc-aaaa")
+	a, _ = a.Fire(AnimShot, animTargetBead)
+	require.Equal(t, 1, a.Queued())
+
+	a = a.SetTab(TabAgents).SetTargets(nil)
+	a = animDrainQueue(t, a)
+
+	require.Equal(t, animTargetCell, animImpactOf(t, a, animTargetBead))
+	require.NotEqual(t, a.tabIndicator(TabAgents), animImpactOf(t, a, animTargetBead))
+}
+
+// TestAnimatorInTheProgramAimsAQueuedShotWhereItWasFired is P7-15's exit
+// criterion, driven through the real program: a shot waits in the queue
+// while the viewer moves the graph cursor and switches to another tab, and
+// it still lands on the cell the bead occupied when the event arrived.
+func TestAnimatorInTheProgramAimsAQueuedShotWhereItWasFired(t *testing.T) {
+	m, _ := animFirstShot(t, animModel(t, 120, 40, animDemo))
+	require.Equal(t, TabGraph, m.tab)
+	require.NotNil(t, m.anim.targets)
+
+	// A bead the graph can aim at, and where it is drawn right now.
+	lay := BuildGraphLayout(m.state)
+	resolve := GraphTargets(m.graph, m.state)
+	var bead domain.BeadID
+	var want Target
+	for _, n := range lay.Nodes {
+		if cell, ok := resolve(n.ID); ok {
+			bead, want = n.ID, cell
+			break
+		}
+	}
+	require.NotEmpty(t, bead, "the scripted run draws no node to aim at")
+
+	// Fill the active set so the shot at that bead has to wait.
+	a := m.anim
+	for a.Active() < AnimMaxActive {
+		a, _ = a.Fire(AnimShot, "sc-filler")
+	}
+	require.Equal(t, 0, a.Queued())
+	a, _ = a.Fire(AnimShot, bead)
+	require.Equal(t, 1, a.Queued(), "the shot has to be queued for this to prove anything")
+
+	// The viewer moves the graph cursor and changes tab before it starts.
+	after := animModelSend(m, tea.KeyMsg{Type: tea.KeyDown})
+	after = animModelSend(after, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("2")})
+	require.Equal(t, TabAgents, after.tab)
+	require.Nil(t, after.animTargets(), "no node is on screen once the graph is not")
+	a = a.SetTargets(after.animTargets()).SetTab(after.tab)
+
+	a = animDrainQueue(t, a)
+	got := animImpactOf(t, a, bead)
+	require.Equal(t, want, got, "the queued shot landed on a stale cell")
+	require.NotEqual(t, a.tabIndicator(TabAgents), got,
+		"the shot fell back to the tab indicator of the view the viewer moved to")
+}

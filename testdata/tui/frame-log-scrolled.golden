@@ -21,4 +21,4 @@
   12:01:57 agent_spawned        fired engineer(claude/fable) at demo-3 "Document
   12:02:00 agent_failed         eng-demo-3-r1 failed: timeout (agent timeout aft
 ▌ 12:02:03 error                error [supervisor] engineer timed out twice on d
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+tab next view • ? help • q stop / quit  ! engineer timed out twic… (+1 more)

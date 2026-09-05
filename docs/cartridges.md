@@ -88,8 +88,23 @@ gated; `WebFetch`, `WebSearch` and any other prompting tool stay denied.
 | `read_exec` | `--allowedTools Bash --disallowedTools Edit,Write,MultiEdit,NotebookEdit` | Testers can run builds and tests. A shell command can still write files; the policy is about which tools are offered and the worktree is disposable. |
 | `read_write` | `--allowedTools Bash,Edit,Write,MultiEdit,NotebookEdit` | Engineers. |
 
-P5-06 may tune `ReadOnlyShell`; the conformance suite (P2-09) checks that a
-write is refused under `read_only`.
+**Decision (P5-09): `read_only` keeps the restricted `Bash` allow-list.**
+The alternative was to drop the shell entirely —
+`--disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit` — which buys back
+Claude Code's own `Glob` and `Grep` tools. It was rejected: the product owner
+is the only role `sc` fires under `read_only` (`agents.rolePolicy`), and its
+job needs `bd` (through the read-only
+shim, D-21) and `git log`/`git diff`/`git show` to see what the repository
+has already done, none of which `Glob` and `Grep` can do. `grep`, `rg` and
+`find` in the allow-list cover what the removed built-ins offered, so the
+allow-list is a superset of the alternative for planning. Both mappings pass
+the conformance `refuse` check (a write is refused under `read_only`), so the
+suite does not decide it; the planning prompt does, and it now states that the
+shell is an allow-list of read-only commands and that builds and tests will be
+refused (P5-16). `claude.ToolFlags` implements this mapping and
+`claude.ReadOnlyShell` is the list; changing either without changing this
+paragraph fails `TestDocs_MappingTableMatchesCode` and
+`TestReadOnlyKeepsTheShellAllowList`.
 
 ### Environment
 

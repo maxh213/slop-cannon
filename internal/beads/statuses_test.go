@@ -277,3 +277,51 @@ func TestForeignStatusesRoundTripThroughList(t *testing.T) {
 		assert.False(t, is.Foreign(), is.ID)
 	}
 }
+
+// TestSafeBeadNormalisesTextTheTrackerHolds covers P3-21. bd stores
+// whatever was written into it, so a bead created by another tool — or by
+// a person who pasted an escape sequence into `bd create` — can carry
+// control characters in its prose. Refusing it would strand the run, so
+// the conversion normalises instead: what comes back out of SafeBead (and
+// out of the strict Bead) is printable, while the raw Issue still shows
+// what bd holds.
+func TestSafeBeadNormalisesTextTheTrackerHolds(t *testing.T) {
+	is := Issue{
+		ID:          "fx-esc",
+		Title:       "Fix \x1b[2JMax\x07",
+		Description: "before\rafter\x1b[31m\nkeeps\tlines",
+		Acceptance:  "TestMax passes\x00",
+		Status:      string(domain.BeadStateOpen),
+		Type:        string(domain.BeadTypeBug),
+		Priority:    domain.PriorityDefault,
+	}
+
+	b, origin := is.SafeBead(StatusMap{})
+	assert.Equal(t, OriginWorkflow, origin)
+	assert.Equal(t, "Fix [2JMax", b.Title, "the title comes back printable")
+	assert.Equal(t, "beforeafter[31m\nkeeps\tlines", b.Description, "LF and TAB survive, the rest does not")
+	assert.Equal(t, "TestMax passes", b.Acceptance)
+	assert.NoError(t, b.ValidateText(), "the converted bead passes the P0-11 rule")
+
+	strict, err := is.Bead()
+	require.NoError(t, err)
+	assert.Equal(t, b.Title, strict.Title, "the strict converter normalises the same way")
+	assert.NoError(t, strict.ValidateText())
+
+	assert.Contains(t, is.Title, "\x1b", "the raw issue still shows what bd holds")
+
+	// A foreign status takes the fallback path inside SafeBead; it must
+	// normalise too.
+	foreign := is
+	foreign.Status = "triage"
+	foreign.Type = "convoy"
+	fb, origin := foreign.SafeBead(StatusMap{"triage": domain.CategoryActive})
+	assert.Equal(t, OriginForeign, origin)
+	assert.NoError(t, fb.ValidateText())
+
+	// Text that needs nothing done to it is untouched.
+	clean := Issue{ID: "fx-ok", Title: "Fix Max", Description: "line\none", Status: string(domain.BeadStateOpen)}
+	cb, _ := clean.SafeBead(StatusMap{})
+	assert.Equal(t, "Fix Max", cb.Title)
+	assert.Equal(t, "line\none", cb.Description)
+}

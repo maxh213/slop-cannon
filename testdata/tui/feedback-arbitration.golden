@@ -1,26 +1,26 @@
 ▄█▓═▶  [1mslop-cannon[0m · run sc-feedback-0001 · brief · ammo 0/4 · safety on
  1 Graph  2 Agents [1m 3 Feedback [0m 4 PRs  5 Log 
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
-7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 open items
+7 beads reviewed · 4 approved · 2 in review · 1 escalated · 2 open items
   BEAD       U Q T │ sc-g7h8  Bump the client timeout
-  sc-a1b2    ✓ ✓ ✓ │ ✓ approved · 3 rounds · ux ✓  qa ✓  test ✓ · satisfied
+  sc-a1b2    ✓ ✓ ✓ │ ✓ approved · 2 rounds · ux ✓  qa ✗  test ✓ · 1 open
   sc-c3d4    ✓ ✓ ✓ │
   sc-e5f6    ✓ ✓ ✓ │ [1mround 1[0m · review · 6f70819 · ux,qa,test
-[1m▌ [0msc-g7h8    ✓ ✓ ✓ │   ⚙ report raise the timeout to 30s
-  sc-i9j0    ✓ ✓ ✓ │   ✗ qa   changes one major
-  sc-k1l2    · ✗ · │     ▲ major   qa-r1-1   Validate the timeout before use
-  sc-m3n4    ✓ ✓ ◐ │   ✓ ux   approve fine
+[1m▌ [0msc-g7h8    ✓ ✗ ✓ │   ⚙ report raise the timeout to 30s
+  sc-i9j0    ✓ ✓ ✓ │   ✓ ux   approve fine
+  sc-k1l2    ✓ ✗ ✓ │   ✗ qa   changes one major
+  sc-m3n4    ✓ ✓ ◐ │     ▲ major   qa-r1-1   Validate the timeout before use
                    │   ✓ test approve fine
                    │
-                   │ [1mround 2[0m · review · 708192a · qa
+                   │ [1mround 2[0m · review
                    │   ↩ pushback qa-r1-1   the config layer already rejects a negative timeout
                    │   ✗ qa   changes still want the guard
                    │     ▲ major   qa-r1-1   [held] Validate the timeout before use
                    │   ⚖ uphold_engineer  qa-r1-1   config validation covers it; a second check is dead code
                    │
-                   │ [1mround 3[0m · review · 8192a3b · qa
-                   │   ✓ qa   approve ruling accepted
-                   │     ▲ major   qa-r1-1   [overruled] Validate the timeout before use
                    │
                    │
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+                   │
+                   │
+                   │
+tab next view • 1…5 jump to view • ? help • q stop / quit • enter details • pgdn scroll down

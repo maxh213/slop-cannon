@@ -203,7 +203,7 @@ func PlanAgentRun(fc FiringContext, r *Run, req agents.PlanRequest) (agents.Agen
 		req.Timeout = fc.Timeout
 	}
 	req.Env = mergeEnv(req.Env, fc.Env)
-	spec, p, err := agents.PlanRunSpec(req)
+	spec, _, err := agents.PlanRunSpec(req)
 	if err != nil && !errors.Is(err, agents.ErrPromptOverBudget) {
 		return agents.AgentRun{}, err
 	}
@@ -213,10 +213,12 @@ func PlanAgentRun(fc FiringContext, r *Run, req agents.PlanRequest) (agents.Agen
 	// The planning product owner reads the repository; it has no worktree
 	// of its own (see the note on SupervisorPlanRunner).
 	spec.Workdir = req.Dir()
+	runDir := ""
 	if r != nil {
-		if werr := p.Write(r.Dir()); werr != nil {
-			r.Warn(SourcePlanning, "could not file the debug copy of the planning prompt", werr)
-		}
+		// P5-13: the firing path files the prompt it actually sent under
+		// <run-dir>/prompts/<agent-id>.md, so this build does not write a
+		// copy of its own — two writers of one file would only disagree.
+		runDir = r.Dir()
 	}
 	return agents.AgentRun{
 		Cartridge: fc.Cartridge,
@@ -226,6 +228,7 @@ func PlanAgentRun(fc FiringContext, r *Run, req agents.PlanRequest) (agents.Agen
 		Agent:     fc.Agent,
 		Task:      events.TaskPlan,
 		Run:       fc.Run,
+		RunDir:    runDir,
 	}, nil
 }
 
@@ -410,12 +413,16 @@ type Planner struct {
 	resumeChecked bool
 	failed        bool
 	nextAt        time.Time
-	lastErr       error
-	lastStatus    SchedulerStatus
-	lastSettle    time.Time
-	settled       bool
-	settleSum     string
-	settleWarn    string
+	// planAt is when the plan now in force was applied and planFired the
+	// scheduler's Fired counter at that moment: the P8-28 watermark.
+	planAt     time.Time
+	planFired  uint64
+	lastErr    error
+	lastStatus SchedulerStatus
+	lastSettle time.Time
+	settled    bool
+	settleSum  string
+	settleWarn string
 
 	// docsMu and shimMu guard the two "once, on first use" loads. Neither
 	// caches a failure: a full disk, an unreadable rules file or a bd
@@ -596,7 +603,42 @@ func (p *Planner) Demands(_ context.Context) ([]Demand, error) {
 	if !st.Quiet && !st.Idle {
 		return nil, nil // the last dispatch still found work to fire
 	}
+	if p.replanHeldLocked(st, now) {
+		return nil, nil // the plan that just landed has not been acted on yet
+	}
 	return []Demand{planDemand()}, nil
+}
+
+// replanHeldLocked reports whether the plan now in force is still waiting
+// to be acted on, in which case autopilot must not plan again (P8-28).
+//
+// [SchedulerStatus.Quiet] is the *last* dispatch's verdict and the beads a
+// plan created reach the work source only once the run's next pass has
+// listed them, so on the tick after a plan lands no engineer has started,
+// the previous dispatch fired nothing, and the run still looks quiet. Both
+// guards above therefore pass and the planning demand is offered again
+// within the same second — a whole second product owner at full model cost
+// on every plan, whose plan is a duplicate by construction because it reads
+// the same repository with the new beads not yet in flight (P8-29).
+//
+// The watermark is the scheduler's own [SchedulerStatus.Fired] counter:
+// once it has started one more agent than it had when the plan was applied,
+// the plan is being carried out and the ordinary guards take over. The idle
+// interval is the backstop, so a plan nothing can pick up — every bead
+// blocked, or a bd that will not list them — still re-plans on the D-18
+// idle schedule instead of holding planning up for ever.
+func (p *Planner) replanHeldLocked(st SchedulerStatus, now time.Time) bool {
+	if p.planAt.IsZero() || st.Fired > p.planFired {
+		return false
+	}
+	return now.Sub(p.planAt) < p.idle
+}
+
+// markPlanAppliedLocked sets the P8-28 watermark: the moment a plan came
+// into force, and the number of agents the scheduler had started by then.
+func (p *Planner) markPlanAppliedLocked(now time.Time) {
+	p.planAt = now
+	p.planFired = p.statusLocked().Fired
 }
 
 // planDemand is the run's planning demand. Its key is stable ("plan|||0"),
@@ -1101,6 +1143,7 @@ func (p *Planner) adoptResumedPlan(ctx context.Context) bool {
 	}
 	p.mu.Lock()
 	p.plans, p.resumedPlan, p.nextAt = 1, true, time.Time{}
+	p.markPlanAppliedLocked(p.opts.Now())
 	p.mu.Unlock()
 	p.logger().Info("this run had already planned before it was interrupted; adopting the plan bd holds",
 		slog.String("epic", epic.String()), slog.Int("beads", work))
@@ -1160,6 +1203,7 @@ func (p *Planner) record(f Firing, created map[string]domain.BeadID, err error) 
 		p.beads += len(created)
 		p.rejections = 0
 		p.nextAt = time.Time{}
+		p.markPlanAppliedLocked(now)
 		if p.cfg.Run.Mode == domain.RunModeBrief {
 			p.finished = true
 		}
@@ -1271,10 +1315,16 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 	if err != nil {
 		return agents.PlanRequest{}, err
 	}
-	open, err := p.openBeads(ctx)
+	open, done, err := p.planBeads(ctx)
 	if err != nil {
 		return agents.PlanRequest{}, err
 	}
+	// The prompt renders one list, with each bead's state beside it, and
+	// the open ones come first: the bead list is the last layer
+	// prompt.Budget degrades, and it is a duplicate of an *open* bead that
+	// agents.ValidatePlan refuses outright.
+	listed := make([]domain.Bead, 0, len(open)+len(done))
+	listed = append(append(listed, open...), done...)
 	req := agents.PlanRequest{
 		Run:       p.cfg.Run.ID,
 		AgentID:   f.Agent.ID,
@@ -1283,9 +1333,9 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 		Repo:      repo,
 		Rules:     rules,
 		Vibes:     vibes,
-		OpenBeads: open,
+		OpenBeads: listed,
 		MaxBeads:  p.maxBeads,
-		Notes:     p.notes(open),
+		Notes:     p.notes(open, done),
 		Model:     p.cfg.Cartridge.Model,
 	}
 	if eff := p.cfg.Effective; eff != nil && eff.Limits.AgentTimeout.Duration() > 0 {
@@ -1315,7 +1365,7 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 // [Planner.splitDemotions] implements — a plan has no field for an existing
 // bead, so the product owner restates it. An instruction the orchestrator
 // would drop on the floor is worse than no instruction at all.
-func (p *Planner) notes(open []domain.Bead) []string {
+func (p *Planner) notes(open, done []domain.Bead) []string {
 	if p.cfg.Run.Mode == domain.RunModeBrief {
 		return nil
 	}
@@ -1341,13 +1391,38 @@ func (p *Planner) notes(open []domain.Bead) []string {
 	if len(open) == 0 && !first {
 		notes = append(notes, "Nothing this run planned earlier is still open.")
 	}
+	if len(done) > 0 {
+		notes = append(notes, planDoneNote)
+	}
 	return notes
 }
+
+// planDoneNote is what the prompt says about the beads listed as [closed]
+// (P8-29). Without it the product owner has no memory of what the run has
+// already done: the listing it is shown carried open beads only, so it
+// re-proposed work it had shipped an hour earlier — in the recorded P8-03
+// run, three pull requests re-fixing the same one line. Saying "closed" is
+// not enough on its own, because with safety on the cannon never touches
+// the default branch (D-10), so the repository the product owner reads
+// still contains every bug the run has already fixed and is waiting for a
+// human to merge.
+const planDoneNote = "Beads listed above as [closed] are work this run has already finished and " +
+	"delivered. Do not propose any of them again, and do not propose a variation of one: the " +
+	"repository you are reading may still show the problem, because a delivered bead can be " +
+	"waiting on a human to merge its pull request."
 
 // planPrioritiesShown bounds the priority list [Planner.notes] renders, so a
 // run with hundreds of open beads cannot crowd the planning prompt out of
 // its budget.
 const planPrioritiesShown = 30
+
+// planClosedShown bounds the closed beads a planning prompt carries (P8-29):
+// the last ones the tracker listed, which is the newest end of bd's own
+// order. The product owner needs a memory of what this run has shipped, not
+// the whole history of the repository, and the bead list is the last thing
+// [prompt.Budget] degrades — so an unbounded list would be the part of the
+// prompt that grows without limit over a long autopilot run.
+const planClosedShown = 20
 
 // planPriorities renders "`sc-1` 2, `sc-2` 0" for the open beads, in the
 // order the listing gave them.
@@ -1424,24 +1499,39 @@ func (p *Planner) docs() ([]prompt.Doc, []prompt.Doc, error) {
 	return p.rules, p.vibes, nil
 }
 
-// openBeads lists the beads the plan must not duplicate: everything of this
-// run that is not closed and is not bookkeeping.
-func (p *Planner) openBeads(ctx context.Context) ([]domain.Bead, error) {
+// planBeads splits the run's beads into the two lists a planning prompt
+// carries: the open ones the plan must not duplicate, and the closed ones
+// it must not propose again (P8-29). Bookkeeping beads — the run epic — are
+// in neither.
+func (p *Planner) planBeads(ctx context.Context) (open, done []domain.Bead, err error) {
 	if p.opts.Beads == nil {
-		return nil, nil
+		return nil, nil, nil
 	}
 	list, err := p.opts.Beads(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("orchestrator: planning: listing the run's beads: %w", err)
+		return nil, nil, fmt.Errorf("orchestrator: planning: listing the run's beads: %w", err)
 	}
-	out := make([]domain.Bead, 0, len(list))
+	open = make([]domain.Bead, 0, len(list))
 	for _, b := range list {
-		if planInfrastructure(b) || b.State == domain.BeadStateClosed {
+		if planInfrastructure(b) {
 			continue
 		}
-		out = append(out, b)
+		if b.State == domain.BeadStateClosed {
+			done = append(done, b)
+			continue
+		}
+		open = append(open, b)
 	}
-	return out, nil
+	if p.cfg.Run.Mode == domain.RunModeBrief {
+		// A brief run plans once, at the start, when nothing of its own is
+		// closed yet, and [Planner.notes] says nothing in brief mode, so a
+		// [closed] entry there would be an unexplained line in the prompt.
+		return open, nil, nil
+	}
+	if len(done) > planClosedShown {
+		done = done[len(done)-planClosedShown:]
+	}
+	return open, done, nil
 }
 
 // planShim installs the planning agent's read-only bd shim under

@@ -72,9 +72,9 @@ Regenerate them with `make update-golden`, or just this family with
 `UPDATE_GOLDEN=1 go test ./internal/agents/...`.
 
 The prompt itself — the layers, their order, and the per-firing debug copies
-under `<state-dir>/runs/<run-id>/prompts/<agent-id>.md` — is documented in the
-`internal/agents/prompt` package comment; a user-facing page for it is still
-open as P10-06.
+under `<state-dir>/runs/<run-id>/prompts/<agent-id>.md` — is documented for
+users in [prompts.md](prompts.md), and for the code in the
+`internal/agents/prompt` package comment.
 
 ## TUI frames (`testdata/tui/`)
 

@@ -3,10 +3,13 @@ package tui
 import (
 	"fmt"
 	"strings"
+	"sync"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/domain"
@@ -307,10 +310,13 @@ func DefaultGraphKeyMap() GraphKeyMap {
 	}
 }
 
-// ShortHelp implements the [help.KeyMap] interface: the keys the footer can
-// show while the graph view is up.
+// ShortHelp implements the [help.KeyMap] interface: the keys the footer
+// shows while the graph view is up. The detail panel comes first because a
+// narrow footer keeps only the head of this list (P7-13), and `enter` is
+// both the least guessable of the three and the one that answers "what is
+// this bead?".
 func (k GraphKeyMap) ShortHelp() []key.Binding {
-	return []key.Binding{k.Left, k.Right, k.Open}
+	return []key.Binding{k.Open, k.Left, k.Right}
 }
 
 // FullHelp implements the [help.KeyMap] interface.
@@ -726,12 +732,24 @@ func graphEdges(lay GraphLayout) (edges []graphEdge, skips, backs int) {
 	return edges, skips, backs
 }
 
-// paint draws every box and edge of the layout onto a fresh canvas and
-// returns it with the position of each node's box, indexed like
-// [GraphLayout.Nodes].
-func (v GraphModel) paint(lay GraphLayout, vertical bool, cursor int) (*graphCanvas, []graphBox) {
-	boxes := make([]graphBox, len(lay.Nodes))
-	edges, skips, backs := graphEdges(lay)
+// graphGeometry is where the boxed layout puts everything, before anything
+// is drawn: the position of every node's box, the dependencies to route and
+// the size of the canvas they need. It is pure arithmetic — no rendering, no
+// measuring — so the view can work out which boxes the pane can actually
+// show before it pays to draw one (P7-24).
+type graphGeometry struct {
+	boxes    []graphBox
+	edges    []graphEdge
+	cw, ch   int
+	skipLane int
+	backLane int
+}
+
+// layout computes the geometry of a boxed layout.
+func (v GraphModel) layout(lay GraphLayout, vertical bool) graphGeometry {
+	g := graphGeometry{boxes: make([]graphBox, len(lay.Nodes))}
+	var skips, backs int
+	g.edges, skips, backs = graphEdges(lay)
 
 	span := 0
 	for _, row := range lay.Layers {
@@ -750,25 +768,24 @@ func (v GraphModel) paint(lay GraphLayout, vertical bool, cursor int) (*graphCan
 	// would otherwise cross. Skip edges run along the far side of the levels,
 	// back edges along the far end of them; the canvas only grows when there
 	// is such an edge to draw.
-	cw, ch := boxW, boxH
-	skipLane, backLane := boxH+GraphRowGap, boxW+1
+	g.cw, g.ch = boxW, boxH
+	g.skipLane, g.backLane = boxH+GraphRowGap, boxW+1
 	if vertical {
-		skipLane, backLane = boxW+GraphColGap, boxH+1
+		g.skipLane, g.backLane = boxW+GraphColGap, boxH+1
 		if skips > 0 {
-			cw = skipLane + skips
+			g.cw = g.skipLane + skips
 		}
 		if backs > 0 {
-			ch = backLane + backs
+			g.ch = g.backLane + backs
 		}
 	} else {
 		if skips > 0 {
-			ch = skipLane + skips
+			g.ch = g.skipLane + skips
 		}
 		if backs > 0 {
-			cw = backLane + backs
+			g.cw = g.backLane + backs
 		}
 	}
-	canvas := newGraphCanvas(cw, ch)
 	for depth, row := range lay.Layers {
 		for slot, idx := range row {
 			b := graphBox{w: GraphBoxWidth, h: GraphBoxHeight}
@@ -779,16 +796,51 @@ func (v GraphModel) paint(lay GraphLayout, vertical bool, cursor int) (*graphCan
 				b.x = depth * (GraphBoxWidth + GraphGutter)
 				b.y = slot * (GraphBoxHeight + GraphRowGap)
 			}
-			boxes[idx] = b
-			v.drawBox(canvas, b, lay.Nodes[idx], idx == cursor)
+			g.boxes[idx] = b
 		}
+	}
+	return g
+}
+
+// lane returns the bypass lane an edge detours through.
+func (g graphGeometry) lane(e graphEdge) int {
+	if e.kind == graphEdgeBack {
+		return g.backLane + e.lane
+	}
+	return g.skipLane + e.lane
+}
+
+// paint draws the layout onto a canvas and returns it with the position of
+// each node's box, indexed like [GraphLayout.Nodes].
+//
+// Only what the pane can show is drawn (P7-24). The geometry of the whole
+// graph is worked out first, which is arithmetic and costs nothing; the
+// canvas then holds cells for the scroll window alone, and a box or an edge
+// route outside it is skipped rather than rendered, measured and thrown away
+// by the clip in [GraphModel.boxLines]. A 200-bead run shows perhaps a fifth
+// of its graph, and a 1000-bead one a fiftieth, so this is the difference
+// between a frame that allocates megabytes and one that allocates what it
+// draws. The boxes are still returned for every node, because the animation
+// layer aims at beads that are off screen too.
+func (v GraphModel) paint(lay GraphLayout, vertical bool, cursor int) (*graphCanvas, []graphBox) {
+	g := v.layout(lay, vertical)
+	offX, offY := 0, 0
+	if cursor >= 0 && cursor < len(g.boxes) {
+		offX, offY = v.scroll(g.boxes[cursor])
+	}
+	canvas := newGraphWindow(g.cw, g.ch, offX, offY, v.width, max(v.height-1, 1))
+	for idx, b := range g.boxes {
+		if !canvas.covers(b.x, b.y, b.w, b.h) {
+			continue
+		}
+		v.drawBox(canvas, b, lay.Nodes[idx], idx == cursor)
 	}
 	// Edges after the boxes, so a route never overwrites a border; the
 	// selected bead's edges go last and in the accent colour.
 	muted := v.theme.Muted()
 	accent := v.theme.Accent()
 	for _, pass := range []bool{false, true} {
-		for _, e := range edges {
+		for _, e := range g.edges {
 			strong := e.dst == cursor || e.src == cursor
 			if strong != pass {
 				continue
@@ -797,14 +849,14 @@ func (v GraphModel) paint(lay GraphLayout, vertical bool, cursor int) (*graphCan
 			if strong {
 				style, force = &accent, true
 			}
-			lane := skipLane + e.lane
-			if e.kind == graphEdgeBack {
-				lane = backLane + e.lane
+			route := graphRoute(g.boxes[e.src], g.boxes[e.dst], vertical, e.kind, g.lane(e))
+			if !canvas.coversRoute(route) {
+				continue
 			}
-			canvas.polyline(graphRoute(boxes[e.src], boxes[e.dst], vertical, e.kind, lane), style, force)
+			canvas.polyline(route, style, force)
 		}
 	}
-	return canvas, boxes
+	return canvas, g.boxes
 }
 
 // graphRoute returns the polyline joining two boxes: out of the blocker,
@@ -1191,9 +1243,15 @@ var graphLineRunes = map[uint8]rune{
 // span, which keeps the escape sequences down and lets the viewport clip by
 // column without ever cutting one in half.
 type graphCanvas struct {
-	w, h   int
-	runes  []rune
-	styles []*lipgloss.Style
+	// w and h are the size of the whole drawing, which is what the scroll
+	// hint and the viewport are measured against; ox, oy, bw and bh are the
+	// window of it that has cells behind it (P7-24). Everything outside the
+	// window is silently dropped on the way in and reads as blank on the way
+	// out, which is exactly what the clip to the pane would have done to it.
+	w, h           int
+	ox, oy, bw, bh int
+	runes          []rune
+	styles         []*lipgloss.Style
 	// cont marks a cell covered by the right half of the double-width rune
 	// in the cell before it: a bead title can hold CJK or emoji, which take
 	// two terminal cells each, and a canvas that assumed one rune per cell
@@ -1204,12 +1262,19 @@ type graphCanvas struct {
 	edges []*lipgloss.Style
 }
 
-// newGraphCanvas returns an empty canvas of w×h cells.
-func newGraphCanvas(w, h int) *graphCanvas {
-	n := max(w, 1) * max(h, 1)
+// newGraphCanvas returns an empty canvas of w×h cells, all of them backed.
+func newGraphCanvas(w, h int) *graphCanvas { return newGraphWindow(w, h, 0, 0, w, h) }
+
+// newGraphWindow returns a canvas of a w×h drawing that holds cells only for
+// the bw×bh window at (ox, oy). The window is clamped to the drawing, so a
+// pane larger than the graph simply backs all of it.
+func newGraphWindow(w, h, ox, oy, bw, bh int) *graphCanvas {
+	w, h = max(w, 1), max(h, 1)
+	ox, oy = min(max(ox, 0), w-1), min(max(oy, 0), h-1)
+	bw, bh = min(max(bw, 1), w-ox), min(max(bh, 1), h-oy)
+	n := bw * bh
 	return &graphCanvas{
-		w:      max(w, 1),
-		h:      max(h, 1),
+		w: w, h: h, ox: ox, oy: oy, bw: bw, bh: bh,
 		runes:  make([]rune, n),
 		styles: make([]*lipgloss.Style, n),
 		cont:   make([]bool, n),
@@ -1218,15 +1283,98 @@ func newGraphCanvas(w, h int) *graphCanvas {
 	}
 }
 
+// at is the index of a cell in the window's buffers; call it only for a cell
+// [graphCanvas.inside] accepted.
+func (c *graphCanvas) at(x, y int) int { return (y-c.oy)*c.bw + (x - c.ox) }
+
+// maskAt returns the edge directions drawn in a cell, and zero for a cell
+// outside the window.
+func (c *graphCanvas) maskAt(x, y int) uint8 {
+	if !c.inside(x, y) {
+		return 0
+	}
+	return c.masks[c.at(x, y)]
+}
+
+// covers reports whether any part of the w×h rectangle at (x, y) is inside
+// the window, which is what decides whether a box is worth drawing.
+func (c *graphCanvas) covers(x, y, w, h int) bool {
+	return x < c.ox+c.bw && x+w > c.ox && y < c.oy+c.bh && y+h > c.oy
+}
+
+// coversRoute reports whether a polyline's bounding box reaches the window.
+// A route is orthogonal, so every cell of it is inside that box: a route
+// whose box misses the window cannot draw a single visible cell.
+func (c *graphCanvas) coversRoute(pts []graphPoint) bool {
+	if len(pts) == 0 {
+		return false
+	}
+	minX, maxX, minY, maxY := pts[0].x, pts[0].x, pts[0].y, pts[0].y
+	for _, p := range pts[1:] {
+		minX, maxX = min(minX, p.x), max(maxX, p.x)
+		minY, maxY = min(minY, p.y), max(maxY, p.y)
+	}
+	return c.covers(minX, minY, maxX-minX+1, maxY-minY+1)
+}
+
 // graphRuneCells is how many terminal cells a rune occupies, measured the
 // same way Lip Gloss measures the strings the boxes are padded and truncated
 // with, so a canvas cell and a padded string agree on every terminal —
 // including one configured for ambiguous-width 2, where [PadGlyph] widens the
 // glyph column.
-func graphRuneCells(r rune) int { return lipgloss.Width(string(r)) }
+//
+// It is called for every rune written to the canvas and again for every cell
+// read back out of it, so it is the hottest function of a frame (P7-24).
+// [lipgloss.Width] splits its argument on newlines before measuring, which
+// allocates on every call; this measures with the function underneath it and
+// takes two shortcuts first. ASCII is decided without measuring at all —
+// no ASCII character is East-Asian-ambiguous, and the control characters the
+// canvas drops are exactly the ones Lip Gloss measures as zero — and the
+// block the box drawing, the arrows and the palette's glyphs live in is
+// measured once into a table, because those runes are drawn thousands of
+// times per frame.
+func graphRuneCells(r rune) int {
+	switch {
+	case r < utf8.RuneSelf:
+		if r < 0x20 || r == 0x7f {
+			return 0
+		}
+		return 1
+	case r >= graphWidthLo && r < graphWidthHi:
+		graphWidthOnce.Do(fillGraphWidths)
+		return int(graphWidths[r-graphWidthLo])
+	default:
+		return ansi.StringWidth(string(r))
+	}
+}
 
-// inside reports whether the cell is on the canvas.
-func (c *graphCanvas) inside(x, y int) bool { return x >= 0 && y >= 0 && x < c.w && y < c.h }
+// The Unicode block the width table covers: general punctuation through the
+// geometric shapes and dingbats, which is every box-drawing character, arrow
+// and palette glyph the view draws.
+const (
+	graphWidthLo = 0x2000
+	graphWidthHi = 0x3000
+)
+
+var (
+	graphWidthOnce sync.Once
+	graphWidths    [graphWidthHi - graphWidthLo]int8
+)
+
+// fillGraphWidths measures the table once, on the first non-ASCII rune of the
+// first frame. It cannot be built at package initialisation: nothing else in
+// a `sc` invocation that never draws a graph should pay for it.
+func fillGraphWidths() {
+	for r := rune(graphWidthLo); r < graphWidthHi; r++ {
+		graphWidths[r-graphWidthLo] = int8(ansi.StringWidth(string(r)))
+	}
+}
+
+// inside reports whether the cell has a buffer behind it: it is on the
+// canvas and within the window the canvas backs.
+func (c *graphCanvas) inside(x, y int) bool {
+	return x >= c.ox && y >= c.oy && x < c.ox+c.bw && y < c.oy+c.bh
+}
 
 // text writes a string starting at (x, y), advancing by the number of cells
 // each rune occupies. A rune that occupies none — a control character, an
@@ -1253,7 +1401,7 @@ func (c *graphCanvas) write(x, y int, r rune, style *lipgloss.Style) {
 		return
 	}
 	c.blank(x, y)
-	i := y*c.w + x
+	i := c.at(x, y)
 	c.runes[i], c.styles[i] = r, style
 }
 
@@ -1264,7 +1412,7 @@ func (c *graphCanvas) writeCont(x, y int, style *lipgloss.Style) {
 		return
 	}
 	c.blank(x, y)
-	i := y*c.w + x
+	i := c.at(x, y)
 	c.styles[i], c.cont[i] = style, true
 }
 
@@ -1272,11 +1420,11 @@ func (c *graphCanvas) writeCont(x, y int, style *lipgloss.Style) {
 // rune, the other half with it, so writing over one half never leaves the
 // other stranded.
 func (c *graphCanvas) blank(x, y int) {
-	i := y*c.w + x
-	if c.cont[i] && x > 0 {
+	i := c.at(x, y)
+	if c.cont[i] && x > c.ox {
 		c.runes[i-1], c.styles[i-1] = 0, nil
 	}
-	if x+1 < c.w && c.cont[i+1] {
+	if x+1 < c.ox+c.bw && c.cont[i+1] {
 		c.styles[i+1], c.cont[i+1] = nil, false
 	}
 	c.runes[i], c.styles[i], c.cont[i] = 0, nil, false
@@ -1290,7 +1438,7 @@ func (c *graphCanvas) line(x, y int, mask uint8, style *lipgloss.Style, force bo
 	if !c.inside(x, y) {
 		return
 	}
-	i := y*c.w + x
+	i := c.at(x, y)
 	if c.runes[i] != 0 || c.cont[i] {
 		return
 	}
@@ -1389,7 +1537,7 @@ func (c *graphCanvas) row(y, offX, w int) string {
 	for x := offX; x < offX+w; {
 		r, style, cells := ' ', (*lipgloss.Style)(nil), 1
 		if c.inside(x, y) {
-			i := y*c.w + x
+			i := c.at(x, y)
 			switch {
 			case c.cont[i]:
 				// The right half of a double-width rune whose left half is

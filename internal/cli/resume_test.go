@@ -24,7 +24,7 @@ func resumeSetup(t *testing.T) (base, repo string) {
 	base, repo = runTestEnv(t)
 	runAddCartridge(t, "claude", "fable")
 	for _, id := range []string{"20260901-000000-1111", "20260902-000000-2222"} {
-		require.NoError(t, os.MkdirAll(config.RunDir(repo, id), 0o755))
+		runWriteRunState(t, repo, id)
 	}
 	return base, repo
 }
@@ -134,4 +134,60 @@ func TestResumeRejectsTwoArguments(t *testing.T) {
 	_, repo := resumeSetup(t)
 	_, err := rootRun(t, "resume", repo, repo)
 	require.Error(t, err)
+}
+
+// ---------------------------------------------------------------------------
+// P8-31: a run directory that recorded nothing is not resumable
+// ---------------------------------------------------------------------------
+
+// TestResumePicksTheNewestRunThatRecordedSomething is P8-31's Done-when.
+// The selection used to be config.LatestRunID, the greatest directory name
+// whatever was in it, so a directory left behind by a kill between
+// logging.OpenRunLog and the first state write was adopted and `--resume`
+// fired a brand-new autopilot run under a dead run's id. Now the newest run
+// with a state.json is continued, and the note says why it is not the
+// newest directory.
+func TestResumePicksTheNewestRunThatRecordedSomething(t *testing.T) {
+	base, repo := runTestEnv(t)
+	runAddCartridge(t, "claude", "fable")
+	runWriteRunState(t, repo, "20260901-000000-1111")
+	// The newer directory never got as far as a state file: a kill in the
+	// window, or a half-pruned state directory.
+	dead := config.RunDir(repo, "20260902-000000-2222")
+	require.NoError(t, os.MkdirAll(dead, 0o755))
+
+	stdout, stderr, code := runResolve(t, "resume", repo)
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, runNormalise(stdout, base, repo), "run        20260901-000000-1111 (resumed)\n")
+	require.Contains(t, stderr, "note: run 20260902-000000-2222 recorded no state.json")
+	require.Contains(t, stderr, "continuing run 20260901-000000-1111, the newest one that did")
+
+	// The run form says exactly the same thing.
+	flagOut, flagErr, code := runResolve(t, repo, "--resume")
+	require.Equal(t, 0, code, flagErr)
+	require.Equal(t, stdout, flagOut)
+	require.Equal(t, stderr, flagErr)
+}
+
+// TestResumeWithNothingRecordedStartsANewRun is the other half of the
+// Done-when: when no recorded run has a state.json there is nothing to
+// resume at all, so a new run is started under a new id — and said so —
+// rather than a fresh autopilot run wearing a dead run's name.
+func TestResumeWithNothingRecordedStartsANewRun(t *testing.T) {
+	base, repo := runTestEnv(t)
+	runAddCartridge(t, "claude", "fable")
+	for _, id := range []string{"20260901-000000-1111", "20260902-000000-2222"} {
+		require.NoError(t, os.MkdirAll(config.RunDir(repo, id), 0o755))
+	}
+
+	stdout, stderr, code := runResolve(t, "resume", repo)
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, stderr, "note: run 20260902-000000-2222 recorded no state.json, and neither did any older run; starting a new run instead")
+	out := runNormalise(stdout, base, repo)
+	require.Contains(t, out, "run        20260902-010203-abcd (new)\n")
+	require.NotContains(t, out, "(resumed)")
+
+	rc := runJSON(t, "resume", repo)
+	require.False(t, rc.Resume, "there was nothing to resume")
+	require.Equal(t, domain.RunID("20260902-010203-abcd"), rc.Run.ID)
 }

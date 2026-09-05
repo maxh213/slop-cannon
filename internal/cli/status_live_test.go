@@ -225,7 +225,10 @@ func TestStatusLiveMapsAForeignStatus(t *testing.T) {
 
 	out, err := rootRun(t, "--repo", repo, "status", "--events", "0")
 	require.NoError(t, err)
-	require.Contains(t, out, "sc-3  open -> blocked (changed outside the run, bd status in-qa)")
+	// A status of the repository's own making is passed over whatever it
+	// maps onto, and the report says so rather than leaving the reader to
+	// know the P6-12 rule (P8-19).
+	require.Contains(t, out, "sc-3  open -> blocked (changed outside the run, bd status in-qa; the run will pass over it)")
 	require.Equal(t, "1", liveCount(t, out, "blocked"))
 }
 

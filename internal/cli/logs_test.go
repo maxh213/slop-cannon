@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -579,4 +580,108 @@ func logsDocRow(t *testing.T, doc, stem string) string {
 	}
 	t.Fatalf("docs/troubleshooting.md has no row keyed %q", stem)
 	return ""
+}
+
+// TestLogsFollowWaitsForTheFirstAgentOfABead is P8-38. A user follows a
+// bead the moment the run adopts it, before any agent has been fired at it:
+// the follow loop already picks up every agent that turns up later, and
+// refusing the command for want of the first one made the user retry by
+// hand for something it was about to do anyway.
+func TestLogsFollowWaitsForTheFirstAgentOfABead(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := config.RunDir(repo, logsRunID)
+	_, err := orchestrator.EnsureRunDir(dir)
+	require.NoError(t, err)
+	logsWriteLog(t, logging.PathsFor(dir).Log, logsLines("sc", 2))
+	logsFastPoll(t)
+
+	w := &logsBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		done <- ExecuteContext(ctx, []string{"--repo", repo, "logs", "sc-7", "--follow"}, w, w)
+	}()
+
+	// Nothing to print yet, and the command says what it is waiting for.
+	logsWaitFor(t, w, `waiting for the first agent log of "sc-7"`)
+	logsWriteAgent(t, dir, "eng-sc-7-r1", []string{"eng line 1"})
+	logsWaitFor(t, w, "eng line 1")
+
+	// A second agent of the same bead still joins, headers and all.
+	logsWriteAgent(t, dir, "tester-qa-sc-7-r1", []string{"qa line 1"})
+	logsWaitFor(t, w, "qa line 1")
+	require.Contains(t, w.String(), "==> tester-qa-sc-7-r1 <==")
+
+	cancel()
+	select {
+	case code := <-done:
+		require.Equal(t, 0, code, "an interrupted follow is not a failure")
+	case <-time.After(5 * time.Second):
+		t.Fatal("sc logs --follow did not stop when the context was cancelled")
+	}
+}
+
+// TestLogsOneShotStillFailsFast is the other half of P8-38: without
+// --follow there is nothing to wait for, so the command says what the run
+// has and exits.
+func TestLogsOneShotStillFailsFast(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := config.RunDir(repo, logsRunID)
+	_, err := orchestrator.EnsureRunDir(dir)
+	require.NoError(t, err)
+	logsWriteLog(t, logging.PathsFor(dir).Log, logsLines("sc", 2))
+
+	_, err = rootRun(t, "--repo", repo, "logs", "sc-7")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "the run has no agent logs yet")
+
+	// And with agents present, an argument matching none of them still
+	// lists what there is rather than waiting for a bead id that is a typo.
+	logsWriteAgent(t, dir, "eng-sc-1-r1", []string{"eng line 1"})
+	_, err = rootRun(t, "--repo", repo, "logs", "sc-7")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "this run has: eng-sc-1-r1")
+}
+
+// TestLogsFollowWaitsForTheRunLogItself: the same rule for the
+// orchestrator's own log, which is not there until the run writes its first
+// line. The notice names the file so a follow that never fills is
+// explicable rather than a hang.
+func TestLogsFollowWaitsForTheRunLogItself(t *testing.T) {
+	_, repo := statusEnv(t)
+	dir := config.RunDir(repo, logsRunID)
+	_, err := orchestrator.EnsureRunDir(dir)
+	require.NoError(t, err)
+	logsFastPoll(t)
+
+	w := &logsBuffer{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan int, 1)
+	go func() {
+		done <- ExecuteContext(ctx, []string{"--repo", repo, "logs", "--follow"}, w, w)
+	}()
+
+	logsWaitFor(t, w, "waiting for "+logging.RunLogName)
+	logsWriteLog(t, logging.PathsFor(dir).Log, []string{"sc line 1"})
+	logsWaitFor(t, w, "sc line 1")
+
+	cancel()
+	select {
+	case code := <-done:
+		require.Equal(t, 0, code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("sc logs --follow did not stop when the context was cancelled")
+	}
+}
+
+// TestLogsWaitingNotice covers the notice itself: it names what is being
+// waited for and keeps the resolver's own explanation, which is where a
+// mistyped bead id is caught.
+func TestLogsWaitingNotice(t *testing.T) {
+	require.Equal(t, `waiting for the first agent log of "sc-7": boom`,
+		logsWaitingNotice("sc-7", errors.New("boom")))
+	require.Equal(t, "waiting for "+logging.RunLogName+": boom",
+		logsWaitingNotice("", errors.New("boom")))
 }

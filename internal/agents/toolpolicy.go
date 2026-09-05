@@ -3,10 +3,16 @@ package agents
 import (
 	"errors"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 
+	"slop-cannon/internal/beads"
 	"slop-cannon/internal/cartridge"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
@@ -360,4 +366,385 @@ func joinPolicies() string {
 		names[i] = p.String()
 	}
 	return strings.Join(names, ", ")
+}
+
+// ---------------------------------------------------------------------------
+// The git guard (P9-22)
+// ---------------------------------------------------------------------------
+//
+// A read_write firing gets Bash with no deny list, and it runs in a linked
+// worktree of the *target* repository, so `git push origin HEAD:main`,
+// `git checkout main` or `git clean -fdx` from an agent would reach the
+// user's own branches — the only guard used to be a sentence in the
+// engineer's prompt. The git guard closes that: a `git` script is written
+// into the same per-agent directory the read-only bd shim lives in
+// (beads.ShimDirFor, already first on the firing's PATH), so every git an
+// agent runs goes through it. It allows the verbs the role prompts actually
+// ask for — status, diff, log, add, commit, rebase --continue — and refuses
+// the ones that can reach outside the agent's own branch, with the same
+// argv vocabulary internal/gitx's safety invariant test judges deliveries
+// by.
+//
+// Like the bd shim it is an allow list, for the same reason: a deny list
+// closes the holes someone thought of, and git grows verbs. And like the bd
+// shim it is a guard rail, not a sandbox — an agent that runs
+// /usr/bin/git by absolute path bypasses it, which is why the invariant
+// tests (P9-02) still watch what a run does to the repository.
+
+// GitGuardHeader is the second line of every generated guard. IsGitGuard
+// recognises a file by it, and RealGit skips such files.
+const GitGuardHeader = "# slop-cannon git guard (P9-22). Do not edit."
+
+// GitGuardBinary is the name the guard is installed under: it shadows the
+// real git on the agent's PATH.
+const GitGuardBinary = "git"
+
+// GitGuardExitCode is the status the guard exits with when it refuses,
+// which is git's own status for a fatal error.
+const GitGuardExitCode = 128
+
+// GitGuardAllowed is the allow list of git subcommands the guard lets
+// through. It holds the reads every role needs to explore a repository and
+// the writes the role prompts ask for — `git add`, `git commit -am …`,
+// `git rebase --continue` — and nothing that writes a ref other than the
+// branch the worktree has checked out.
+//
+// Deliberately absent, each because it can reach past the agent's own
+// branch: push, pull and fetch (they move refs, and a refspec can name the
+// default branch), remote, clone and submodule (they change where the
+// repository points, or fetch into it), checkout, switch and worktree (they
+// change which branch this tree is on, or make a tree elsewhere), branch,
+// tag, notes, update-ref, symbolic-ref and replace (ref writes that need no
+// checkout), clean (it deletes untracked work), config (it can rewrite the
+// remote or the hooks path), and the repository-wide rewriters — init, gc,
+// prune, repack, reflog, fsck, filter-branch. `git branch` is the one
+// exception: reading the branch list is useful and harmless, so it is
+// allowed unless one of GitGuardBranchWriters is among its arguments.
+var GitGuardAllowed = []string{
+	"add", "annotate", "apply", "blame",
+	"cat-file", "check-attr", "check-ignore", "cherry", "cherry-pick",
+	"commit", "describe", "diff", "diff-files", "diff-index", "diff-tree",
+	"grep", "help", "log", "ls-files", "ls-tree",
+	"merge", "merge-base", "mv", "name-rev",
+	"rebase", "reset", "restore", "rev-list", "rev-parse", "revert", "rm",
+	"shortlog", "show", "show-branch", "stash", "status", "stripspace",
+	"var", "verify-commit", "whatchanged",
+}
+
+// GitGuardBranchWriters are the arguments that turn `git branch` from a
+// listing into a ref write: creating, deleting, renaming, copying or
+// force-moving a branch, the default branch included. Any of them makes the
+// guard refuse the call.
+var GitGuardBranchWriters = []string{
+	"-d", "-D", "--delete",
+	"-m", "-M", "--move",
+	"-c", "-C", "--copy",
+	"-f", "--force",
+	"-u", "--set-upstream-to", "--set-upstream", "--unset-upstream",
+	"--edit-description",
+}
+
+// GitGuardGlobalWriters are git's own options, valid before or after the
+// subcommand, that would point it at another repository, another working
+// tree or another configuration — `git -C /repo checkout main`,
+// `git --git-dir=… update-ref …`, `git -c core.hooksPath=… commit`. The
+// guard refuses a call carrying any of them wherever it appears, because
+// none of them can be part of doing the work in the agent's own worktree.
+var GitGuardGlobalWriters = []string{
+	"-C", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+	"-c", "--config-env",
+}
+
+// GitGuardHint is the second line the guard prints when it refuses, telling
+// the agent what the git on its PATH is and what it may do instead. Like
+// git's own hints it starts with "hint:", so the first ("fatal: …") line
+// stays the message.
+const GitGuardHint = "hint: the git on your PATH is slop-cannon's guard; it allows you to inspect this " +
+	"worktree and to commit in it (git status, git diff, git log, git add, git commit, git rebase --continue), " +
+	"and refuses anything that could move a branch outside it. The cannon pushes and opens the pull request for you."
+
+// GitGuardDeniedMessage is the guard's refusal for one subcommand, in git's
+// own "fatal: …" shape.
+func GitGuardDeniedMessage(sub string) string {
+	return fmt.Sprintf("fatal: git %s is not allowed from an agent session", sub)
+}
+
+// GitGuardOptionMessage is the guard's refusal for one global option.
+func GitGuardOptionMessage(opt string) string {
+	return fmt.Sprintf("fatal: the git option %s is not allowed from an agent session", opt)
+}
+
+// GitGuardOutsideMessage is the guard's refusal for a git run from outside
+// the agent's worktree — `cd /repo && git commit` would otherwise land on
+// whatever branch the user has checked out there.
+func GitGuardOutsideMessage(wt string) string {
+	return fmt.Sprintf("fatal: git may only be run inside %s from an agent session", wt)
+}
+
+// GitGuard is one installed guard.
+type GitGuard struct {
+	// Dir is the directory holding the script; put it first on the agent's
+	// PATH with Apply.
+	Dir string `json:"dir"`
+	// Path is the script itself, Dir/git.
+	Path string `json:"path"`
+	// Real is the absolute path of the genuine git the script execs.
+	Real string `json:"real"`
+	// Worktree, when set, is the only directory the guard lets git run in.
+	Worktree string `json:"worktree,omitempty"`
+}
+
+// GitGuardOptions configure WriteGitGuard.
+type GitGuardOptions struct {
+	// Real is the genuine git to exec; empty means RealGit().
+	Real string
+	// Worktree, when set, confines the guard: a git run from anywhere
+	// outside that directory is refused, so an agent cannot step into the
+	// repository's own working tree and commit there.
+	Worktree string
+}
+
+// WriteGitGuard installs the guard script at dir/git, replacing any earlier
+// one atomically so a running agent never reads a half-written file. dir is
+// normally the per-agent shim directory the read-only bd shim already uses
+// (beads.ShimDirFor), which is first on the firing's PATH.
+func WriteGitGuard(dir string, opts GitGuardOptions) (GitGuard, error) {
+	if runtime.GOOS == "windows" {
+		return GitGuard{}, fmt.Errorf("agents: the git guard needs a POSIX shell, unsupported on %s", runtime.GOOS)
+	}
+	if dir == "" {
+		return GitGuard{}, errors.New("agents: git guard directory is empty")
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return GitGuard{}, fmt.Errorf("agents: resolving the git guard directory: %w", err)
+	}
+	real := opts.Real
+	if real == "" {
+		real, err = RealGit()
+		if err != nil {
+			return GitGuard{}, err
+		}
+	}
+	if !filepath.IsAbs(real) {
+		real, err = filepath.Abs(real)
+		if err != nil {
+			return GitGuard{}, fmt.Errorf("agents: resolving the real git path: %w", err)
+		}
+	}
+	if IsGitGuard(real) {
+		return GitGuard{}, fmt.Errorf("agents: %s is itself a git guard, refusing to chain guards", real)
+	}
+	wt := opts.Worktree
+	if wt != "" {
+		if !filepath.IsAbs(wt) {
+			return GitGuard{}, fmt.Errorf("agents: git guard worktree %q is not absolute", wt)
+		}
+		wt = filepath.Clean(wt)
+		if resolved, err := filepath.EvalSymlinks(wt); err == nil {
+			wt = resolved
+		}
+	}
+	if err := os.MkdirAll(abs, 0o755); err != nil {
+		return GitGuard{}, fmt.Errorf("agents: creating the git guard directory: %w", err)
+	}
+	g := GitGuard{Dir: abs, Path: filepath.Join(abs, GitGuardBinary), Real: real, Worktree: wt}
+	tmp, err := os.CreateTemp(abs, "."+GitGuardBinary+".*")
+	if err != nil {
+		return GitGuard{}, fmt.Errorf("agents: creating the git guard: %w", err)
+	}
+	tmpName := tmp.Name()
+	_, werr := tmp.WriteString(GitGuardScript(real, wt))
+	cerr := tmp.Close()
+	if werr != nil || cerr != nil {
+		_ = os.Remove(tmpName)
+		return GitGuard{}, fmt.Errorf("agents: writing the git guard: %w", errors.Join(werr, cerr))
+	}
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		_ = os.Remove(tmpName)
+		return GitGuard{}, fmt.Errorf("agents: making the git guard executable: %w", err)
+	}
+	if err := os.Rename(tmpName, g.Path); err != nil {
+		_ = os.Remove(tmpName)
+		return GitGuard{}, fmt.Errorf("agents: installing the git guard: %w", err)
+	}
+	return g, nil
+}
+
+// InstallGitGuardForWorktree writes the guard for the agent worktree at wt
+// into the per-agent directory the read-only bd shim already uses
+// (beads.ShimDirFor(wt)), so one PATH entry carries both and the guard is
+// thrown away with the run. dir overrides that placement for a caller with
+// its own layout.
+//
+// The worktree is always baked in: a firing's git may only run inside its
+// own worktree, so an agent cannot step into the repository's own working
+// tree — where the default branch is the one checked out — and commit
+// there.
+func InstallGitGuardForWorktree(wt, dir string) (GitGuard, error) {
+	if wt == "" {
+		return GitGuard{}, errors.New("agents: InstallGitGuardForWorktree: empty worktree path")
+	}
+	if !filepath.IsAbs(wt) {
+		return GitGuard{}, fmt.Errorf("agents: InstallGitGuardForWorktree: worktree path %q is not absolute", wt)
+	}
+	if dir == "" {
+		var err error
+		dir, err = beads.ShimDirFor(wt)
+		if err != nil {
+			return GitGuard{}, err
+		}
+	}
+	return WriteGitGuard(dir, GitGuardOptions{Worktree: wt})
+}
+
+// Apply puts the guard's directory first on PATH in env (a
+// cartridge.RunSpec.Env map), prepending to a PATH already in env rather
+// than to the parent's. It is idempotent and does nothing on a nil map or
+// an uninstalled guard.
+func (g GitGuard) Apply(env map[string]string) {
+	if env == nil || g.Dir == "" {
+		return
+	}
+	if current, ok := env["PATH"]; ok {
+		env["PATH"] = beads.PrependPath(g.Dir, current)
+		return
+	}
+	env["PATH"] = beads.PrependPath(g.Dir, os.Getenv("PATH"))
+}
+
+// IsGitGuard reports whether path is a guard generated by WriteGitGuard
+// (its second line is GitGuardHeader). Missing or unreadable files are not.
+func IsGitGuard(path string) bool {
+	f, err := os.Open(path) //nolint:gosec // the caller names a file on its own PATH
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	buf := make([]byte, 256)
+	n, _ := f.Read(buf)
+	lines := strings.SplitN(string(buf[:n]), "\n", 3)
+	return len(lines) >= 2 && lines[1] == GitGuardHeader
+}
+
+// RealGit resolves the genuine git binary on PATH, skipping any guard, so a
+// caller whose own PATH already carries one still finds the real tool. The
+// error wraps exec.ErrNotFound.
+func RealGit() (string, error) {
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate := filepath.Join(dir, GitGuardBinary)
+		info, err := os.Stat(candidate)
+		if err != nil || info.IsDir() || info.Mode().Perm()&0o111 == 0 || IsGitGuard(candidate) {
+			continue
+		}
+		if !filepath.IsAbs(candidate) {
+			if abs, err := filepath.Abs(candidate); err == nil {
+				candidate = abs
+			}
+		}
+		return candidate, nil
+	}
+	return "", fmt.Errorf("agents: %s: %w (no real binary on PATH)", GitGuardBinary, exec.ErrNotFound)
+}
+
+// GitGuardScript renders the guard: a POSIX shell script that refuses the
+// global options of GitGuardGlobalWriters wherever they appear, refuses any
+// subcommand outside GitGuardAllowed, refuses a `git branch` carrying one of
+// GitGuardBranchWriters, refuses a call made from outside wt when wt is
+// non-empty, and execs real for everything else.
+func GitGuardScript(real, wt string) string {
+	var b strings.Builder
+	b.WriteString("#!/bin/sh\n")
+	b.WriteString(GitGuardHeader + "\n")
+	b.WriteString("# Agents run git through this guard. It allows the verbs the role prompts\n")
+	b.WriteString("# ask for and refuses anything that could move a branch outside the\n")
+	b.WriteString("# agent's own worktree; slop-cannon pushes and delivers the work itself.\n")
+	if wt != "" {
+		// pwd -P resolves symlinks, as filepath.EvalSymlinks did for wt, so
+		// the two spellings of the same directory compare equal.
+		b.WriteString("_sc_wt=" + shQuote(wt) + "\n")
+		b.WriteString("_sc_pwd=$(pwd -P 2>/dev/null || pwd)\n")
+		b.WriteString("case \"$_sc_pwd\" in\n")
+		b.WriteString("  \"$_sc_wt\"|\"$_sc_wt\"/*) ;;\n")
+		b.WriteString("  *)\n")
+		b.WriteString("    echo " + shQuote(GitGuardOutsideMessage(wt)) + " >&2\n")
+		b.WriteString("    echo " + shQuote(GitGuardHint) + " >&2\n")
+		b.WriteString("    exit " + strconv.Itoa(GitGuardExitCode) + " ;;\n")
+		b.WriteString("esac\n")
+	}
+	// One pass over the whole argument list: the first operand is the
+	// subcommand, and a global writer anywhere refuses the call. Nothing
+	// stops at "--", because git's global options are only ever read before
+	// the subcommand and a "--" after it cannot make one appear.
+	b.WriteString("_sc_sub=''\n_sc_bad=''\n_sc_branch=0\n")
+	b.WriteString("for _sc_arg in \"$@\"; do\n")
+	b.WriteString("  case \"$_sc_arg\" in\n")
+	b.WriteString("    " + shQuoteJoin(GitGuardGlobalWriters, true) + ")\n")
+	b.WriteString("      if [ -z \"$_sc_bad\" ]; then _sc_bad=$_sc_arg; fi\n")
+	b.WriteString("      continue ;;\n")
+	b.WriteString("    " + shQuoteJoin(GitGuardBranchWriters, false) + ")\n")
+	b.WriteString("      _sc_branch=1\n")
+	b.WriteString("      continue ;;\n")
+	b.WriteString("    -*|'') continue ;;\n")
+	b.WriteString("  esac\n")
+	b.WriteString("  if [ -z \"$_sc_sub\" ]; then _sc_sub=$_sc_arg; fi\n")
+	b.WriteString("done\n")
+	b.WriteString("if [ -n \"$_sc_bad\" ]; then\n")
+	b.WriteString("  echo " + shInterp(GitGuardOptionMessage(gitGuardWord), "$_sc_bad") + " >&2\n")
+	b.WriteString("  echo " + shQuote(GitGuardHint) + " >&2\n")
+	b.WriteString("  exit " + strconv.Itoa(GitGuardExitCode) + "\nfi\n")
+	// No subcommand at all is `git`, `git --version`, `git --help`: it
+	// prints and touches nothing.
+	b.WriteString("_sc_ok=0\n")
+	b.WriteString("if [ -z \"$_sc_sub\" ]; then _sc_ok=1; fi\n")
+	b.WriteString("case \"$_sc_sub\" in\n  " + shQuoteJoin(GitGuardAllowed, false) + ") _sc_ok=1 ;;\nesac\n")
+	b.WriteString("case \"$_sc_sub\" in\n  branch) if [ \"$_sc_branch\" = 0 ]; then _sc_ok=1; fi ;;\nesac\n")
+	b.WriteString("if [ \"$_sc_ok\" = 0 ]; then\n")
+	b.WriteString("  echo " + shInterp(GitGuardDeniedMessage(gitGuardWord), "$_sc_sub") + " >&2\n")
+	b.WriteString("  echo " + shQuote(GitGuardHint) + " >&2\n")
+	b.WriteString("  exit " + strconv.Itoa(GitGuardExitCode) + "\nfi\n")
+	b.WriteString("exec " + shQuote(real) + " \"$@\"\n")
+	return b.String()
+}
+
+// gitGuardWord is the placeholder the script's own copy of a refusal is
+// built around: the message is rendered once with it, then split there and
+// the shell variable holding the offending word put in its place, so the
+// exported message functions and the generated script can never disagree.
+const gitGuardWord = "\x00"
+
+// shInterp renders msg — which must contain exactly one gitGuardWord — as a
+// double-quoted shell word with the shell expression expr in its place.
+func shInterp(msg, expr string) string {
+	pre, post, ok := strings.Cut(msg, gitGuardWord)
+	if !ok {
+		return shQuote(msg)
+	}
+	return `"` + shEscape(pre) + expr + shEscape(post) + `"`
+}
+
+// shEscape escapes the four characters a double-quoted shell word still
+// expands.
+func shEscape(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, `"`, `\"`, "$", `\$`, "`", "\\`")
+	return r.Replace(s)
+}
+
+// shQuote renders s as a single shell word.
+func shQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+
+// shQuoteJoin renders words as the alternatives of a shell `case` pattern.
+// withValues also matches the "--opt=value" spelling of each word.
+func shQuoteJoin(words []string, withValues bool) string {
+	out := make([]string, 0, len(words)*2)
+	for _, w := range words {
+		out = append(out, shQuote(w))
+		if withValues {
+			out = append(out, shQuote(w+"=")+"*")
+		}
+	}
+	return strings.Join(out, "|")
 }

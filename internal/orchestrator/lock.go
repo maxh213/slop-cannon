@@ -270,9 +270,13 @@ func (e *LockedError) Error() string {
 		return fmt.Sprintf("%s: the run lock %s cannot be read (%v); if no run is going, delete it and try again",
 			ErrLocked, e.Path, e.Err())
 	default:
+		// P9-24: `sc stop` is the remedy that works from any terminal, so
+		// it is named first; Ctrl-C is the same graceful stop for whoever
+		// is sitting in front of the run, and the pid is kept so a user
+		// with neither still knows what to kill.
 		return fmt.Sprintf("%s: run %s is already going in this repository (pid %d, since %s); "+
-			"run `sc status` to see it, then either wait for it to finish or stop it with Ctrl-C "+
-			"in the terminal it is running in (kill %d if that terminal is gone)",
+			"run `sc status` to see it, then either wait for it to finish or stop it with `sc stop` "+
+			"(Ctrl-C in the terminal it is running in does the same, and kill %d is the last resort)",
 			ErrLocked, e.Record.Run, e.Record.PID, lockStamp(e.Record.TakenAt), e.Record.PID)
 	}
 }

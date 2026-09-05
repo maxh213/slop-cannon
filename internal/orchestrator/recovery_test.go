@@ -62,15 +62,18 @@ package orchestrator
 // without it reconciles the worktrees and then does nothing about what it
 // found — which is what this file's rig would otherwise hide.
 //
-// Two things this file deliberately does not prove, so that its claims
-// match what runs. The "pull request opened before the crash" subtest runs
-// against recFakeGH, which reports every pull request MERGED — the state
-// the gate poller needs to close a safety-on bead — so the resume's OPEN
-// branch is not taken here; it is covered by unit tests in
-// internal/gitx/cleanup_test.go. And the "delivered" pair covers a crash
-// after the pull request (safety on) and after the fast-forward (safety
-// off), but a delivered bead whose branch was deleted, or whose pull
-// request was closed without merging, is again gitx's own test's.
+// The "pull request opened before the crash" subtest takes the resume's
+// OPEN branch, which is the one a crash really leaves behind: e2eFakeGH
+// reports a pull request OPEN the first time anything looks at it and
+// MERGED afterwards (P8-26), so the resume finds PR #n open with no gate
+// watching it — the D-20 state nothing else in the run can move — hands it
+// to Deliverer.RedeliverPR, and the gate that re-delivery creates resolves
+// on the next poll, when gh says the pull request merged. What this file
+// still does not prove is the rest of the pull request's fates: a
+// delivered bead whose branch was deleted, or whose pull request was
+// closed without merging, is covered by unit tests in
+// internal/gitx/cleanup_test.go. The "delivered" pair covers a crash after
+// the pull request (safety on) and after the fast-forward (safety off).
 //
 // Every helper here is prefixed "rec" so it cannot collide with e2e_test.go
 // (whose rig it reuses) or with any other file in the package.
@@ -135,6 +138,11 @@ const (
 	// moment it starts, which is how the child knows the delivery has
 	// reached the kill point.
 	recCheckHitEnv = "SC_RECOVERY_CHECK_HIT"
+	// recPRHoldHitEnv names the file the gh wrapper writes when it has
+	// caught a `gh pr create` and is holding it (recModeOpening only): it
+	// holds the head branch of the pull request that was never opened, so
+	// the child knows which bead the kill point is about.
+	recPRHoldHitEnv = "SC_RECOVERY_PR_HOLD_HIT"
 )
 
 // The kill points. Every one of them is a state of the *run*, not of the
@@ -170,6 +178,16 @@ const (
 	// tracker — which is what a kill between those two calls leaves behind
 	// (P6-15, D-20). See [recGateBlock].
 	recModeDelivering = "delivering"
+	// recModeOpening kills a safety-on run in the window before the pull
+	// request exists: the bead is `delivering`, `gh pr create` has been
+	// reached and is being held, so nothing has been opened, nothing is
+	// recorded on the bead and no gate blocks it. It is recModeMerging's
+	// safety-on twin — the same "delivering with nothing to show for it"
+	// state, reached down the pull request path, which runs no check
+	// command and so has no seam of its own (P9-29). Only
+	// Deliverer.Redeliver can end it, and it must end with exactly one
+	// pull request across both processes.
+	recModeOpening = "opening"
 )
 
 const (
@@ -185,7 +203,10 @@ const (
 	// recQuietFor is how long the fake tracker must record no call before
 	// the parent believes the killed process's subprocesses are gone.
 	recQuietFor = 300 * time.Millisecond
-	// recQuietBudget bounds that wait.
+	// recQuietBudget bounds that wait. It is short enough to expire on a
+	// loaded machine, so every use scales it by testutil.Patience (P6-56);
+	// the three- and five-minute bounds above are deadlock bounds rather
+	// than budgets and are deliberately absolute.
 	recQuietBudget = 30 * time.Second
 )
 
@@ -538,11 +559,17 @@ func TestRecoveryKillNineAndResume(t *testing.T) {
 		recAssertLockTakenOver(t, rig, crash)
 
 		// P6-15: the resume found the pull request the dead process opened
-		// and handed the entry to Deliverer.RedeliverPR, which re-ran the
-		// idempotent delivery — so the gate the crashed delivery never
-		// managed to create exists after all, and the bead can close.
+		// — still open, which is what a crash a moment after `gh pr create`
+		// leaves behind — and handed the entry to Deliverer.RedeliverPR,
+		// which re-ran the idempotent delivery. So the gate the crashed
+		// delivery never managed to create exists after all, and the bead
+		// can close when the pull request merges (P8-26).
 		entry := recResumeEntry(t, rig, stuck)
-		assert.Equal(t, "MERGED", entry.PRState, "gh knows the pull request: %s", entry.Reason)
+		assert.Equal(t, "OPEN", entry.PRState, "gh knows the pull request: %s", entry.Reason)
+		assert.Contains(t, entry.Reason, "re-run the PR delivery",
+			"which is the entry only Deliverer.RedeliverPR can act on")
+		assert.Equal(t, domain.BeadStateDelivering, entry.State,
+			"an open pull request settles nothing by itself")
 		require.NotNil(t, entry.PR)
 		assert.Equal(t, crash.Sig.PRNumber, entry.PR.Number)
 
@@ -582,6 +609,83 @@ func TestRecoveryKillNineAndResume(t *testing.T) {
 		assert.Equal(t, mainBefore, rig.Repo.Head(t), "the local default branch never moved (D-10)")
 		assert.Equal(t, mainBefore, e2eRemoteHead(t, rig), "nor did the remote one (D-10)")
 		assert.Zero(t, rig.Adapter.Uses("plan"), "the resumed run fired no product owner")
+		recAssertResumedRun(t, rig, crash)
+	})
+
+	t.Run("a crash before the pull request exists opens exactly one", func(t *testing.T) {
+		ctx := context.Background()
+		crash := recCrash(t, recModeOpening, true)
+		stuck := crash.Sig.Bead
+		mainBefore := crash.Env.Repo.Head(t)
+
+		// P9-29: the safety-on half of recModeMerging's window. The bead is
+		// `delivering` and `gh pr create` never returned, so — unlike the
+		// recModeDelivering crash above — there is no pull request to find,
+		// nothing recorded on the bead and no gate: the only thing that can
+		// move it is Deliverer.Redeliver, and the only wrong answer is a
+		// second pull request.
+		assert.Equal(t, PhaseRunning, crash.State.Phase, "the killed run never reached a finished state")
+		require.Equal(t, crash.Sig.Branch, crash.PRHold.Held(t),
+			"the crash landed inside the `gh pr create` of %s", stuck)
+		assert.Equal(t, domain.BeadStateDelivering, crash.Killed[stuck], "%s was mid-delivery", stuck)
+		assert.Zero(t, crash.Sig.PRNumber, "no pull request number was recorded on it")
+		assert.Empty(t, crash.Sig.PRURL, "nor a url")
+		assert.Empty(t, crash.Sig.Gate, "and no gh:pr gate was ever created for it")
+		assert.Zero(t, recPRCreates(t, crash.Env.GH)[crash.Sig.Branch],
+			"no `gh pr create` for %s ever completed", crash.Sig.Branch)
+		assert.DirExists(t, crash.Sig.Worktree, "the killed run's worktree is still there")
+
+		// --- the resume ---------------------------------------------------
+		rig := e2eBuild(t, crash.Env, true, true)
+		require.Equal(t, crash.Sig.Run, rig.RC.Run.ID, "the resume found the killed run")
+		require.NotNil(t, rig.Run.ResumeHandler(),
+			"a run must be assembled with a resume handler or this state is unreachable (P9-03)")
+
+		rig.start(ctx)
+		recAssertLockTakenOver(t, rig, crash)
+
+		// gitx found no pull request to reconcile, so the entry is the one
+		// only Deliverer.Redeliver acts on: delivering, nothing landed,
+		// nothing open, no conflict.
+		entry := recResumeEntry(t, rig, stuck)
+		assert.Equal(t, domain.BeadStateDelivering, entry.State, "%s is still delivering: %s", stuck, entry.Reason)
+		assert.Empty(t, entry.PRState, "there is no pull request to find: %s", entry.Reason)
+		assert.Nil(t, entry.PR)
+		assert.False(t, entry.Landed, "safety on lands nothing on the default branch")
+		assert.False(t, entry.Conflict, "the crash was not in a rebase")
+		assert.NoError(t, entry.Err, "gitx could inspect the branch")
+
+		out, err := rig.wait(e2eTimeout)
+		require.NoError(t, err, "problems: %v", rig.Problems())
+		assert.Empty(t, rig.Problems(), "the conductor hit no problem")
+		assert.Equal(t, events.FinishCompleted, out.Reason,
+			"the run that could not finish before now does")
+
+		// The acceptance criterion: exactly one pull request for the bead
+		// across both processes. The dead process's `gh pr create` never
+		// reached gh, and the resumed run opened it once.
+		heads := recPRCreates(t, crash.Env.GH)
+		assert.Equal(t, 1, heads[crash.Sig.Branch],
+			"%s has exactly one pull request across both processes (got %v)", stuck, heads)
+		assert.Len(t, heads, 2, "one pull request per bead across both processes (got %v)", heads)
+		for head, n := range heads {
+			assert.Equalf(t, 1, n, "%s was opened once", head)
+			assert.Truef(t, strings.HasPrefix(head, gitx.BranchPrefix), "%s is an sc/ branch", head)
+		}
+
+		states := rig.States(ctx)
+		require.Len(t, states, 2)
+		for id, st := range states {
+			assert.Equalf(t, domain.BeadStateClosed, st, "%s is closed", id)
+		}
+		gates, err := rig.Beads.Gates(ctx, true)
+		require.NoError(t, err)
+		require.Len(t, gates, 2, "one gh:pr gate per bead (D-20)")
+		for _, g := range gates {
+			assert.Falsef(t, g.IsOpen(), "gate %s was resolved", g.ID)
+		}
+		assert.Equal(t, mainBefore, rig.Repo.Head(t), "the local default branch never moved (D-10)")
+		assert.Equal(t, mainBefore, e2eRemoteHead(t, rig), "nor did the remote one (D-10)")
 		recAssertResumedRun(t, rig, crash)
 	})
 
@@ -897,6 +1001,9 @@ type recCrashResult struct {
 	// released by the time the crash is returned; nil at every other kill
 	// point.
 	Hold *recCheckHold
+	// PRHold is the held `gh pr create` of a recModeOpening crash, released
+	// by the time the crash is returned; nil at every other kill point.
+	PRHold *recPRCreateHold
 }
 
 // recCrash sets up a machine, runs the first invocation of the run as a real
@@ -910,22 +1017,27 @@ func recCrash(t *testing.T, mode string, safety bool) *recCrashResult {
 	// A crash inside a delivery needs a seam the plain rig does not have,
 	// installed in front of the rig's own shims (FakeBin prepends to PATH,
 	// so the last one installed wins). Which seam depends on the window the
-	// kill point is aimed at: a `gh` that remembers the pull requests it
-	// opened, because a resumed run must be able to find the one the dead
-	// process opened the way the real gh would, and a `bd` whose
-	// `gate create` never reaches the tracker, which is what the dead
-	// process's own gate creation did; a `bd` whose `close` never reaches
-	// it, which is where a crash right after the fast-forward leaves
-	// things; or a check command that blocks, which holds the delivery open
-	// where a real repository's checks hold it.
+	// kill point is aimed at: a `bd` whose `gate create` never reaches the
+	// tracker, which is what the dead process's own gate creation did; a
+	// `bd` whose `close` never reaches it, which is where a crash right
+	// after the fast-forward leaves things; or a check command that blocks,
+	// which holds the delivery open where a real repository's checks hold
+	// it. The `gh` stand-in needs no such seam any more: e2eFakeGH itself
+	// remembers the pull requests it opened and reports one OPEN before it
+	// reports it MERGED (P8-26).
 	var (
-		block *recGateBlock
-		hold  *recCheckHold
+		block  *recGateBlock
+		hold   *recCheckHold
+		prHold *recPRCreateHold
 	)
 	switch mode {
 	case recModeDelivering:
-		env.GH = recFakeGH(t)
 		block = recSwallowGateCreate(t, env.BD)
+	case recModeOpening:
+		// The pull request path runs no check command, so the only seam in
+		// the window between `delivering` and the pull request is the
+		// `gh pr create` call itself (P9-29).
+		prHold = recHoldPRCreate(t, env.GH)
 	case recModeLanded:
 		// The fast-forward and the push happen; the close that would end
 		// the delivery never reaches the tracker, which is what a crash in
@@ -967,6 +1079,9 @@ func recCrash(t *testing.T, mode string, safety bool) *recCrashResult {
 	}
 	if hold != nil {
 		childEnv[recCheckEnv], childEnv[recCheckHitEnv] = hold.Command, hold.Hit
+	}
+	if prHold != nil {
+		childEnv[recPRHoldHitEnv] = prHold.Hit
 	}
 	cmd.Env = recEnviron(childEnv, env.Repo.Env())
 	cmd.Stdout, cmd.Stderr = logFile, logFile
@@ -1012,9 +1127,16 @@ func recCrash(t *testing.T, mode string, safety bool) *recCrashResult {
 	if hold != nil {
 		hold.release(t)
 	}
+	// The held `gh pr create` is let go the same way, and never reaches the
+	// real shim: the pull request it would have opened belongs to a process
+	// that no longer exists, and letting it through would open the second
+	// pull request this kill point exists to rule out.
+	if prHold != nil {
+		prHold.release(t)
+	}
 	recAwaitQuiet(t, env)
 
-	out := &recCrashResult{Env: env, Sig: sig, Gate: block, Hold: hold}
+	out := &recCrashResult{Env: env, Sig: sig, Gate: block, Hold: hold, PRHold: prHold}
 	out.State, err = LoadState(sig.RunDir)
 	require.NoError(t, err, "the killed process left a state file to resume from (P6-11)")
 	out.Lock, err = readLock(LockPath(sig.RunDir))
@@ -1049,7 +1171,8 @@ func recAwaitKillPoint(t *testing.T, sigPath, logPath string, exited <-chan stru
 func recAwaitQuiet(t *testing.T, env *e2eEnv) {
 	t.Helper()
 	logs := []string{env.BD.LogPath, env.GH.LogPath}
-	deadline := time.Now().Add(recQuietBudget)
+	budget := testutil.Patience(recQuietBudget)
+	deadline := time.Now().Add(budget)
 	last, since := recLogSizes(logs), time.Now()
 	for {
 		time.Sleep(recPoll)
@@ -1061,7 +1184,7 @@ func recAwaitQuiet(t *testing.T, env *e2eEnv) {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the killed run's subprocesses were still busy after %s", recQuietBudget)
+			t.Fatalf("the killed run's subprocesses were still busy after %s", budget)
 		}
 	}
 }
@@ -1308,6 +1431,79 @@ func (h *recCheckHold) release(t *testing.T) {
 	require.NoError(t, os.Remove(h.Arm))
 }
 
+// recPRCreateHold is the seam of a crash in the window before a pull
+// request exists (recModeOpening, P9-29): a `gh` wrapper that catches the
+// first `gh pr create`, records its head branch and then blocks, so the
+// bead sits at `delivering` with nothing opened, nothing recorded on it and
+// no gate — the safety-on twin of recModeMerging, which the check command
+// holds open. The pull request path runs no check command, so without this
+// the window cannot be reached deliberately.
+//
+// It holds rather than swallows, because the point is that the call never
+// completed: on release it exits non-zero without ever reaching the real
+// shim, so the pull request the dead process asked for is never opened and
+// "exactly one across both processes" means the resumed run's own. Holding
+// is safe here in a way it is not for bd: the gh calls are not serialised
+// behind one client mutex, so the rest of the run carries on while the
+// deliverer waits.
+type recPRCreateHold struct {
+	// Shim is the gh wrapper; the rig's own gh shim runs behind it.
+	Shim *testutil.Shim
+	// Arm is the file the wrapper waits for the disappearance of, and Hit
+	// the file it writes when it catches the call, holding the head branch
+	// of the pull request that was never opened.
+	Arm, Hit string
+}
+
+// recHoldPRCreate installs that wrapper in front of inner.
+func recHoldPRCreate(t *testing.T, inner *testutil.Shim) *recPRCreateHold {
+	t.Helper()
+	dir := t.TempDir()
+	h := &recPRCreateHold{
+		Arm: filepath.Join(dir, "armed"),
+		Hit: filepath.Join(dir, "held-pr-create"),
+	}
+	require.NoError(t, os.WriteFile(h.Arm, nil, 0o600))
+	// Only the first create is held: a later one belongs to the resumed
+	// run, which must reach the real shim. "pr" and "create" are looked for
+	// as an adjacent pair rather than at $1 and $2, so a global flag in
+	// front of them changes nothing.
+	script := fmt.Sprintf(`_create=0
+_head=''
+_prev=''
+for _a in "$@"; do
+  if [ "$_prev" = "pr" ] && [ "$_a" = "create" ]; then _create=1; fi
+  if [ "$_prev" = "--head" ]; then _head=$_a; fi
+  _prev=$_a
+done
+if [ "$_create" = 1 ] && [ -f %[1]s ] && [ ! -f %[2]s ]; then
+  printf '%%s
+' "$_head" > %[2]s.tmp
+  mv %[2]s.tmp %[2]s
+  while [ -f %[1]s ]; do sleep 0.02; done
+  echo "the process that asked for this pull request was killed before it was opened" >&2
+  exit 1
+fi
+exec %[3]s "$@"
+`, e2eShellQuote(h.Arm), e2eShellQuote(h.Hit), e2eShellQuote(inner.Path))
+	h.Shim = testutil.FakeBin(t, "gh", script)
+	return h
+}
+
+// release lets the held `gh pr create` finish — failing, without ever
+// reaching the real shim.
+func (h *recPRCreateHold) release(t *testing.T) {
+	t.Helper()
+	require.NoError(t, os.Remove(h.Arm))
+}
+
+// Held reports the head branch of the pull request the wrapper caught, or
+// "" when it has caught nothing.
+func (h *recPRCreateHold) Held(t *testing.T) string {
+	t.Helper()
+	return string(recBlockedGateBead(h.Hit))
+}
+
 // recFileExists reports whether path is there, treating an empty path (a
 // seam this kill point does not use) as absent.
 func recFileExists(path string) bool {
@@ -1331,76 +1527,6 @@ func recBlockedGateBead(path string) domain.BeadID {
 		return ""
 	}
 	return domain.BeadID(strings.TrimSpace(string(data)))
-}
-
-// recFakeGH is [e2eFakeGH] with the one thing a crash-and-resume test needs
-// that the plain shim does not have: a memory (P8-26). The plain shim
-// answers every `gh pr list` with "[]", so a resumed run that legitimately
-// re-delivers a bead whose pull request is already open would open a second
-// one — a failure of the shim rather than of the product. This one keeps a
-// head branch → number registry, answers `gh pr list --head` from it and
-// `gh pr view <n>` by number, so the resumed run finds the pull request the
-// dead process opened, exactly as the real gh would.
-//
-// Every pull request reports MERGED, which is what the gate poller (and
-// `bd gate check`, which shells out to `gh pr view <n> --json state`) needs
-// to see to close a safety-on bead (D-20).
-func recFakeGH(t *testing.T) *testutil.Shim {
-	t.Helper()
-	return testutil.FakeBin(t, "gh", `
-_head=''
-_prev=''
-for _a in "$@"; do
-  if [ "$_prev" = "--head" ]; then _head=$_a; fi
-  _prev=$_a
-done
-_key=$(printf '%s' "$_head" | tr '/' '_')
-_pr() {
-  printf '{"number":%s,"url":"`+e2ePRHost+`/pull/%s","state":"MERGED","title":"Pull request %s","headRefName":"%s"}' "$1" "$1" "$1" "$2"
-}
-case "$1 $2" in
-  "label create")
-    ;;
-  "pr list")
-    if [ -n "$_head" ] && [ -f "$SC_FAKEBIN_DIR/head.$_key" ]; then
-      _n=$(cat "$SC_FAKEBIN_DIR/head.$_key")
-      printf '['; _pr "$_n" "$_head"; printf ']\n'
-    else
-      echo '[]'
-    fi
-    ;;
-  "pr create")
-    cat > "$SC_FAKEBIN_DIR/body.$SC_FAKEBIN_SEQ"
-    w=0
-    while ! mkdir "$SC_FAKEBIN_DIR/.prlock" 2>/dev/null; do
-      # A shim killed while it held the lock would otherwise hang every
-      # later pull request for ever; steal a lock nobody released within
-      # five seconds. Numbering takes microseconds, so a live holder never
-      # reaches that.
-      if [ "$w" -ge 500 ]; then rmdir "$SC_FAKEBIN_DIR/.prlock" 2>/dev/null; w=0; continue; fi
-      w=$((w + 1))
-      sleep 0.01
-    done
-    n=$(cat "$SC_FAKEBIN_DIR/prcount" 2>/dev/null || echo 0)
-    n=$((n + 1))
-    echo "$n" > "$SC_FAKEBIN_DIR/prcount"
-    echo "$n" > "$SC_FAKEBIN_DIR/head.$_key"
-    echo "$_head" > "$SC_FAKEBIN_DIR/num.$n"
-    rmdir "$SC_FAKEBIN_DIR/.prlock"
-    echo "Creating pull request in acme/widgets"
-    echo "`+e2ePRHost+`/pull/$n"
-    ;;
-  "pr view")
-    _n=$3
-    _h=$(cat "$SC_FAKEBIN_DIR/num.$_n" 2>/dev/null || echo '')
-    _pr "$_n" "$_h"; printf '\n'
-    ;;
-  *)
-    echo "gh shim: unexpected command: $*" >&2
-    exit 1
-    ;;
-esac
-`)
 }
 
 // recGHListHeads returns the --head of every `gh pr list` the shims
@@ -1540,6 +1666,7 @@ func recKillPoint(t *testing.T, rig *e2eRig, mode string) (recSignal, bool) {
 	blocked := recBlockedGateBead(os.Getenv(recGateHitEnv))
 	closeSwallowed := recBlockedGateBead(os.Getenv(recCloseHitEnv))
 	checking := recFileExists(os.Getenv(recCheckHitEnv))
+	heldHead := string(recBlockedGateBead(os.Getenv(recPRHoldHitEnv)))
 
 	for _, b := range list {
 		if b.Type == domain.BeadTypeEpic {
@@ -1594,6 +1721,24 @@ func recKillPoint(t *testing.T, rig *e2eRig, mode string) (recSignal, bool) {
 			sig.Bead, sig.State, sig.Assignee = b.ID, b.State, b.Assignee
 			sig.Branch = gitx.BranchName(b)
 			sig.Worktree = rig.Manager.PathFor(b.ID)
+			return sig, true
+		case recModeOpening:
+			// The delivery has written `delivering` and is inside
+			// `gh pr create`, which the wrapper is holding: nothing is
+			// opened, nothing is recorded on the bead and no gate blocks
+			// it (P9-29).
+			if b.State != domain.BeadStateDelivering || gitx.BranchName(b) != heldHead {
+				continue
+			}
+			sig.Bead, sig.State, sig.Assignee = b.ID, b.State, b.Assignee
+			sig.Branch = gitx.BranchName(b)
+			sig.Worktree = rig.Manager.PathFor(b.ID)
+			recDescribePR(t, rig, b, &sig)
+			if sig.PRNumber != 0 || sig.Gate != "" {
+				// A pull request or a gate means the delivery got further
+				// than this kill point is about.
+				return recSignal{}, false
+			}
 			return sig, true
 		case recModeDelivering:
 			// The delivery has opened the pull request, recorded it on the

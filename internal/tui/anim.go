@@ -191,6 +191,12 @@ type pending struct {
 	bead  domain.BeadID
 	agent domain.AgentID
 	seq   uint64
+	// to is the cell the animation plays at, resolved when the event
+	// arrived rather than when a slot frees up (P7-15). A shot that waits
+	// in the queue while the viewer scrolls the graph or changes tab must
+	// still land where the bead was when it was fired: re-resolving at
+	// start time aimed it at whatever now occupies that part of the screen.
+	to Target
 }
 
 // Animator is the cannon's animation layer: a bounded queue of animations, a
@@ -437,7 +443,12 @@ func (a Animator) Fire(kind AnimKind, bead domain.BeadID) (Animator, tea.Cmd) {
 // layer always drains within a couple of seconds of the last one.
 func (a Animator) fire(kind AnimKind, bead domain.BeadID, agent domain.AgentID) (Animator, tea.Cmd) {
 	a.seq++
-	p := pending{kind: kind, bead: bead, agent: agent, seq: a.seq}
+	// P7-15: aim now. The queue can hold an animation for a couple of
+	// seconds, and the graph cursor, the scroll offset and the tab on
+	// screen all move in that time, so resolving at start time lands the
+	// sprite on a stale cell — a different bead's node, or the tab
+	// indicator of a view the shot was never fired at.
+	p := pending{kind: kind, bead: bead, agent: agent, seq: a.seq, to: a.resolve(kind, bead)}
 	if len(a.active) < a.maxActive {
 		a = a.start(p)
 		return a.wake()
@@ -452,10 +463,11 @@ func (a Animator) fire(kind AnimKind, bead domain.BeadID, agent domain.AgentID) 
 	return a.wake()
 }
 
-// start builds the animation's frames and puts it on screen.
+// start builds the animation's frames and puts it on screen, aimed at the
+// cell [Animator.fire] captured when the event arrived (P7-15).
 func (a Animator) start(p pending) Animator {
 	an := animation{kind: p.kind, bead: p.bead, agent: p.agent}
-	to := a.resolve(p.kind, p.bead)
+	to := p.to
 	from := Target{Row: 0, Col: CannonMuzzleCol + 2}
 	switch p.kind {
 	case AnimShot:

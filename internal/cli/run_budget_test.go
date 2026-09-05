@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +17,7 @@ import (
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
 	"slop-cannon/internal/orchestrator"
+	"slop-cannon/internal/tui"
 )
 
 // The run budget, fired for real (P9-01).
@@ -86,17 +89,30 @@ func TestRunStopsABriefRunThatCrossesItsTokenBudget(t *testing.T) {
 	require.Contains(t, stdout, "fired po(mock) [plan", "the planning session still happens")
 	require.NotContains(t, stdout, "fired engineer",
 		"a crossed budget starts no new work: no bead may be implemented")
-	require.Contains(t, stdout, "run finished: stopped")
+	require.Contains(t, stdout, "run finished: budget_reached",
+		"a run its budget ended says so; a user stop is a different reason (P9-12)")
 	require.Contains(t, stdout, "limits.max_tokens",
 		"the banner is published as a warning the moment the budget fires")
 
 	sum := runBudgetSummary(t, env.Repo.Dir)
-	require.Equal(t, events.FinishStopped, sum.Finish)
+	require.Equal(t, events.FinishBudgetReached, sum.Finish)
 	require.Contains(t, sum.FinishSummary, "1000 tokens of its 500 budget (limits.max_tokens)")
 	require.Contains(t, sum.FinishSummary, "over 1 agent session",
 		"the planning session is the only one that was metered, and the only one that ran")
 	require.Equal(t, 1, sum.Fired, "no agent fired after the budget was crossed")
 	require.Zero(t, sum.Merges, "nothing was implemented, so nothing landed")
+
+	// P9-12's Done-when: a machine consumer is told the budget ended the
+	// run. The reason used to be `stopped`, which is what pressing `s`
+	// leaves behind, so the only place the difference survived was the
+	// prose of the summary.
+	statusOut, statusErr, statusCode := runExec(t, "--json", "--repo", env.Repo.Dir, "status")
+	require.Equal(t, 0, statusCode, statusErr)
+	var rep StatusReport
+	require.NoError(t, json.Unmarshal([]byte(statusOut), &rep), statusOut)
+	require.NotNil(t, rep.State)
+	require.Equal(t, events.FinishBudgetReached, rep.State.Finish)
+	require.Contains(t, statusOut, `"finish_reason": "budget_reached"`)
 }
 
 // runBudgetChangesScenario is the scripted run with the qa lens asking for
@@ -150,10 +166,10 @@ func TestRunChargesEveryAgentSessionAgainstTheRunBudget(t *testing.T) {
 	// sessions on one bead and never finishing (P9-01, P9-21).
 	require.Equal(t, len(domain.Lenses()), strings.Count(stdout, "fired tester/"),
 		"each lens reviews the round once")
-	require.Contains(t, stdout, "run finished: stopped")
+	require.Contains(t, stdout, "run finished: budget_reached")
 
 	sum := runBudgetSummary(t, env.Repo.Dir)
-	require.Equal(t, events.FinishStopped, sum.Finish)
+	require.Equal(t, events.FinishBudgetReached, sum.Finish)
 	// The banner is written at the crossing: the planning session's 100 plus
 	// the engineer's 1000. Without MeterPlanner the engineer's session is
 	// never charged, the budget is never crossed, and the run carries on to
@@ -209,10 +225,12 @@ func TestRunResumedCarriesTheBudgetItAlreadySpent(t *testing.T) {
 	require.Equal(t, 0, code, "stdout:\n%s\nstderr:\n%s", stdout, stderr)
 	require.Equal(t, first, runLatestID(t, env.Repo.Dir), "the resume must be of the same run")
 
-	// The notice goes into the run's event log — what `sc logs` prints and
-	// `sc status` folds — rather than being asserted on the screen: it is
-	// published as the resumed run takes its first tick, which is before
-	// the headless renderer has subscribed to the bus.
+	// P9-28: the notice is published as the resumed run takes its first
+	// tick, which is before the headless renderer has subscribed to the
+	// bus. The startup replay holds those first events until something is
+	// listening, so it reaches the screen as well as the run log.
+	require.Contains(t, stdout+stderr, "the run was resumed over its budget",
+		"a warning raised in the run's first tick must still reach the screen")
 	log, err := os.ReadFile(filepath.Join(config.RunDir(env.Repo.Dir, string(first)), orchestrator.EventLogName))
 	require.NoError(t, err)
 	require.Contains(t, string(log), "the run was resumed over its budget: it carries the 1000 tokens",
@@ -231,4 +249,45 @@ func TestRunResumedCarriesTheBudgetItAlreadySpent(t *testing.T) {
 		"the resumed run wrote its own spend back on top of what it inherited")
 	require.Equal(t, 3, st.Spent().Grants,
 		"one grant to start with, and the two it took to put 1000 tokens under a 500 ceiling")
+}
+
+// TestRunAssemblyKeepsTheBudgetForTheTUIKey is P9-14's wire point: the `b`
+// key raises the live budget through the controller `sc run` attaches, so
+// the assembled run has to keep the budget it built rather than letting it
+// disappear into the four wrappers.
+func TestRunAssemblyKeepsTheBudgetForTheTUIKey(t *testing.T) {
+	env := runFireSetup(t, true)
+	rc, set := runAssembleSetup(t, env)
+
+	c, err := assembleRun(context.Background(), rc, set)
+	require.NoError(t, err)
+	defer c.close()
+
+	require.NotNil(t, c.budget, "the run's budget must survive the assembly for the TUI to raise it")
+	ctl := &runController{run: c.run, budget: c.budget}
+	require.Implements(t, (*tui.BudgetController)(nil), ctl)
+}
+
+// TestRunControllerRaisesTheLiveBudget drives the seam the `b` key calls:
+// the amount is refused when it is under what the run has already spent,
+// and accepted when it is above, which lets the held run carry on.
+func TestRunControllerRaisesTheLiveBudget(t *testing.T) {
+	budget := orchestrator.NewRunBudget(orchestrator.RunBudgetOptions{
+		Limits: config.Limits{MaxTokens: 500}, Mode: domain.RunModeAutopilot,
+	})
+	budget.Record(cartridge.Usage{InputTokens: 700})
+	require.True(t, budget.Tripped(), "the budget must be held before it can be raised")
+
+	ctl := &runController{budget: budget}
+	err := ctl.SetBudget(context.Background(), 100)
+	require.ErrorIs(t, err, orchestrator.ErrBudgetTooSmall)
+	require.True(t, budget.Tripped(), "a refused raise leaves the run held")
+
+	require.NoError(t, ctl.SetBudget(context.Background(), 5000))
+	require.False(t, budget.Tripped(), "the raised budget lets the run carry on")
+	require.Equal(t, int64(700), budget.Spent().Tokens, "raising a budget spends nothing")
+
+	// A run with no cap at all says so rather than pretending.
+	none := &runController{budget: orchestrator.NewRunBudget(orchestrator.RunBudgetOptions{})}
+	require.ErrorIs(t, none.SetBudget(context.Background(), 1000), orchestrator.ErrNoBudget)
 }

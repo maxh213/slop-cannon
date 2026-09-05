@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -14,9 +15,11 @@ import (
 	"slop-cannon/internal/agents"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/cartridge"
+	"slop-cannon/internal/cartridge/mock"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
+	"slop-cannon/internal/testutil"
 )
 
 // P9-01: every `[limits]` key is resolved in one place and the two budget
@@ -25,10 +28,12 @@ import (
 
 // limPauser stands in for the run's pause gate.
 type limPauser struct {
-	mu      sync.Mutex
-	reasons []string
-	paused  bool
-	err     error
+	mu        sync.Mutex
+	reasons   []string
+	resumes   []string
+	paused    bool
+	err       error
+	resumeErr error
 }
 
 func (p *limPauser) Pause(reason string) error {
@@ -52,6 +57,25 @@ func (p *limPauser) resume() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.paused = false
+}
+
+// Resume is [BudgetResumer]: what *Run does when the budget is raised from
+// the TUI (P9-14).
+func (p *limPauser) Resume(reason string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.resumes = append(p.resumes, reason)
+	if p.resumeErr != nil {
+		return p.resumeErr
+	}
+	p.paused = false
+	return nil
+}
+
+func (p *limPauser) resumed() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.resumes...)
 }
 
 func (p *limPauser) pauses() []string {
@@ -373,8 +397,11 @@ func TestRunBudgetFinishesABriefRunWithTheReasonInTheSummary(t *testing.T) {
 	if err != nil || !done {
 		t.Fatalf("Done = (%v, %v), want the run to finish", done, err)
 	}
-	if out.Reason != events.FinishStopped {
-		t.Errorf("finish reason = %q, want %q", out.Reason, events.FinishStopped)
+	// P9-12: the reason names the budget. It is not events.FinishStopped
+	// (the user pressed `s`) and not events.FinishCompleted (the beads
+	// settled), because neither is what happened.
+	if out.Reason != events.FinishBudgetReached {
+		t.Errorf("finish reason = %q, want %q", out.Reason, events.FinishBudgetReached)
 	}
 	for _, want := range []string{"$6.00", "$5.00", "limits.max_cost_usd", "agent session"} {
 		if !strings.Contains(out.Summary, want) {
@@ -831,10 +858,27 @@ func TestRunBudgetSurvivesTheStateFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	if err := first.Start(t.Context()); err != nil {
+	// The run is given a context of its own rather than t.Context(): Go
+	// cancels the test's context after the body returns but *before* its
+	// cleanups, so the run's finish path — which writes state.json — would
+	// still be going while t.TempDir()'s RemoveAll deleted the directory
+	// under it ("TempDir RemoveAll cleanup: directory not empty", P9-27).
+	// Cleanups run last-in-first-out, and t.TempDir registered its own
+	// inside limRunConfig above, so this one stops the run first.
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := first.Start(ctx); err != nil {
+		cancel()
 		t.Fatalf("Start: %v", err)
 	}
-	t.Cleanup(func() { _ = first.Close() })
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-first.Done():
+		case <-time.After(testutil.Patience(30 * time.Second)):
+			t.Error("the run did not finish after its context was cancelled")
+		}
+		_ = first.Close()
+	})
 
 	b := NewRunBudget(RunBudgetOptions{
 		Limits: config.Limits{MaxTokens: 500}, Mode: domain.RunModeBrief, Run: first, Host: first,
@@ -846,6 +890,12 @@ func TestRunBudgetSurvivesTheStateFile(t *testing.T) {
 	// after every session in a real run.
 	if err := first.AgentStarted(domain.Agent{ID: "eng-b-1-r1", Role: domain.RoleEngineer}); err != nil {
 		t.Fatalf("AgentStarted: %v", err)
+	}
+	// The live-agent write is coalesced (P9-11), and this test reads the
+	// file behind the run's back, so it asks for the flush the run would
+	// have made a moment later anyway.
+	if err := first.FlushState(); err != nil {
+		t.Fatalf("FlushState: %v", err)
 	}
 
 	st, err := LoadState(cfg.Run.StateDir)
@@ -1055,5 +1105,266 @@ func TestAnAdoptedBeadStillWorksOutItsOwnReviewers(t *testing.T) {
 	again, err := loop.Demands(t.Context())
 	if err != nil || len(again) != len(ds) {
 		t.Fatalf("the second tick wanted %d demands (err=%v), want the same %d", len(again), err, len(ds))
+	}
+}
+
+// TestRunBudgetChargesASessionKilledByTheAgentTimeout is P9-13: the budget
+// used to be fed only by [AgentFiring.Result], which the supervisor runs
+// for a session that finished *and* decoded. An agent killed by
+// `limits.agent_timeout` after twenty minutes of work, or one that crashed
+// on its last attempt, spent real tokens the budget never saw — so a run
+// whose agents mostly time out could overrun `max_cost_usd` for ever.
+//
+// It fires the real supervisor over the mock cartridge, whose timed-out
+// session reports the usage the rule pins, and asks the budget what it was
+// charged.
+func TestRunBudgetChargesASessionKilledByTheAgentTimeout(t *testing.T) {
+	sc := mock.NewScenario("slow")
+	sc.Otherwise("hangs").
+		FailWith(mock.Failure{Kind: mock.FailTimeout}).
+		Usage(cartridge.Usage{InputTokens: 600, OutputTokens: 100})
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: sc})
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.Timeout = 20 * time.Millisecond
+		o.CrashRetries = -1 // one attempt, so the arithmetic is unambiguous
+	})
+
+	b, p, _ := limBudget(t, domain.RunModeAutopilot, 500, 0)
+	af := supTesterFiring("tester-qa-bd-1-r1", "bd-1", f.worktree(t, "bd-1"))
+	b.MeterFiring(&af)
+
+	_, tr, err := FireAgent[domain.Verdict](context.Background(), sup, af)
+	if err == nil {
+		t.Fatal("the mock session was supposed to time out")
+	}
+	if !errors.Is(err, cartridge.ErrTimeout) {
+		t.Fatalf("firing error = %v, want a timeout", err)
+	}
+	if got := tr.Usage.TotalTokens(); got != 700 {
+		t.Fatalf("the transcript of the timed-out session reports %d tokens, want 700", got)
+	}
+
+	spent := b.Spent()
+	if spent.Tokens != 700 || spent.Firings != 1 {
+		t.Errorf("Spent = %+v, want the timed-out session's 700 tokens over 1 firing", spent)
+	}
+	if !b.Tripped() {
+		t.Fatal("the budget did not fire although the run is over its 500-token cap")
+	}
+	if got := p.pauses(); len(got) != 1 || got[0] != PauseReasonTokenCap {
+		t.Errorf("pauses = %v, want one %q", got, PauseReasonTokenCap)
+	}
+}
+
+// TestRunBudgetChargesEveryRetriedAttemptOfACrashedFiring is the other half
+// of P9-13, through the production wiring the scheduler uses: the
+// supervisor plans the firing with [RunBudget.MeterPlanner], crashes twice
+// and approves on the third attempt. Every attempt spent a session's worth
+// of tokens; the two failures are charged by [AgentFiring.Spent] and the
+// success by [AgentFiring.Result], and neither counts the other's.
+func TestRunBudgetChargesEveryRetriedAttemptOfACrashedFiring(t *testing.T) {
+	sc := mock.NewScenario("flaky")
+	sc.Rule("crash", mock.Match{}).Times(2).
+		FailWith(mock.Failure{Kind: mock.FailCrash, ExitCode: 3}).
+		Usage(cartridge.Usage{InputTokens: 100})
+	sc.Otherwise("approve").
+		Say("fine").
+		Structured(json.RawMessage(`{"outcome":"approve"}`)).
+		Usage(cartridge.Usage{InputTokens: 50})
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: sc})
+
+	b, _, _ := limBudget(t, domain.RunModeAutopilot, 1_000_000, 0)
+	wt := f.worktree(t, "bd-2")
+	sup := f.supervisor(t, func(o *SupervisorOptions) {
+		o.RetryBackoff = time.Millisecond
+		o.Planner = b.MeterPlanner(FiringPlannerFunc(func(_ context.Context, sf Firing) (AgentFiring, error) {
+			af := supTesterFiring(sf.Agent.ID, sf.Demand.Bead, wt)
+			af.Agent = sf.Agent
+			return af, nil
+		}))
+	})
+
+	if _, err := sup.Fire(context.Background(), Firing{
+		Agent:  domain.Agent{ID: "tester-qa-bd-2-r1", Role: domain.RoleTester, Lens: domain.LensQA, Bead: "bd-2"},
+		Demand: Demand{Kind: DemandReview, Bead: "bd-2", Lens: domain.LensQA, Round: 1, BeadTitle: "review me"},
+		Run:    f.Run,
+		Update: func(domain.Agent) {},
+	}); err != nil {
+		t.Fatalf("Fire: %v", err)
+	}
+	if spent := b.Spent(); spent.Tokens != 250 || spent.Firings != 3 {
+		t.Errorf("Spent = %+v, want the two crashes (100 each) and the approval (50) over 3 sessions", spent)
+	}
+}
+
+// TestRunBudgetMeterPlannerWiresTheFailurePathToo pins the wiring P9-13
+// added: a firing the scheduler's planner produced carries the Spent hook,
+// and a failed attempt the cartridge reported nothing for is not a session.
+func TestRunBudgetMeterPlannerWiresTheFailurePathToo(t *testing.T) {
+	t.Parallel()
+	b, _, _ := limBudget(t, domain.RunModeAutopilot, 1000, 0)
+
+	var inner int
+	planner := b.MeterPlanner(FiringPlannerFunc(func(context.Context, Firing) (AgentFiring, error) {
+		return AgentFiring{
+			Agent: domain.Agent{ID: "eng-b-1-r1"},
+			Spent: func(agents.Transcript) { inner++ },
+		}, nil
+	}))
+	af, err := planner.PlanFiring(t.Context(), Firing{})
+	if err != nil {
+		t.Fatalf("PlanFiring: %v", err)
+	}
+	if af.Spent == nil {
+		t.Fatal("the metered firing has no Spent hook, so a timed-out session is never charged")
+	}
+
+	af.Spent(agents.Transcript{Usage: cartridge.Usage{InputTokens: 300}})
+	af.Spent(agents.Transcript{}) // a session the cartridge reported nothing for
+	if got := b.Spent(); got.Tokens != 300 || got.Firings != 1 {
+		t.Errorf("Spent = %+v, want 300 tokens over 1 firing", got)
+	}
+	if inner != 2 {
+		t.Errorf("the wrapped hook ran %d times, want 2", inner)
+	}
+}
+
+// TestRunBudgetCanBeRaisedWhileTheRunIsHeld is P9-14: a run paused on a cap
+// used to be actionable in two ways only — resume it into another grant of
+// the same size, or stop it — because `limits.max_tokens` is read once from
+// the configuration the run was frozen with. Raising it in place is the
+// third, and it is what the TUI's `b` key calls.
+func TestRunBudgetCanBeRaisedWhileTheRunIsHeld(t *testing.T) {
+	t.Parallel()
+	b, p, h := limBudget(t, domain.RunModeAutopilot, 500, 0)
+	work := b.Work(limWork{{Kind: DemandImplement, Bead: "sc-1"}})
+
+	b.Record(cartridge.Usage{InputTokens: 700})
+	if !b.Tripped() || !p.Paused() {
+		t.Fatal("the budget did not stop the run at its cap")
+	}
+	if ds, err := work.Demands(t.Context()); err != nil || len(ds) != 0 {
+		t.Fatalf("Demands = %v (err=%v), want no new work while the budget is held", ds, err)
+	}
+
+	ceiling, err := b.Raise(2000)
+	if err != nil {
+		t.Fatalf("Raise: %v", err)
+	}
+	if ceiling != "2000 tokens" {
+		t.Errorf("the new ceiling is %q, want 2000 tokens", ceiling)
+	}
+	if b.Tripped() || b.Exceeded() {
+		t.Error("the budget is still held after being raised above the spend")
+	}
+	if got := p.resumed(); len(got) != 1 || got[0] != BudgetRaisedReason {
+		t.Errorf("resumes = %v, want one %q: raising a budget is the whole gesture", got, BudgetRaisedReason)
+	}
+	if p.Paused() {
+		t.Error("the run is still paused after its budget was raised")
+	}
+	if ds, err := work.Demands(t.Context()); err != nil || len(ds) != 1 {
+		t.Fatalf("Demands = %v (err=%v), want the work source back", ds, err)
+	}
+
+	// The new ceiling is the whole answer, not another grant on top of the
+	// old one: the run carries on to 2000 and stops there.
+	b.Record(cartridge.Usage{InputTokens: 1000})
+	if b.Tripped() {
+		t.Fatalf("the budget fired again at %+v, under its new 2000 ceiling", b.Spent())
+	}
+	b.Record(cartridge.Usage{InputTokens: 400})
+	if !b.Tripped() {
+		t.Fatal("the raised budget never fired again")
+	}
+	if got := b.Banner(); !strings.Contains(got, "2100 tokens of its 2000 budget") {
+		t.Errorf("banner = %q, want the new ceiling in it", got)
+	}
+	if warned := h.warnings(); len(warned) != 3 {
+		t.Errorf("published warnings = %v, want the first banner, the raise and the second banner", warned)
+	}
+}
+
+// TestRunBudgetRaisesTheCapThatStoppedTheRun: the number the user types is
+// in the unit of the cap that fired, which is the one they set.
+func TestRunBudgetRaisesTheCapThatStoppedTheRun(t *testing.T) {
+	t.Parallel()
+	b, _, _ := limBudget(t, domain.RunModeAutopilot, 100_000, 10)
+
+	b.Record(cartridge.Usage{InputTokens: 20, CostUSD: 12, HasCost: true})
+	if got := b.Reason(); got != PauseReasonCostCap {
+		t.Fatalf("Reason = %q, want the cost cap", got)
+	}
+	ceiling, err := b.Raise(25)
+	if err != nil {
+		t.Fatalf("Raise: %v", err)
+	}
+	if ceiling != "$25.00" {
+		t.Errorf("the new ceiling is %q, want $25.00", ceiling)
+	}
+	if b.Tripped() {
+		t.Error("the cost cap is still held after being raised")
+	}
+	b.Record(cartridge.Usage{CostUSD: 14, HasCost: true})
+	if !b.Tripped() || b.Reason() != PauseReasonCostCap {
+		t.Errorf("the raised cost cap did not fire again at $26: tripped=%v reason=%q", b.Tripped(), b.Reason())
+	}
+}
+
+// TestRunBudgetRefusesARaiseItCannotHonour covers the two refusals a user
+// can read in the TUI's footer.
+func TestRunBudgetRefusesARaiseItCannotHonour(t *testing.T) {
+	t.Parallel()
+	b, _, _ := limBudget(t, domain.RunModeAutopilot, 500, 0)
+	b.Record(cartridge.Usage{InputTokens: 700})
+
+	for _, ceiling := range []float64{0, -1, 500, 700} {
+		if _, err := b.Raise(ceiling); !errors.Is(err, ErrBudgetTooSmall) {
+			t.Errorf("Raise(%v) = %v, want ErrBudgetTooSmall", ceiling, err)
+		}
+	}
+	if !b.Tripped() {
+		t.Error("a refused raise let the run go")
+	}
+
+	// A run with no cap has nothing to raise, and neither has no run.
+	none, _, _ := limBudget(t, domain.RunModeAutopilot, 0, 0)
+	if _, err := none.Raise(1000); !errors.Is(err, ErrNoBudget) {
+		t.Errorf("Raise on an uncapped run = %v, want ErrNoBudget", err)
+	}
+	var nilBudget *RunBudget
+	if _, err := nilBudget.Raise(1000); !errors.Is(err, ErrNoBudget) {
+		t.Errorf("Raise on a nil budget = %v, want ErrNoBudget", err)
+	}
+}
+
+// TestRunBudgetRaiseSaysWhenTheOtherCapIsStillCrossed: a run over both caps
+// is not let go by raising one of them, and says so rather than reporting
+// success.
+func TestRunBudgetRaiseSaysWhenTheOtherCapIsStillCrossed(t *testing.T) {
+	t.Parallel()
+	b, _, _ := limBudget(t, domain.RunModeAutopilot, 500, 10)
+	b.Record(cartridge.Usage{InputTokens: 700, CostUSD: 12, HasCost: true})
+
+	// The cost cap is the one reported when both are crossed at once.
+	if got := b.Reason(); got != PauseReasonCostCap {
+		t.Fatalf("Reason = %q, want the cost cap", got)
+	}
+	_, err := b.Raise(25)
+	if err == nil {
+		t.Fatal("raising one cap over a run that is over both reported success")
+	}
+	if !strings.Contains(err.Error(), "other cap") {
+		t.Errorf("error = %v, want it to name the cap still crossed", err)
+	}
+	if !b.Tripped() {
+		t.Error("the run was let go although its token cap is still crossed")
+	}
+	// And raising the second one lets it go.
+	if _, err := b.Raise(2000); err != nil {
+		t.Fatalf("Raise (tokens): %v", err)
+	}
+	if b.Tripped() {
+		t.Error("the run is still held after both caps were raised")
 	}
 }

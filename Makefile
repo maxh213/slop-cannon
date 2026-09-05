@@ -50,9 +50,9 @@ update-golden: ## Regenerate testdata/**/*.golden files (and docs/cli.md) from c
 update-golden-tui: ## Regenerate only the TUI frames in testdata/tui/*.golden (P7-09)
 	UPDATE_GOLDEN=1 go test -count=1 ./internal/tui/...
 
-check-golden: ## Fail if any golden file or docs/cli.md is stale (regenerates in place; run it on a clean tree)
+check-golden: ## Fail if any golden file or generated doc is stale (regenerates in place; run it on a clean tree)
 	@UPDATE_GOLDEN=1 go test -count=1 ./... >/dev/null
-	@stale="$$(git status --porcelain -- '*.golden' '*.golden.*' '*.expected' docs/cli.md)"; \
+	@stale="$$(git status --porcelain -- '*.golden' '*.golden.*' '*.expected' docs/cli.md docs/architecture.md)"; \
 	if [ -n "$$stale" ]; then \
 		echo "golden files are out of date; run 'make update-golden' and commit the result:"; \
 		echo "$$stale"; \

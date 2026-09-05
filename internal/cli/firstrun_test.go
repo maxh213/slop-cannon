@@ -746,9 +746,9 @@ func TestRunNoticeNamesOnlyPathsTheRunReallyWrote(t *testing.T) {
 	}
 
 	// The prompts row is printed because this run filed prompts, and every
-	// file in it belongs to an agent the run fired. Only the planning
-	// firing files its copy today; P5-13 is the open task that makes every
-	// firing leave one, and this holds either way.
+	// file in it belongs to an agent the run fired. Since P5-13 the firing
+	// path files a copy for every agent, not only the planning one, so the
+	// two directories hold the same names.
 	dir := config.RunDir(env.Repo.Dir, runLatestID(t, env.Repo.Dir).String())
 	require.Equal(t, prompt.Dir(dir), rows["prompts"])
 	prompts, err := os.ReadDir(rows["prompts"])
@@ -760,13 +760,21 @@ func TestRunNoticeNamesOnlyPathsTheRunReallyWrote(t *testing.T) {
 	for _, a := range agents {
 		fired[strings.TrimSuffix(a.Name(), filepath.Ext(a.Name()))] = true
 	}
+	filed := map[string]bool{}
 	for _, p := range prompts {
 		name := strings.TrimSuffix(p.Name(), prompt.PromptFileExt)
 		require.Truef(t, fired[name], "prompts/%s belongs to no agent this run fired", p.Name())
+		filed[name] = true
 		info, err := p.Info()
 		require.NoError(t, err)
 		require.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "a prompt quotes the user's rules and vibes")
 	}
+	// P5-13: every firing files the prompt it sent, not only the planning
+	// one, so an agent with a log has a prompt beside it.
+	for name := range fired {
+		require.Truef(t, filed[name], "agent %s has a log but no prompt under prompts/", name)
+	}
+	require.Greater(t, len(filed), 1, "a real run fires more than the product owner")
 }
 
 // TestRunLockRefusalFromStartPrintsTheFixList closes the window the
@@ -950,8 +958,9 @@ var tsPackages = []string{
 // or exempted, not only the exported sentinels. They are the two packages
 // the words a user reads are written in: internal/cli is the command layer,
 // which prints what it returns as `sc: <message>`, and internal/config
-// reads the files a user edits by hand. The deeper packages are covered by
-// their sentinels; their wrapped messages are P9-19.
+// reads the files a user edits by hand. The deeper packages have a guard of
+// their own over the same ground, with its own exemption list: see
+// TestTroubleshootingCoversEveryMessageTheWrappedPackagesBuild (P9-19).
 var tsMessagePackages = []string{
 	"internal/cli",
 	"internal/config",
@@ -968,7 +977,6 @@ const tsWildcard = "\x00"
 // situation a user can be advised out of. A new sentinel must be documented
 // or listed here, and a stale entry fails too.
 var tsExempt = map[string]string{
-	"cli.ErrNotImplemented":               "dead placeholder: root_test.go is its only reference, no released command returns it, and no user can reach it; P9-16 deletes it",
 	"agents.ErrInvalidAgentRun":           "a firing sc assembled wrongly; the user cannot cause it",
 	"agents.ErrInvalidPlanRequest":        "same: the planning request is built by sc",
 	"agents.ErrIncompleteRuling":          "same: the arbitration request is built by sc",
@@ -1461,6 +1469,11 @@ func TestTroubleshootingMessagesStillExistInTheCode(t *testing.T) {
 	// messages, warnings and doctor details count too: what matters is that
 	// a user can read it.
 	rendered := tsCodeMessages(t, tsMessagePackages)
+	// P9-19 put the packages underneath in the net as well, so a row may be
+	// keyed on a phrase only their rendered text has: "after setting
+	// status.custom=" is built from a format and a string constant in
+	// internal/beads.
+	rendered = append(rendered, tsCodeMessages(t, tsWrappedPackages)...)
 	rendered = append(rendered, tsWarnings(t)...)
 	rendered = append(rendered, tsDetails(t)...)
 	seen := map[string]bool{}
@@ -1743,40 +1756,295 @@ func tsStringy(dir string, consts tsConsts, expr ast.Expr) (string, bool) {
 // assigned, so a warning whose message is built a line above the call —
 // `msg := fmt.Sprintf(…)`, then `msg += " (…)"` — is read rather than
 // missed. Both halves count as messages: both reach the user.
-func tsLocals(dir string, consts tsConsts, fn ast.Node) map[string][]string {
+func tsLocals(dir string, consts tsConsts, returns tsReturnTexts, fn ast.Node) map[string][]string {
 	out := map[string][]string{}
 	ast.Inspect(fn, func(n ast.Node) bool {
 		as, ok := n.(*ast.AssignStmt)
-		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+		if !ok {
 			return true
 		}
 		if as.Tok != token.ASSIGN && as.Tok != token.DEFINE && as.Tok != token.ADD_ASSIGN {
 			return true
 		}
-		name, ok := as.Lhs[0].(*ast.Ident)
-		if !ok {
+		if len(as.Rhs) == 1 && len(as.Lhs) >= 1 {
+			// `b.reason, b.banner = b.describeLocked()`: the words are in
+			// the callee's return statements (P9-30). One hop, no further.
+			tsFoldReturns(dir, out, returns, as)
+		}
+		if len(as.Lhs) != len(as.Rhs) {
 			return true
 		}
-		if text, ok := tsStringy(dir, consts, as.Rhs[0]); ok {
-			out[name.Name] = append(out[name.Name], text)
+		for i, lhs := range as.Lhs {
+			name := tsAssignKey(lhs)
+			if name == "" || name == "_" {
+				continue
+			}
+			if text, ok := tsStringy(dir, consts, as.Rhs[i]); ok {
+				out[name] = append(out[name], text)
+				continue
+			}
+			// `reason, banner := b.reason, b.banner`: a field this same
+			// function filled from a callee a moment ago.
+			if from := tsAssignKey(as.Rhs[i]); from != "" {
+				out[name] = append(out[name], out[from]...)
+			}
 		}
 		return true
 	})
 	return out
 }
 
+// tsAssignKey names the thing an assignment writes to or reads from: a
+// local (`banner`) or a field of the receiver (`b.banner`). Both are one
+// place a warning's words can sit between being built and being warned.
+func tsAssignKey(e ast.Expr) string {
+	switch v := e.(type) {
+	case *ast.Ident:
+		return v.Name
+	case *ast.SelectorExpr:
+		return v.Sel.Name
+	default:
+		return ""
+	}
+}
+
+// tsFoldReturns resolves `a, b := f()` (and `a := f()`) to the texts f's
+// return statements put in each position.
+func tsFoldReturns(dir string, out map[string][]string, returns tsReturnTexts, as *ast.AssignStmt) {
+	call, ok := as.Rhs[0].(*ast.CallExpr)
+	if !ok {
+		return
+	}
+	byPos, ok := returns[tsCallKey(dir, call)]
+	if !ok {
+		return
+	}
+	for i, lhs := range as.Lhs {
+		key := tsAssignKey(lhs)
+		if key == "" || key == "_" {
+			continue
+		}
+		out[key] = append(out[key], byPos[i]...)
+	}
+}
+
+// tsReturnTexts is, for a function name, the texts each of its result
+// positions is ever returned with.
+type tsReturnTexts map[string]map[int][]string
+
+// tsCollectReturnTexts indexes what every function in the scanned packages
+// returns, so a warning whose text is built in one function, handed back to
+// another and warned there is read rather than missed (P9-30). The budget
+// banner — built in RunBudget.describeLocked, warned in RunBudget.fire — is
+// the live example.
+func tsCollectReturnTexts(t *testing.T, consts tsConsts) tsReturnTexts {
+	t.Helper()
+	out := tsReturnTexts{}
+	seen := map[string]bool{}
+	for _, pkg := range tsPackages {
+		for _, path := range tsGoFiles(t, pkg) {
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			require.NoError(t, err, path)
+			dir := filepath.Dir(path)
+			for _, decl := range f.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Body == nil {
+					continue
+				}
+				// Locals of the callee itself, with no return index of
+				// their own: one hop only.
+				locals := tsLocals(dir, consts, nil, fn.Body)
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					ret, ok := n.(*ast.ReturnStmt)
+					if !ok {
+						return true
+					}
+					for i, res := range ret.Results {
+						for _, text := range tsWarnTexts(dir, consts, locals, nil, res) {
+							if !tsSaysSomething(text) {
+								continue
+							}
+							key := tsFuncKey(dir, fn)
+							if out[key] == nil {
+								out[key] = map[int][]string{}
+							}
+							out[key][i] = append(out[key][i], text)
+						}
+					}
+					return true
+				})
+			}
+		}
+	}
+	return out
+}
+
 // tsWarnTexts renders one argument of a warning call to the texts it can
-// carry: its own, or those of the local it names.
-func tsWarnTexts(dir string, consts tsConsts, locals map[string][]string, arg ast.Expr) []string {
+// carry: its own, those of the local it names, or — one level up (P9-30) —
+// those every caller passes for the parameter it names.
+func tsWarnTexts(dir string, consts tsConsts, locals, params map[string][]string, arg ast.Expr) []string {
 	if id, ok := arg.(*ast.Ident); ok {
 		if texts := locals[id.Name]; len(texts) > 0 {
 			return texts
+		}
+		if texts := params[id.Name]; len(texts) > 0 {
+			return texts
+		}
+	}
+	// `what + ": " + next`, where the halves are locals of the function
+	// that builds the sentence. tsStringy would render both identifiers as
+	// wildcards and hand back a sentence with no words in it, so the
+	// concatenation is resolved a side at a time first (P9-30).
+	if bin, ok := arg.(*ast.BinaryExpr); ok && bin.Op == token.ADD {
+		l := tsWarnTexts(dir, consts, locals, params, bin.X)
+		r := tsWarnTexts(dir, consts, locals, params, bin.Y)
+		if len(l) > 0 || len(r) > 0 {
+			if len(l) == 0 {
+				l = []string{tsWildcard}
+			}
+			if len(r) == 0 {
+				r = []string{tsWildcard}
+			}
+			var out []string
+			for _, a := range l {
+				for _, b := range r {
+					out = append(out, a+b)
+				}
+			}
+			return out
 		}
 	}
 	if text, ok := tsStringy(dir, consts, arg); ok {
 		return []string{text}
 	}
 	return nil
+}
+
+// tsFuncKey and tsCallKey give a function declaration and a call of it the
+// same name, so two functions of one name in one package — internal/
+// orchestrator has three unrelated `fire` methods — cannot lend each other
+// their words. A method is keyed by its receiver's own variable name, which
+// is what a call site says too (`b.fire(…)`); a plain function is keyed by
+// its name alone. The pairing is a heuristic and a wrong one can only make
+// the audit ask for a row a warning does not carry, never let one through.
+func tsFuncKey(dir string, fn *ast.FuncDecl) string {
+	recv := ""
+	if fn.Recv != nil && len(fn.Recv.List) == 1 && len(fn.Recv.List[0].Names) == 1 {
+		recv = fn.Recv.List[0].Names[0].Name
+	}
+	return dir + "." + recv + "." + fn.Name.Name
+}
+
+// tsCallKey is tsFuncKey's other half, read off a call expression.
+func tsCallKey(dir string, call *ast.CallExpr) string {
+	switch fun := call.Fun.(type) {
+	case *ast.Ident:
+		return dir + ".." + fun.Name
+	case *ast.SelectorExpr:
+		recv := ""
+		if id, ok := fun.X.(*ast.Ident); ok {
+			recv = id.Name
+		}
+		return dir + "." + recv + "." + fun.Sel.Name
+	default:
+		return ""
+	}
+}
+
+// tsParamTexts is what one level of parameter flow yields: for a function
+// name, the texts each of its parameter positions is ever called with.
+// A warning built in one function and passed into another as a plain
+// parameter — internal/orchestrator/limits.go's budget banner is the live
+// example — is invisible without it, and a whole sentence a user reads can
+// then leave the page undocumented (P9-30).
+//
+// One level is deliberate: it reads the arguments at every call site of
+// every function in the scanned packages, resolving each with that caller's
+// own locals and constants, and goes no further. A warning built two hops
+// away is still unreadable here — and would have to be built at its call
+// site instead.
+type tsParamTexts map[string]map[string][]string
+
+// tsCollectParamTexts indexes, for every function declared in the scanned
+// packages, the texts its callers pass for each named parameter.
+func tsCollectParamTexts(t *testing.T, consts tsConsts, returns tsReturnTexts) tsParamTexts {
+	t.Helper()
+	// names[fn] is the parameter list of the function called fn.
+	names := map[string][]string{}
+	type callSite struct {
+		dir  string
+		fn   string
+		args []ast.Expr
+		locs map[string][]string
+	}
+	var calls []callSite
+	seen := map[string]bool{}
+	for _, pkg := range tsPackages {
+		for _, path := range tsGoFiles(t, pkg) {
+			if seen[path] {
+				continue
+			}
+			seen[path] = true
+			fset := token.NewFileSet()
+			f, err := parser.ParseFile(fset, path, nil, 0)
+			require.NoError(t, err, path)
+			dir := filepath.Dir(path)
+			for _, decl := range f.Decls {
+				fn, ok := decl.(*ast.FuncDecl)
+				if !ok || fn.Body == nil {
+					continue
+				}
+				var ps []string
+				for _, field := range fn.Type.Params.List {
+					for _, id := range field.Names {
+						ps = append(ps, id.Name)
+					}
+					if len(field.Names) == 0 {
+						ps = append(ps, "")
+					}
+				}
+				names[tsFuncKey(dir, fn)] = ps
+				locals := tsLocals(dir, consts, returns, fn.Body)
+				ast.Inspect(fn.Body, func(n ast.Node) bool {
+					call, ok := n.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					if key := tsCallKey(dir, call); key != "" {
+						calls = append(calls, callSite{dir: dir, fn: key, args: call.Args, locs: locals})
+					}
+					return true
+				})
+			}
+		}
+	}
+	out := tsParamTexts{}
+	for _, c := range calls {
+		ps, ok := names[c.fn]
+		if !ok {
+			continue
+		}
+		for i, arg := range c.args {
+			if i >= len(ps) || ps[i] == "" {
+				continue
+			}
+			for _, text := range tsWarnTexts(c.dir, consts, c.locs, nil, arg) {
+				if !tsSaysSomething(text) {
+					continue
+				}
+				if out[c.fn] == nil {
+					out[c.fn] = map[string][]string{}
+				}
+				out[c.fn][ps[i]] = append(out[c.fn][ps[i]], text)
+			}
+		}
+	}
+	return out
 }
 
 // tsIsSourceArg reports whether an argument is one of the orchestrator's
@@ -1800,6 +2068,8 @@ func tsIsSourceArg(arg ast.Expr) bool {
 func tsWarnings(t *testing.T) []tsMessage {
 	t.Helper()
 	consts := tsStringConsts(t)
+	returns := tsCollectReturnTexts(t, consts)
+	params := tsCollectParamTexts(t, consts, returns)
 	var out []tsMessage
 	seen := map[string]bool{}
 	for _, pkg := range tsPackages {
@@ -1817,7 +2087,8 @@ func tsWarnings(t *testing.T) []tsMessage {
 				if !ok || fn.Body == nil {
 					continue
 				}
-				locals := tsLocals(dir, consts, fn.Body)
+				locals := tsLocals(dir, consts, returns, fn.Body)
+				fnParams := params[tsFuncKey(dir, fn)]
 				ast.Inspect(fn.Body, func(n ast.Node) bool {
 					call, ok := n.(*ast.CallExpr)
 					if !ok {
@@ -1845,7 +2116,7 @@ func tsWarnings(t *testing.T) []tsMessage {
 						if tsIsSourceArg(arg) {
 							continue
 						}
-						texts := tsWarnTexts(dir, consts, locals, arg)
+						texts := tsWarnTexts(dir, consts, locals, fnParams, arg)
 						said := false
 						for _, text := range texts {
 							if !tsSaysSomething(text) {
@@ -1927,7 +2198,6 @@ var tsExemptWarnings = map[string]string{
 	"could not deprioritise … (…) from priority … to …":                                  "a tidy-up of the backlog's priorities; nothing about the run depends on it",
 	"could not check whether this resumed run had already planned":                       "the resumed run plans again rather than not at all",
 	"could not tell whether the run's beads have settled; trying again on the next poll": "it says so itself: the next poll retries",
-	"could not file the debug copy of the planning prompt":                               "the prompt is fired either way; only the debug copy under the run directory is missing",
 	"bd reported a warning while creating the plan: …":                                   "the documented `bd warned about the graph plan` row is the refusal a user acts on",
 	"could not resolve the escalated gate … on …":                                        "bd would not close a gate sc had settled; the gate stays open and the next poll retries",
 	"could not read gate …":                                                              "one gate could not be read this poll; the next poll reads it again",
@@ -1935,11 +2205,38 @@ var tsExemptWarnings = map[string]string{
 	"could not move … on …":                                                              "a bd transition the gate poller could not apply; it is retried on the next poll",
 	"gate poller: transition refused":                                                    "the D-07 table refused the move; the documented `orchestrator: invalid bead state transition` row is the same event",
 
+	// Deliverer.retryable's reasons (P9-30 made them visible to this
+	// guard): each is one delivery step that failed and will be tried
+	// again. The words a user acts on are the wrapped error's, which has
+	// its own row, and when the retries run out the documented `a delivery
+	// failed too many times` warning follows.
+	"the worktree could not be inspected":               "a delivery step that is retried; the bead stays in delivering",
+	"the engineer's leftovers could not be committed":   "the same, before the delivery itself (D-14)",
+	"the pull request could not be delivered":           "the same, for the safety-on path; gh's own message is the one to read",
+	"the merge reported neither a result nor an error":  "the same, for a safety-off merge that answered nothing",
+	"the merge landed but the bead could not be closed": "the merge is done; only the bd write is retried",
+	"the merge failed":                                      "a delivery step that is retried; git's own message is the one to read",
+	"the delivery failed at …":                              "the same, naming the stage gitx stopped at",
+	"the check failed and the bead could not be moved back": "the documented `the check command failed at delivery` warning is the user-facing half; only the bd move is retried",
+	"the bead could not be handed to a human":               "the documented `delivery handed to a human` warning is the user-facing half; only the bd move is retried",
+	"the conflict round could not be opened":                "a delivery step that is retried; the conflict itself is in the worktree either way",
+	"the resolved conflict could not be submitted":          "the same, after the engineer resolved it",
+	"the resolved conflict could not be approved":           "the same, for the approval that follows",
+
+	// Prefixed forms of the bookkeeping warnings above, resolved by the
+	// P9-30 parameter flow: the prefix names the component, the rest is the
+	// message that already has its reason here.
+	"feedback loop: could not measure how far the round moved the change set":       "the unprefixed form is exempt above",
+	"feedback loop: could not read the diff for the next review round":              "the same",
+	"feedback loop: could not record the message on the bead":                       "the same",
+	"feedback loop: could not write the narrowed acceptance criteria to the bead":   "the same",
+	"external pull request review: could not close the review bead":                 "the same",
+	"external pull request review: could not hand the review bead to a human":       "the same",
+	"external pull request review: could not record the verdict on the review bead": "the same",
+
 	// Prefixes: the words a user reads are in the error they carry.
-	"feedback loop: …":                "a prefix on the wrapped error, which has its own row",
-	"external pull request review: …": "the same, for the reviewer's own failures",
-	"resume: …":                       "the same, for a resume step",
-	"…; … fires … instead":            "the reason is the cartridge selection failure, which is documented above; the rest names the role and the cartridge that fired in its place",
+	"resume: …":            "the same, for a resume step",
+	"…; … fires … instead": "the reason is the cartridge selection failure, which is documented above; the rest names the role and the cartridge that fired in its place",
 
 	// sc's own programming errors: reaching one is a bug, not a situation.
 	"ignored a demand of unknown kind …":                               "a demand kind that does not exist: the scheduler drops it and says so",
@@ -1970,6 +2267,8 @@ var tsExemptDetails = map[string]string{
 	"clean working tree at …":                    "the repository row passing",
 	"… present":                                  "the beads row passing, naming the .beads directory it found",
 	"ignores .env":                               "the .gitignore row passing",
+	"embedded: bd runs Dolt in-process, so the standalone dolt CLI is not needed":                                         "the dolt row passing, saying why the dolt on the machine is irrelevant (P1-15)",
+	"embedded: bd runs Dolt in-process, so the standalone dolt CLI is not needed (from metadata.json; bd context failed)": "the same row passing on what .beads/metadata.json says, because bd could not answer",
 }
 
 // tsDetails returns the Detail of every doctor row, rendered the way

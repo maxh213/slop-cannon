@@ -27,11 +27,10 @@ import (
 //     whole call with "cannot unmarshal number into Go struct field
 //     GraphApplyPlan.nodes.N.metadata.<key> of type string". GraphMetadata
 //     converts, and Issue metadata accessors read "0" and 0 alike (P3-13).
-//   - parent_deps counts the nodes carrying a parent; an epic created in the
-//     plan gives its children hierarchical parents through parent_key.
-//     Reparenting afterwards works with `bd update <id> --parent <epic>`,
-//     which is how beads join an existing run epic until GraphNode carries
-//     parent_id (see the deviations note on P3-10).
+//   - parent_deps counts the nodes carrying a parent, through either
+//     parent_key (an epic minted by the same plan) or parent_id (a run epic
+//     that already exists, P3-18). Both go in the plan, so a bead is never
+//     created outside its epic and no `bd update --parent` follows.
 
 // Sentinel errors of plan application. Every failure of BuildGraphPlan,
 // VerifyDryRun and ApplyPlan wraps one of these, domain.ErrInvalidPlan, or
@@ -104,8 +103,8 @@ type PlanResult struct {
 	// Beads are the minted ids in plan order (nil on a dry run).
 	Beads []domain.BeadID
 	// Unfinished lists beads that were created but whose acceptance
-	// criteria (and, for an existing epic, parent) could not be written
-	// before an error; the returned error says why. Empty on success.
+	// criteria could not be written before an error; the returned error
+	// says why. Empty on success.
 	Unfinished []domain.BeadID
 	// Warnings are `warning:` lines bd printed on the real create call.
 	// The dry run of the very same plan is verified first (any warning
@@ -128,8 +127,10 @@ type planBuild struct {
 // labels, WorkMetadata (string-valued, see GraphMetadata) and, when the
 // request creates the epic, parent_key pointing at the epic node; one
 // blocks edge per dependency, so len(Edges) == req.Plan.DependencyCount().
-// Acceptance criteria are not part of the result (bd 1.2.2 drops them);
-// ApplyPlan writes them afterwards. Errors wrap ErrInvalid (missing run,
+// When the request names an existing epic, every work node carries it as
+// parent_id instead (P3-18), so joining an epic is part of the same atomic
+// create. Acceptance criteria are not part of the result (bd 1.2.2 drops
+// them); ApplyPlan writes them afterwards. Errors wrap ErrInvalid (missing run,
 // empty plan) or domain.ErrInvalidPlan.
 func BuildGraphPlan(req PlanRequest) (GraphPlan, error) {
 	b, err := buildPlan(req)
@@ -195,6 +196,7 @@ func buildPlan(req PlanRequest) (planBuild, error) {
 			Labels:      append([]string(nil), labels...),
 			Metadata:    GraphMetadata(WorkMetadata(req.Run, pb.Size)),
 			ParentKey:   b.epicKey,
+			ParentID:    domain.BeadID(epic),
 		})
 		for _, dep := range pb.Deps {
 			b.graph.Edges = append(b.graph.Edges, GraphEdge{FromKey: pb.Key, ToKey: dep, Type: DepBlocks})
@@ -286,7 +288,9 @@ func VerifyDryRun(plan GraphPlan, res GraphResult) error {
 // verifies the report (VerifyDryRun), then, unless dryRun is set, creates
 // every bead in one atomic call and finally writes each bead's acceptance
 // criteria with `bd update --acceptance` (bd 1.2.2 drops them from the
-// plan), also reparenting to req.Epic when the epic already existed.
+// plan). The epic is always part of the create — as a node of the plan, or
+// as every work node's parent_id when it already existed (P3-18) — so no
+// bead is ever left parentless by a failure here.
 //
 // With dryRun the result carries Graph and DryRun only and nothing is
 // written. A failure before the real call leaves beads untouched. A
@@ -361,12 +365,8 @@ func (c *Client) ApplyPlan(ctx context.Context, req PlanRequest, dryRun bool) (P
 	}
 	for i, k := range b.keys {
 		id := out.IDs[k]
-		args := []string{"update", string(id), "--acceptance", b.acceptance[k]}
-		if !out.EpicCreated {
-			args = append(args, "--parent", string(out.Epic))
-		}
-		args = append(args, "--json")
-		if _, err := c.callIssue(ctx, args...); err != nil {
+		acceptance := b.acceptance[k]
+		if _, err := c.Update(ctx, id, Patch{Acceptance: &acceptance}); err != nil {
 			out.Unfinished = append([]domain.BeadID(nil), out.Beads[i:]...)
 			return out, fmt.Errorf("beads: plan created but finalising %s (key %q) failed: %w", id, k, err)
 		}

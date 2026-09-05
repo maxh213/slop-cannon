@@ -88,9 +88,10 @@ func TestDurationText(t *testing.T) {
 
 	// JSON uses the same text form.
 	js, err := json.Marshal(Limits{AgentTimeout: NewDuration(DefaultAgentTimeout), MaxReviewRounds: 5, MaxPushbackRounds: 2,
+		MaxConflictRounds: DefaultMaxConflictRounds,
 		MaxPlanRejections: DefaultMaxPlanRejections, MaxPlanFailures: DefaultMaxPlanFailures})
 	require.NoError(t, err)
-	assert.JSONEq(t, `{"max_review_rounds":5,"max_pushback_rounds":2,"agent_timeout":"30m",`+
+	assert.JSONEq(t, `{"max_review_rounds":5,"max_pushback_rounds":2,"max_conflict_rounds":3,"agent_timeout":"30m",`+
 		`"max_plan_rejections":2,"max_plan_failures":5}`, string(js))
 }
 
@@ -105,10 +106,13 @@ func TestDefaultsMatchD04(t *testing.T) {
 	assert.Equal(t, 10*time.Minute, d.IdleReplanInterval.Duration())
 	assert.Equal(t, time.Minute, d.GatePollInterval.Duration())
 	assert.Equal(t, time.Minute, d.PRPollInterval.Duration())
+	assert.Equal(t, 2*time.Second, d.GraphPollInterval.Duration())
+	assert.Equal(t, 200*1024, d.MaxDiffBytes)
+	assert.InEpsilon(t, 0.4, d.ReReviewThreshold, 1e-9)
 	assert.Equal(t, DefaultMaxBeadsPerPlan, d.MaxBeadsPerPlan)
 	assert.Equal(t, 8, d.MaxBeadsPerPlan)
-	assert.Equal(t, Limits{MaxReviewRounds: 5, MaxPushbackRounds: 2, AgentTimeout: NewDuration(30 * time.Minute),
-		MaxPlanRejections: 2, MaxPlanFailures: 5}, d.Limits)
+	assert.Equal(t, Limits{MaxReviewRounds: 5, MaxPushbackRounds: 2, MaxConflictRounds: 3,
+		AgentTimeout: NewDuration(30 * time.Minute), MaxPlanRejections: 2, MaxPlanFailures: 5}, d.Limits)
 	assert.Empty(t, d.Roles)
 }
 

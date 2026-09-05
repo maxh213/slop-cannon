@@ -449,14 +449,23 @@ var gfViewGoldens = []string{
 	// TestControlGoldenFrames in controls_wiring_test.go rather than by
 	// gfScenarios, because they need a Controller attached.
 	"controls-ammo", "controls-confirm", "controls-footer", "controls-help",
+	// The 80-column frame a control's answer has to read in full on (P7-21),
+	// owned by TestModelFooterControlGoldenFrame in model_test.go.
+	"footer-control-80",
 	"feedback", "feedback-arbitration", "feedback-changes",
 	"feedback-details", "feedback-empty", "feedback-escalation", "feedback-narrow",
-	"feedback-pushback", "feedback-rereview", "feedback-rules", "feedback-scrolled",
+	"feedback-pushback", "feedback-recorded", "feedback-rereview", "feedback-rules",
+	"feedback-scrolled",
 	"graph-50-200x50", "graph-50-80x24", "graph-chain-200x50", "graph-chain-80x24",
 	"graph-cursor", "graph-cycle", "graph-cycle-narrow", "graph-detail",
 	"graph-detail-scrolled", "graph-diamond-200x50", "graph-diamond-80x24", "graph-empty",
 	"graph-fanout-200x50", "graph-fanout-80x24", "graph-narrow", "graph-skip",
-	"graph-skip-vertical", "graph-vertical", "headless", "headless-json",
+	"graph-skip-vertical", "graph-vertical",
+	// The run-vitals header frame (P6-51), owned by
+	// TestHeaderVitalsGoldenFrame in header_test.go: the composed frames
+	// wire no vitals source in, so nothing in gfScenarios can draw it.
+	"header-vitals",
+	"headless", "headless-json",
 	"headless-sparse", "prs", "prs-empty", "prs-external",
 	"prs-narrow", "prs-safety-off",
 }

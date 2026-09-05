@@ -61,9 +61,6 @@ from a written brief.
   rules      rules communicated to all agents
   -m         start work with this brief; a bare repo path means full autopilot`
 
-// ErrNotImplemented marks behaviour that a later task fills in.
-var ErrNotImplemented = errors.New("not implemented")
-
 // ExitError lets a command choose the process exit code. Execute prints Err
 // (when non-nil) and exits with Code.
 type ExitError struct {

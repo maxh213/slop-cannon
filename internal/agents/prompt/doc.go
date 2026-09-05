@@ -28,8 +28,13 @@
 // Every prompt is written to <runDir>/prompts/<agent-id>.md for debugging
 // (D-23: runDir is the caller's run directory under XDG_STATE_HOME, never
 // anything inside the target repository). Building a prompt does not write
-// it: the caller that fires the agent must call [Prompt.Write] with its run
-// directory, and a caller that does not leaves the run with no debug copy.
+// it: whoever fires the agent does. The firing path
+// ([slop-cannon/internal/agents.RunAgent], through
+// [WriteFile]) files the prompt of every attempt when its
+// AgentRun.RunDir is set, so a retry leaves the prompt actually last fired
+// (P5-13); a caller that assembles a prompt without firing it — or fires
+// with no run directory — writes the copy itself with [Prompt.Write], and
+// one that does neither leaves the run with no debug copy.
 //
 // Quoted context — the tree summary, the README head, a diff, and every
 // piece of prose an agent wrote (a bead description and its acceptance

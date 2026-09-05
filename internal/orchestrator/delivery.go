@@ -12,6 +12,7 @@ import (
 
 	"slop-cannon/internal/agents"
 	"slop-cannon/internal/beads"
+	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
 	"slop-cannon/internal/gitx"
@@ -113,14 +114,14 @@ const SourceDelivery = "delivery"
 // for the default branch moving again underneath the first resolution —
 // plus a spare. It is not a review budget: a conflict round fires one
 // engineer and no testers unless D-09 asks for them. A run that wants a
-// different number sets [DeliveryOptions.MaxConflictRounds]; there is no
-// configuration key for it yet.
+// different number sets [DeliveryOptions.MaxConflictRounds], which `sc run`
+// fills from the `limits.max_conflict_rounds` configuration key (P1-18).
 //
 // Only a round an engineer was really given is counted. A conflict round
 // whose bd write failed is a [DeliveryRetryable] outcome the caller answers
 // by delivering again, so counting it would let transient bd failures spend
 // the whole budget and park the bead in needs_human having fired nobody.
-const DefaultMaxConflictRounds = 3
+const DefaultMaxConflictRounds = config.DefaultMaxConflictRounds
 
 // DefaultCheckItemCategory is the [domain.FeedbackItem] Category of the qa
 // change request a failed check command raises.
@@ -226,17 +227,24 @@ type DeliveryGit interface {
 }
 
 // managerGit is the *gitx.Manager implementation of [DeliveryGit].
-type managerGit struct{ m *gitx.Manager }
+type managerGit struct {
+	m *gitx.Manager
+	// diff are the options every diff this adapter takes is read with —
+	// [gitx.WithMaxDiffBytes] from the `max_diff_bytes` key (P1-14), so a
+	// reviewer's diff is capped where the configuration says rather than
+	// where gitx's own constant does.
+	diff []gitx.DiffOption
+}
 
 // NewDeliveryGit adapts a worktree manager to [DeliveryGit]. A nil manager
 // yields nil, which a [Deliverer] accepts: it then commits no leftovers and
 // measures no diffs, which is what a test with pre-committed worktrees
-// wants.
-func NewDeliveryGit(m *gitx.Manager) DeliveryGit {
+// wants. The options are applied to every diff it takes.
+func NewDeliveryGit(m *gitx.Manager, diff ...gitx.DiffOption) DeliveryGit {
 	if m == nil {
 		return nil
 	}
-	return &managerGit{m: m}
+	return &managerGit{m: m, diff: diff}
 }
 
 // DefaultBranch implements [DeliveryGit].
@@ -286,7 +294,7 @@ func (g *managerGit) CommitLeftovers(ctx context.Context, bead domain.Bead, roun
 
 // Diff implements [DeliveryGit].
 func (g *managerGit) Diff(ctx context.Context, id domain.BeadID) (*gitx.Diff, error) {
-	return g.m.Diff(ctx, id)
+	return g.m.Diff(ctx, id, g.diff...)
 }
 
 // ChangeRatio implements [DeliveryGit].
@@ -807,7 +815,9 @@ func (d *Deliverer) deliverMerge(ctx context.Context, req DeliveryRequest, out *
 	if res == nil {
 		return d.retryable(out, "the merge reported neither a result nor an error", errNoMergeResult)
 	}
-	out.Target, out.MergeSHA, out.Pushed, out.Check = res.Target, res.Head, res.Pushed, res.Check
+	// res.Branch is the branch the work was really on, which is not
+	// gitx.BranchName(bead) once the bead has been retitled (P4-12).
+	out.Branch, out.Target, out.MergeSHA, out.Pushed, out.Check = res.Branch, res.Target, res.Head, res.Pushed, res.Check
 	reason := fmt.Sprintf("merged into %s as %s", res.Target, deliveryShortSHA(res.Head))
 	if _, err := d.states.Apply(ctx, StateRequest{
 		Bead: req.Bead.ID, From: domain.BeadStateDelivering, Event: BeadEventDelivered,
@@ -1410,7 +1420,7 @@ func (d *Deliverer) Resolved(ctx context.Context, id domain.BeadID) (*DeliveryOu
 // the whole default branch's movement as the engineer's work: on any busy
 // branch that is more than the change set itself, and every conflict,
 // however trivial, would score above the threshold and buy a three-lens
-// re-review. [conflictChangeRatio] compares the lines the two patches add
+// re-review. [gitx.ChangeSetRatio] compares the lines the two patches add
 // and remove instead, which upstream's own commits are in neither of.
 // Tip-to-tip is still the fallback for a diff too large to have a patch,
 // where it over-reports and so errs towards a review.
@@ -1443,7 +1453,7 @@ func (d *Deliverer) reReview(ctx context.Context, p PendingConflict) (gitx.Chang
 		d.warn(p.Bead.ID, "the conflict resolution could not be measured; reviewing it again", err)
 		return gitx.ChangeRatio{Ratio: 1}, true
 	}
-	if ratio, ok := conflictChangeRatio(p.Diff, current); ok {
+	if ratio, ok := gitx.ChangeSetRatio(p.Diff, current); ok {
 		return ratio, ratio.Exceeds(d.threshold)
 	}
 	ratio, err := d.git.ChangeRatio(ctx, p.Bead.ID, p.Diff, current)
@@ -1452,96 +1462,6 @@ func (d *Deliverer) reReview(ctx context.Context, p PendingConflict) (gitx.Chang
 		return gitx.ChangeRatio{Ratio: 1}, true
 	}
 	return ratio, ratio.Exceeds(d.threshold)
-}
-
-// conflictChangeRatio measures how far a conflict resolution moved the
-// change set under review, in the shape D-09's threshold is expressed in:
-// Delta is the number of added or removed lines that differ between the two
-// patches, Total the current change set's changed lines, Ratio their
-// quotient (see [gitx.RatioOf], so an emptied change set is 1 rather than a
-// division by zero).
-//
-// It is the rebase-safe counterpart of [gitx.Repo.ChangeRatio]: the change
-// sets are both measured against their own merge-base, so the upstream
-// commits the branch was rebased onto are in neither and cancel out. A
-// resolution that only settled the conflict therefore scores near zero even
-// when the default branch moved a long way underneath it.
-//
-// The second result is false when either patch is missing (gitx truncates
-// an oversized diff to its file list), which the caller answers with the
-// tip-to-tip measurement.
-func conflictChangeRatio(previous, current *gitx.Diff) (gitx.ChangeRatio, bool) {
-	before, ok := changeSetLines(previous)
-	if !ok {
-		return gitx.ChangeRatio{}, false
-	}
-	after, ok := changeSetLines(current)
-	if !ok {
-		return gitx.ChangeRatio{}, false
-	}
-	delta := 0
-	for line, n := range before {
-		delta += deliveryAbs(n - after[line])
-	}
-	for line, n := range after {
-		if _, seen := before[line]; !seen {
-			delta += n
-		}
-	}
-	c := gitx.ChangeRatio{
-		Previous: previous.Head(), Current: current.Head(),
-		Delta: delta, Total: current.ChangedLines(),
-	}
-	c.Ratio = gitx.RatioOf(c.Delta, c.Total)
-	return c, true
-}
-
-// changeSetLines counts the lines a diff's patch adds and removes, keyed by
-// the file's own "diff --git" header line so that identical lines in
-// different files are told apart. The header is the key rather than a parsed
-// path because it needs to be nothing more than stable between two diffs of
-// the same file, and it changes when the file is renamed — which is a
-// change. Hunk headers, context lines and the file headers before the first
-// hunk are ignored, so upstream commits that move the surrounding code do
-// not count as the engineer's work.
-//
-// The second result is false when there is no patch to read: an empty change
-// set counts as an empty tally, but a diff gitx truncated cannot be compared
-// this way.
-func changeSetLines(d *gitx.Diff) (map[string]int, bool) {
-	if d == nil {
-		return nil, false
-	}
-	lines := map[string]int{}
-	if d.Empty() {
-		return lines, true
-	}
-	if d.Truncated || d.Patch == "" {
-		return nil, false
-	}
-	file, inHunk := "", false
-	for _, line := range strings.Split(d.Patch, "\n") {
-		switch {
-		case strings.HasPrefix(line, "diff --git "):
-			file, inHunk = line, false
-		case strings.HasPrefix(line, "@@"):
-			inHunk = true
-		case !inHunk:
-			// "index", "new file mode", "--- a/x", "+++ b/x" and the rest
-			// of the extended header: not content.
-		case strings.HasPrefix(line, "+"), strings.HasPrefix(line, "-"):
-			lines[file+"\x00"+line]++
-		}
-	}
-	return lines, true
-}
-
-// deliveryAbs is the absolute value of an int.
-func deliveryAbs(n int) int {
-	if n < 0 {
-		return -n
-	}
-	return n
 }
 
 // rememberConflict stores an updated conflict round.

@@ -3,8 +3,12 @@ package structured
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -135,7 +139,10 @@ func TestExtractEdgeCases(t *testing.T) {
 
 func TestParseErrorRendering(t *testing.T) {
 	pe := &ParseError{Reason: ReasonSchema, Contract: "verdict", Detail: "2 violation(s)", Problems: []string{"at '/outcome': value must be one of 'approve', 'request_changes'", "at '/items/0': missing property 'severity'"}, Cause: errors.New("x")}
-	assert.Equal(t, "structured: result does not match schema (verdict): 2 violation(s)\n  - at '/outcome': value must be one of 'approve', 'request_changes'\n  - at '/items/0': missing property 'severity'", pe.Error())
+	assert.Equal(t, "structured: result does not match schema (verdict): 2 violation(s)"+
+		"\n  - at '/outcome': value must be one of 'approve', 'request_changes'"+
+		"\n  - at '/items/0': missing property 'severity'"+
+		"\n  cause: x", pe.Error(), "P9-31: a cause whose words are nowhere else is rendered")
 	assert.Contains(t, pe.Feedback(), `did not match the "verdict" schema:`)
 	assert.Contains(t, pe.Feedback(), "\n- at '/items/0': missing property 'severity'")
 	assert.NotContains(t, pe.Feedback(), "2 violation(s)", "the count is a log detail, not model feedback")
@@ -166,4 +173,135 @@ func TestReasons(t *testing.T) {
 	}
 	assert.False(t, Reason("nope").Valid())
 	assert.Nil(t, Reason("nope").Sentinel())
+}
+
+// multiViolationContract has five required properties with five different
+// types, so one bad document breaks several keywords at once — the shape
+// that used to come back in a different order on every run (P2-12).
+const multiViolationContract = `{
+  "type": "object",
+  "required": ["a", "b", "c", "d", "e"],
+  "properties": {
+    "a": {"type": "string"},
+    "b": {"type": "integer"},
+    "c": {"type": "string"},
+    "d": {"type": "string"},
+    "e": {"type": "string"}
+  }
+}`
+
+// TestProblemsAreSortedAndStable pins P2-12: jsonschema v6 walks the
+// schema's keyword maps, so repeated validations of one document used to
+// report the same violations in a different order. Every caller that shows
+// Problems — a golden, a log line, a retry prompt — depends on one order,
+// so leafProblems sorts.
+func TestProblemsAreSortedAndStable(t *testing.T) {
+	t.Parallel()
+	const doc = `{"a": 1, "b": "x", "c": 2}`
+	want := []string{
+		"at '': missing properties 'd', 'e'",
+		"at '/a': got number, want string",
+		"at '/b': got string, want integer",
+		"at '/c': got number, want string",
+	}
+	// A fresh contract per round: the compiler's own maps are re-walked too.
+	for i := range 200 {
+		c, err := NewContract("multi", []byte(multiViolationContract))
+		require.NoError(t, err)
+		pe, ok := AsParseError(c.Validate(json.RawMessage(doc)))
+		require.True(t, ok, "round %d", i)
+		assert.Equal(t, want, pe.Problems, "round %d: the problem order must not depend on map iteration", i)
+		assert.True(t, sort.StringsAreSorted(pe.Problems), "round %d", i)
+	}
+}
+
+// TestProblemsAreDeduplicated keeps the property the pre-P2-12 code had:
+// two branches of the tree that fail the same way are one line.
+func TestProblemsAreDeduplicated(t *testing.T) {
+	t.Parallel()
+	c, err := NewContract("dupes", []byte(`{
+		"type": "object",
+		"properties": {"n": {"anyOf": [{"type": "string"}, {"type": "string"}]}}
+	}`))
+	require.NoError(t, err)
+	pe, ok := AsParseError(c.Validate(json.RawMessage(`{"n": 1}`)))
+	require.True(t, ok)
+	seen := map[string]int{}
+	for _, p := range pe.Problems {
+		seen[p]++
+	}
+	for p, n := range seen {
+		assert.Equal(t, 1, n, "problem %q is repeated", p)
+	}
+	assert.Equal(t, len(pe.Problems), len(seen))
+	assert.Contains(t, pe.Detail, strconv.Itoa(len(pe.Problems)), "the detail counts the lines it printed")
+}
+
+// TestErrorRendersACauseNothingElseSays pins P9-31: a cause whose words are
+// not repeated by Detail or Problems reaches the log line, so a wrapped
+// sentinel is readable and not merely matchable with errors.Is.
+func TestErrorRendersACauseNothingElseSays(t *testing.T) {
+	t.Parallel()
+	sentinel := errors.New("agents: plan rejected")
+
+	t.Run("a wrapped sentinel is rendered", func(t *testing.T) {
+		t.Parallel()
+		pe := &ParseError{
+			Reason:   ReasonSchema,
+			Contract: "plan",
+			Detail:   "the plan breaks a planning rule",
+			Problems: []string{"at '/beads/0': the acceptance criteria are empty"},
+			Cause:    fmt.Errorf("%w: bead \"a\" has no acceptance criteria", sentinel),
+		}
+		got := pe.Error()
+		assert.Contains(t, got, "agents: plan rejected", "the sentinel's words must survive into the log line")
+		assert.True(t, strings.HasPrefix(got, "structured: result does not match schema (plan): the plan breaks a planning rule"))
+		assert.Contains(t, got, "\n  cause: ")
+		assert.ErrorIs(t, pe, sentinel)
+		assert.ErrorIs(t, pe, ErrSchema)
+	})
+
+	t.Run("a multi-line cause is indented under its first line", func(t *testing.T) {
+		t.Parallel()
+		pe := &ParseError{Reason: ReasonSchema, Detail: "two rules", Cause: errors.New("first rule\nsecond rule")}
+		assert.Equal(t, "structured: result does not match schema: two rules\n  cause: first rule\n    second rule", pe.Error())
+	})
+
+	t.Run("a cause the detail already quotes is not printed twice", func(t *testing.T) {
+		t.Parallel()
+		cause := errors.New("invalid character 'h' looking for beginning of value")
+		pe := &ParseError{Reason: ReasonInvalidJSON, Contract: "impl_report", Detail: cause.Error(), Cause: cause}
+		assert.Equal(t, "structured: sc-result block is not valid JSON (impl_report): "+cause.Error(), pe.Error())
+		assert.Equal(t, 1, strings.Count(pe.Error(), "invalid character"))
+	})
+
+	t.Run("a cause the problems already list is not printed twice", func(t *testing.T) {
+		t.Parallel()
+		cause := errors.New("the responses answer no item")
+		pe := &ParseError{Reason: ReasonSchema, Contract: "response", Detail: cause.Error(),
+			Problems: []string{cause.Error()}, Cause: cause}
+		assert.Equal(t, 2, strings.Count(pe.Error(), cause.Error()), "the detail and the problem line, and no third copy")
+		assert.NotContains(t, pe.Error(), "cause:")
+	})
+
+	t.Run("the validator's own tree is never repeated", func(t *testing.T) {
+		t.Parallel()
+		c, err := NewContract("multi", []byte(multiViolationContract))
+		require.NoError(t, err)
+		pe, ok := AsParseError(c.Validate(json.RawMessage(`{"a": 1, "b": "x", "c": 2}`)))
+		require.True(t, ok)
+		require.NotNil(t, pe.Cause, "the validation error stays reachable through Unwrap")
+		got := pe.Error()
+		assert.NotContains(t, got, "cause:")
+		assert.NotContains(t, got, BaseURL, "the internal schema URL is not user-facing")
+		for _, p := range pe.Problems {
+			assert.Equal(t, 1, strings.Count(got, p), "problem %q is printed once", p)
+		}
+	})
+
+	t.Run("no cause renders as before", func(t *testing.T) {
+		t.Parallel()
+		pe := &ParseError{Reason: ReasonMissing, Detail: "empty block"}
+		assert.Equal(t, "structured: no sc-result block in output: empty block", pe.Error())
+	})
 }

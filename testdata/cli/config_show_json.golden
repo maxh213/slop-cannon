@@ -19,10 +19,14 @@
     "idle_replan_interval": "10m",
     "gate_poll_interval": "1m",
     "pr_poll_interval": "1m",
+    "graph_poll_interval": "2s",
+    "max_diff_bytes": 204800,
+    "re_review_threshold": 0.4,
     "max_beads_per_plan": 8,
     "limits": {
       "max_review_rounds": 3,
       "max_pushback_rounds": 2,
+      "max_conflict_rounds": 3,
       "agent_timeout": "30m",
       "max_plan_rejections": 2,
       "max_plan_failures": 5
@@ -39,8 +43,10 @@
     "check_command": "repo",
     "exclude": "default",
     "gate_poll_interval": "default",
+    "graph_poll_interval": "default",
     "idle_replan_interval": "default",
     "limits.agent_timeout": "default",
+    "limits.max_conflict_rounds": "default",
     "limits.max_cost_usd": "default",
     "limits.max_plan_failures": "default",
     "limits.max_plan_rejections": "default",
@@ -48,7 +54,9 @@
     "limits.max_review_rounds": "repo",
     "limits.max_tokens": "default",
     "max_beads_per_plan": "default",
+    "max_diff_bytes": "default",
     "pr_poll_interval": "default",
+    "re_review_threshold": "default",
     "roles.tester": "repo",
     "rules": "global+repo",
     "safety": "repo",
@@ -124,6 +132,21 @@
       "source": "default"
     },
     {
+      "key": "graph_poll_interval",
+      "value": "2s",
+      "source": "default"
+    },
+    {
+      "key": "max_diff_bytes",
+      "value": "204800",
+      "source": "default"
+    },
+    {
+      "key": "re_review_threshold",
+      "value": "0.4",
+      "source": "default"
+    },
+    {
       "key": "max_beads_per_plan",
       "value": "8",
       "source": "default"
@@ -136,6 +159,11 @@
     {
       "key": "limits.max_pushback_rounds",
       "value": "2",
+      "source": "default"
+    },
+    {
+      "key": "limits.max_conflict_rounds",
+      "value": "3",
       "source": "default"
     },
     {

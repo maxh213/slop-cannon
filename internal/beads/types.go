@@ -161,6 +161,10 @@ type Issue struct {
 	ClosedAt  time.Time `json:"closed_at,omitempty"`
 	// CloseReason is the `bd close --reason` text.
 	CloseReason string `json:"close_reason,omitempty"`
+	// ExternalRef is the `--external-ref` value: where the bead came from
+	// outside beads ("gh-9" for a GitHub pull request). bd echoes it on
+	// create and show (P3-19).
+	ExternalRef string `json:"external_ref,omitempty"`
 	// Metadata is the custom metadata object (sc_* keys, D-06).
 	Metadata Metadata `json:"metadata,omitempty"`
 	// Labels are the bd labels.
@@ -259,6 +263,15 @@ func (i Issue) HasLabel(label string) bool {
 // domain vocabulary (a foreign custom status, P3-14) is an error wrapping
 // domain.ErrUnknownValue; callers listing a whole repository should filter
 // by run label first or skip such issues.
+//
+// The prose fields are normalised on the way out (domain.Bead.Sanitized,
+// P3-21): control characters are stripped from the title, description and
+// acceptance criteria, and invalid UTF-8 is dropped. bd holds whatever was
+// written into it — by another tool, by a person pasting an escape
+// sequence into `bd create` — and from here the text travels into prompts,
+// TUI frames and the event log, so this is the boundary that normalises
+// it. Refusing the bead is not an option: a run must not be stranded by a
+// bead someone else wrote (P0-11 rejects only text an agent just invented).
 func (i Issue) Bead() (domain.Bead, error) {
 	state, err := domain.ParseBeadState(i.Status)
 	if err != nil {
@@ -297,7 +310,7 @@ func (i Issue) Bead() (domain.Bead, error) {
 	if n, ok := i.Metadata.Int(MetaPRNumber); ok {
 		b.PRNumber = n
 	}
-	return b, nil
+	return b.Sanitized(), nil
 }
 
 // Dependency types bd uses (Appendix A). Only DepBlocks affects readiness.
@@ -451,6 +464,13 @@ type BeadInput struct {
 	Metadata map[string]any
 	// Parent makes the bead a hierarchical child of that issue (`--parent`).
 	Parent domain.BeadID
+	// ExternalRef records where the bead came from outside beads
+	// (`--external-ref`): "gh-9" for a GitHub pull request, "jira-ABC", a
+	// Linear URL. sc sets it on the review bead of an external pull
+	// request (D-11) beside the sc_external_ref metadata, so bd's own
+	// tooling can find the bead from the reference too (P3-19). Empty
+	// means the flag is not passed.
+	ExternalRef string
 }
 
 // Patch describes an update for Client.Update. Only set fields are sent;
@@ -466,6 +486,13 @@ type Patch struct {
 	// Acceptance replaces the acceptance criteria (`--acceptance`); nil
 	// means unchanged.
 	Acceptance *string
+	// Parent reparents the bead (`--parent`); nil means unchanged and a
+	// pointer to "" removes the parent, which is how bd 1.2.2 spells it.
+	// A plan built by BuildGraphPlan sets the parent in the graph plan
+	// instead (GraphNode.ParentID), so this is for the beads sc adopts
+	// later — a review bead joining a run epic, a repair after a partial
+	// plan.
+	Parent *domain.BeadID
 	// SetMetadata sets keys with `--set-metadata k=v`. bd types the values
 	// itself: "1" is stored as the number 1, "true" as a boolean, anything
 	// else as a string (P3-13). Use Metadata to control the type.
@@ -484,7 +511,7 @@ type Patch struct {
 // IsEmpty reports whether the patch changes nothing.
 func (p Patch) IsEmpty() bool {
 	return p.Status == "" && p.Assignee == nil && p.Priority == nil && p.Acceptance == nil &&
-		len(p.SetMetadata) == 0 && len(p.Metadata) == 0 && len(p.UnsetMetadata) == 0 &&
+		p.Parent == nil && len(p.SetMetadata) == 0 && len(p.Metadata) == 0 && len(p.UnsetMetadata) == 0 &&
 		len(p.AddLabels) == 0 && len(p.RemoveLabels) == 0
 }
 
@@ -530,11 +557,26 @@ type GraphNode struct {
 	Priority domain.Priority `json:"priority"`
 	// Description is the body text.
 	Description string `json:"description,omitempty"`
-	// Labels and Metadata are attached at creation.
+	// Labels and Metadata are attached at creation. Every metadata value
+	// must be a JSON string: bd 1.2.2 fails the whole `bd create --graph`
+	// call on a number ("cannot unmarshal number into Go struct field
+	// GraphApplyPlan.nodes.N.metadata.<key> of type string"), so build the
+	// map with GraphMetadata (P3-11).
 	Labels   []string       `json:"labels,omitempty"`
 	Metadata map[string]any `json:"metadata,omitempty"`
-	// ParentKey makes the node a child of another node (the run epic).
+	// ParentKey makes the node a child of another node of the same plan
+	// (the run epic when the plan mints it).
 	ParentKey string `json:"parent_key,omitempty"`
+	// ParentID makes the node a child of a bead that already exists — the
+	// run epic of an earlier plan — so joining an existing epic is part of
+	// the one atomic create rather than a `bd update --parent` afterwards
+	// (P3-18). A node carrying either parent is counted in the dry run's
+	// ParentDeps.
+	ParentID domain.BeadID `json:"parent_id,omitempty"`
+	// Assignee sets the bead's assignee at creation. sc leaves it empty:
+	// beads are claimed with `bd update --claim` (D-07), which is the
+	// atomic path.
+	Assignee string `json:"assignee,omitempty"`
 }
 
 // GraphEdge is one dependency of a graph plan: FromKey depends on ToKey,

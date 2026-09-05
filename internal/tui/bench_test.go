@@ -167,36 +167,50 @@ func BenchmarkGraphLayout(b *testing.B) {
 	}
 }
 
+// benchBigBeadCount is the run size P7-24 states its budget for: ten times
+// the pane's own capacity, so all but a fiftieth of the graph is off screen
+// and the cull is what decides the frame's cost.
+const benchBigBeadCount = 1000
+
 // BenchmarkGraphView measures the graph pane alone — the layering plus the
 // canvas paint, the edge routing and the clip to the pane, in every layout
-// the view can pick. It is not a whole frame: [GraphModel.View] draws no
-// header, tab bar, footer or overlay, so a real frame costs this plus what
-// [BenchmarkFullFrame] measures on top.
+// the view can pick, at the P9-07 run size and the P7-24 one. It is not a
+// whole frame: [GraphModel.View] draws no header, tab bar, footer or
+// overlay, so a real frame costs this plus what [BenchmarkFullFrame]
+// measures on top.
+//
+// P7-24 is what the 1000-bead rows record: the paint used to draw every box
+// of every level and let the clip throw away the ones the pane cannot show
+// (6.8 MB and 68 000 allocations for a 200-bead frame), and now draws only
+// the boxes and routes the scroll window reaches. What is left at 200 beads
+// is the layering, which [BenchmarkGraphLayout] measures on its own.
 func BenchmarkGraphView(b *testing.B) {
-	st := benchGraphState(benchBeadCount)
-	views := []struct {
-		name string
-		view GraphModel
-	}{
-		{"left-right", NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphLeftToRight}).
-			Resize(benchPaneWidth, benchPaneHeight)},
-		{"top-bottom", NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphTopToBottom}).
-			Resize(benchPaneWidth, benchPaneHeight)},
-		{"list", NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphIndentedList}).
-			Resize(60, 24)},
-		{"themed", NewGraphModel(GraphOptions{Theme: ThemeFor(ProfileTrueColor), Orientation: GraphLeftToRight}).
-			Resize(benchPaneWidth, benchPaneHeight)},
-	}
-	for _, tc := range views {
-		v := tc.view
-		b.Run(tc.name, func(b *testing.B) {
-			b.ReportAllocs()
-			for b.Loop() {
-				if v.View(st) == "" {
-					b.Fatal("the graph view drew nothing")
+	for _, n := range []int{benchBeadCount, benchBigBeadCount} {
+		st := benchGraphState(n)
+		views := []struct {
+			name string
+			view GraphModel
+		}{
+			{"left-right", NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphLeftToRight}).
+				Resize(benchPaneWidth, benchPaneHeight)},
+			{"top-bottom", NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphTopToBottom}).
+				Resize(benchPaneWidth, benchPaneHeight)},
+			{"list", NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphIndentedList}).
+				Resize(60, 24)},
+			{"themed", NewGraphModel(GraphOptions{Theme: ThemeFor(ProfileTrueColor), Orientation: GraphLeftToRight}).
+				Resize(benchPaneWidth, benchPaneHeight)},
+		}
+		for _, tc := range views {
+			v := tc.view
+			b.Run(strconv.Itoa(n)+"beads/"+tc.name, func(b *testing.B) {
+				b.ReportAllocs()
+				for b.Loop() {
+					if v.View(st) == "" {
+						b.Fatal("the graph view drew nothing")
+					}
 				}
-			}
-		})
+			})
+		}
 	}
 }
 
@@ -308,23 +322,37 @@ func TestGraphPerformanceBudgets(t *testing.T) {
 		t.Skip("set SC_PERF_BUDGETS=1 to check the P9-07 timing budgets")
 	}
 	st := benchGraphState(benchBeadCount)
+	big := benchGraphState(benchBigBeadCount)
 	full := benchFullModel(t, benchBeadCount)
 	cases := []struct {
 		name string
+		n    int
 		fn   func()
 	}{
-		{"layout", func() { BuildGraphLayout(st) }},
-		{"view left→right", func() {
+		{"layout", benchBeadCount, func() { BuildGraphLayout(st) }},
+		{"view left→right", benchBeadCount, func() {
 			v := NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphLeftToRight}).
 				Resize(benchPaneWidth, benchPaneHeight)
 			_ = v.View(st)
 		}},
-		{"view top→bottom", func() {
+		{"view top→bottom", benchBeadCount, func() {
 			v := NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphTopToBottom}).
 				Resize(benchPaneWidth, benchPaneHeight)
 			_ = v.View(st)
 		}},
-		{"whole frame", func() { _ = full.View() }},
+		{"whole frame", benchBeadCount, func() { _ = full.View() }},
+		// P7-24's own budget: a run ten times the size, where the pane can
+		// show a fiftieth of the graph.
+		{"view left→right", benchBigBeadCount, func() {
+			v := NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphLeftToRight}).
+				Resize(benchPaneWidth, benchPaneHeight)
+			_ = v.View(big)
+		}},
+		{"view top→bottom", benchBigBeadCount, func() {
+			v := NewGraphModel(GraphOptions{NoColor: true, Orientation: GraphTopToBottom}).
+				Resize(benchPaneWidth, benchPaneHeight)
+			_ = v.View(big)
+		}},
 	}
 	for _, tc := range cases {
 		res := testing.Benchmark(func(b *testing.B) {
@@ -333,9 +361,9 @@ func TestGraphPerformanceBudgets(t *testing.T) {
 			}
 		})
 		if per := res.T / time.Duration(max(res.N, 1)); per > benchGraphBudget {
-			t.Errorf("%s of %d beads took %s, over the %s budget", tc.name, benchBeadCount, per, benchGraphBudget)
+			t.Errorf("%s of %d beads took %s, over the %s budget", tc.name, tc.n, per, benchGraphBudget)
 		} else {
-			t.Logf("%s of %d beads: %s (budget %s)", tc.name, benchBeadCount, per, benchGraphBudget)
+			t.Logf("%s of %d beads: %s (budget %s)", tc.name, tc.n, per, benchGraphBudget)
 		}
 	}
 }

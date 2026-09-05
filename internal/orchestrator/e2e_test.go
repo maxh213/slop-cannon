@@ -51,6 +51,7 @@ import (
 	"slop-cannon/internal/events"
 	"slop-cannon/internal/gitx"
 	"slop-cannon/internal/testutil"
+	"slop-cannon/internal/testutil/gitguard"
 )
 
 // ---------------------------------------------------------------------------
@@ -161,24 +162,66 @@ func e2eShellQuote(s string) string {
 const e2ePRHost = "https://github.com/acme/widgets"
 
 // e2eFakeGH installs a `gh` shim that opens numbered pull requests and
-// reports every one of them as merged, which is what the gate poller needs
-// to see to close a safety-on bead (D-20). Every invocation is recorded, so
-// a test can assert the pull requests the run created.
+// remembers them (P8-26). It is the one gh stand-in the package has: the
+// end-to-end scenarios and the crash-recovery children all run against it,
+// so what one test proves about a pull request the next one may rely on.
+//
+// Three things make it behave like GitHub rather than like a stub:
+//
+//   - a head→number registry, so `gh pr list --head <branch>` answers with
+//     the pull request that branch already has. Without it every lookup
+//     said "no pull request" for ever and a re-delivery of a bead left
+//     `delivering` by a crash (PRDeliverer.Deliver → FindPR → CreatePR)
+//     would open a second pull request for the same branch — the shim's
+//     failure, not the product's, which is exactly what a crash-recovery
+//     test must not be able to hide;
+//   - a number→head registry, so `gh pr view <n>` answers by number, which
+//     is the query [gitx.Resumer] makes for a bead that already carries a
+//     pull request and the query `bd gate check` makes for a gh:pr gate;
+//   - a pull request is OPEN the first time it is looked at and MERGED
+//     from the second look on. A pull request sc has just opened is open,
+//     as it is in life, so a resume finds the D-20 state that hangs — a
+//     pull request open with no gate watching it — and the merge lands
+//     between two polls, which is what the gate poller exists to notice.
+//
+// Every invocation is recorded, so a test can assert the pull requests the
+// run created and the order it asked about them in.
 func e2eFakeGH(t *testing.T) *testutil.Shim {
 	t.Helper()
 	return testutil.FakeBin(t, "gh", `
+_head=''
+_prev=''
+for _a in "$@"; do
+  if [ "$_prev" = "--head" ]; then _head=$_a; fi
+  _prev=$_a
+done
+_key=$(printf '%s' "$_head" | tr '/' '_')
+# _state prints the state of pull request $1: OPEN until it has been looked
+# at once, MERGED afterwards.
+_state() {
+  if [ -f "$SC_FAKEBIN_DIR/merged.$1" ]; then echo MERGED; else echo OPEN; fi
+}
+# _pr prints one pull request as JSON: $1 number, $2 head branch, $3 state.
+_pr() {
+  printf '{"number":%s,"url":"`+e2ePRHost+`/pull/%s","state":"%s","title":"Pull request %s","headRefName":"%s"}' "$1" "$1" "$3" "$1" "$2"
+}
 case "$1 $2" in
-  "pr list")
-    echo '[]'
-    ;;
   "label create")
+    ;;
+  "pr list")
+    if [ -n "$_head" ] && [ -f "$SC_FAKEBIN_DIR/head.$_key" ]; then
+      _n=$(cat "$SC_FAKEBIN_DIR/head.$_key")
+      printf '['; _pr "$_n" "$_head" "$(_state "$_n")"; printf ']\n'
+    else
+      echo '[]'
+    fi
     ;;
   "pr create")
     cat > "$SC_FAKEBIN_DIR/body.$SC_FAKEBIN_SEQ"
     w=0
     while ! mkdir "$SC_FAKEBIN_DIR/.prlock" 2>/dev/null; do
       # A shim killed while it held the lock would otherwise hang every
-      # later pull request for ever, and the kill-and-resume test kills a
+      # later pull request for ever, and the kill-and-resume tests kill a
       # run's process group on purpose; steal a lock nobody released
       # within five seconds. Numbering takes microseconds, so a live
       # holder never reaches that.
@@ -189,12 +232,18 @@ case "$1 $2" in
     n=$(cat "$SC_FAKEBIN_DIR/prcount" 2>/dev/null || echo 0)
     n=$((n + 1))
     echo "$n" > "$SC_FAKEBIN_DIR/prcount"
+    echo "$n" > "$SC_FAKEBIN_DIR/head.$_key"
+    echo "$_head" > "$SC_FAKEBIN_DIR/num.$n"
     rmdir "$SC_FAKEBIN_DIR/.prlock"
     echo "Creating pull request in acme/widgets"
     echo "`+e2ePRHost+`/pull/$n"
     ;;
   "pr view")
-    echo '{"state":"MERGED"}'
+    _n=$3
+    _h=$(cat "$SC_FAKEBIN_DIR/num.$_n" 2>/dev/null || echo '')
+    _s=$(_state "$_n")
+    echo merged > "$SC_FAKEBIN_DIR/merged.$_n"
+    _pr "$_n" "$_h" "$_s"; printf '\n'
     ;;
   *)
     echo "gh shim: unexpected command: $*" >&2
@@ -336,6 +385,9 @@ type e2eRig struct {
 	Safety bool
 	// Resumed is true for the second rig of a kill-and-resume scenario,
 	// and Recovered is what the stale-lease recovery released for it.
+	// Env is the machine the run happens on, so a test can reach the
+	// recording shims the argv invariant is judged from (P9-23).
+	Env       *e2eEnv
 	Resumed   bool
 	Recovered beads.RecoverResult
 
@@ -392,6 +444,70 @@ type e2eEnv struct {
 	Repo *testutil.FixtureRepo
 	BD   *testutil.Shim
 	GH   *testutil.Shim
+	// Git is the recording git shim every run on this machine goes
+	// through (P9-23). It is nil in a crash-recovery child, which
+	// inherits the parent's PATH and so records into the parent's log
+	// without needing to read it.
+	Git *testutil.Shim
+
+	// SafetyOn and built are what the argv invariant needs to know about
+	// the runs this machine hosted; e2eBuild fills them in.
+	SafetyOn bool
+	built    bool
+}
+
+// e2eFakeGit installs a `git` shim that records every invocation and then
+// execs the real git, so the whole end-to-end run happens for real while
+// the exact argv is kept for judgement (P9-23).
+//
+// Only the code under test goes through it: everything the tests
+// themselves run — testutil.FixtureRepo.Git and the rec* helpers built on
+// it — resolves git with testutil.RealBinary, which skips shim
+// directories, so what a test does to the fixture is never mistaken for
+// what a run did.
+func e2eFakeGit(t *testing.T) *testutil.Shim {
+	t.Helper()
+	return testutil.FakeBin(t, "git", `
+if [ -z "$SC_FAKEBIN_REAL" ]; then
+  echo "git shim: no real git on PATH" >&2
+  exit 127
+fi
+exec "$SC_FAKEBIN_REAL" "$@"
+`)
+}
+
+// assertGitInvariant judges every git and gh command line the runs on this
+// machine produced against the P9-02 safety invariant (P9-23). It runs
+// when the test ends, so it covers the whole run — the deliverers and the
+// worktree manager, but also branch cleanup, the resume, the delivery
+// settler and the gate poller, none of which internal/gitx's own scenario
+// reaches — and it covers a crash-recovery child too, because the child
+// inherits this machine's PATH and appends to these very logs.
+//
+// A run that made no git call at all fails rather than passing vacuously.
+func (e *e2eEnv) assertGitInvariant(t *testing.T) {
+	t.Helper()
+	if e.Git == nil || !e.built {
+		return
+	}
+	env := gitguard.Env{
+		Safety:  gitguard.SafetyFor(e.SafetyOn),
+		Default: e.Repo.DefaultBranch,
+		Remote:  "origin",
+		MainDir: gitguard.ResolvePath(e.Repo.Dir),
+	}
+	calls := gitguard.Parse(t, e.Git)
+	assert.NotEmpty(t, calls, "the run made no git call at all, so the invariant would pass vacuously")
+	if bad := gitguard.Scan(calls, env); len(bad) > 0 {
+		assert.Failf(t, "git broke the safety invariant",
+			"safety %s: git was asked to do something a run may never do:\n%s",
+			env.Safety, strings.Join(bad, "\n"))
+	}
+	if bad := gitguard.ScanGH(t, e.GH); len(bad) > 0 {
+		assert.Failf(t, "gh broke the safety invariant",
+			"safety %s: gh was asked to do something a run may never do (D-11):\n%s",
+			env.Safety, strings.Join(bad, "\n"))
+	}
 }
 
 // e2eNewEnv sets up that machine. Everything it creates is temporary: the
@@ -411,12 +527,30 @@ func e2eNewEnv(t *testing.T) *e2eEnv {
 	t.Setenv("XDG_STATE_HOME", filepath.Join(home, "state"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "config"))
 
-	return &e2eEnv{
+	env := &e2eEnv{
 		Home: home,
 		Repo: testutil.NewFixtureRepo(t, testutil.WithBareRemote()),
 		BD:   e2eFakeBD(t),
 		GH:   e2eFakeGH(t),
+		Git:  e2eFakeGit(t),
 	}
+	// P9-23: every git and gh invocation any run on this machine makes is
+	// judged by argv when the test ends, in whichever safety mode the run
+	// used.
+	t.Cleanup(func() { env.assertGitInvariant(t) })
+	return env
+}
+
+// judgedGit judges every git and gh invocation the run has made so far
+// against the safety invariant and returns the git calls, so a test can
+// also assert that the scenario really produced the commands the invariant
+// is about — a scan of nothing passes every rule (P9-23). The same
+// judgement runs again when the test ends, covering whatever happens after
+// this call.
+func (r *e2eRig) judgedGit(t *testing.T) []gitguard.Call {
+	t.Helper()
+	r.Env.assertGitInvariant(t)
+	return gitguard.Parse(t, r.Env.Git)
 }
 
 // e2eSetup builds the rig for one safety setting on a fresh machine.
@@ -438,9 +572,10 @@ func e2eBuild(t *testing.T, env *e2eEnv, safety, resume bool) *e2eRig {
 	ctx := context.Background()
 
 	repo, bd, gh := env.Repo, env.BD, env.GH
+	env.SafetyOn, env.built = safety, true
 	start := time.Now()
 	rig := &e2eRig{
-		T: t, Safety: safety, Repo: repo, BD: bd, GH: gh, Resumed: resume,
+		T: t, Safety: safety, Repo: repo, BD: bd, GH: gh, Env: env, Resumed: resume,
 		delivered: map[domain.BeadID]*DeliveryOutcome{},
 		peakRole:  map[domain.Role]int{},
 		now:       func() time.Time { return e2eEpoch.Add(time.Since(start)) },
@@ -802,7 +937,7 @@ func (r *e2eRig) start(ctx context.Context) {
 		_ = r.Run.Stop("test cleanup")
 		select {
 		case <-r.Run.Done():
-		case <-time.After(20 * time.Second):
+		case <-time.After(testutil.Patience(20 * time.Second)):
 			r.T.Error("the run did not finish")
 		}
 		cancel()
@@ -889,7 +1024,7 @@ func (r *e2eRig) diagnose() string {
 		fmt.Fprintf(&b, "thread %s state=%s phase=%s round=%d reviewers=%v approved=%v items=%d\n",
 			t.Bead, t.State, t.Phase, t.Round, t.Reviewers, t.Approved, len(t.Items))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), testutil.Patience(10*time.Second))
 	defer cancel()
 	if list, err := r.beadSource(ctx); err == nil {
 		for _, bd := range list {
@@ -1041,6 +1176,15 @@ func TestE2EBriefRunWithSafetyOn(t *testing.T) {
 	assert.Equal(t, 2, calls["gate-create"], "one gh:pr gate per bead (D-20)")
 	assert.GreaterOrEqual(t, calls["gate-check"], 1, "the poller ran `bd gate check`")
 
+	// P9-23: the whole run — the deliverer, the worktree manager, branch
+	// cleanup and the gate poller alike — is judged by argv and not only
+	// by where the branch tips ended up, and the scenario really produced
+	// the commands that invariant is about, so it cannot pass vacuously.
+	git := rig.judgedGit(t)
+	assert.GreaterOrEqual(t, gitguard.Count(git, "worktree"), 2, "a worktree per bead (git calls: %d)", len(git))
+	assert.Positive(t, gitguard.Count(git, "push"), "the sc/ branches were pushed")
+	assert.Zero(t, gitguard.Count(git, "merge"), "safety on merges nothing (D-10)")
+
 	e2eAssertEvents(t, rig, true)
 	e2eAssertStateFile(t, rig, out)
 }
@@ -1092,6 +1236,14 @@ func TestE2EBriefRunWithSafetyOff(t *testing.T) {
 		require.Truef(t, ok, "%s has no %s metadata", id, beads.MetaMergeSHA)
 		assert.Containsf(t, rig.Repo.Git(t, "log", "--format=%H"), sha, "%s: %s is on the default branch", id, sha)
 	}
+
+	// P9-23: the same argv judgement as safety on, with the fast-forward
+	// rule in force instead — and the run really did merge, so the rule
+	// had something to judge.
+	git := rig.judgedGit(t)
+	assert.GreaterOrEqual(t, gitguard.Count(git, "worktree"), 2, "a worktree per bead (git calls: %d)", len(git))
+	assert.Positive(t, gitguard.Count(git, "merge"), "safety off merges into the default branch")
+	assert.Positive(t, gitguard.Count(git, "push"), "and pushes it")
 
 	e2eAssertEvents(t, rig, false)
 	e2eAssertStateFile(t, rig, out)
@@ -1320,6 +1472,15 @@ func e2eAssertStateFile(t *testing.T, rig *e2eRig, out Outcome) {
 	assert.Equal(t, evs[len(evs)-1].Kind(), st.LastEventKind)
 }
 
+// e2eLazy renders a rig's diagnosis only when a failing assertion asks for
+// it. Go evaluates a call's arguments before the call, so passing
+// rig.Problems() to require.Eventually reports the problems the run had
+// *before* the wait, which is always none.
+type e2eLazy struct{ rig *e2eRig }
+
+// String implements fmt.Stringer.
+func (l e2eLazy) String() string { return l.rig.diagnose() }
+
 // BDCalls counts the bd calls the run made, keyed the way testutil derives
 // a bd sample name ("ready", "gate-check", "create-graph-dry-run", …).
 func (r *e2eRig) BDCalls() map[string]int {
@@ -1476,7 +1637,10 @@ func TestE2EKillAndResume(t *testing.T) {
 			return true
 		}
 		return false
-	}, e2eTimeout, 10*time.Millisecond, "a bead to be claimed by an engineer (problems: %v)", first.Problems())
+		// require.Eventually's message arguments are evaluated at the call,
+		// before the wait has begun, so the diagnosis has to be taken here
+		// rather than passed in — it was always "problems: []" otherwise.
+	}, e2eTimeout, 10*time.Millisecond, "a bead to be claimed by an engineer; %s", e2eLazy{first})
 
 	require.NoError(t, first.Run.Kill("SIGINT (twice)"))
 	out, err := first.wait(e2eTimeout)
@@ -1503,7 +1667,7 @@ func TestE2EKillAndResume(t *testing.T) {
 
 	second.start(ctx)
 	out2, err := second.wait(e2eTimeout)
-	require.NoError(t, err, "problems: %v", second.Problems())
+	require.NoError(t, err, "%s", e2eLazy{second})
 	assert.Empty(t, second.Problems(), "the conductor hit no problem")
 	assert.Equal(t, events.FinishCompleted, out2.Reason)
 

@@ -432,6 +432,88 @@ func TestRepo_ChangeRatio(t *testing.T) {
 		require.ErrorAs(t, err, &ge)
 		assert.Equal(t, 128, ge.ExitCode)
 	})
+
+	t.Run("the rebase-safe measurement needs no surviving commit", func(t *testing.T) {
+		// P4-14: the patches are the evidence, so a previous round that was
+		// rebased away and pruned no longer costs a full re-review.
+		gone := &Diff{Stats: round1.Stats, Patch: round1.Patch}
+		gone.Stats.Head = strings.Repeat("0", 40)
+		c, err := repo.RebaseSafeChangeRatio(ctx, gone, round1)
+		require.NoError(t, err)
+		assert.Zero(t, c.Delta, "the same change set, whatever commit carries it")
+		assert.False(t, c.Exceeds(DefaultReReviewThreshold))
+
+		// Without a patch there is nothing to compare, so it falls back to
+		// the commits — and a commit that is gone is an unknown revision.
+		truncated := &Diff{Stats: DiffStats{Head: strings.Repeat("0", 40), Files: 1, Insertions: 1}, Truncated: true}
+		_, err = repo.RebaseSafeChangeRatio(ctx, truncated, round1)
+		require.ErrorIs(t, err, ErrUnknownRevision)
+
+		_, err = repo.RebaseSafeChangeRatio(ctx, nil, round1)
+		require.Error(t, err)
+	})
+}
+
+// TestRepo_ChangeRatio_AcrossARebase is P4-14: the D-09 measurement has to
+// survive a rebase. Reading the two branch tips counts every upstream
+// commit the branch was rebased onto as the engineer's work, so on a busy
+// default branch even a one-line fix scores above the threshold and buys a
+// three-lens re-review it never earned.
+func TestRepo_ChangeRatio_AcrossARebase(t *testing.T) {
+	ctx := context.Background()
+	r, repo := dfBranch(t)
+
+	dfCommit(t, repo, "round 1", map[string]*string{"a.txt": dfStr(dfLines("a", 10))})
+	round1, err := repo.Diff(ctx, "main")
+	require.NoError(t, err)
+	require.Equal(t, 10, round1.ChangedLines())
+
+	// The default branch moves a long way underneath the branch.
+	r.Git(t, "checkout", "-q", "main")
+	r.WriteFile(t, "upstream.txt", dfLines("upstream", 200))
+	r.Commit(t, "a busy default branch")
+	r.Git(t, "checkout", "-q", "feature")
+	_, err = repo.Git(ctx, "-c", "commit.gpgsign=false", "rebase", "--quiet", "main")
+	require.NoError(t, err)
+
+	// Round 2 is one line of the engineer's own work.
+	dfCommit(t, repo, "round 2", map[string]*string{
+		"a.txt": dfStr(strings.Replace(dfLines("a", 10), "a 3\n", "a three\n", 1)),
+	})
+	round2, err := repo.Diff(ctx, "main")
+	require.NoError(t, err)
+	require.Equal(t, 10, round2.ChangedLines(), "the change set is still the same ten lines")
+
+	c, err := repo.RebaseSafeChangeRatio(ctx, round1, round2)
+	require.NoError(t, err)
+	assert.Equal(t, 2, c.Delta, "one line edited: +1 -1, and none of upstream's 200")
+	assert.Equal(t, 10, c.Total)
+	assert.InDelta(t, 0.2, c.Ratio, 1e-9)
+	assert.False(t, c.Exceeds(DefaultReReviewThreshold), "earlier approvals stand (D-09)")
+
+	// Non-vacuity: the tip-to-tip measurement really would have counted the
+	// whole default branch as the round's work.
+	tips, err := repo.ChangeRatio(ctx, round1, round2)
+	require.NoError(t, err)
+	assert.Greater(t, tips.Delta, 200, "the tips are 200 upstream lines apart")
+	assert.True(t, tips.Exceeds(DefaultReReviewThreshold),
+		"which would have sent every tester back to review")
+
+	// The pure comparison is available on its own, for callers that
+	// already hold both diffs.
+	pure, ok := ChangeSetRatio(round1, round2)
+	require.True(t, ok)
+	assert.Equal(t, c, pure)
+
+	// A resolution that changed nothing at all scores zero across the same
+	// rebase.
+	same, ok := ChangeSetRatio(round2, round2)
+	require.True(t, ok)
+	assert.Zero(t, same.Delta)
+	_, ok = ChangeSetRatio(&Diff{Truncated: true, Stats: DiffStats{Files: 1}}, round2)
+	assert.False(t, ok, "a truncated diff cannot be compared this way")
+	_, ok = ChangeSetRatio(nil, round2)
+	assert.False(t, ok)
 }
 
 func TestRatioOf(t *testing.T) {

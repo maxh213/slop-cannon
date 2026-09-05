@@ -313,6 +313,7 @@ func TestExecuteContextHonoursExitError(t *testing.T) {
 
 	err := &ExitError{Code: 3}
 	require.Equal(t, "exit status 3", err.Error())
-	wrapped := &ExitError{Code: 4, Err: ErrNotImplemented}
-	require.ErrorIs(t, wrapped, ErrNotImplemented)
+	inner := errors.New("inner")
+	wrapped := &ExitError{Code: 4, Err: inner}
+	require.ErrorIs(t, wrapped, inner)
 }

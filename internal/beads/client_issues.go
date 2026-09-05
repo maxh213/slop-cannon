@@ -13,9 +13,9 @@ import (
 )
 
 // Create runs `bd create <title> -t <type> -p <priority> [--description]
-// [--acceptance] [-l a,b] [--metadata @file] [--parent <id>] --json` and
-// returns the new issue. Metadata is written through a temporary file so
-// its values keep their JSON types.
+// [--acceptance] [--external-ref <ref>] [-l a,b] [--metadata @file]
+// [--parent <id>] --json` and returns the new issue. Metadata is written
+// through a temporary file so its values keep their JSON types.
 func (c *Client) Create(ctx context.Context, in BeadInput) (Issue, error) {
 	if strings.TrimSpace(in.Title) == "" {
 		return Issue{}, fmt.Errorf("beads: create: %w: empty title", ErrInvalid)
@@ -30,6 +30,9 @@ func (c *Client) Create(ctx context.Context, in BeadInput) (Issue, error) {
 	}
 	if in.Acceptance != "" {
 		args = append(args, "--acceptance", in.Acceptance)
+	}
+	if in.ExternalRef != "" {
+		args = append(args, "--external-ref", in.ExternalRef)
 	}
 	if len(in.Labels) > 0 {
 		args = append(args, "-l", strings.Join(in.Labels, ","))
@@ -222,6 +225,9 @@ func (c *Client) Update(ctx context.Context, id domain.BeadID, p Patch) (Issue, 
 	}
 	if p.Acceptance != nil {
 		args = append(args, "--acceptance", *p.Acceptance)
+	}
+	if p.Parent != nil {
+		args = append(args, "--parent", string(*p.Parent))
 	}
 	for _, k := range sortedKeys(p.SetMetadata) {
 		args = append(args, "--set-metadata", k+"="+p.SetMetadata[k])

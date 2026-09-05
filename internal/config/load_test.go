@@ -2,8 +2,11 @@ package config
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,11 +49,15 @@ check_command = "make check"
 idle_replan_interval = "5m"
 gate_poll_interval = "30s"
 pr_poll_interval = "45s"
+graph_poll_interval = "3s"
+max_diff_bytes = 4096
+re_review_threshold = 0.5
 max_beads_per_plan = 6
 
 [limits]
 max_review_rounds = 4
 max_pushback_rounds = 1
+max_conflict_rounds = 2
 agent_timeout = "20m"
 max_tokens = 1000
 max_cost_usd = 2.5
@@ -77,11 +84,15 @@ check_command = "go test ./..."
 idle_replan_interval = "1h"
 gate_poll_interval = "2m"
 pr_poll_interval = "3m"
+graph_poll_interval = "5s"
+max_diff_bytes = 8192
+re_review_threshold = 0.25
 max_beads_per_plan = 4
 
 [limits]
 max_review_rounds = 6
 max_pushback_rounds = 3
+max_conflict_rounds = 4
 agent_timeout = "45m"
 max_tokens = 2000
 max_cost_usd = 9
@@ -162,8 +173,11 @@ func TestLoadGlobalOnly(t *testing.T) {
 	assert.Equal(t, 5*time.Minute, eff.IdleReplanInterval.Duration())
 	assert.Equal(t, 30*time.Second, eff.GatePollInterval.Duration())
 	assert.Equal(t, 45*time.Second, eff.PRPollInterval.Duration())
+	assert.Equal(t, 3*time.Second, eff.GraphPollInterval.Duration())
+	assert.Equal(t, 4096, eff.MaxDiffBytes)
+	assert.InEpsilon(t, 0.5, eff.ReReviewThreshold, 1e-9)
 	assert.Equal(t, 6, eff.MaxBeadsPerPlan)
-	assert.Equal(t, Limits{MaxReviewRounds: 4, MaxPushbackRounds: 1, AgentTimeout: NewDuration(20 * time.Minute),
+	assert.Equal(t, Limits{MaxReviewRounds: 4, MaxPushbackRounds: 1, MaxConflictRounds: 2, AgentTimeout: NewDuration(20 * time.Minute),
 		MaxTokens: 1000, MaxCostUSD: 2.5, MaxPlanRejections: 3, MaxPlanFailures: 7}, eff.Limits)
 	assert.Equal(t, map[domain.Role]string{domain.RoleTester: "claude"}, eff.Roles)
 
@@ -190,7 +204,10 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 	assert.Equal(t, time.Hour, eff.IdleReplanInterval.Duration())
 	assert.Equal(t, 2*time.Minute, eff.GatePollInterval.Duration(), "the repo's gate poll interval wins")
 	assert.Equal(t, 3*time.Minute, eff.PRPollInterval.Duration(), "the repo's pull request poll interval wins")
-	assert.Equal(t, Limits{MaxReviewRounds: 6, MaxPushbackRounds: 3, AgentTimeout: NewDuration(45 * time.Minute),
+	assert.Equal(t, 5*time.Second, eff.GraphPollInterval.Duration(), "the repo's graph poll interval wins")
+	assert.Equal(t, 8192, eff.MaxDiffBytes, "the repo's diff cap wins")
+	assert.InEpsilon(t, 0.25, eff.ReReviewThreshold, 1e-9, "the repo's re-review threshold wins")
+	assert.Equal(t, Limits{MaxReviewRounds: 6, MaxPushbackRounds: 3, MaxConflictRounds: 4, AgentTimeout: NewDuration(45 * time.Minute),
 		MaxTokens: 2000, MaxCostUSD: 9, MaxPlanRejections: 4, MaxPlanFailures: 9}, eff.Limits)
 	// Lists union across layers, global first, deduplicated by absolute path.
 	globalDir, repoDir := filepath.Dir(globalPath), filepath.Dir(repoPath)
@@ -213,9 +230,11 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 		KeyActiveCartridge: SourceGlobal, KeyCartridges: SourceGlobal,
 		KeyAmmo: SourceRepo, KeySafety: SourceRepo, KeyVibes: SourceMerged, KeyRules: SourceMerged, KeyExclude: SourceMerged,
 		KeyCheckCommand: SourceRepo, KeyIdleReplanInterval: SourceRepo, KeyGatePollInterval: SourceRepo,
-		KeyPRPollInterval:  SourceRepo,
-		KeyMaxReviewRounds: SourceRepo, KeyMaxPushbackRounds: SourceRepo, KeyAgentTimeout: SourceRepo,
-		KeyMaxTokens: SourceRepo, KeyMaxCostUSD: SourceRepo,
+		KeyPRPollInterval: SourceRepo, KeyGraphPollInterval: SourceRepo, KeyMaxDiffBytes: SourceRepo,
+		KeyReReviewThreshold: SourceRepo,
+		KeyMaxReviewRounds:   SourceRepo, KeyMaxPushbackRounds: SourceRepo, KeyMaxConflictRounds: SourceRepo,
+		KeyAgentTimeout: SourceRepo,
+		KeyMaxTokens:    SourceRepo, KeyMaxCostUSD: SourceRepo,
 		KeyRoles + ".tester": SourceGlobal, KeyRoles + ".engineer": SourceRepo,
 	}
 	for key, src := range want {
@@ -318,16 +337,102 @@ func TestLoadUnknownKeyIsAnError(t *testing.T) {
 
 func TestLoadDurationMustBeString(t *testing.T) {
 	repoRoot, globalPath, _ := configTestEnv(t)
-	configWrite(t, globalPath, "idle_replan_interval = 10\n")
+	configWrite(t, globalPath, "ammo = 10\nidle_replan_interval = 10\n")
 	_, err := Load(repoRoot)
 	var pe *ParseError
 	require.ErrorAs(t, err, &pe)
 	assert.Contains(t, pe.Msg, `invalid duration "10"`, "a bare integer is not read as nanoseconds")
+	// P1-13: go-toml hands Duration.UnmarshalText the raw text of a
+	// non-string value from a place with no position, so the loader looks
+	// the key up itself and the message still names line and column.
+	assert.Equal(t, globalPath+`:2:24: idle_replan_interval: invalid duration "10" (use a Go duration such as "10m" or "1h30m")`, err.Error())
 
 	configWrite(t, globalPath, "idle_replan_interval = \"soon\"\n")
 	_, err = Load(repoRoot)
 	require.ErrorAs(t, err, &pe)
 	assert.Contains(t, pe.Msg, `invalid duration "soon"`)
+	assert.Equal(t, globalPath+`:1:24: idle_replan_interval: invalid duration "soon" (use a Go duration such as "10m" or "1h30m")`, err.Error())
+}
+
+// TestLoadMalformedDurationReportsPosition covers P1-13 for every duration
+// key and every TOML type that is not a string: the error names the file,
+// the line, the column and the key.
+func TestLoadMalformedDurationReportsPosition(t *testing.T) {
+	// One case per duration key in the schema; durationKeysOfFile below
+	// fails the test if a key is added to File and forgotten here.
+	keys := []string{
+		KeyIdleReplanInterval, KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyAgentTimeout,
+	}
+	assert.ElementsMatch(t, keys, durationKeysOfFile(reflect.TypeOf(File{}), ""), "every duration key needs a case here")
+
+	// A TOML array never reaches Duration.UnmarshalText, so go-toml
+	// reports it itself, with a position; the scalar kinds are the ones
+	// P1-13 had to look up.
+	values := []struct{ kind, value, want string }{
+		{"integer", "10", `invalid duration "10"`},
+		{"float", "1.5", `invalid duration "1.5"`},
+		{"boolean", "true", `invalid duration "true"`},
+		{"array", "[1, 2]", "cannot decode TOML array"},
+	}
+	for _, key := range keys {
+		for _, v := range values {
+			t.Run(key+"/"+v.kind, func(t *testing.T) {
+				repoRoot, globalPath, _ := configTestEnv(t)
+				name := key
+				doc, line := "", 1
+				if table, leaf, ok := strings.Cut(key, "."); ok {
+					name = leaf
+					doc, line = "["+table+"]\n", 2
+				}
+				col := len(name) + len(" = ") + 1
+				configWrite(t, globalPath, doc+name+" = "+v.value+"\n")
+
+				_, err := Load(repoRoot)
+				var pe *ParseError
+				require.ErrorAs(t, err, &pe, "got %v", err)
+				assert.Equal(t, globalPath, pe.Path)
+				assert.Equal(t, line, pe.Line)
+				assert.Equal(t, col, pe.Column)
+				assert.Contains(t, pe.Msg, key+": "+v.want)
+				assert.Contains(t, err.Error(), fmt.Sprintf("%s:%d:%d: ", globalPath, line, col))
+			})
+		}
+	}
+}
+
+// durationKeysOfFile returns the config keys of every *Duration field in t,
+// recursing into nested tables (so limits.agent_timeout is reported with
+// its table). It is the test's own walk of the schema, independent of the
+// loader's durationProbe, so the two disagreeing is a test failure.
+func durationKeysOfFile(t reflect.Type, prefix string) []string {
+	var keys []string
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		name, _, _ := strings.Cut(f.Tag.Get("toml"), ",")
+		if name == "" || f.PkgPath != "" {
+			continue
+		}
+		switch {
+		case f.Type.Kind() == reflect.Pointer && f.Type.Elem() == reflect.TypeOf(Duration{}):
+			keys = append(keys, prefix+name)
+		case f.Type.Kind() == reflect.Struct:
+			keys = append(keys, durationKeysOfFile(f.Type, prefix+name+".")...)
+		}
+	}
+	return keys
+}
+
+// TestLoadNonDurationErrorsKeepTheirOwnMessage guards the P1-13 lookup
+// against claiming an unrelated failure is a bad duration.
+func TestLoadNonDurationErrorsKeepTheirOwnMessage(t *testing.T) {
+	repoRoot, globalPath, _ := configTestEnv(t)
+	configWrite(t, globalPath, "idle_replan_interval = \"10m\"\nlimits = 5\n")
+	_, err := Load(repoRoot)
+	var pe *ParseError
+	require.ErrorAs(t, err, &pe)
+	assert.Contains(t, pe.Msg, "limits: cannot decode TOML integer")
+	assert.NotContains(t, pe.Msg, "invalid duration")
+	assert.Equal(t, 2, pe.Line)
 }
 
 func TestLoadValidation(t *testing.T) {
@@ -344,6 +449,13 @@ func TestLoadValidation(t *testing.T) {
 		{"zero interval", "idle_replan_interval = \"0s\"\n", "", KeyIdleReplanInterval, "must be a positive duration"},
 		{"zero gate poll interval", "gate_poll_interval = \"0s\"\n", "", KeyGatePollInterval, "must be a positive duration"},
 		{"zero pr poll interval", "pr_poll_interval = \"0s\"\n", "", KeyPRPollInterval, "must be a positive duration"},
+		{"zero graph poll interval", "graph_poll_interval = \"0s\"\n", "", KeyGraphPollInterval, "must be a positive duration"},
+		{"zero diff cap", "max_diff_bytes = 0\n", "", KeyMaxDiffBytes, "must be at least 1024 (1 KiB)"},
+		{"tiny diff cap", "", "max_diff_bytes = 512\n", KeyMaxDiffBytes, "must be at least 1024 (1 KiB)"},
+		{"zero re-review threshold", "re_review_threshold = 0.0\n", "", KeyReReviewThreshold, "must be greater than 0 and at most 1"},
+		{"re-review threshold above one", "", "re_review_threshold = 1.5\n", KeyReReviewThreshold, "must be greater than 0 and at most 1"},
+		{"zero conflict rounds", "[limits]\nmax_conflict_rounds = 0\n", "", KeyMaxConflictRounds, "must be at least 1"},
+		{"negative conflict rounds", "", "[limits]\nmax_conflict_rounds = -2\n", KeyMaxConflictRounds, "must be at least 1"},
 		{"zero beads per plan", "max_beads_per_plan = 0\n", "", KeyMaxBeadsPerPlan, "must be at least 1"},
 		{"negative beads per plan", "", "max_beads_per_plan = -3\n", KeyMaxBeadsPerPlan, "must be at least 1"},
 		{"zero rounds", "", "[limits]\nmax_review_rounds = 0\n", KeyMaxReviewRounds, "must be at least 1"},
@@ -498,6 +610,10 @@ func TestEntries(t *testing.T) {
 	assert.Equal(t, "5m", byKey[KeyIdleReplanInterval].Value)
 	assert.Equal(t, "30s", byKey[KeyGatePollInterval].Value)
 	assert.Equal(t, "45s", byKey[KeyPRPollInterval].Value)
+	assert.Equal(t, "3s", byKey[KeyGraphPollInterval].Value)
+	assert.Equal(t, Entry{Key: KeyMaxDiffBytes, Value: "4096", Source: SourceGlobal}, byKey[KeyMaxDiffBytes])
+	assert.Equal(t, Entry{Key: KeyReReviewThreshold, Value: "0.5", Source: SourceGlobal}, byKey[KeyReReviewThreshold])
+	assert.Equal(t, Entry{Key: KeyMaxConflictRounds, Value: "2", Source: SourceGlobal}, byKey[KeyMaxConflictRounds])
 	assert.Equal(t, Entry{Key: KeyMaxBeadsPerPlan, Value: "6", Source: SourceGlobal}, byKey[KeyMaxBeadsPerPlan])
 	assert.Equal(t, "20m", byKey[KeyAgentTimeout].Value)
 	assert.Equal(t, "2.5", byKey[KeyMaxCostUSD].Value)

@@ -82,6 +82,16 @@ type Options struct {
 	// as well, so a run fired with more ammo than the ceiling can still be
 	// put back to the number it started with.
 	ControlMaxAmmo int
+	// Vitals is the run's "why is nothing happening?" line for the header
+	// (P6-51): the next plan, a `gh` outage, the gates still pending. Pass
+	// orchestrator.RunVitals.Header over the run's own snapshot; nil draws
+	// no such field, which is what a recorded run or a golden frame wants.
+	//
+	// It is called on the render goroutine every time the header is drawn,
+	// so it must not block. The production reporters behind
+	// orchestrator.Vitals take their own locks and return a value, which is
+	// exactly that.
+	Vitals func() string
 	// Output is where the program draws; nil means os.Stdout.
 	Output io.Writer
 	// Input is where key presses are read from; nil means os.Stdin.

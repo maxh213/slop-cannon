@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -148,6 +149,30 @@ type BudgetPauser interface {
 	Paused() bool
 }
 
+// BudgetResumer is the other optional half of [BudgetPauser]: a pauser that
+// can also let the run go again, which is what raising a crossed budget from
+// the TUI needs ([RunBudget.Raise], P9-14). A pauser that does not implement
+// it can still have its budget raised — the hold on new work is lifted — but
+// the user has to press `p` to clear the pause itself.
+type BudgetResumer interface {
+	// Resume lets a paused run fire again.
+	Resume(reason string) error
+}
+
+// BudgetRaisedReason is the [Run.Resume] reason a budget raise resumes with,
+// so the run log tells it from the user pressing `p`.
+const BudgetRaisedReason = "budget_raised"
+
+// The refusals [RunBudget.Raise] answers with. They reach a user: the TUI
+// prints them in its footer, and docs/troubleshooting.md documents them.
+var (
+	// ErrNoBudget means the run has no cap to raise.
+	ErrNoBudget = errors.New("orchestrator: this run has no budget to raise: neither limits.max_tokens nor limits.max_cost_usd is set")
+	// ErrBudgetTooSmall means the new ceiling is not above what the run has
+	// already spent, so raising to it would stop the run again at once.
+	ErrBudgetTooSmall = errors.New("orchestrator: a new budget must be above what the run has already spent")
+)
+
 // BudgetPhaser is the optional half of [BudgetPauser]: a pauser that can
 // also say where the run is in its lifecycle. [RunBudget] uses it to tell
 // the user clearing a budget pause from the run ending underneath it —
@@ -161,10 +186,12 @@ type BudgetPhaser interface {
 	Phase() Phase
 }
 
-// *Run is the production pauser, and it knows its own phase.
+// *Run is the production pauser: it knows its own phase and it can be
+// resumed.
 var (
-	_ BudgetPauser = (*Run)(nil)
-	_ BudgetPhaser = (*Run)(nil)
+	_ BudgetPauser  = (*Run)(nil)
+	_ BudgetPhaser  = (*Run)(nil)
+	_ BudgetResumer = (*Run)(nil)
 )
 
 // RunBudgetOptions configures [NewRunBudget]. The zero value is a budget
@@ -536,6 +563,126 @@ func (b *RunBudget) describeLocked() (reason, banner string) {
 	return reason, what + ": " + next
 }
 
+// Raise sets a new ceiling for the budget that stopped the run and lets it
+// carry on (P9-14).
+//
+// Until it existed, a run paused on a cap could only be resumed into
+// *another grant of the same size* (`p`, which is one more budget's worth
+// and no more) or stopped: there was no way to say "make it 200 000 tokens"
+// to the run in front of you, and `limits.max_tokens` is read once, at
+// start-up, from the configuration the run was frozen with (P6-11). The
+// pause was a banner the user could not act on except by restarting.
+//
+// The ceiling is in the unit of the cap that stopped the run: tokens for
+// `limits.max_tokens`, dollars for `limits.max_cost_usd`. When no cap has
+// fired yet — raising a budget before it is reached is allowed — it is the
+// cap that is set, the cost one when both are. It replaces the ceiling
+// outright rather than adding to it, grants included, so the number the
+// user typed is the number the run stops at next; it must be above what the
+// run has already spent, or the run would stop again on the same session
+// ([ErrBudgetTooSmall]).
+//
+// Raising a budget that has fired clears the hold on new work and resumes
+// the run ([BudgetResumer]), so one keystroke is the whole gesture. The
+// returned string is the new ceiling as the notice states it, for a caller
+// that wants to repeat it.
+func (b *RunBudget) Raise(ceiling float64) (string, error) {
+	if b == nil || !b.Enabled() {
+		return "", ErrNoBudget
+	}
+	if ceiling <= 0 {
+		return "", fmt.Errorf("%w: %v is not a budget", ErrBudgetTooSmall, ceiling)
+	}
+
+	b.mu.Lock()
+	cost := b.raisesCostLocked()
+	switch {
+	case cost && ceiling <= b.spend.CostUSD:
+		spent := b.spend.CostUSD
+		b.mu.Unlock()
+		return "", fmt.Errorf("%w: it has spent $%.2f, and $%.2f is not more", ErrBudgetTooSmall, spent, ceiling)
+	case !cost && int64(ceiling) <= b.spend.Tokens:
+		spent := b.spend.Tokens
+		b.mu.Unlock()
+		return "", fmt.Errorf("%w: it has spent %s, and %d is not more",
+			ErrBudgetTooSmall, budgetPlural(spent, "token"), int64(ceiling))
+	}
+	if cost {
+		b.maxCost = ceiling
+	} else {
+		b.maxTokens = int64(ceiling)
+	}
+	// The grants a resume made are what the old ceiling was multiplied by;
+	// the new one is the whole answer, so they go with it.
+	b.grants = 1
+	was := b.tripped
+	stuck := b.exceededLocked()
+	if stuck {
+		// The other cap is holding the run now, so the banner and the pause
+		// reason are re-derived: a second raise must be read in *that* cap's
+		// unit, and the banner a user is looking at must name the cap that
+		// is still stopping them.
+		b.reason, b.banner = b.describeLocked()
+	} else {
+		b.tripped, b.reason, b.banner = false, "", ""
+	}
+	resume := was && !stuck && b.paused
+	if resume {
+		b.paused = false
+	}
+	newCeiling := b.ceilingTextLocked(cost)
+	b.mu.Unlock()
+
+	if stuck {
+		// Only one cap was raised and the other one is still crossed, so
+		// nothing may start yet. Nothing is undone: the cap the user asked
+		// for is the cap the run now has.
+		return newCeiling, fmt.Errorf("orchestrator: the budget was raised to %s, but the run is over its other cap as well: %s",
+			newCeiling, b.Banner())
+	}
+
+	b.log.Info("the run's budget was raised", slog.String("ceiling", newCeiling))
+	if b.host != nil {
+		b.host.Publish(events.Warning{Meta: b.host.Meta(), Source: SourceLimits, Message: fmt.Sprintf(
+			"the run's budget was raised: it will stop at %s", newCeiling)})
+	}
+	if !resume {
+		return newCeiling, nil
+	}
+	r, ok := b.pauser.(BudgetResumer)
+	if !ok {
+		// New work flows again either way — the hold is [RunBudget.Work]'s,
+		// not the run's — but this run cannot clear its own pause.
+		return newCeiling, nil
+	}
+	if err := r.Resume(BudgetRaisedReason); err != nil {
+		return newCeiling, fmt.Errorf("orchestrator: the budget was raised to %s, but the run could not be resumed: %w", newCeiling, err)
+	}
+	return newCeiling, nil
+}
+
+// raisesCostLocked reports whether [RunBudget.Raise] is raising the cost cap
+// rather than the token one: the cap that stopped the run, or — when none
+// has — the cost cap when there is one.
+func (b *RunBudget) raisesCostLocked() bool {
+	switch b.reason {
+	case PauseReasonCostCap:
+		return true
+	case PauseReasonTokenCap:
+		return false
+	default:
+		return b.maxCost > 0
+	}
+}
+
+// ceilingTextLocked renders the ceiling now in force, in the unit given.
+func (b *RunBudget) ceilingTextLocked(cost bool) string {
+	if cost {
+		return fmt.Sprintf("$%.2f", b.ceilCostLocked())
+	}
+	return fmt.Sprintf("%d tokens", b.ceilTokensLocked())
+}
+
 // Work wraps a work source so that a crossed budget stops new work: while
 // the budget is tripped the run is offered only what finishes something
 // already in flight — the reviews and arbitrations of a round under way,
@@ -696,6 +843,13 @@ func budgetExternalReview(d Demand) bool {
 // summary (P9-01). An autopilot run is never finished here: D-18 says a cap
 // pauses it, and [RunBudget.Record] has already done that.
 //
+// The finish reason is [events.FinishBudgetReached] (P9-12). It used to be
+// [events.FinishStopped], which is the user pressing `s`, so `sc status
+// --json` and every other machine consumer read a run the budget ended as
+// one a person ended, and the only place the difference survived was the
+// prose of [Outcome.Summary]. [events.FinishCompleted] would have been
+// worse: it says the beads settled, and they have not.
+//
 // A nil or disabled budget returns inner unchanged.
 func (b *RunBudget) Stop(inner StopCondition) StopCondition {
 	if b == nil || !b.Enabled() {
@@ -704,7 +858,7 @@ func (b *RunBudget) Stop(inner StopCondition) StopCondition {
 	return StopConditionFunc(func(ctx context.Context, r *Run, st SchedulerStatus) (Outcome, bool, error) {
 		b.notice()
 		if b.mode == domain.RunModeBrief && b.Tripped() && st.Live == 0 && st.Idle {
-			return Outcome{Reason: events.FinishStopped, Summary: b.Summary()}, true, nil
+			return Outcome{Reason: events.FinishBudgetReached, Summary: b.Summary()}, true, nil
 		}
 		if inner == nil {
 			return Outcome{}, false, nil
@@ -745,12 +899,12 @@ func budgetPlural(n int64, noun string) string {
 // one [FiringPlanner], so one wrapper meters engineers, testers, arbitrating
 // and planning product owners alike.
 //
-// Only a session that finished and decoded is metered:
-// [AgentFiring.Result], the hook this chains onto, runs on success. A
-// crashed or timed-out session's partial usage is not counted, which errs
-// towards letting the run carry on rather than pausing it over work that
-// produced nothing. A caller that holds such a transcript can add it with
-// [RunBudget.Record].
+// Every session the cartridge reported usage for is metered, whether or not
+// it delivered a reply (P9-13): [AgentFiring.Result] carries the ones that
+// finished and decoded, [AgentFiring.Spent] the crashes, the timeouts and
+// the kills. What an agent killed by `limits.agent_timeout` spent is as real
+// as what a successful one spent, and a run whose agents mostly time out
+// could otherwise overrun `max_cost_usd` for ever.
 //
 // A nil or disabled budget returns inner unchanged.
 func (b *RunBudget) MeterPlanner(inner FiringPlanner) FiringPlanner {
@@ -807,9 +961,19 @@ func UsageReported(u cartridge.Usage) bool {
 }
 
 // MeterFiring chains usage accounting onto one firing's [AgentFiring.Result]
-// hook, for a caller that builds an [AgentFiring] itself rather than
-// through a [FiringPlanner]. The hook it adds never fails, so it can never
-// turn a finished session into a failed firing.
+// and [AgentFiring.Spent] hooks, for a caller that builds an [AgentFiring]
+// itself rather than through a [FiringPlanner]. The hooks it adds never
+// fail, so they can never turn a finished session into a failed firing.
+//
+// Both halves are metered (P9-13): Result is the session that finished and
+// decoded, Spent is every attempt that did not — a crash, a timeout, a kill,
+// a rate-limited attempt on its way to a retry. A session killed by
+// `limits.agent_timeout` after twenty minutes of work spent real tokens, and
+// a run whose agents mostly time out used to overrun `max_cost_usd`
+// indefinitely because none of them was ever charged. A cartridge that
+// reported nothing for the failed attempt is not counted at all, so a
+// firing that never reached the CLI is not a session
+// ([UsageReported]).
 func (b *RunBudget) MeterFiring(af *AgentFiring) {
 	if b == nil || af == nil || !b.Enabled() {
 		return
@@ -821,5 +985,14 @@ func (b *RunBudget) MeterFiring(af *AgentFiring) {
 			return prev(payload, tr)
 		}
 		return nil
+	}
+	prevSpent := af.Spent
+	af.Spent = func(tr agents.Transcript) {
+		if UsageReported(tr.Usage) {
+			b.Record(tr.Usage)
+		}
+		if prevSpent != nil {
+			prevSpent(tr)
+		}
 	}
 }

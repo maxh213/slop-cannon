@@ -90,7 +90,9 @@ func TestIntegrationApplyPlanDiamond(t *testing.T) {
 	assert.Equal(t, []domain.BeadID{id["a"]}, IssueIDs(g.Ready()))
 	assert.NoError(t, g.Validate())
 
-	// A second plan joins the existing epic through --parent.
+	// A second plan joins the existing epic in the create itself: every
+	// node carries parent_id, so the dry run counts one parent dependency
+	// per bead and no `bd update --parent` follows (P3-18).
 	more := PlanRequest{
 		Run: "r1", Epic: res.Epic, Roles: []domain.Role{domain.RolePO},
 		Plan: domain.Plan{Beads: []domain.PlanBead{
@@ -103,12 +105,12 @@ func TestIntegrationApplyPlanDiamond(t *testing.T) {
 	assert.False(t, res2.EpicCreated)
 	assert.Equal(t, res.Epic, res2.Epic)
 	assert.Equal(t, 1, res2.DryRun.EdgeCount)
-	assert.Equal(t, 0, res2.DryRun.ParentDeps)
+	assert.Equal(t, len(more.Plan.Beads), res2.DryRun.ParentDeps, "parent_deps == the bead count (P3-18)")
 	for _, key := range []string{"g", "h"} {
 		issues, err := c.Show(ctx, res2.IDs[key])
 		require.NoError(t, err)
 		require.Len(t, issues, 1)
-		assert.Equal(t, res.Epic, issues[0].ParentID(), "%s reparented to the run epic", key)
+		assert.Equal(t, res.Epic, issues[0].ParentID(), "%s was created inside the run epic", key)
 		assert.Equal(t, "acceptance "+key, issues[0].Acceptance)
 	}
 	children, err := c.List(ctx, ListFilter{Parent: res.Epic})

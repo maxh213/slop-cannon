@@ -21,4 +21,4 @@ safety off · merged straight to the default branch · 1 delivered, 1 merged
 
 
 demo-2  "Retry failed HTTP reque…"  https://example.invalid/demo/pull/42  o open
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • o open PR  ! engineer timed out twic… (+1 more)

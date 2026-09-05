@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
+	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/cartridge"
 	"slop-cannon/internal/cartridge/structured"
 	"slop-cannon/internal/domain"
@@ -65,6 +67,16 @@ type AgentRun struct {
 	Task events.Task
 	// Run is the run id stamped on published events.
 	Run domain.RunID
+	// RunDir is the run directory (<state-dir>/runs/<run-id>, D-23). When
+	// it is set, every attempt files the prompt it fired to
+	// <RunDir>/prompts/<agent-id>.md for debugging (P5-01, P5-13), so a
+	// retry leaves the prompt that was actually last fired. It must be
+	// absolute: the agent's own working directory is the target
+	// repository's worktree, and a relative path would write our debug
+	// copy inside the user's repository, which D-23 forbids. Empty means
+	// no copy is filed (the role builders' own tests, and any caller with
+	// no run directory).
+	RunDir string
 	// Bus receives one [events.AgentOutput] per line the session produced.
 	// Nil means nothing is published (the transcript is still collected).
 	Bus *events.Bus
@@ -105,6 +117,9 @@ func (r AgentRun) Validate() error {
 	}
 	if r.Agent.Lens != "" && !r.Agent.Lens.Valid() {
 		return fmt.Errorf("%w: agent lens %q is not a lens", ErrInvalidAgentRun, r.Agent.Lens.String())
+	}
+	if r.RunDir != "" && !filepath.IsAbs(r.RunDir) {
+		return fmt.Errorf("%w: run directory %q is not absolute", ErrInvalidAgentRun, r.RunDir)
 	}
 	if err := r.CheckPolicy(); err != nil {
 		return err
@@ -257,6 +272,10 @@ type Transcript struct {
 	// SessionID and ExitCode come from the last attempt.
 	SessionID string `json:"session_id,omitempty"`
 	ExitCode  int    `json:"exit_code"`
+	// PromptPath is where the prompt of the last attempt was filed
+	// (AgentRun.RunDir, P5-13); empty when no run directory was given or
+	// the copy could not be written.
+	PromptPath string `json:"prompt_path,omitempty"`
 }
 
 // Retries is how many extra sessions were fired after the first.
@@ -399,15 +418,18 @@ func FailureOf(err error) events.Failure {
 //     one the role and task were given ([AgentRun.CheckPolicy]) and re-checked
 //     with [EnforcementFor]; a policy nobody chose, or one the cartridge
 //     cannot hold, refuses the firing before any subprocess starts (P5-06);
-//  2. the session runs through [structured.Fire], which appends the
+//  2. the prompt is filed to <run-dir>/prompts/<agent-id>.md when
+//     AgentRun.RunDir is set, before the session starts and again on every
+//     retry, so the file holds the prompt last fired (P5-13);
+//  3. the session runs through [structured.Fire], which appends the
 //     contract to the prompt when the prompt builder has not already
 //     (WithPromptSuffix is idempotent);
-//  3. every session event is turned into output lines and published;
-//  4. the reply is checked against the schema and, when AgentRun.Check is
+//  4. every session event is turned into output lines and published;
+//  5. the reply is checked against the schema and, when AgentRun.Check is
 //     set, against the role's own rules ([PlanCheck] and friends);
-//  5. a reply that fails either check is retried once (AgentRun.SchemaRetries),
+//  6. a reply that fails either check is retried once (AgentRun.SchemaRetries),
 //     with structured.ParseError.Feedback quoted back to the model;
-//  6. the validated block is decoded into T.
+//  7. the validated block is decoded into T.
 //
 // T is the payload type of the contract: domain.Plan, domain.ImplReport,
 // domain.Verdict, [ResponseSet], domain.Arbitration or domain.Escalation.
@@ -453,6 +475,28 @@ func (r AgentRun) decodeFailure(tr *Transcript, detail string, cause error) *Age
 	return r.agentError(*tr, pe)
 }
 
+// filePrompt writes the debug copy of one attempt's prompt to
+// <RunDir>/prompts/<agent-id>.md and returns the path it wrote (P5-13).
+//
+// It is deliberately fail-soft: a debug copy is not worth losing an agent's
+// work over, so an unwritable state directory is reported as one stderr
+// line on the agent's own output — which reaches the bus, the transcript,
+// the run log and `sc logs <agent-id>` like every other line the firing
+// produced — and the firing goes ahead. A caller that wants the copy to be
+// mandatory checks Transcript.PromptPath.
+func (r AgentRun) filePrompt(sink *outputSink, text string) string {
+	if strings.TrimSpace(r.RunDir) == "" {
+		return ""
+	}
+	path, err := prompt.WriteFile(r.RunDir, r.Agent.ID, text)
+	if err != nil {
+		sink.write(r.now(), events.StreamStderr,
+			fmt.Sprintf("[prompt] the debug copy of this prompt could not be written: %v", err))
+		return ""
+	}
+	return path
+}
+
 // fireAgent runs the session and fills in the transcript; the callers decode
 // the validated block into the shape they want.
 func fireAgent(ctx context.Context, r AgentRun) (Transcript, error) {
@@ -493,8 +537,19 @@ func fireAgent(ctx context.Context, r AgentRun) (Transcript, error) {
 			reason = firstLine(rc.Err.Feedback())
 		}
 		sink.write(r.now(), events.StreamStderr, fmt.Sprintf("[retry %d] %s", rc.Attempt+1, reason))
-		return retry(rc)
+		text := retry(rc)
+		// The retry replaces the copy, so the file always holds the
+		// prompt the agent was last fired with (P5-13).
+		tr.PromptPath = r.filePrompt(sink, text)
+		return text
 	}
+
+	// File the prompt before the first session starts, not after it ends:
+	// the copy is for watching a firing that is still running (and for the
+	// post-mortem of one that never returns). structured.Fire appends the
+	// contract to the spec's prompt the same way, and WithPromptSuffix is
+	// idempotent, so this is byte-for-byte what the cartridge is given.
+	tr.PromptPath = r.filePrompt(sink, contract.WithPromptSuffix(r.Spec.Prompt))
 
 	start := r.now()
 	out, ferr := structured.Fire(ctx, r.Cartridge, r.Spec, contract,

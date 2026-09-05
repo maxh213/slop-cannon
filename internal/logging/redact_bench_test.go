@@ -1,6 +1,7 @@
 package logging_test
 
 import (
+	"os"
 	"regexp"
 	"strings"
 	"testing"
@@ -101,16 +102,104 @@ func BenchmarkSafeEvent(b *testing.B) {
 	}
 }
 
-// BenchmarkSafeEventClean is the same hook over an event with nothing to
-// mask, which is the common case: it is the floor a run pays per event just
-// for looking.
-func BenchmarkSafeEventClean(b *testing.B) {
-	ev := events.AgentOutput{
+// benchCleanOutput is an output line with nothing to mask, which is what
+// nearly every event carries.
+func benchCleanOutput() events.Event {
+	return events.AgentOutput{
 		Meta: benchMeta(), Agent: "eng-sc-1a2b-r1", Stream: events.StreamStdout,
 		Line: "ok   slop-cannon/internal/proc  0.42s",
 	}
+}
+
+// BenchmarkSafeEventClean is the same hook over an event with nothing to
+// mask, which is the common case: it is the floor a run pays per event just
+// for looking. Since P9-26 that floor is a byte scan rather than a regular
+// expression per rule, and the prefilter is what this benchmark watches.
+func BenchmarkSafeEventClean(b *testing.B) {
+	ev := benchCleanOutput()
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = logging.SafeEvent(ev)
 	}
+}
+
+// The publication hook's timing budget (P9-26).
+//
+// P9-07 budgets a publish at 10 000 events a second and asserts it over
+// `Run.Publish` in front of the teed run log — the part *below* the hook.
+// A real run publishes through one more layer, `(*logging.Redactor).SafeEvent`
+// (internal/cli, runPublisher.Publish), and that layer was the larger half
+// of a publish until the prefilter landed. These assertions cover it, so the
+// two together cover the whole path an event travels.
+//
+// Like the orchestrator's, they are opt-in: a wall-clock threshold is not
+// deterministic on a loaded machine, so they run only under
+// SC_PERF_BUDGETS=1, which is how the numbers in docs/performance.md are
+// re-checked.
+const (
+	// redactCleanBudget is the longest the hook may take over an event with
+	// nothing to mask, which is nearly every event. It is the cost of the
+	// publish beneath it (`RunPublishTeed`, 2.6 µs): P9-26's Done-when is
+	// that looking costs no more than writing. The measured figure is an
+	// order of magnitude inside it, so what this catches is the fast path
+	// being lost — a rule whose words cannot be derived, or the scan being
+	// taken out — rather than ordinary drift.
+	redactCleanBudget = 2600 * time.Nanosecond
+	// redactEventBudget is the 10 000 events a second the whole wiring is
+	// budgeted at (orchestrator's perfBusBudget), asserted over the fattest
+	// event the loop publishes: a verdict with four items, twenty pieces of
+	// prose, one of which carries a credential.
+	redactEventBudget = 100 * time.Microsecond
+)
+
+// TestRedactionPerformanceBudgets asserts P9-26's budgets over the
+// publication hook, with the rules a real run carries.
+func TestRedactionPerformanceBudgets(t *testing.T) {
+	if os.Getenv("SC_PERF_BUDGETS") != "1" {
+		t.Skip("set SC_PERF_BUDGETS=1 to check the P9-26 timing budgets")
+	}
+	// The redactor a run builds: the defaults plus the rules the secret
+	// filter adds (agents.SecretPatterns, P9-05), which is the six the
+	// prefilter has to answer for. They are repeated rather than imported
+	// because internal/agents imports this package.
+	r := logging.NewRedactor(
+		logging.Pattern{
+			Name:   "assignment",
+			Regexp: regexp.MustCompile(`(?m)(?:^|[^A-Za-z0-9_])(?:export\s+)?[A-Z][A-Z0-9_]*(?:TOKEN|SECRET|PASSWD|PASSWORD|KEY|CREDENTIAL)[A-Z0-9_]*\s*[=:]\s*["']?([^\s"']{6,})`),
+		},
+		logging.Pattern{Name: "pem", Regexp: regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----(.+?)-----END`)},
+		logging.Pattern{Name: "aws", Regexp: regexp.MustCompile(`\b(?:AKIA|ASIA)([0-9A-Z]{12,})`)},
+	)
+
+	t.Run("a clean agent output line", func(t *testing.T) {
+		ev := benchCleanOutput()
+		res := testing.Benchmark(func(b *testing.B) {
+			for b.Loop() {
+				_ = r.SafeEvent(ev)
+			}
+		})
+		redactAssert(t, "the hook over a clean output line", res, redactCleanBudget)
+	})
+
+	t.Run("the fattest event the loop publishes", func(t *testing.T) {
+		ev := benchVerdict()
+		res := testing.Benchmark(func(b *testing.B) {
+			for b.Loop() {
+				_ = r.SafeEvent(ev)
+			}
+		})
+		redactAssert(t, "the hook over a verdict of four items", res, redactEventBudget)
+	})
+}
+
+// redactAssert fails when a benchmark's time per operation is over its
+// budget, and records the measurement either way.
+func redactAssert(t *testing.T, what string, res testing.BenchmarkResult, budget time.Duration) {
+	t.Helper()
+	per := res.T / time.Duration(max(res.N, 1))
+	if per > budget {
+		t.Errorf("%s took %s, over the %s budget", what, per, budget)
+		return
+	}
+	t.Logf("%s: %s (budget %s)", what, per, budget)
 }

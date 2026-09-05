@@ -193,6 +193,11 @@ func SafeState(status string, category domain.StateCategory) (domain.BeadState, 
 // custom status is mapped with SafeState (the origin tells the caller) and
 // an unknown issue type becomes a task. Use it for listings that may
 // contain beads the cannon did not create; Bead stays strict.
+//
+// Like Bead it returns printable prose: the title, description and
+// acceptance criteria come back through domain.Bead.Sanitized, so a bead
+// carrying an escape sequence cannot repaint a TUI frame or smuggle
+// instructions into a prompt (P3-21).
 func (i Issue) SafeBead(m StatusMap) (domain.Bead, StatusOrigin) {
 	state, origin := m.Resolve(i.Status)
 	j := i
@@ -206,7 +211,7 @@ func (i Issue) SafeBead(m StatusMap) (domain.Bead, StatusOrigin) {
 	if err != nil {
 		// Unreachable: state and type are now in the vocabulary. Keep the
 		// id so a caller can still report the bead.
-		b = domain.Bead{ID: i.ID, Title: i.Title, State: state, Priority: i.Priority}
+		b = domain.Bead{ID: i.ID, Title: i.Title, State: state, Priority: i.Priority}.Sanitized()
 	}
 	return b, origin
 }

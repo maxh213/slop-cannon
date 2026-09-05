@@ -18,6 +18,7 @@ import (
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
 	"slop-cannon/internal/gitx"
+	"slop-cannon/internal/testutil"
 )
 
 // Tests for the run lifecycle (P6-01) and the tasks folded into it: the
@@ -503,7 +504,7 @@ func TestLifecyclePauseGatesTheLoop(t *testing.T) {
 	require.NoError(t, r.Resume("user"))
 	select {
 	case <-fired:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testutil.Patience(2 * time.Second)):
 		t.Fatal("the loop never got past the pause gate")
 	}
 	require.NoError(t, r.Stop("done"))
@@ -528,7 +529,7 @@ func TestLifecycleAwaitResumeReturnsOnStopAndOnContext(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-	case <-time.After(2 * time.Second):
+	case <-time.After(testutil.Patience(2 * time.Second)):
 		t.Fatal("AwaitResume did not return when the run was stopped")
 	}
 	_, err = r.Wait()
@@ -543,13 +544,19 @@ func TestLifecycleAgentBookkeepingIsPersisted(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Start(context.Background()))
 
+	// P9-11: the agent list is coalesced into one write rather than one
+	// write per agent, so the file is caught up with Run.FlushState before
+	// it is read. Everything the run reports in memory is current at once.
 	a := domain.Agent{ID: "eng-sc-1", Role: domain.RoleEngineer, Cartridge: "claude",
 		Bead: "sc-1", State: domain.AgentStateRunning, StartedAt: lifecycleEpoch, PID: 4242}
 	require.NoError(t, r.AgentStarted(a))
+	require.Len(t, r.Agents(), 1)
+	require.NoError(t, r.FlushState())
 	require.Len(t, lifecycleRead(t, r).Agents, 1)
 
 	a.PID = 4243
 	require.NoError(t, r.AgentUpdated(a))
+	require.NoError(t, r.FlushState())
 	st := lifecycleRead(t, r)
 	require.Len(t, st.Agents, 1)
 	require.Equal(t, 4243, st.Agents[0].PID)
@@ -557,6 +564,7 @@ func TestLifecycleAgentBookkeepingIsPersisted(t *testing.T) {
 	require.NoError(t, r.AgentStopped("nobody"), "an unknown agent is ignored")
 	require.NoError(t, r.AgentStopped(a.ID))
 	require.Empty(t, r.Agents())
+	require.NoError(t, r.FlushState())
 	require.Empty(t, lifecycleRead(t, r).Agents)
 
 	require.NoError(t, r.Stop("done"))

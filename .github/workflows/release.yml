@@ -1,0 +1,120 @@
+name: Release
+
+# Tag a release with `git tag -a v0.1.0 -m v0.1.0 && git push origin v0.1.0`.
+# Run the workflow by hand (workflow_dispatch) for a dry run: it builds and
+# checksums the same artefacts, publishes nothing, and uploads dist/ so you can
+# download and inspect it. The same dry run locally is
+# `./bin/goreleaser release --snapshot --clean --skip=publish` (P10-03).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build the artefacts without publishing anything"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  GORELEASER_VERSION: v2.18.0
+
+jobs:
+  gate:
+    name: gate (make check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: make check
+        run: make check
+      - name: make check-golden
+        run: make check-golden
+
+  release:
+    name: goreleaser
+    needs: gate
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to create the GitHub release and upload the artefacts.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Fetch tags
+        run: git fetch --force --tags
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Cache goreleaser binary
+        uses: actions/cache@v4
+        with:
+          path: bin/goreleaser
+          key: goreleaser-${{ runner.os }}-${{ env.GORELEASER_VERSION }}
+      - name: Install goreleaser
+        run: |
+          if [ ! -x bin/goreleaser ]; then
+            GOBIN="$PWD/bin" go install "github.com/goreleaser/goreleaser/v2@${GORELEASER_VERSION}"
+          fi
+          ./bin/goreleaser --version
+      - name: Validate .goreleaser.yaml
+        run: ./bin/goreleaser check
+      - name: Decide the goreleaser arguments
+        id: args
+        run: |
+          if [ "${{ github.event_name }}" = "push" ]; then
+            echo "value=release --clean" >> "$GITHUB_OUTPUT"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=release --snapshot --clean --skip=publish,announce" >> "$GITHUB_OUTPUT"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Run goreleaser
+        run: ./bin/goreleaser ${{ steps.args.outputs.value }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SC_REPO_OWNER: ${{ github.repository_owner }}
+          SC_REPO_NAME: ${{ github.event.repository.name }}
+          # Only push the Homebrew cask when a tap token is configured; without
+          # one the cask is still rendered into dist/ for inspection.
+          HOMEBREW_TAP_OWNER: ${{ github.repository_owner }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          HOMEBREW_TAP_SKIP_UPLOAD: ${{ (steps.args.outputs.publish == 'true' && secrets.HOMEBREW_TAP_TOKEN != '') && 'false' || 'true' }}
+      - name: Smoke-test the built binary
+        run: |
+          set -eu
+          out="$(./dist/sc_linux_amd64_v1/sc version)"
+          echo "$out"
+          if [ "${{ steps.args.outputs.publish }}" = "true" ]; then
+            tag="${GITHUB_REF#refs/tags/}"
+            case "$out" in
+              *"$tag"*) echo "sc version reports the tag $tag" ;;
+              *) echo "sc version does not report the tag $tag: $out" >&2; exit 1 ;;
+            esac
+          fi
+          test -s dist/checksums.txt
+      - name: Upload dist/ (dry run)
+        if: steps.args.outputs.publish != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+            dist/homebrew/**
+          if-no-files-found: error
+          retention-days: 7

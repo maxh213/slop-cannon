@@ -15,7 +15,6 @@ import (
 
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/domain"
-	"slop-cannon/internal/proc"
 )
 
 // Safety-on delivery (D-10, D-20): the bead's branch is pushed to the
@@ -240,13 +239,14 @@ func (d *PRDeliverer) Deliver(ctx context.Context, req PRRequest) (*PRResult, er
 		return nil, errors.New("gitx: Deliver: bead has no id")
 	}
 	repo := d.m.Repo()
-	branch := BranchName(bead)
-	log := d.logger.With("bead", string(bead.ID), "branch", branch)
-
-	exists, err := repo.BranchExists(ctx, branch)
+	// The branch the bead's work is on, not the one its current title
+	// spells: a bead retitled after its branch was cut still delivers
+	// (P4-12).
+	branch, exists, err := d.m.BranchFor(ctx, bead)
 	if err != nil {
 		return nil, err
 	}
+	log := d.logger.With("bead", string(bead.ID), "branch", branch)
 	if !exists {
 		return nil, fmt.Errorf("%w: %s in %s", ErrBranchMissing, branch, repo.Root)
 	}
@@ -526,23 +526,6 @@ func (r *Repo) PushBranch(ctx context.Context, remote, branch string) error {
 // RemoteURL returns the fetch URL of remote.
 func (r *Repo) RemoteURL(ctx context.Context, remote string) (string, error) {
 	return r.Git(ctx, "remote", "get-url", "--", remote)
-}
-
-// ghUnavailable classifies an error from [GH] as "gh cannot be used
-// here": not installed, not authenticated, or no GitHub remote. Other
-// failures (network, rate limits, a bad argument) are not.
-func ghUnavailable(err error) (string, bool) {
-	switch {
-	case err == nil:
-		return "", false
-	case errors.Is(err, ErrGHNotFound) || proc.IsNotFound(err):
-		return "gh is not installed", true
-	case errors.Is(err, ErrNoGitHubRemote):
-		return "the remote is not on a GitHub host gh knows", true
-	case errors.Is(err, ErrGHUnauthenticated):
-		return "gh is not authenticated (run `gh auth login`)", true
-	}
-	return "", false
 }
 
 // ghPRRef is the raw gh JSON shape of `gh pr list --json number,url,state,title`.

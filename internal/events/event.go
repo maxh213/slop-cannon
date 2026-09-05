@@ -140,6 +140,13 @@ const (
 	// FinishCreditsExhausted means every configured cartridge reported its
 	// quota or billing as exhausted; the only way autopilot ends on its own.
 	FinishCreditsExhausted FinishReason = "credits_exhausted"
+	// FinishBudgetReached means a brief run crossed `limits.max_tokens` or
+	// `limits.max_cost_usd` and finished once the reviews in flight had
+	// drained (P9-12). It is not a user stop and not a failure: the run did
+	// what the cap told it to, so a machine consumer can tell "I set a
+	// budget and it was reached" from "somebody pressed `s`". An autopilot
+	// run never ends this way — a cap pauses it (D-18).
+	FinishBudgetReached FinishReason = "budget_reached"
 	// FinishFailed means the orchestrator hit an unrecoverable error.
 	FinishFailed FinishReason = "failed"
 )

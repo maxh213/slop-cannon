@@ -557,6 +557,30 @@ var shimProbes = []struct {
 // Only the version, read and bd-side probes start bd; the rest are refused
 // by the script itself, so the check stays cheap enough to run before every
 // agent.
+//
+// # What a stand-in bd owes this check (P8-27)
+//
+// Two of those probes reach past the shim to the binary underneath, and
+// neither is ever asked for by a run's own work, so anything driving sc
+// against a stand-in bd — the deterministic demo, a rehearsal mode, a docs
+// recording — must implement them on top of the commands the run makes, or
+// every agent is refused before it starts:
+//
+//   - `bd version --json` must print an envelope with a non-empty
+//     "version": the check will not install a shim over a binary it cannot
+//     identify;
+//   - `bd --readonly update <id> -s open`, run directly, must fail with
+//     bd's own read-only refusal ([ReadOnlyMessage]'s wording), because
+//     that is the second line of defence D-21 relies on and this check
+//     proves it rather than assuming it.
+//
+// A ready-made shell fragment answering both (plus `bd ping --json` for
+// D-13's health check) is testutil.BDVerifyPrologue, and
+// scripts/demo/demo.sh's bd wrapper is held to the same requirement by
+// TestTheDemosBDStandInSatisfiesTheShimSelfCheck. The one way out is
+// [ShimOptions.SkipVerify], which internal/cli deliberately keeps in an
+// unexported variable so nothing outside the command layer's own tests can
+// turn the guard's self-check off.
 func (s Shim) Verify(ctx context.Context, dir string) error {
 	res, err := s.verifyVersion(ctx, dir)
 	if err != nil {

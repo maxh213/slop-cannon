@@ -27,11 +27,13 @@ import (
 //
 //   - `sc status` folds the run log at <run-dir>/events.jsonl together with
 //     <run-dir>/state.json into the state of a run: phase, per-state bead
-//     counts, live agents and the last events. It needs neither bd nor git
-//     nor the process that wrote them, so it works on a run that crashed —
-//     and says so, by asking the run lock whether anybody is still running
-//     it ([orchestrator.ProbeLiveness]) rather than believing a `running`
-//     that nothing got the chance to overwrite.
+//     counts, what it delivered, live agents and the last events. It needs
+//     neither bd nor git nor the process that wrote them, so it works on a
+//     run that crashed — and says so, by asking the run lock whether
+//     anybody is still running it ([orchestrator.InspectLock], the same
+//     P9-04 verdict `sc run` acts on, so the two commands cannot contradict
+//     each other about one file) rather than believing a `running` that
+//     nothing got the chance to overwrite.
 //   - `sc status <bead-id>` asks bd for the bead and prints
 //     [beads.FormatTimeline] over its structured messages (P6-15), rather
 //     than re-deriving a history the messages already record (D-06).
@@ -66,7 +68,9 @@ const statusLong = `Report what a run did and is doing.
 
 Without arguments it describes the most recent run recorded for the
 repository (--run ID picks another): its phase, how its beads are spread
-across the workflow states, which agents are live, and the last few events.
+across the workflow states, what it delivered — pull requests, merges, and
+the reviews it posted on pull requests it did not open — which agents are
+live, and the last few events.
 Everything comes from the run directory — state.json and events.jsonl — so
 it also works after a crash and while another process holds the run.
 
@@ -145,10 +149,16 @@ type StatusReport struct {
 	// Summary is the fold of <run-dir>/events.jsonl, absent when there is
 	// no run log.
 	Summary *orchestrator.RunSummary `json:"summary,omitempty"`
-	// Liveness is what the repository's run lock says about this run:
-	// whether a process is still running it. A run directory alone cannot
-	// tell a live run from a killed one — both say "running".
+	// Liveness is the bare probe of the repository's run lock: is there
+	// one, is it this run's, does its pid exist. A pid that exists is not
+	// the same thing as the run being alive, so read [StatusReport.Lock]
+	// (or [StatusReport.Running]) for the verdict and this only for the raw
+	// answer the probe gave.
 	Liveness orchestrator.Liveness `json:"liveness"`
+	// Lock is the same lock read through the P9-04 policy, which tells a
+	// lock held on another machine, and one whose pid has been recycled
+	// into an unrelated program, from a genuinely live one (P9-15).
+	Lock StatusLock `json:"lock"`
 	// Recent are the last events as one-line text, oldest first
 	// (tui.FormatHeadless, scrubbed); events are an interface, so JSON gets
 	// the rendered lines rather than half-decoded objects.
@@ -156,6 +166,9 @@ type StatusReport struct {
 	// Live is what the reconciliation against bd found (P8-15), absent
 	// when it did not run: --live=false, no beads database, or no bd.
 	Live *StatusLive `json:"live,omitempty"`
+	// Reviews is the run's external pull request review progress (D-11,
+	// P8-24), absent for a run that reviewed none.
+	Reviews *StatusReviews `json:"reviews,omitempty"`
 	// Notes explain anything missing or unreadable.
 	Notes []string `json:"notes,omitempty"`
 }
@@ -178,6 +191,35 @@ type StatusLive struct {
 	Added []StatusLiveChange `json:"added,omitempty"`
 }
 
+// StatusReviews is how far the run has got with the pull requests it did
+// not open (D-11, P8-24). A run whose whole job is reviewing somebody
+// else's pull requests reported nothing about it at all: the count is in
+// the run log and the outcome is in bd, and `sc status` read neither.
+//
+// [StatusReviews.PullRequests] comes from the run log — one
+// [events.PROpened] with External set per pull request the run adopted — so
+// it is there whether or not bd can be reached. Everything else is what bd
+// holds for the review beads themselves, so it is present only when the
+// P8-15 reconciliation ran.
+type StatusReviews struct {
+	// PullRequests is how many external pull requests the run adopted for
+	// review, folded from the run log.
+	PullRequests int `json:"pull_requests"`
+	// Beads is how many review beads bd holds for this run.
+	Beads int `json:"review_beads,omitempty"`
+	// Open is how many of them are still being reviewed.
+	Open int `json:"in_review,omitempty"`
+	// Posted is how many consolidated reviews have gone out: review beads
+	// bd closed with the reason [statusReviewPosted] names.
+	Posted int `json:"posted,omitempty"`
+	// Settled is how many review beads were closed without a review, which
+	// is what happens to one whose pull request went away (P8-11).
+	Settled int `json:"settled_without_review,omitempty"`
+	// NeedsHuman is how many were handed to a person, which is where a
+	// review that could not be posted ends up.
+	NeedsHuman int `json:"needs_human,omitempty"`
+}
+
 // StatusLiveChange is one bead the reconciliation corrected.
 type StatusLiveChange struct {
 	// Bead is the bead.
@@ -194,6 +236,17 @@ type StatusLiveChange struct {
 	// Foreign marks a status the cannon did not register, mapped by its
 	// category rather than by name.
 	Foreign bool `json:"foreign,omitempty"`
+	// OutOfReach marks a bead the run may not act on any more: bd holds it
+	// in a status the cannon never registered, or in one of bd's read-only
+	// built-ins. It is [orchestrator.ResolveBeadStatus]'s verdict, the same
+	// P6-12 guard the gate poller and the state machine apply, so `sc
+	// status` cannot disagree with what the run will actually do (P8-19).
+	OutOfReach bool `json:"out_of_reach,omitempty"`
+	// Claimable marks a bead the run can take up again: bd holds it in a
+	// status [orchestrator.TransitionStatus] accepts a claim from. It is
+	// how a report says that a bead a person reopened will be worked on,
+	// rather than leaving the reader to know the D-07 table.
+	Claimable bool `json:"claimable,omitempty"`
 }
 
 // Phase returns the run's lifecycle phase: state.json's when it exists,
@@ -209,15 +262,111 @@ func (r *StatusReport) Phase() orchestrator.Phase {
 	}
 }
 
-// Running reports whether a live process still holds this run's lock.
-func (r *StatusReport) Running() bool { return r.Liveness.Running() }
+// Running reports whether a live process still holds this run's lock. A
+// recycled pid does not count as one, which is the whole point of P9-15:
+// the lock's own verdict decides, not the bare existence of a pid.
+func (r *StatusReport) Running() bool {
+	return r.Lock.Mine && (r.Lock.State == statusLockLive || r.Lock.State == statusLockMine)
+}
+
+// Unknowable reports the one case `sc status` cannot decide from here: this
+// run's lock was written on another machine, whose processes this one
+// cannot probe. Such a run is neither running nor crashed as far as this
+// report is concerned, and saying either would be a guess.
+func (r *StatusReport) Unknowable() bool { return r.Lock.Elsewhere() && r.Lock.Mine }
 
 // Crashed reports a run whose last recorded phase is still an active one
 // but which nothing is running any more: it was killed, its machine went
 // away, or it died without writing a finish. Nothing in the run directory
 // can say this on its own, which is why the lock is probed.
 func (r *StatusReport) Crashed() bool {
-	return r.Found && r.Phase().Live() && !r.Running()
+	return r.Found && r.Phase().Live() && !r.Running() && !r.Unknowable()
+}
+
+// The six verdicts [orchestrator.InspectLock] can reach, as
+// [orchestrator.LockState.String] spells them. They are the JSON values of
+// [StatusLock.State]; TestStatusLockStateNamesMatchTheProbe pins them
+// against the probe's own names, so a state renamed there cannot leave this
+// file quietly reporting the wrong one.
+const (
+	statusLockFree      = "free"
+	statusLockMine      = "mine"
+	statusLockLive      = "live"
+	statusLockStale     = "stale"
+	statusLockElsewhere = "elsewhere"
+	statusLockCorrupt   = "corrupt"
+)
+
+// StatusLock is what the repository's run lock says, read through the P9-04
+// policy (P9-15).
+//
+// [orchestrator.Liveness] answers three questions — is there a lock, is it
+// this run's, does its pid exist — and a pid that exists is not the same
+// thing as the run being alive: a killed run whose pid the kernel has since
+// handed to an unrelated program answers a bare liveness probe just as
+// loudly. That is why `sc status` used to say "process running" about a run
+// `sc run` would reap as stale, and the two contradicted each other.
+// [orchestrator.InspectLock] is the one implementation of the rule both
+// commands now read.
+type StatusLock struct {
+	// State is the verdict: free, mine, live, stale, elsewhere or corrupt.
+	State string `json:"state"`
+	// Path is the lock file, <state-dir>/run.lock (D-23).
+	Path string `json:"path,omitempty"`
+	// Run, PID, Host and TakenAt are what the lock records; their zero
+	// values when there is no readable lock.
+	Run     domain.RunID `json:"run,omitempty"`
+	PID     int          `json:"pid,omitempty"`
+	Host    string       `json:"host,omitempty"`
+	TakenAt time.Time    `json:"taken_at,omitempty"`
+	// Mine is true when the lock names the run this report is about.
+	Mine bool `json:"mine,omitempty"`
+	// PIDReused marks the stale verdict a recycled pid earns: the pid is
+	// alive, but the process behind it is not the one that took the lock,
+	// so the run is gone however loudly the pid answers.
+	PIDReused bool `json:"pid_reused,omitempty"`
+	// Error is why a corrupt lock could not be read.
+	Error string `json:"error,omitempty"`
+}
+
+// Held reports whether there is a lock file that could be read at all. A
+// corrupt one is not held: nothing can be said about who owns it.
+func (l StatusLock) Held() bool { return l.PID > 0 }
+
+// Elsewhere reports the one verdict `sc status` cannot resolve from this
+// machine: the lock was written on another host, whose processes cannot be
+// probed, so a run that looks dead here may be firing there.
+func (l StatusLock) Elsewhere() bool { return l.State == statusLockElsewhere }
+
+// statusLockOptions tunes the lock probe. The zero value is production —
+// this process, this hostname, the real clock and the real probes — and
+// nothing in it ever writes: `sc status` inspects the lock, it never claims
+// or removes one. Tests set it to reach the verdicts that would otherwise
+// need a second machine or a recycled pid.
+var statusLockOptions orchestrator.LockOptions
+
+// statusProbeLock reads the repository's run lock twice over, for the two
+// halves of one answer: [orchestrator.InspectLock] for the P9-04 verdict,
+// and [orchestrator.ProbeLiveness] for the bare "does that pid exist"
+// probe, which is what tells a stale lock whose holder is gone from one
+// whose pid has been recycled into another program. Both read the same
+// file; neither changes it.
+func statusProbeLock(stateDir, runDir string, run domain.RunID) (orchestrator.Liveness, StatusLock) {
+	live := orchestrator.ProbeLiveness(runDir, run)
+	p := orchestrator.InspectLock(stateDir, statusLockOptions)
+	l := StatusLock{
+		State: p.State.String(), Path: p.Path,
+		Run: p.Record.Run, PID: p.Record.PID, Host: p.Record.Host,
+		TakenAt: p.Record.TakenAt,
+		Mine:    p.Record.PID > 0 && (run == "" || p.Record.Run == run),
+	}
+	if p.Err != nil {
+		l.Error = p.Err.Error()
+	}
+	if l.State == statusLockStale && live.Alive {
+		l.PIDReused = true
+	}
+	return live, l
 }
 
 // statusBeadReader is the slice of the beads client `sc status <bead-id>`
@@ -324,7 +473,7 @@ func RunStatus(repo string, runID domain.RunID, recent int) (*StatusReport, erro
 		return rep, nil
 	}
 	rep.Found = true
-	rep.Liveness = orchestrator.ProbeLiveness(rep.Dir, rep.Run)
+	rep.Liveness, rep.Lock = statusProbeLock(config.StateDir(repo), rep.Dir, rep.Run)
 
 	switch st, err := orchestrator.LoadState(rep.Dir); {
 	case err == nil:
@@ -359,6 +508,11 @@ func RunStatus(repo string, runID domain.RunID, recent int) (*StatusReport, erro
 		}
 		// A damaged record is a note, not a missing report.
 		rep.Notes = append(rep.Notes, rep.Summary.Notes...)
+		if rep.Summary.Reviewing > 0 {
+			// D-11: what the run adopted for review is in the log; what came
+			// of it is in bd, and statusReconcile adds that when it can.
+			rep.Reviews = &StatusReviews{PullRequests: rep.Summary.Reviewing}
+		}
 	}
 	if note := statusLockNote(rep); note != "" {
 		// First, because whose lock it is outranks a missing file: the
@@ -384,11 +538,11 @@ func RunStatus(repo string, runID domain.RunID, recent int) (*StatusReport, erro
 // It is computed after the state and the log are folded in because the
 // phase is what decides, and nothing knows the phase until then.
 func statusLockNote(r *StatusReport) string {
-	if !r.Liveness.Held || r.Liveness.Mine || r.Phase().Live() {
+	if !r.Lock.Held() || r.Lock.Mine || r.Phase().Live() {
 		return ""
 	}
 	return fmt.Sprintf("the run lock is held by run %s (pid %d)",
-		r.Liveness.Holder.Run, r.Liveness.Holder.PID)
+		r.Lock.Run, r.Lock.PID)
 }
 
 // RunStatusLive is [RunStatus] followed by the P8-15 reconciliation
@@ -469,18 +623,16 @@ func statusReconcile(ctx context.Context, repo string, rep *StatusReport) {
 			continue
 		}
 		live.Checked++
-		bead, origin := is.SafeBead(statuses)
+		change := statusResolve(is, statuses)
 		if b.Title == "" {
-			b.Title = bead.Title
+			b.Title = change.Title
 		}
-		if bead.State == b.State {
+		if change.To == b.State {
 			continue
 		}
-		live.Changed = append(live.Changed, StatusLiveChange{
-			Bead: b.ID, Title: bead.Title, From: b.State, To: bead.State,
-			Status: is.Status, Foreign: origin == beads.OriginForeign,
-		})
-		b.State = bead.State
+		change.From = b.State
+		live.Changed = append(live.Changed, change)
+		b.State = change.To
 		if !is.UpdatedAt.IsZero() {
 			b.UpdatedAt = is.UpdatedAt
 		}
@@ -492,19 +644,108 @@ func statusReconcile(ctx context.Context, repo string, rep *StatusReport) {
 			continue
 		}
 		live.Checked++
-		bead, origin := is.SafeBead(statuses)
+		change := statusResolve(is, statuses)
 		rep.Summary.Beads = append(rep.Summary.Beads, orchestrator.BeadSummary{
-			ID: is.ID, Title: bead.Title, State: bead.State, UpdatedAt: is.UpdatedAt,
+			ID: is.ID, Title: change.Title, State: change.To, UpdatedAt: is.UpdatedAt,
 		})
-		live.Added = append(live.Added, StatusLiveChange{
-			Bead: is.ID, Title: bead.Title, To: bead.State,
-			Status: is.Status, Foreign: origin == beads.OriginForeign,
-		})
+		live.Added = append(live.Added, change)
 	}
 	if len(live.Changed) > 0 || len(live.Added) > 0 {
 		rep.Summary.Counts = statusCount(rep.Summary.Beads)
 	}
 	rep.Live = live
+	statusMergeReviews(rep, issues, statuses)
+}
+
+// statusResolve reads one bd issue into the change the report prints: the
+// state the cannon may treat it as, and whether it may treat it as anything
+// at all.
+//
+// The resolution is [orchestrator.ResolveBeadStatus] and the claim question
+// is [orchestrator.TransitionStatus] — the same two functions the gate
+// poller and the state machine use — rather than a second reading of bd's
+// vocabulary here (P8-19). That matters because the two readings could
+// disagree: a status of the repository's own making maps onto a workflow
+// state and is still none of the cannon's business (P6-12), and `sc status`
+// must say what the run will do, not what a plausible reading suggests.
+func statusResolve(is beads.Issue, statuses beads.StatusMap) StatusLiveChange {
+	// ResolveBeadStatus answers with beads.SafeState's state whether or not
+	// it refuses the bead, so the report can always name the state.
+	state, err := orchestrator.ResolveBeadStatus(is.Status, statuses)
+	c := StatusLiveChange{
+		// The title is a person's or a model's prose, read back out of a
+		// database sc does not own, so it is normalised the way every other
+		// bead read out of bd is (P3-21) rather than only where it happens
+		// to be printed.
+		Bead: is.ID, Title: domain.SanitizeLine(is.Title), To: state, Status: is.Status,
+		Foreign:    errors.Is(err, orchestrator.ErrForeignStatus),
+		OutOfReach: err != nil,
+	}
+	if err == nil {
+		_, claimErr := orchestrator.TransitionStatus(is.Status, statuses, orchestrator.BeadEventClaimed)
+		c.Claimable = claimErr == nil
+	}
+	return c
+}
+
+// statusMergeReviews folds the external pull request review beads bd holds
+// into the report's review progress (P8-24).
+func statusMergeReviews(rep *StatusReport, issues []beads.Issue, statuses beads.StatusMap) {
+	rv := statusReviewProgress(issues, statuses)
+	if rv == nil {
+		return
+	}
+	if rep.Reviews != nil {
+		rv.PullRequests = rep.Reviews.PullRequests
+	}
+	if rv.Beads > rv.PullRequests {
+		// bd knows review beads the run log never mentioned: a resumed run
+		// adopting the beads an earlier one raised, or a log that was
+		// pruned. The pull requests are real either way.
+		rv.PullRequests = rv.Beads
+	}
+	rep.Reviews = rv
+}
+
+// statusReviewPosted is the phrase [orchestrator.PRReview] writes into a
+// review bead's close reason when the consolidated review has gone out
+// ("reviewed pull request #12: APPROVE …"). It is the only durable record
+// that a review was posted: no event carries it and nothing survives the
+// process that counted it, so a run read back later has bd's word or
+// nothing. A review bead closed for any other reason is counted as settled
+// without a review rather than as one that went out, so a reworded reason
+// costs the report detail and never makes it claim a review that never
+// happened.
+const statusReviewPosted = "reviewed pull request #"
+
+// statusReviewProgress counts the run's review beads (D-11) as bd holds
+// them: how many pull requests are still being reviewed, how many reviews
+// have gone out, and how many beads were settled without one. It returns
+// nil when the run has no review beads at all, so an ordinary run's report
+// is the one it always was.
+func statusReviewProgress(issues []beads.Issue, statuses beads.StatusMap) *StatusReviews {
+	rv := &StatusReviews{}
+	for _, is := range issues {
+		if !is.IsExternalPR() {
+			continue
+		}
+		rv.Beads++
+		state, _ := orchestrator.ResolveBeadStatus(is.Status, statuses)
+		switch {
+		case state == domain.BeadStateNeedsHuman || state == domain.BeadStateFailed:
+			rv.NeedsHuman++
+		case state != domain.BeadStateClosed:
+			rv.Open++
+		case strings.HasPrefix(strings.TrimSpace(is.CloseReason), statusReviewPosted):
+			rv.Posted++
+		default:
+			rv.Settled++
+		}
+	}
+	if rv.Beads == 0 {
+		return nil
+	}
+	return rv
 }
 
 // statusCount recounts the per-state totals after a reconciliation, the way
@@ -536,6 +777,8 @@ func WriteStatus(w io.Writer, r *StatusReport) error {
 	statusHeader(&b, r)
 	statusVitalsSection(&b, r)
 	statusBeadsSection(&b, r)
+	statusDeliverySection(&b, r)
+	statusReviewsSection(&b, r)
 	statusAgentsSection(&b, r)
 	statusEventsSection(&b, r)
 	for _, n := range r.Notes {
@@ -666,24 +909,47 @@ func statusPhaseText(r *StatusReport) string {
 // is nothing worth saying: a finished run releases its lock, and that is
 // not news. An active phase always gets a line, because "who is running
 // this" is the first thing a reader wants after a crash.
+//
+// It says which of the six P9-04 verdicts the lock earned (P9-15), because
+// they are not the same news at all: a lock held on another machine may be
+// a run that is still firing, a lock whose pid has been recycled into an
+// unrelated program is a run that is definitely gone — and reporting the
+// second as "process running", which a bare liveness probe does, told the
+// user the opposite of what `sc run` would say about the same file.
 func statusProcessText(r *StatusReport) string {
-	l := r.Liveness
+	l := r.Lock
 	switch {
 	case r.Running():
-		who := fmt.Sprintf("pid %d", l.Holder.PID)
-		if l.Holder.Host != "" {
-			who += " on " + l.Holder.Host
+		who := fmt.Sprintf("pid %d", l.PID)
+		if l.Host != "" {
+			who += " on " + l.Host
 		}
 		return who + " holds the run lock"
 	case !r.Phase().Live():
 		return "" // a run that ended owes no explanation for releasing it
-	case l.Held && !l.Mine:
-		return fmt.Sprintf("none; the run lock is held by run %s (pid %d)", l.Holder.Run, l.Holder.PID)
-	case l.Held:
-		return fmt.Sprintf("none; pid %d took the run lock and is gone", l.Holder.PID)
+	case r.Unknowable():
+		return fmt.Sprintf("pid %d on %s holds the run lock; this machine cannot tell whether it is still alive",
+			l.PID, statusLockHost(l.Host))
+	case l.Held() && !l.Mine:
+		return fmt.Sprintf("none; the run lock is held by run %s (pid %d)", l.Run, l.PID)
+	case l.State == statusLockCorrupt:
+		return fmt.Sprintf("none; the run lock %s cannot be read (%s)", l.Path, statusScrub(l.Error))
+	case l.PIDReused:
+		return fmt.Sprintf("none; pid %d took the run lock, and that pid belongs to another program now", l.PID)
+	case l.Held():
+		return fmt.Sprintf("none; pid %d took the run lock and is gone", l.PID)
 	default:
 		return "none; nothing holds the run lock"
 	}
+}
+
+// statusLockHost names the machine a lock was written on, which a lock
+// written by an sc that could not read its own hostname does not have.
+func statusLockHost(h string) string {
+	if h == "" {
+		return "an unnamed host"
+	}
+	return statusScrub(h)
 }
 
 // statusFinishReason returns the run's finish reason from whichever source
@@ -802,13 +1068,37 @@ func statusLiveLines(b *strings.Builder, l *StatusLive) {
 		return
 	}
 	for _, c := range l.Changed {
-		fmt.Fprintf(b, "  %s  %s -> %s (changed outside the run%s)\n",
+		fmt.Fprintf(b, "  %s  %s -> %s (changed outside the run%s%s)\n",
 			statusScrub(string(c.Bead)), statusScrub(string(c.From)),
-			statusScrub(string(c.To)), statusForeignGloss(c))
+			statusScrub(string(c.To)), statusForeignGloss(c), statusReachGloss(c, true))
 	}
 	for _, c := range l.Added {
-		fmt.Fprintf(b, "  %s  %s (created outside the run%s)\n",
-			statusScrub(string(c.Bead)), statusScrub(string(c.To)), statusForeignGloss(c))
+		fmt.Fprintf(b, "  %s  %s (created outside the run%s%s)\n",
+			statusScrub(string(c.Bead)), statusScrub(string(c.To)),
+			statusForeignGloss(c), statusReachGloss(c, false))
+	}
+}
+
+// statusReachGloss says what the run will do with a bead somebody else
+// moved (P8-19). Both answers come from the D-07 machine itself, so the
+// report cannot promise something the run would refuse:
+//
+//   - a status the cannon does not own is passed over, however sensible the
+//     state it maps onto (P6-12);
+//   - a bead in a status a claim is valid from will be worked on again,
+//     which is the thing a person who reopened one wants to know.
+//
+// The second is said only about a bead that had left the run's hands, and
+// never about one bd merely holds open: "the run can claim it" under every
+// open bead of every report would be noise, not news.
+func statusReachGloss(c StatusLiveChange, changed bool) string {
+	switch {
+	case c.OutOfReach:
+		return "; the run will pass over it"
+	case changed && c.Claimable && c.From.Terminal():
+		return "; the run can claim it again"
+	default:
+		return ""
 	}
 }
 
@@ -847,6 +1137,48 @@ func statusStateOrder(counts map[domain.BeadState]int) []domain.BeadState {
 		}
 	})
 	return out
+}
+
+// statusDeliverySection writes what the run has delivered: the pull
+// requests it opened and the merges that landed (P8-34).
+//
+// The numbers were folded and persisted all along, and `sc run` prints them
+// when it finishes, but `sc status` printed none of them — so a run read
+// back later said nothing at all about what it had shipped. The row is
+// printed even when both are zero, exactly as the run's own summary line
+// is: "0 pull requests, 0 merges" is the answer to "what did it deliver?",
+// and leaving the row out would look like a report that forgot to ask.
+func statusDeliverySection(b *strings.Builder, r *StatusReport) {
+	if r.Summary == nil {
+		return
+	}
+	fmt.Fprintf(b, "\n%-*s%s, %s\n", statusLabelWidth, "delivery",
+		runPlural(r.Summary.PRs, "pull request"), runPlural(r.Summary.Merges, "merge"))
+}
+
+// statusReviewsSection writes how far the run has got with the pull
+// requests it did not open (D-11, P8-24): how many it is reviewing, and how
+// many reviews have gone out. A run that reviewed none prints nothing.
+func statusReviewsSection(b *strings.Builder, r *StatusReport) {
+	rv := r.Reviews
+	if rv == nil || rv.PullRequests == 0 {
+		return
+	}
+	parts := []string{runPlural(rv.PullRequests, "external pull request")}
+	if rv.Beads > 0 {
+		// bd was reached, so the outcome is known bead by bead.
+		parts = append(parts, runPlural(rv.Posted, "review")+" posted")
+		if rv.Open > 0 {
+			parts = append(parts, fmt.Sprintf("%d still in review", rv.Open))
+		}
+		if rv.Settled > 0 {
+			parts = append(parts, fmt.Sprintf("%d settled without a review", rv.Settled))
+		}
+		if rv.NeedsHuman > 0 {
+			parts = append(parts, fmt.Sprintf("%d waiting for a human", rv.NeedsHuman))
+		}
+	}
+	fmt.Fprintf(b, "\n%-*s%s\n", statusLabelWidth, "reviews", strings.Join(parts, ", "))
 }
 
 // statusAgentsSection writes the agents that were live at the last event:
@@ -980,7 +1312,7 @@ func statusScrubBlock(s string) string { return textsafe.ScrubBlock(s, textsafe.
 // statusBead prints one bead's timeline from beads (P6-15).
 func statusBead(cmd *cobra.Command, repo string, id domain.BeadID, asJSON bool) error {
 	if strings.TrimSpace(string(id)) == "" {
-		return errors.New("status: empty bead id")
+		return errors.New("status: empty bead id; name the bead you want the timeline of, as in sc status sc-3, or leave the argument out for the whole run")
 	}
 	if _, err := os.Stat(filepath.Join(repo, statusBeadsDirName)); errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("%s has no beads database yet (no %s directory); sc creates one on the first run (D-13)",

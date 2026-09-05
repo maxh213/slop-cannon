@@ -52,6 +52,28 @@ const (
 	// DefaultGatePollInterval. It is gitx.DefaultPRPollInterval, which is
 	// an alias of this constant so there is one number.
 	DefaultPRPollInterval = 60 * time.Second
+	// DefaultGraphPollInterval is how often the graph watcher lists the
+	// beads database to publish what changed (P3-07, P1-14). It is the
+	// number beads.DefaultPollInterval carries: two seconds is fast enough
+	// that the TUI graph feels live and slow enough that a listing costing
+	// ~0.2 s of bd time leaves the database free for the run's writes.
+	DefaultGraphPollInterval = 2 * time.Second
+	// DefaultMaxDiffBytes is the largest unified diff handed to a reviewer
+	// in full (200 KiB, P4-04, P1-14). It is the number
+	// gitx.DefaultMaxDiffBytes carries: a bigger diff comes back as a file
+	// list with per-file statistics and the testers open the files
+	// themselves.
+	DefaultMaxDiffBytes = 200 << 10
+	// MinMaxDiffBytes is the smallest max_diff_bytes accepted (1 KiB).
+	// Anything smaller truncates every diff to nothing, and zero would be
+	// read by gitx as "use the default", so both are refused rather than
+	// silently ignored.
+	MinMaxDiffBytes = 1 << 10
+	// DefaultReReviewThreshold is the D-09 default: an earlier approval
+	// stands unless the engineer's diff moved by more than 40% of its
+	// changed lines between rounds, in which case every tester re-reviews.
+	// It is the number gitx.DefaultReReviewThreshold carries.
+	DefaultReReviewThreshold = 0.4
 	// DefaultMaxBeadsPerPlan is how many beads one planning firing may
 	// propose before the plan is rejected outright (P5-02, P1-16). Dropping
 	// the surplus is not an option: it would break the dependencies of the
@@ -61,6 +83,19 @@ const (
 	DefaultMaxReviewRounds = 5
 	// DefaultMaxPushbackRounds is the pushback cap per feedback item (D-08).
 	DefaultMaxPushbackRounds = 2
+	// DefaultMaxConflictRounds bounds how many times one bead may bounce
+	// between the delivery and its engineer for the same delivery (D-10,
+	// P6-06, P1-18). An engineer that keeps leaving the worktree
+	// mid-rebase would otherwise loop forever; after this many rounds the
+	// bead goes to needs_human. Three is the smallest number that still
+	// allows the two rounds a legitimate conflict can need — one for the
+	// conflict itself and one more for the default branch moving again
+	// underneath the first resolution — plus a spare. It is not a review
+	// budget: D-10 keeps conflict rounds out of max_review_rounds and
+	// max_pushback_rounds, and a conflict round fires one engineer and no
+	// testers unless D-09 asks for them. It is the number
+	// orchestrator.DefaultMaxConflictRounds carries.
+	DefaultMaxConflictRounds = 3
 	// DefaultMaxPlanRejections is how many plans in a row the planning
 	// validator may reject before the run gives up on that round of
 	// planning (P6-19, P1-19). One rejection has already cost two plans:
@@ -145,10 +180,17 @@ func (d *Duration) UnmarshalText(b []byte) error {
 	s := strings.TrimSpace(string(b))
 	td, err := time.ParseDuration(s)
 	if err != nil {
-		return fmt.Errorf("invalid duration %q (use a Go duration such as \"10m\" or \"1h30m\")", s)
+		return errors.New(invalidDurationMsg(s))
 	}
 	d.d = td
 	return nil
+}
+
+// invalidDurationMsg is the one wording for a value that is not a Go
+// duration, shared by [Duration.UnmarshalText] and the loader's
+// position lookup for values TOML never offered as text (P1-13).
+func invalidDurationMsg(value string) string {
+	return fmt.Sprintf("invalid duration %q (use a Go duration such as %q or %q)", value, "10m", "1h30m")
 }
 
 // Cartridge is one configured LLM CLI subscription ([cartridges.<name>]).
@@ -182,6 +224,7 @@ type RoleConfig struct {
 type LimitsFile struct {
 	MaxReviewRounds   *int      `toml:"max_review_rounds,omitempty"`
 	MaxPushbackRounds *int      `toml:"max_pushback_rounds,omitempty"`
+	MaxConflictRounds *int      `toml:"max_conflict_rounds,omitempty"`
 	AgentTimeout      *Duration `toml:"agent_timeout,omitempty"`
 	MaxTokens         *int64    `toml:"max_tokens,omitempty"`
 	MaxCostUSD        *float64  `toml:"max_cost_usd,omitempty"`
@@ -223,6 +266,15 @@ type File struct {
 	// PRPollInterval is how often GitHub is asked for external pull
 	// requests to review (D-11, P8-04).
 	PRPollInterval *Duration `toml:"pr_poll_interval,omitempty"`
+	// GraphPollInterval is how often the graph watcher lists the beads
+	// database (P3-07, P1-14).
+	GraphPollInterval *Duration `toml:"graph_poll_interval,omitempty"`
+	// MaxDiffBytes caps the unified diff a reviewer is shown in full
+	// (P4-04, P1-14).
+	MaxDiffBytes *int `toml:"max_diff_bytes,omitempty"`
+	// ReReviewThreshold is the D-09 fraction of changed lines above which
+	// every tester re-reviews instead of only those who did not approve.
+	ReReviewThreshold *float64 `toml:"re_review_threshold,omitempty"`
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02).
 	MaxBeadsPerPlan *int `toml:"max_beads_per_plan,omitempty"`
 	// Limits holds the feedback-loop and budget limits (D-08, D-18).
@@ -249,6 +301,12 @@ type Limits struct {
 	MaxReviewRounds int `json:"max_review_rounds"`
 	// MaxPushbackRounds caps pushback exchanges per item before arbitration (D-08).
 	MaxPushbackRounds int `json:"max_pushback_rounds"`
+	// MaxConflictRounds caps how many times one delivery may send a bead
+	// back to its engineer to resolve a merge conflict before it is parked
+	// in needs_human (D-10, P6-06). Conflict rounds are deliberately
+	// outside MaxReviewRounds and MaxPushbackRounds, so this is the only
+	// thing bounding them.
+	MaxConflictRounds int `json:"max_conflict_rounds"`
 	// AgentTimeout bounds one agent session.
 	AgentTimeout Duration `json:"agent_timeout"`
 	// MaxTokens is an opt-in token budget; 0 means unlimited (D-18).
@@ -300,6 +358,19 @@ type Config struct {
 	// up, and how quickly one that is merged or closed while a review is
 	// in flight settles its review bead (P8-11).
 	PRPollInterval Duration `json:"pr_poll_interval"`
+	// GraphPollInterval is how often the graph watcher lists the beads
+	// database so the TUI and the scheduler see what changed (P3-07). Pass
+	// it as beads.WatcherOptions.Interval.
+	GraphPollInterval Duration `json:"graph_poll_interval"`
+	// MaxDiffBytes is the largest unified diff a reviewer is handed in
+	// full; a bigger change set comes back as a file list with per-file
+	// statistics (P4-04). Pass it as gitx.WithMaxDiffBytes.
+	MaxDiffBytes int `json:"max_diff_bytes"`
+	// ReReviewThreshold is the D-09 fraction of changed lines above which
+	// an earlier approval no longer stands and every tester re-reviews.
+	// Pass it to gitx.ChangeRatio.Exceeds (through the orchestrator's
+	// ReReviewThreshold options).
+	ReReviewThreshold float64 `json:"re_review_threshold"`
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02);
 	// always at least 1.
 	MaxBeadsPerPlan int `json:"max_beads_per_plan"`
@@ -322,10 +393,14 @@ func Defaults() Config {
 		IdleReplanInterval: NewDuration(DefaultIdleReplanInterval),
 		GatePollInterval:   NewDuration(DefaultGatePollInterval),
 		PRPollInterval:     NewDuration(DefaultPRPollInterval),
+		GraphPollInterval:  NewDuration(DefaultGraphPollInterval),
+		MaxDiffBytes:       DefaultMaxDiffBytes,
+		ReReviewThreshold:  DefaultReReviewThreshold,
 		MaxBeadsPerPlan:    DefaultMaxBeadsPerPlan,
 		Limits: Limits{
 			MaxReviewRounds:   DefaultMaxReviewRounds,
 			MaxPushbackRounds: DefaultMaxPushbackRounds,
+			MaxConflictRounds: DefaultMaxConflictRounds,
 			AgentTimeout:      NewDuration(DefaultAgentTimeout),
 			MaxPlanRejections: DefaultMaxPlanRejections,
 			MaxPlanFailures:   DefaultMaxPlanFailures,

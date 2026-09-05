@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,6 +64,11 @@ agent id it prints that agent's log; with a bead id it prints the log of
 every agent that has worked on that bead, oldest agent first, each under a
 header naming it.
 
+With --follow it keeps printing as the logs grow, and waits for a log that
+is not there yet: follow a bead the moment the run adopts it and the output
+starts when its first agent spawns. Without --follow a bead that has no
+agent log yet is an error, because a one-shot read has nothing to print.
+
 Logs are read straight from the run directory, so this works on a finished
 run, on a crashed one, and while another sc process is still firing —
 nothing here writes anything. --run picks a run other than the most recent
@@ -87,7 +93,7 @@ func newLogsCommand() *cobra.Command {
 	f := cmd.Flags()
 	f.String(FlagLogsRun, "", "read run `ID` instead of the most recent one")
 	f.IntP(FlagLogsLines, "n", DefaultLogLines, "print the last `N` lines of each log (0 for all of it)")
-	f.BoolP(FlagLogsFollow, "f", false, "keep printing as the logs grow (until interrupted)")
+	f.BoolP(FlagLogsFollow, "f", false, "keep printing as the logs grow, waiting for a log that is not there yet (until interrupted)")
 	return cmd
 }
 
@@ -168,7 +174,18 @@ func runLogs(cmd *cobra.Command, args []string) error {
 	}
 	srcs, err := logsResolve(dir, arg)
 	if err != nil {
-		return err
+		if !follow {
+			return err
+		}
+		// P8-38: --follow is a subscription, not a read. A bead whose first
+		// agent has not spawned yet — the normal case when a user starts
+		// following a bead the moment the run adopts it — has no log to
+		// resolve, and failing there made the user retry by hand for
+		// something the follow loop already handles for every later agent.
+		// The one-shot form still fails fast: there is nothing to wait for
+		// when the command is going to return immediately.
+		fmt.Fprintln(cmd.ErrOrStderr(), logsWaitingNotice(arg, err))
+		srcs = nil
 	}
 
 	out := cmd.OutOrStdout()
@@ -362,6 +379,20 @@ func logsUnknown(runDir, arg string, names []string) error {
 	}
 	return fmt.Errorf("no log for %q in %s; this run has: %s%s",
 		arg, runDir, strings.Join(shown, ", "), more)
+}
+
+// logsWaitingNotice is the line `--follow` prints when there is nothing to
+// tail yet (P8-38). It says what is being waited for and, through the
+// resolver's own error, what the run does have — so a user who mistyped a
+// bead id sees the list of agent ids rather than an empty screen that never
+// fills. It goes to stderr, so `sc logs <bead> --follow | grep …` still
+// pipes only log lines.
+func logsWaitingNotice(arg string, err error) string {
+	what := logging.RunLogName
+	if arg != "" {
+		what = "the first agent log of " + strconv.Quote(arg)
+	}
+	return fmt.Sprintf("waiting for %s: %v", what, err)
 }
 
 // logsMentions reports whether the agent id name refers to id: name is id,

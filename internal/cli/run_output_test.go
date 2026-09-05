@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -218,7 +219,10 @@ func TestRunHelpersStopWhatTheyStarted(t *testing.T) {
 		<-ctx.Done()
 		return ctx.Err()
 	}
-	h := startRunHelpers(context.Background(), task, task, task)
+	h := startRunHelpers(context.Background(),
+		runHelper{Name: "the gate poller", Run: task},
+		runHelper{Name: "the conductor", Run: task},
+		runHelper{Name: "the external pull request reviewer", Run: task})
 	require.True(t, h.stop(5*time.Second), "three well-behaved helpers stopped")
 	require.EqualValues(t, 3, ran.Load())
 	require.True(t, h.stop(5*time.Second), "stop is idempotent; the run calls it twice")
@@ -230,12 +234,12 @@ func TestRunHelpersStopWhatTheyStarted(t *testing.T) {
 func TestRunHelpersSurviveTheirCallersContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	going, gone := make(chan struct{}), make(chan struct{})
-	h := startRunHelpers(ctx, func(hctx context.Context) error {
+	h := startRunHelpers(ctx, runHelper{Name: "the conductor", Run: func(hctx context.Context) error {
 		close(going)
 		<-hctx.Done()
 		close(gone)
 		return nil
-	})
+	}})
 	<-going
 	cancel()
 	select {
@@ -253,10 +257,10 @@ func TestRunHelpersSurviveTheirCallersContext(t *testing.T) {
 func TestRunHelpersGiveUpOnAWedgedHelper(t *testing.T) {
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
-	h := startRunHelpers(context.Background(), func(context.Context) error {
+	h := startRunHelpers(context.Background(), runHelper{Name: "the conductor", Run: func(context.Context) error {
 		<-release // ignores the cancellation, exactly like a wedged subprocess
 		return nil
-	})
+	}})
 
 	start := time.Now()
 	require.False(t, h.stop(50*time.Millisecond), "the wedged helper was reported as stopped")
@@ -322,4 +326,47 @@ func writeSummaryLog(t *testing.T, dir string, evs ...events.Event) {
 		b.WriteByte('\n')
 	}
 	require.NoError(t, os.WriteFile(orchestrator.EventLogPath(dir), b.Bytes(), 0o600))
+}
+
+// ---------------------------------------------------------------------------
+// P8-35: the warning names the helper that would not stop
+// ---------------------------------------------------------------------------
+
+// TestRunHelpersNameTheOnesThatWouldNotStop is P8-35's Done-when: with one
+// helper deliberately wedged, the warning says which of the three it was —
+// the tasks used to be anonymous functions, so the line could only say "a
+// helper".
+func TestRunHelpersNameTheOnesThatWouldNotStop(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	polite := func(ctx context.Context) error { <-ctx.Done(); return nil }
+
+	h := startRunHelpers(context.Background(),
+		runHelper{Name: "the gate poller", Run: polite},
+		runHelper{Name: "the conductor", Run: func(context.Context) error {
+			<-release // wedged inside bd, git or gh, exactly like the real thing
+			return nil
+		}},
+		runHelper{Name: "the external pull request reviewer", Run: polite})
+
+	var buf bytes.Buffer
+	h.stopOrWarn(slog.New(slog.NewTextHandler(&buf, nil)), 50*time.Millisecond)
+
+	line := buf.String()
+	require.Contains(t, line, "a helper did not stop; ending the run without it")
+	require.Contains(t, line, "the conductor", "the warning must name the wedged helper")
+	require.NotContains(t, line, "the gate poller", "a helper that stopped is not reported")
+	require.NotContains(t, line, "the external pull request reviewer")
+	require.Equal(t, []string{"the conductor"}, h.outstanding())
+}
+
+// TestRunHelpersSayNothingWhenTheyAllStop: the P8-35 line is raised only
+// when a helper is actually outstanding.
+func TestRunHelpersSayNothingWhenTheyAllStop(t *testing.T) {
+	h := startRunHelpers(context.Background(),
+		runHelper{Name: "the conductor", Run: func(ctx context.Context) error { <-ctx.Done(); return nil }})
+	var buf bytes.Buffer
+	h.stopOrWarn(slog.New(slog.NewTextHandler(&buf, nil)), 5*time.Second)
+	require.Empty(t, buf.String())
+	require.Empty(t, h.outstanding())
 }

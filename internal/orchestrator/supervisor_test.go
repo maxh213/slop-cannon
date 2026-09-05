@@ -24,6 +24,7 @@ import (
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
+	"slop-cannon/internal/testutil"
 )
 
 // Tests for the agent supervisor (P6-07) and the tasks folded into it: the
@@ -643,7 +644,7 @@ func TestSupervisorRenewsTheLeaseWhileTheAgentRuns(t *testing.T) {
 	ticker.Tick()
 	select {
 	case <-leases.seen:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testutil.Patience(2 * time.Second)):
 		t.Fatal("the lease was never renewed")
 	}
 	require.NoError(t, <-done)
@@ -674,7 +675,7 @@ func TestSupervisorReportsALostLease(t *testing.T) {
 	ticker.Tick()
 	select {
 	case <-leases.seen:
-	case <-time.After(2 * time.Second):
+	case <-time.After(testutil.Patience(2 * time.Second)):
 		t.Fatal("the lease renewal never ran")
 	}
 	require.NoError(t, <-done)
@@ -701,14 +702,14 @@ func TestSupervisorStopAgentsKillsAndRefusesMore(t *testing.T) {
 		_, _, err := FireAgent[domain.Verdict](context.Background(), sup, supTesterFiring("tester-qa-bd-12-r1", "bd-12", wt))
 		done <- err
 	}()
-	require.Eventually(t, func() bool { return len(sup.Live()) == 1 }, 2*time.Second, time.Millisecond)
+	require.Eventually(t, func() bool { return len(sup.Live()) == 1 }, testutil.Patience(2*time.Second), time.Millisecond)
 
 	require.NoError(t, sup.StopAgents(context.Background(), 0))
 	select {
 	case err := <-done:
 		require.Error(t, err)
 		require.ErrorIs(t, err, cartridge.ErrKilled)
-	case <-time.After(2 * time.Second):
+	case <-time.After(testutil.Patience(2 * time.Second)):
 		t.Fatal("the killed firing never returned")
 	}
 
@@ -1586,7 +1587,7 @@ func TestSupervisorStartsNoSessionAfterStopAgentsHasReturned(t *testing.T) {
 	case err := <-done:
 		require.Error(t, err)
 		require.ErrorIs(t, err, ErrSupervisorStopped)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.Patience(5 * time.Second)):
 		t.Fatal("the firing never returned")
 	}
 

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -56,6 +57,12 @@ const killSlack = 5 * time.Second
 // run republishes them. One cartridge output line is one event (P5-08), so
 // this is a few seconds of a chatty agent.
 const DefaultAgentBusBuffer = 8192
+
+// StateFlushDelay is how long state.json may lag the run's own memory when
+// the only thing that moved is the live agent list (P9-11). It is
+// wall-clock rather than the run's clock on purpose: it bounds a
+// background write, not the run's behaviour.
+const StateFlushDelay = 50 * time.Millisecond
 
 // agentBusDrain bounds how long the finish waits for the forwarding bus to
 // be drained. It is wall-clock rather than the run's clock on purpose: it
@@ -189,6 +196,21 @@ type ResumeHandler interface {
 	ConflictRound(ctx context.Context, e gitx.ResumeEntry) error
 }
 
+// ResumeDeliveryQueue is the queue a run routes its resume hand-offs
+// through (P6-55). [*Conductor] implements it, and gives itself to the run
+// when it is built, so an assembled run's resume-time deliveries are
+// serialised against its ordinary ones and retried like them; a run built
+// without one calls its [ResumeHandler] directly, which is what every
+// resume did before P6-55.
+type ResumeDeliveryQueue interface {
+	// QueueResume runs one resume hand-off through the delivery queue.
+	// bead is what the hand-off is about and what names it in the log,
+	// and it returns when the hand-off's first attempt has finished — a
+	// retryable failure is retried behind the caller rather than holding
+	// [Run.Start] open for the whole backoff.
+	QueueResume(ctx context.Context, bead domain.Bead, what string, fn func(context.Context) error) error
+}
+
 // BeadSource lists the run's beads with their current states. The run asks
 // for them on resume (to reattach worktrees) and at finish (to decide which
 // worktrees to prune). The beads client's run-scoped listing provides it.
@@ -291,11 +313,18 @@ type Run struct {
 	cancelLoop context.CancelFunc
 	lock       *lockFile
 	resumeRes  *gitx.ResumeResult
+	resumeH    ResumeHandler
+	resumeQ    ResumeDeliveryQueue
 	beadSrc    BeadSource
 	vitals     func() RunVitals
 	budget     func() BudgetState
 	agentBus   *events.Bus
 	agentDone  chan struct{}
+	// stateDirty and stateTimer coalesce the state.json writes the live
+	// agent list asks for (P9-11): a dispatch that fires fifty agents
+	// marks the state dirty fifty times and writes the file once.
+	stateDirty bool
+	stateTimer *time.Timer
 	outcome    Outcome
 	err        error
 }
@@ -330,6 +359,7 @@ func New(cfg *config.RunConfig, opts Options) (*Run, error) {
 		bus:       opts.Bus,
 		stopGrace: opts.StopGrace,
 		beadSrc:   opts.Beads,
+		resumeH:   opts.OnResume,
 		abort:     make(chan struct{}),
 		done:      make(chan struct{}),
 	}
@@ -428,6 +458,15 @@ func (r *Run) Log() *slog.Logger { return r.log }
 
 // SetEpic records the run's epic bead once the first plan lands (D-22) and
 // persists it, so a resumed run finds its own beads again.
+//
+// It writes only the run's own copy of [domain.Run] (State.Run, the one
+// state.json is written from). Until P8-23 it also wrote the epic back
+// through r.cfg — the very *config.RunConfig the command layer resolved and
+// still holds — so every reader of rc.Run after [Run.Start] raced with the
+// planner, and `sc run` had to snapshot domain.Run before starting to keep
+// its renderers' headers off that race. Nothing needs the write: the epic
+// is read back through [Run.Epic], [Run.State] and state.json, and
+// [RestoreRunConfig] is what puts it into a *config.RunConfig, before New.
 func (r *Run) SetEpic(id domain.BeadID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -435,7 +474,6 @@ func (r *Run) SetEpic(id domain.BeadID) error {
 		return nil
 	}
 	r.st.Run.Epic = id
-	r.cfg.Run.Epic = id
 	return r.persistLocked()
 }
 
@@ -527,11 +565,25 @@ func (r *Run) Warn(source, message string, err error) {
 //
 //	sup, err := NewSupervisor(SupervisorOptions{Bus: run.AgentBus(), …})
 //
-// The forwarding is asynchronous (a subscription is the only way to observe
-// a bus), so an event can be dropped when the buffer is full — under a
-// producer faster than the run log for [DefaultAgentBusBuffer] events. A
-// dropped event reaches neither the counter nor the log, so the two still
-// agree; the count is reported once as a warning when the run ends.
+// The forwarding is asynchronous — a subscription is the only way to
+// observe a bus — and P6-46 is what that used to cost: the one forwarder
+// republished through [Run.Publish], which writes the run log, so a
+// producer faster than the disk filled the subscription's
+// [DefaultAgentBusBuffer] events and everything past that was dropped. It
+// could never desynchronise the counter from the log (a dropped event
+// reaches neither), but it lost agent output, which is the only record of
+// what a model did.
+//
+// The relay is two goroutines rather than one, so the buffer is no longer
+// the bound. [Run.relayAgentBus] does nothing but move events off the
+// subscription into an unbounded queue — an append under a mutex, cheaper
+// per event than the publish that produced it — and [Run.forwardAgentBus]
+// drains that queue through [Run.Publish] at whatever rate the run log
+// manages. A burst is absorbed by memory instead of being thrown away, and
+// the queue is bounded in practice by the finish draining it
+// ([Run.stopAgentBus]). The drop counter is still read and still warned
+// about, because a relay that is descheduled for long enough could in
+// principle miss one and a silent loss is the thing being fixed.
 //
 // Never pass the run's own [Options.Bus] to a producer through this: the
 // forwarder would publish into a bus that feeds it.
@@ -543,23 +595,94 @@ func (r *Run) AgentBus() *events.Bus {
 	}
 	bus := events.NewBus()
 	sub := bus.Subscribe(context.Background(), DefaultAgentBusBuffer)
+	q := newEventQueue()
 	done := make(chan struct{})
 	r.agentBus, r.agentDone = bus, done
-	go r.forwardAgentBus(sub, done)
+	go relayAgentBus(sub, q)
+	go r.forwardAgentBus(sub, q, done)
 	return bus
 }
 
-// forwardAgentBus republishes everything the forwarding bus receives, until
-// the bus is closed and the buffered events have been drained.
-func (r *Run) forwardAgentBus(sub *events.Subscription, done chan struct{}) {
-	defer close(done)
+// relayAgentBus moves everything the forwarding bus receives into q as fast
+// as the subscription yields it, and closes q when the bus is closed. It
+// does no work of its own on purpose: it is the goroutine that must keep up
+// with the producer (P6-46).
+func relayAgentBus(sub *events.Subscription, q *eventQueue) {
+	defer q.close()
 	for ev := range sub.Events() {
+		q.push(ev)
+	}
+}
+
+// forwardAgentBus republishes everything the relay queued, until the queue
+// is closed and drained.
+func (r *Run) forwardAgentBus(sub *events.Subscription, q *eventQueue, done chan struct{}) {
+	defer close(done)
+	for {
+		ev, ok := q.pop()
+		if !ok {
+			break
+		}
 		r.Publish(ev)
 	}
 	if n := sub.Dropped(); n > 0 {
 		r.Warn(SourceRun, fmt.Sprintf(
 			"%d agent event(s) were dropped: the run log could not keep up with the agents' output", n), nil)
 	}
+}
+
+// eventQueue is the unbounded hand-off between the two halves of the agent
+// bus relay (P6-46): the relay pushes, the forwarder pops, and a closed
+// queue still yields everything already in it before pop reports that it is
+// finished.
+type eventQueue struct {
+	mu     sync.Mutex
+	ready  *sync.Cond
+	items  []events.Event
+	closed bool
+}
+
+// newEventQueue returns an empty open queue.
+func newEventQueue() *eventQueue {
+	q := &eventQueue{}
+	q.ready = sync.NewCond(&q.mu)
+	return q
+}
+
+// push appends one event. A push after close is dropped, which cannot
+// happen: only the relay pushes and only the relay closes.
+func (q *eventQueue) push(ev events.Event) {
+	q.mu.Lock()
+	if !q.closed {
+		q.items = append(q.items, ev)
+		q.ready.Signal()
+	}
+	q.mu.Unlock()
+}
+
+// pop returns the oldest event, waiting for one. It reports false only when
+// the queue is closed and empty.
+func (q *eventQueue) pop() (events.Event, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for len(q.items) == 0 && !q.closed {
+		q.ready.Wait()
+	}
+	if len(q.items) == 0 {
+		return nil, false
+	}
+	ev := q.items[0]
+	q.items[0] = nil
+	q.items = q.items[1:]
+	return ev, true
+}
+
+// close ends the queue once everything in it has been popped.
+func (q *eventQueue) close() {
+	q.mu.Lock()
+	q.closed = true
+	q.ready.Broadcast()
+	q.mu.Unlock()
 }
 
 // stopAgentBus closes the forwarding bus and waits for the events already
@@ -607,6 +730,13 @@ func (r *Run) removePlanShim() {
 // it (P6-08). Without it a real run leaves no events.jsonl behind and
 // `sc status` folds nothing. The caller closes the returned log when the
 // run has finished; a nil opts is refused.
+//
+// The live bus goes behind a [StartupReplay] (P9-28), because the assembly
+// this helper exists for starts the run and only then renders it: without
+// the replay every event of the run's first milliseconds — the resume
+// notices, and P9-01's "resumed over its budget" banner among them —
+// reached the run log and never the screen. The log itself is not wrapped:
+// it is a file, and a file is always listening.
 func TeeRunLog(opts *Options, runDir string, bus Publisher) (*EventLog, error) {
 	if opts == nil {
 		return nil, errors.New("orchestrator: TeeRunLog: nil options")
@@ -615,7 +745,7 @@ func TeeRunLog(opts *Options, runDir string, bus Publisher) (*EventLog, error) {
 	if err != nil {
 		return nil, err
 	}
-	opts.Bus = Tee(log, bus)
+	opts.Bus = Tee(log, NewStartupReplay(bus, 0))
 	return log, nil
 }
 
@@ -950,17 +1080,31 @@ func InterruptChannel() (ch <-chan os.Signal, stop func()) {
 // AgentStarted records a live agent in state.json. The scheduler calls it
 // when a subprocess has been spawned, so a resumed run knows what was in
 // flight and so the stop path knows whose lease to release.
+//
+// The write is coalesced rather than synchronous (P9-11). A cold tick fills
+// every slot in one dispatch, and writing the whole state file once per
+// agent — marshalling a list one agent longer each time — made the file
+// two thirds of a fifty-agent dispatch and grew quadratically with the
+// ammo. state.json is a crash-recovery record, not a transaction log, so
+// the run marks itself dirty here and flushes once, at most
+// [StateFlushDelay] later; every lifecycle transition (and
+// [Run.FlushState]) still writes synchronously, so the file a resume reads
+// is never more than that behind the last agent to be spawned. The error
+// is therefore always nil, and a write that fails is logged by
+// [Run.persistLocked] as before.
 func (r *Run) AgentStarted(a domain.Agent) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for i, existing := range r.st.Agents {
 		if existing.ID == a.ID {
 			r.st.Agents[i] = a
-			return r.persistLocked()
+			r.markStateDirtyLocked()
+			return nil
 		}
 	}
 	r.st.Agents = append(r.st.Agents, a)
-	return r.persistLocked()
+	r.markStateDirtyLocked()
+	return nil
 }
 
 // AgentUpdated replaces a recorded agent (a state or pid change). An
@@ -968,6 +1112,7 @@ func (r *Run) AgentStarted(a domain.Agent) error {
 func (r *Run) AgentUpdated(a domain.Agent) error { return r.AgentStarted(a) }
 
 // AgentStopped removes an agent from state.json. Unknown ids are ignored.
+// Like [Run.AgentStarted] the write is coalesced (P9-11).
 func (r *Run) AgentStopped(id domain.AgentID) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -976,9 +1121,50 @@ func (r *Run) AgentStopped(id domain.AgentID) error {
 			continue
 		}
 		r.st.Agents = append(r.st.Agents[:i:i], r.st.Agents[i+1:]...)
-		return r.persistLocked()
+		r.markStateDirtyLocked()
+		return nil
 	}
 	return nil
+}
+
+// FlushState writes state.json now if anything the run coalesced is still
+// only in memory (P9-11). The lifecycle flushes on every transition; this
+// is for a caller — a test, or anything about to read the file behind the
+// run's back — that wants the file to be current this instant.
+func (r *Run) FlushState() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.flushStateLocked()
+}
+
+// markStateDirtyLocked records that state.json is behind r.st and arms the
+// flush that will catch it up. The caller holds r.mu.
+func (r *Run) markStateDirtyLocked() {
+	r.stateDirty = true
+	if r.stateTimer != nil || r.finished {
+		return
+	}
+	r.stateTimer = time.AfterFunc(StateFlushDelay, func() { _ = r.FlushState() })
+}
+
+// flushStateLocked writes the coalesced state, if there is any. The caller
+// holds r.mu.
+func (r *Run) flushStateLocked() error {
+	if !r.stateDirty {
+		r.disarmFlushLocked()
+		return nil
+	}
+	return r.persistLocked()
+}
+
+// disarmFlushLocked cancels a pending flush and marks the state clean. The
+// caller holds r.mu.
+func (r *Run) disarmFlushLocked() {
+	r.stateDirty = false
+	if r.stateTimer != nil {
+		r.stateTimer.Stop()
+		r.stateTimer = nil
+	}
 }
 
 // Agents returns the run's live agents.
@@ -996,14 +1182,83 @@ func (r *Run) ResumeResult() *gitx.ResumeResult {
 	return r.resumeRes
 }
 
-// ResumeHandler returns what the run acts on a resume with ([Options.OnResume]),
-// or nil when it was given none — in which case [Run.reconcileResume]
-// reconciles the worktrees and stops there, leaving a bead whose pull
-// request is open without its gh:pr gate and a mid-rebase worktree without
-// its engineer. Whoever assembles a run is meant to pass one, and this is
-// how a test pins that they did (P9-03).
+// ResumeHandler returns what the run acts on a resume with
+// ([Options.OnResume], or whatever [Run.UseResumeHandler] gave it), or nil
+// when it was given none — in which case [Run.reconcileResume] reconciles
+// the worktrees and stops there, leaving a bead whose pull request is open
+// without its gh:pr gate and a mid-rebase worktree without its engineer.
+// Whoever assembles a run is meant to pass one, and this is how a test pins
+// that they did (P9-03).
 func (r *Run) ResumeHandler() ResumeHandler {
-	return r.opts.OnResume
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.resumeH
+}
+
+// UseResumeHandler gives a run built without one the handler it acts on a
+// resume with (P6-54). [Conductor.Attach] calls it with the delivery
+// handoff it was just given, so a run assembled through the conductor
+// reconciles a resumed pull request and a mid-rebase worktree whether or
+// not the assembler remembered [Options.OnResume] — which for a whole
+// phase nobody did, and nothing failed (P9-03).
+//
+// An explicit [Options.OnResume] wins: this only fills a gap, so an
+// assembly that passes its own handler keeps it, and a caller can tell
+// which it got from [Run.ResumeHandler]. Like [Run.UseBeads] it must be
+// called before [Run.Start], because the resume is acted on inside Start; a
+// started run returns [ErrAlreadyStarted], a finished one [ErrFinished].
+func (r *Run) UseResumeHandler(h ResumeHandler) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch {
+	case r.finished:
+		return ErrFinished
+	case r.started:
+		return ErrAlreadyStarted
+	case r.resumeH != nil:
+		return nil
+	}
+	r.resumeH = h
+	return nil
+}
+
+// UseResumeQueue names the queue the run's resume hand-offs run through
+// (P6-55). Without one they are called on the delivery handoff directly,
+// so two beads reconciled at resume time could rebase and fast-forward the
+// same default branch at the same time as each other and as the
+// conductor's own deliveries, and a retryable failure there was stranded.
+// [NewConductor] passes the conductor, which is the queue P8-14 already
+// serialises everything else through.
+//
+// Like [Run.UseResumeHandler] it must be called before [Run.Start].
+func (r *Run) UseResumeQueue(q ResumeDeliveryQueue) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch {
+	case r.finished:
+		return ErrFinished
+	case r.started:
+		return ErrAlreadyStarted
+	}
+	r.resumeQ = q
+	return nil
+}
+
+// ResumeQueue returns the queue the run's resume hand-offs run through, or
+// nil when it has none.
+func (r *Run) ResumeQueue() ResumeDeliveryQueue {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.resumeQ
+}
+
+// resumeDelivery runs one resume hand-off, through the run's delivery queue
+// when it has one (P6-55) and directly when it has not.
+func (r *Run) resumeDelivery(ctx context.Context, b domain.Bead, what string, fn func(context.Context) error) error {
+	if q := r.ResumeQueue(); q != nil {
+		return q.QueueResume(ctx, b, what, fn)
+	}
+	return fn(ctx)
 }
 
 // reconcileResume is the --resume half of P6-15: gitx reattaches the
@@ -1054,7 +1309,8 @@ func (r *Run) reconcileResume(ctx context.Context) error {
 			})
 		}
 	}
-	if r.opts.OnResume == nil {
+	handler := r.ResumeHandler()
+	if handler == nil {
 		return nil
 	}
 	for _, e := range res.Entries {
@@ -1062,11 +1318,15 @@ func (r *Run) reconcileResume(ctx context.Context) error {
 		case e.Conflict:
 			// A worktree left mid-rebase cannot be delivered; the engineer
 			// resolves it first (D-10), even when a pull request exists.
-			if err := r.opts.OnResume.ConflictRound(ctx, e); err != nil {
+			if err := r.resumeDelivery(ctx, e.Bead, "the conflict round", func(ctx context.Context) error {
+				return handler.ConflictRound(ctx, e)
+			}); err != nil {
 				r.Warn(SourceRun, fmt.Sprintf("resume: %s: could not schedule the conflict round", e.Bead.ID), err)
 			}
 		case e.PRState != "":
-			if err := r.opts.OnResume.RedeliverPR(ctx, e); err != nil {
+			if err := r.resumeDelivery(ctx, e.Bead, "the pull request re-delivery", func(ctx context.Context) error {
+				return handler.RedeliverPR(ctx, e)
+			}); err != nil {
 				r.Warn(SourceRun, fmt.Sprintf("resume: %s: could not re-run the pull request delivery", e.Bead.ID), err)
 			}
 		case e.State == domain.BeadStateDelivering && e.Err == nil:
@@ -1083,7 +1343,9 @@ func (r *Run) reconcileResume(ctx context.Context) error {
 			// lives. An entry gitx could not inspect is left alone: its
 			// branch state is a guess, and delivering from a guess is how
 			// work gets lost.
-			if err := r.opts.OnResume.Redeliver(ctx, e); err != nil {
+			if err := r.resumeDelivery(ctx, e.Bead, "the interrupted delivery", func(ctx context.Context) error {
+				return handler.Redeliver(ctx, e)
+			}); err != nil {
 				r.Warn(SourceRun, fmt.Sprintf("resume: %s: could not finish the interrupted delivery", e.Bead.ID), err)
 			}
 		}
@@ -1405,12 +1667,17 @@ func (r *Run) Close() error {
 	r.stopAgentBus()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// P9-11: whatever the coalesced write still owes the file is owed now;
+	// nothing will arm another flush.
+	_ = r.flushStateLocked()
 	r.releaseLockLocked()
 	return nil
 }
 
-// persistLocked stamps and writes state.json. The caller holds r.mu.
+// persistLocked stamps and writes state.json. The caller holds r.mu. It is
+// the synchronous write: every coalesced one (P9-11) ends here.
 func (r *Run) persistLocked() error {
+	r.disarmFlushLocked()
 	r.st.Version = StateFileVersion
 	r.st.UpdatedAt = r.now()
 	if r.vitals != nil {
@@ -1915,9 +2182,12 @@ type ConductorStats struct {
 	Restored int
 	// Announced counts the beads first seen by the glue (one
 	// events.BeadCreated each) and Graphs the events.GraphChanged
-	// published (P6-32).
+	// published (P6-32). Updates counts the events.BeadUpdated published
+	// instead of a snapshot for a pass in which the graph's shape did not
+	// move (P6-45).
 	Announced int
 	Graphs    int
+	Updates   int
 	// Delivered counts delivery attempts started, Shipped the ones that
 	// merged or opened a pull request.
 	Delivered int
@@ -1975,10 +2245,13 @@ type Conductor struct {
 	frozen   bool
 	seen     map[domain.BeadID]bool
 	snapshot []beads.Issue
-	warned   string
-	stats    ConductorStats
-	dctx     context.Context
-	dcancel  context.CancelFunc
+	// graph is the work beads as the run log last saw them, which is what
+	// the next pass's snapshot is diffed against (P6-45).
+	graph   map[domain.BeadID]domain.Bead
+	warned  string
+	stats   ConductorStats
+	dctx    context.Context
+	dcancel context.CancelFunc
 }
 
 // NewConductor builds the glue. It gives the run its bead source when it
@@ -2009,6 +2282,7 @@ func NewConductor(opts ConductorOptions) (*Conductor, error) {
 		shipped:  map[domain.BeadID]bool{},
 		owed:     map[domain.BeadID]bool{},
 		seen:     map[domain.BeadID]bool{},
+		graph:    map[domain.BeadID]domain.Bead{},
 	}
 	c.idle = sync.NewCond(&c.mu)
 	if c.interval <= 0 {
@@ -2044,8 +2318,19 @@ func NewConductor(opts ConductorOptions) (*Conductor, error) {
 			return nil, err
 		}
 	}
+	// P6-55: the run's resume hand-offs go through this conductor's
+	// delivery queue, so they are serialised against its ordinary
+	// deliveries and retried like them. A run that has already started is
+	// past the only place a resume is acted on, so there is nothing to
+	// wire.
+	if err := c.run.UseResumeQueue(c); err != nil && !errors.Is(err, ErrAlreadyStarted) && !errors.Is(err, ErrFinished) {
+		return nil, err
+	}
 	return c, nil
 }
+
+// *Conductor is the production queue a run's resume hand-offs run through.
+var _ ResumeDeliveryQueue = (*Conductor)(nil)
 
 // ConductorParts are the components the glue drives, for [Conductor.Attach].
 type ConductorParts struct {
@@ -2063,7 +2348,6 @@ type ConductorParts struct {
 // is already attached alone, so Attach can be called more than once.
 func (c *Conductor) Attach(p ConductorParts) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	if p.Feedback != nil {
 		c.feedback = p.Feedback
 	}
@@ -2073,6 +2357,39 @@ func (c *Conductor) Attach(p ConductorParts) {
 	if p.Gates != nil {
 		c.gates = p.Gates
 	}
+	delivery := c.delivery
+	c.mu.Unlock()
+	c.adoptResumeHandler(delivery)
+}
+
+// adoptResumeHandler gives the run a resume handler over the delivery
+// handoff when nothing else has (P6-54).
+//
+// [Options.OnResume] was never filled in the shipped binary for a whole
+// phase, so both P6-15 hand-offs were dead code and no test noticed:
+// --resume reconciled the worktrees, announced the states it had written,
+// and then left a bead whose pull request was open without its gh:pr gate
+// (nothing polls a gate that does not exist, so its dependents never become
+// ready, D-20) and a worktree mid-rebase without its engineer. P9-03 filled
+// the call site in `sc run`; this makes it structural, because the
+// conductor is handed both the run and the deliverer and is therefore the
+// one place that can. An assembly that passes its own handler keeps it
+// ([Run.UseResumeHandler] fills a gap rather than overwriting).
+func (c *Conductor) adoptResumeHandler(delivery ConductorDelivery) {
+	if delivery == nil || c.run.ResumeHandler() != nil {
+		return
+	}
+	// *Deliverer has all three hand-offs, so the production delivery
+	// handoff is already a ResumeHandler; a slice of it that is not says
+	// this assembly has nothing to act on a resume with, which is the run's
+	// own warning to raise, not a failure of Attach.
+	h, ok := delivery.(ResumeHandler)
+	if !ok {
+		return
+	}
+	// The only errors are ErrAlreadyStarted and ErrFinished, and both mean
+	// the resume is already behind this run, so there is nothing to wire.
+	_ = c.run.UseResumeHandler(h)
 }
 
 // RulesWiring is P9-06's half of a conductor's options, as
@@ -2524,6 +2841,27 @@ type deliveryJob struct {
 	bead    domain.Bead
 	attempt int
 	at      time.Time
+	// resume is set when the job is a resume hand-off routed through the
+	// queue (P6-55) rather than an ordinary delivery of an approved bead.
+	resume *resumeDelivery
+}
+
+// resumeDelivery is one resume hand-off waiting its turn in the delivery
+// queue (P6-55): what it is, how to do it, and the answer the resume that
+// asked for it is waiting on.
+type resumeDelivery struct {
+	what string
+	fn   func(context.Context) error
+	once sync.Once
+	// first carries the first attempt's outcome. The resume waits on it
+	// rather than on the whole job, so a failure that will be retried does
+	// not hold Run.Start open for the backoff.
+	first chan error
+}
+
+// answer hands the first attempt's outcome to whoever is waiting, once.
+func (rd *resumeDelivery) answer(err error) {
+	rd.once.Do(func() { rd.first <- err })
 }
 
 // deliverApproved queues the delivery of every bead the loop approved, at
@@ -2669,10 +3007,88 @@ func (c *Conductor) nextDelivery(now time.Time) (deliveryJob, time.Duration, boo
 // the pending count never dips to zero between an attempt and its retry.
 func (c *Conductor) runDelivery(ctx context.Context, job deliveryJob) {
 	defer c.finishDelivery()
+	if job.resume != nil {
+		c.runResumeDelivery(ctx, job)
+		return
+	}
 	if err := c.deliverJob(ctx, job); err != nil && ctx.Err() == nil {
 		c.record(false, err)
 		c.warn(err)
 	}
+}
+
+// QueueResume runs one resume hand-off through the delivery queue (P6-55).
+//
+// [Deliverer.Redeliver] and [Deliverer.RedeliverPR] mutate the same
+// repository an ordinary delivery does — a fetch, a rebase, a
+// fast-forward and a push with safety off, a `gh pr create` with it on —
+// so calling them straight off the deliverer, as the run's resume did until
+// now, meant two beads reconciled at resume time could do that to the same
+// default branch at once, and could do it while the conductor was already
+// delivering a third. Routing them here puts them behind the same single
+// worker and the same [Conductor.deliver] lock as everything else, and
+// gives them the bounded retry a hand-off that failed on a `gh` that could
+// not be reached has always needed.
+//
+// It returns when the first attempt has finished, with that attempt's
+// error. A retryable failure is retried behind the caller — up to the
+// conductor's attempt cap, on its backoff — because the resume is acted on
+// inside [Run.Start] and holding a run's start open for a minute and a half
+// of retries would be worse than the failure.
+func (c *Conductor) QueueResume(ctx context.Context, bead domain.Bead, what string, fn func(context.Context) error) error {
+	if fn == nil {
+		return nil
+	}
+	if what == "" {
+		what = "the resume hand-off"
+	}
+	rd := &resumeDelivery{what: what, fn: fn, first: make(chan error, 1)}
+	c.enqueue(ctx, deliveryJob{bead: bead, attempt: 1, at: time.Now(), resume: rd})
+	select {
+	case err := <-rd.first:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// runResumeDelivery runs one attempt of a queued resume hand-off under the
+// delivery lock, answers the resume that is waiting for it, and queues the
+// retry when there is one left to make.
+func (c *Conductor) runResumeDelivery(ctx context.Context, job deliveryJob) {
+	rd := job.resume
+	c.deliver.Lock()
+	err := rd.fn(ctx)
+	c.deliver.Unlock()
+
+	rd.answer(err)
+	switch {
+	case err == nil:
+		if job.attempt > 1 {
+			c.log.Info("a resume hand-off succeeded on a later attempt",
+				slog.String("bead", job.bead.ID.String()),
+				slog.String("what", rd.what), slog.Int("attempt", job.attempt))
+		}
+		return
+	case ctx.Err() != nil:
+		return
+	case job.attempt >= c.attempts:
+		c.record(false, fmt.Errorf("orchestrator: conductor: %s for %s: %w", rd.what, job.bead.ID, err))
+		c.warn(fmt.Errorf("orchestrator: conductor: %s for %s: %w", rd.what, job.bead.ID, err))
+		return
+	}
+	wait := deliveryBackoff(c.backoff, job.attempt)
+	// Info, like [Conductor.retryDelivery]'s: the user hears about it when
+	// the attempts run out, through the same warning every other delivery
+	// failure raises.
+	c.log.Info("the resume hand-off will be tried again",
+		slog.String("bead", job.bead.ID.String()), slog.String("what", rd.what),
+		slog.Int("attempt", job.attempt+1), slog.Int("of", c.attempts),
+		slog.Duration("in", wait), slog.Any("err", err))
+	// Queued before this attempt is counted out ([Conductor.runDelivery]
+	// defers that), so the pending count never dips to zero between an
+	// attempt and its retry.
+	c.enqueue(ctx, deliveryJob{bead: job.bead, attempt: job.attempt + 1, at: time.Now().Add(wait), resume: rd})
 }
 
 // finishDelivery counts one delivery out and wakes [Conductor.WaitDeliveries]
@@ -2694,6 +3110,13 @@ func (c *Conductor) dropQueued() {
 	c.mu.Lock()
 	for _, job := range c.queue {
 		delete(c.inflight, job.bead.ID)
+		if job.resume != nil {
+			// P6-55: a resume is waiting on this job's first attempt, and
+			// the worker that would have made it is gone.
+			job.resume.answer(fmt.Errorf(
+				"orchestrator: conductor: the delivery queue stopped before %s for %s ran",
+				job.resume.what, job.bead.ID))
+		}
 	}
 	c.queue = nil
 	c.pending = 0
@@ -3239,28 +3662,153 @@ func (c *Conductor) announce(issues []beads.Issue, list []domain.Bead) {
 			}
 		}
 	}
-	empty := change.Empty()
 	c.stats.Announced += len(added)
-	if !empty {
-		c.stats.Graphs++
-	}
 	c.mu.Unlock()
 
 	for _, b := range added {
 		c.run.Publish(events.BeadCreated{Meta: c.run.Meta(), Bead: b})
 	}
-	if empty {
-		return
-	}
-	work := make([]domain.Bead, 0, len(list))
+	c.publishGraph(list)
+}
+
+// publishGraph tells the run what moved in the bead graph since the last
+// pass: a full [events.GraphChanged] snapshot when the graph's *shape*
+// changed, and one [events.BeadUpdated] per bead when only their contents
+// did.
+//
+// P6-45: every non-empty change used to publish the whole graph, which is
+// what [beads.Watcher] does and what the TUI relays out of. But a change is
+// any bd write at all — a status, an assignee, a renewed lease — while a
+// snapshot is every work bead in full, description and acceptance criteria
+// included. On a hundred-bead autopilot run that made graph_changed the
+// biggest line in events.jsonl after the agents' own output, and the run
+// wrote one for every claim, every verdict and every lease renewal. The
+// information was never new: [events.GraphChanged]'s own contract is "the
+// shape of the dependency graph changes: beads added or removed,
+// dependencies added", and a bead whose state moved is exactly what
+// [events.BeadUpdated] is for. Both are folded by [Summarise] and by the
+// TUI, so the graph is rebuilt from the same events either way — the
+// snapshot is just no longer repeated to say one field of one bead moved.
+//
+// A pass in which most of the graph changed publishes the snapshot anyway:
+// per-bead events carry the same bead bodies plus a header each, so once
+// half the graph has moved the snapshot is the smaller of the two.
+func (c *Conductor) publishGraph(list []domain.Bead) {
 	epic := c.run.Epic()
+	work := make([]domain.Bead, 0, len(list))
 	for _, b := range list {
-		if b.Type == domain.BeadTypeEpic || b.ID == epic {
+		if b.ID == "" || b.Type == domain.BeadTypeEpic || b.ID == epic {
 			continue
 		}
 		work = append(work, b)
 	}
-	c.run.Publish(events.GraphChanged{Meta: c.run.Meta(), Epic: epic, Beads: work})
+
+	c.mu.Lock()
+	prev := c.graph
+	next := make(map[domain.BeadID]domain.Bead, len(work))
+	shape := false
+	changed := make([]domain.Bead, 0, len(work))
+	for _, b := range work {
+		next[b.ID] = b
+		before, known := prev[b.ID]
+		switch {
+		case !known:
+			shape = true
+		case beadShapeMoved(before, b):
+			shape = true
+			changed = append(changed, b)
+		case len(beadFieldsChanged(before, b)) > 0:
+			changed = append(changed, b)
+		}
+	}
+	for id := range prev {
+		if _, still := next[id]; !still {
+			shape = true
+		}
+	}
+	if !shape && len(changed) == 0 {
+		c.mu.Unlock()
+		return
+	}
+	full := shape || 2*len(changed) >= len(work)
+	c.graph = next
+	if full {
+		c.stats.Graphs++
+	} else {
+		c.stats.Updates += len(changed)
+	}
+	fields := make([][]string, 0, len(changed))
+	if !full {
+		for _, b := range changed {
+			fields = append(fields, beadFieldsChanged(prev[b.ID], b))
+		}
+	}
+	c.mu.Unlock()
+
+	if full {
+		c.run.Publish(events.GraphChanged{Meta: c.run.Meta(), Epic: epic, Beads: work})
+		return
+	}
+	for i, b := range changed {
+		c.run.Publish(events.BeadUpdated{Meta: c.run.Meta(), Bead: b, Fields: fields[i]})
+	}
+}
+
+// beadShapeMoved reports whether the graph's shape changed between two
+// readings of one bead: only its dependencies are shape (P6-45).
+func beadShapeMoved(before, after domain.Bead) bool {
+	return !sameIDs(before.Deps, after.Deps)
+}
+
+// beadFieldsChanged names the JSON fields of [domain.Bead] that differ
+// between two readings of it, in the struct's own order, for
+// [events.BeadUpdated.Fields].
+func beadFieldsChanged(before, after domain.Bead) []string {
+	var out []string
+	add := func(name string, differs bool) {
+		if differs {
+			out = append(out, name)
+		}
+	}
+	add("title", before.Title != after.Title)
+	add("description", before.Description != after.Description)
+	add("acceptance", before.Acceptance != after.Acceptance)
+	add("type", before.Type != after.Type)
+	add("priority", before.Priority != after.Priority)
+	add("size", before.Size != after.Size)
+	add("deps", !sameIDs(before.Deps, after.Deps))
+	add("state", before.State != after.State)
+	add("assignee", before.Assignee != after.Assignee)
+	add("labels", !sameStrings(before.Labels, after.Labels))
+	add("round", before.Round != after.Round)
+	add("pr_url", before.PRURL != after.PRURL)
+	add("pr_number", before.PRNumber != after.PRNumber)
+	return out
+}
+
+// sameIDs compares two bead id lists as sets, so a listing that returns the
+// same dependencies in another order is not a change.
+func sameIDs(a, b []domain.BeadID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x := append([]domain.BeadID(nil), a...)
+	y := append([]domain.BeadID(nil), b...)
+	slices.Sort(x)
+	slices.Sort(y)
+	return slices.Equal(x, y)
+}
+
+// sameStrings is sameIDs for labels.
+func sameStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x := append([]string(nil), a...)
+	y := append([]string(nil), b...)
+	slices.Sort(x)
+	slices.Sort(y)
+	return slices.Equal(x, y)
 }
 
 // claim reserves a bead for delivery so two passes never ship one twice: a

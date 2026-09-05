@@ -1037,3 +1037,102 @@ func TestWaitWithoutDrainingDoesNotBlock(t *testing.T) {
 		t.Fatal("Wait blocked on an undrained channel")
 	}
 }
+
+// TestCancellationIsObservedAtStepBoundaries pins the P2-11 decision: the
+// player polls the run context once before each step and never after the
+// last one, so a rule with nothing left to play finishes with its scripted
+// result even though ctx is already cancelled — the way a real CLI whose
+// process exited before the signal reports its result rather than a kill.
+// The package doc says so; these subtests are the guard on both halves of
+// the rule.
+func TestCancellationIsObservedAtStepBoundaries(t *testing.T) {
+	t.Parallel()
+	workdir := t.TempDir()
+
+	t.Run("a rule with no steps finishes Done under a cancelled context", func(t *testing.T) {
+		t.Parallel()
+		s := NewScenario("no steps")
+		s.Otherwise("nothing to do").Output("all done")
+		a, err := NewAdapter(Name, s)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		sess, err := a.Run(ctx, mockSpec(workdir, domain.RoleEngineer, "", "sc-1", events.TaskImplement, 0))
+		require.NoError(t, err)
+		evs, res, err := mockCollect(t, sess)
+		assert.NoError(t, err, "there was no step left at which to notice the cancellation")
+		assert.Equal(t, cartridge.EventDone, mockAssertStream(t, evs).Kind)
+		assert.Equal(t, "all done", res.Output)
+		assert.Equal(t, 0, res.ExitCode)
+	})
+
+	t.Run("one step left is enough to notice it", func(t *testing.T) {
+		t.Parallel()
+		s := NewScenario("one step")
+		s.Otherwise("one step").Say("never emitted")
+		a, err := NewAdapter(Name, s)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		sess, err := a.Run(ctx, mockSpec(workdir, domain.RoleEngineer, "", "sc-1", events.TaskImplement, 0))
+		require.NoError(t, err)
+		evs, res, err := mockCollect(t, sess)
+		assert.ErrorIs(t, err, cartridge.ErrKilled)
+		assert.Equal(t, cartridge.EventError, mockAssertStream(t, evs).Kind)
+		assert.Empty(t, res.Output, "the step never ran")
+	})
+
+	t.Run("a cancel while the session is parked at a boundary kills it", func(t *testing.T) {
+		t.Parallel()
+		clock := NewFakeClock(mockEpoch)
+		s := NewScenario("parked")
+		s.Otherwise("parked").Say("a").Sleep(time.Hour).Say("b")
+		a, err := NewAdapter(Name, s, WithClock(clock))
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sess, err := a.Run(ctx, mockSpec(workdir, domain.RoleEngineer, "", "sc-1", events.TaskImplement, 0))
+		require.NoError(t, err)
+		clock.BlockUntil(1) // the session is inside wait, before the sleep step
+		cancel()
+		_, res, err := mockCollect(t, sess)
+		assert.ErrorIs(t, err, cartridge.ErrKilled)
+		assert.Equal(t, "a", res.Output, "the steps before the boundary still happened")
+	})
+
+	t.Run("a cancel during the last step still finishes Done", func(t *testing.T) {
+		t.Parallel()
+		s := NewScenario("last step")
+		s.Otherwise("long command").Exec("sleep", "30")
+		a, err := NewAdapter(Name, s)
+		require.NoError(t, err)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		sess, err := a.Run(ctx, mockSpec(workdir, domain.RoleEngineer, "", "sc-1", events.TaskImplement, 0))
+		require.NoError(t, err)
+		// Cancelling as soon as the command is announced interrupts it; the
+		// loop then has no step left, so the session succeeds.
+		var evs []cartridge.SessionEvent
+		res, werr := cartridge.Collect(sess, func(ev cartridge.SessionEvent) {
+			evs = append(evs, ev)
+			if ev.Kind == cartridge.EventToolUse {
+				cancel()
+			}
+		})
+		assert.NoError(t, werr, "the interrupted command was the last step")
+		assert.Equal(t, cartridge.EventDone, mockAssertStream(t, evs).Kind)
+		assert.Equal(t, 0, res.ExitCode)
+		var toolResult cartridge.SessionEvent
+		for _, ev := range evs {
+			if ev.Kind == cartridge.EventToolResult {
+				toolResult = ev
+			}
+		}
+		require.Equal(t, cartridge.EventToolResult, toolResult.Kind, "the command reported back")
+		assert.True(t, toolResult.IsError, "the interrupted command is an error tool result, not a killed session")
+	})
+}

@@ -1,0 +1,24 @@
+▄█▓═▶  run demo-20260101-120000 · autopilot · ammo 0/10 · safety on
+[1m 1 Graph [0m 2 Agents  3 Feedback  4 PRs  5 Log 
+────────────────────────────────────────────────────────────────────────────────
+2 beads · 2 levels · 0 ready · 0 blocked · 1 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━┓    [1m┌────────────────────┐[0m
+┃[1m● demo-2        r2 ▲[0m┃────[1m│[0m[1m⚑ demo-3        r1 ■[0m[1m│[0m
+┃ Retry failed HTTP …┃    [1m│[0m Document the retry…[1m│[0m
+┗━━━━━━━━━━━━━━━━━━━━┛    [1m└────────────────────┘[0m
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+? help • q stop / quit  ! 2 notices  safety on for future deliveries

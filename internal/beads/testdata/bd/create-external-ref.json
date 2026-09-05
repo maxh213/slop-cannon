@@ -1,0 +1,25 @@
+{
+  "data": {
+    "id": "fx-c5v",
+    "title": "Review PR #9: Add Median",
+    "description": "External pull request review",
+    "status": "open",
+    "priority": 2,
+    "issue_type": "task",
+    "owner": "sc@example.com",
+    "created_at": "2026-09-05T00:57:09.240167874Z",
+    "created_by": "sc",
+    "updated_at": "2026-09-05T00:57:09.240167874Z",
+    "external_ref": "gh-9",
+    "metadata": {
+      "sc_run": "r1",
+      "sc_kind": "review",
+      "sc_external_ref": "gh-9"
+    },
+    "labels": [
+      "sc:run:r1",
+      "sc:external-pr"
+    ]
+  },
+  "schema_version": 1
+}

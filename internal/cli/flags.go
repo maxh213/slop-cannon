@@ -89,7 +89,7 @@ func resolveRepo(repo string) (string, error) {
 		return "", fmt.Errorf("--%s %q: %w", FlagRepo, repo, err)
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("--%s %q: not a directory", FlagRepo, repo)
+		return "", fmt.Errorf("--%s %q: not a directory; the flag takes the repository directory, not a file inside it: --%s /path/to/repo", FlagRepo, repo, FlagRepo)
 	}
 	return abs, nil
 }

@@ -1,20 +1,20 @@
 ▄█▓═▶  run sc-feedback-0001 · brief · ammo 0/4 · safety on
  1 Graph  2 Agents [1m 3 Feedback [0m 4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────
-7 beads reviewed · 5 approved · 1 in review · 1 escalated · 5 op
+7 beads reviewed · 4 approved · 2 in review · 1 escalated · 2 op
   BEAD       U Q T │ sc-c3d4  Cache DNS lookups
   sc-a1b2    ✓ ✓ ✓ │ ✓ approved · 2 rounds · ux ✓  qa ✓  test ✓
 [1m▌ [0msc-c3d4    ✓ ✓ ✓ │
   sc-e5f6    ✓ ✓ ✓ │ [1mround 1[0m · review · 2b3c4d5 · ux,qa,test
-  sc-g7h8    ✓ ✓ ✓ │   ⚙ report cache lookups for the TTL the r…
+  sc-g7h8    ✓ ✗ ✓ │   ⚙ report cache lookups for the TTL the r…
   sc-i9j0    ✓ ✓ ✓ │   ✓ ux   approve no user-visible change
-  sc-k1l2    · ✗ · │   ✗ qa   changes one blocker
-  sc-m3n4    ✓ ✓ ◐ │     [1m! blocker[0m qa-r1-1   [resolved] Retry l…
+  sc-k1l2    ✓ ✗ ✓ │   ✗ qa   changes one blocker
+  sc-m3n4    ✓ ✓ ◐ │     [1m! blocker[0m qa-r1-1   Retry loops foreve…
                    │   ✓ test approve coverage is fine
                    │
                    │ [1mround 2[0m · review · 3c4d5e6 · qa
-                   │   ⚙ report cap the retry loop
                    │   → fixed    qa-r1-1   capped the loop at…
                    │   ✓ qa   approve the cap holds
+                   │     [1m! blocker[0m qa-r1-1   [resolved] Retry l…
                    │
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • 
+? help • q stop / quit • enter details • pgdn scroll down

@@ -1,0 +1,26 @@
+▄█▓═▶  [1mslop-cannon[0m · run 20260305-110000-fb00 · brief · ammo 0/10 · safety on
+ 1 Graph  2 Agents [1m 3 Feedback [0m 4 PRs  5 Log 
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+1 bead reviewed · 1 approved · lines 1-21/23
+  BEAD       U Q T │ sc-fb1
+[1m▌ [0msc-fb1     ✓ ✓ ✓ │ ✓ approved · 3 rounds · ux ✓  qa ✓  test ✓ · satisfied
+                   │
+                   │ [1mround 1[0m · review · 1a2b3c4 · ux,qa,test
+                   │   ⚙ report stream instead of buffering
+                   │   ✓ ux   approve no interface change
+                   │   ✓ qa   approve streams as advertised
+                   │   ✗ test changes missing coverage
+                   │     [1m! blocker[0m test-r1-1 (rules) No test for the empty-body case
+                   │     ▲ major   test-r1-2 Name the reader parameter
+                   │
+                   │ [1mround 2[0m · review
+                   │   → fixed    test-r1-1 added TestStreamEmptyBody
+                   │   ↩ pushback test-r1-2 the parameter is named after the interface it takes
+                   │   ✗ test changes rules say every parameter reads as prose
+                   │     ▲ major   test-r1-2 [held] Name the reader parameter
+                   │   ⚖ uphold_tester    test-r1-2 rename it to body
+                   │
+                   │ [1mround 3[0m · review · b4c5d6e · test
+                   │   → fixed    test-r1-2 renamed it to body
+                   │   ✓ test approve reads well now
+tab next view • 1…5 jump to view • ? help • q stop / quit • enter details • pgdn scroll down

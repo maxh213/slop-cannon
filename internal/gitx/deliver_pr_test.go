@@ -135,7 +135,7 @@ func dpGH(t *testing.T) *testutil.Shim {
 mode=$(cat "$SC_FAKEBIN_DIR/mode" 2>/dev/null || echo ok)
 case "$mode" in
   noauth) echo "You are not logged into any GitHub hosts. To log in, run:  gh auth login" >&2; exit 4 ;;
-  nohost) echo "none of the git remotes configured for this repository point to a known GitHub host." >&2; exit 1 ;;
+  nohost) echo "none of the git remotes configured for this repository point to a known GitHub host. To tell gh about a new GitHub host, please use 'gh auth login'" >&2; exit 1 ;;
 esac
 case "$1 $2" in
   "pr list") cat "$SC_FAKEBIN_DIR/prs.json" 2>/dev/null || echo '[]' ;;
@@ -613,6 +613,24 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		assert.Equal(t, PRPushOnly, res.Status)
 		assert.Equal(t, "the remote is not on a GitHub host gh knows", res.Reason)
 		assert.Equal(t, domain.BeadStateNeedsHuman, res.State)
+	})
+
+	// P4-12: the product owner retitled the bead after its branch was cut,
+	// so BranchName no longer names it. The delivery must still push the
+	// branch the work is on rather than fail with ErrBranchMissing.
+	t.Run("a retitled bead delivers the branch its work is on", func(t *testing.T) {
+		f := dpSetup(t, true)
+		dpGitHubRemote(t, f)
+		req := dpRequest()
+		req.Bead.Title = "a much better title the PO thought of later"
+		require.NotEqual(t, f.wt.Branch, BranchName(req.Bead))
+
+		res, err := f.d.Deliver(ctx, req)
+		require.NoError(t, err)
+		assert.Equal(t, PRCreated, res.Status)
+		assert.Equal(t, f.wt.Branch, res.Branch, "the work's branch, not the new title's")
+		assert.Equal(t, f.head, dpRemoteHeads(t, f)[f.wt.Branch])
+		assert.Equal(t, domain.BeadStateDelivering, res.State)
 	})
 
 	t.Run("no remote: the branch stays local and the bead goes to a human", func(t *testing.T) {

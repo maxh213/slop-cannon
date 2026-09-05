@@ -248,7 +248,7 @@ func TestSchemaInvalidExamplesFailWithAReadableMessage(t *testing.T) {
 				assert.Contains(t, p, "at '", "each problem names the offending location: %q", p)
 			}
 
-			got := schemaSortProblems(err.Error())
+			got := err.Error()
 			golden := strings.TrimSuffix(path, ".json") + ".expected"
 			if schemaUpdateGolden() {
 				require.NoError(t, os.WriteFile(golden, []byte(got+"\n"), 0o644)) //nolint:gosec // published docs
@@ -262,20 +262,6 @@ func TestSchemaInvalidExamplesFailWithAReadableMessage(t *testing.T) {
 	for _, mt := range domain.MessageTypes() {
 		assert.Truef(t, seen[mt], "no invalid example for %s in docs/schemas/examples/invalid", mt)
 	}
-}
-
-// schemaSortProblems sorts the "  - at ..." lines of a validation error. The
-// validator walks the schema's keyword maps, so two violations in one
-// document can be reported in either order; the goldens are sorted so they
-// stay readable without being flaky.
-func schemaSortProblems(msg string) string {
-	lines := strings.Split(msg, "\n")
-	if len(lines) < 3 {
-		return msg
-	}
-	problems := append([]string(nil), lines[1:]...)
-	sort.Strings(problems)
-	return strings.Join(append(lines[:1], problems...), "\n")
 }
 
 func TestSchemaPublishedDocsMatchTheEmbeddedFiles(t *testing.T) {

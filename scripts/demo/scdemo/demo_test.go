@@ -12,7 +12,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"slop-cannon/internal/beads"
 	"slop-cannon/internal/cartridge/mock"
+	"slop-cannon/internal/testutil"
 )
 
 // The demo's own tests (P8-07). `make demo DEMO_ARGS=--check` proves the
@@ -215,4 +217,53 @@ func TestREADMEEmbedsTheDemoGIF(t *testing.T) {
 	text := string(readme)
 	assert.Contains(t, text, "docs/demo.gif", "the README does not embed the recording")
 	assert.Contains(t, text, "make demo", "the README does not say how to run the demo")
+}
+
+// TestTheDemosBDStandInSatisfiesTheShimSelfCheck is P8-27's teeth. The
+// demo replaces bd with a wrapper of its own, and the two things
+// beads.Shim.Verify demands of the binary under the read-only shim — a
+// `bd version --json` envelope and bd's own --readonly refusal — are
+// asked for by nothing else a run does, so the demo used to discover a
+// change in that requirement by failing halfway through a recording.
+//
+// This lifts the wrapper's dispatch out of demo.sh, puts it behind the
+// production shim, and runs the real self-check over it. A new probe in
+// internal/beads now fails here, naming itself, before anyone records
+// anything.
+func TestTheDemosBDStandInSatisfiesTheShimSelfCheck(t *testing.T) {
+	real := testutil.FakeBin(t, "bd", demoBDDispatch(t)+`
+echo '{"schema_version":1,"data":[]}'
+exit 0
+`).Path
+
+	dir := t.TempDir()
+	wt := filepath.Join(t.TempDir(), "worktree")
+	require.NoError(t, os.MkdirAll(wt, 0o755))
+	shim, err := beads.InstallForWorktree(t.Context(), wt,
+		beads.ShimOptions{Dir: dir, Real: real, SkipVerify: true})
+	require.NoError(t, err)
+
+	require.NoError(t, shim.Verify(t.Context(), wt),
+		"scripts/demo/demo.sh's bd wrapper must satisfy what beads.Shim.Verify "+
+			"demands of a stand-in (see \"What a stand-in bd owes this check\")")
+}
+
+// demoBDDispatch is the body of demo.sh's bd wrapper: everything between
+// the quoted heredoc that starts it and the `exec` line that hands the
+// call on to the real tracker. Reading it out of the script rather than
+// copying it here is the point — a wrapper that stops answering `bd
+// version` fails the test above.
+func demoBDDispatch(t *testing.T) string {
+	t.Helper()
+	src, err := os.ReadFile(filepath.Join(demoRoot, "scripts", "demo", "demo.sh"))
+	require.NoError(t, err)
+	const open = "cat >>\"$bin/bd\" <<'EOF'\n"
+	i := strings.Index(string(src), open)
+	require.NotEqual(t, -1, i, "demo.sh no longer writes its bd wrapper with a quoted heredoc")
+	rest := string(src)[i+len(open):]
+	j := strings.Index(rest, "\nEOF\n")
+	require.NotEqual(t, -1, j, "the bd wrapper's heredoc is unterminated")
+	body := rest[:j+1]
+	require.Contains(t, body, "--readonly", "the wrapper this test found is not the bd one")
+	return body
 }

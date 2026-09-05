@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -652,4 +653,75 @@ func TestHeadlessSparseGolden(t *testing.T) {
 	require.NotContains(t, out, "  ")
 	// No RunFinished in this recording: the run did not end.
 	require.Equal(t, tui.ExitFailed, h.ExitCode())
+}
+
+// TestGlyphColumnUnderEastAsianWidth re-runs the glyph-column assertions in a
+// child process started with RUNEWIDTH_EASTASIAN=1, the setting a terminal
+// configured for ambiguous-width 2 exports (P7-16). That is the mode where
+// the assertions bite: there ○, ⧗, ◍, ◐, ·, ⊘, ◆, ▶ and § are two cells and
+// ✓, ✔, ✗, !, →, ⤴ and │ are still one, so a view that keeps a glyph set of
+// its own outside the palette shifts a column by a cell unless every glyph
+// goes through [tui.PadGlyph].
+//
+// It has to be a second process: the width libraries latch the mode at
+// package initialisation, so it cannot be turned on from inside a running
+// test. The child is marked with themeEAChildEnv — the same marker
+// [TestThemeGlyphColumnHoldsUnderEastAsianWidth] uses — because that is what
+// tells this package's TestMain that this process wants the mode on purpose
+// and must not be handed on to a child without it.
+func TestGlyphColumnUnderEastAsianWidth(t *testing.T) {
+	t.Parallel()
+
+	if os.Getenv(themeEAChildEnv) != "" {
+		t.Skip("already the re-executed child")
+	}
+	cmd := exec.CommandContext(t.Context(), os.Args[0], //nolint:gosec // re-runs this very test binary
+		"-test.run", "^TestGlyphColumnHolds", "-test.count=1", "-test.timeout=5m")
+	cmd.Env = append(os.Environ(), "RUNEWIDTH_EASTASIAN=1", themeEAChildEnv+"=1")
+	out, err := cmd.CombinedOutput()
+	require.NoErrorf(t, err, "a view's own glyphs do not hold the palette's column with RUNEWIDTH_EASTASIAN=1:\n%s", out)
+}
+
+// TestHeadlessFinishSummaryReadsAsOneSentence pins P7-25. A finish summary
+// is not always a sentence: gitx.CleanupResult names every worktree it kept
+// on an indented line of its own, and the renderer's one-event-per-line
+// promise used to fold that with a bare newline→space swap, leaving the
+// report's own indentation in the middle of the line ("kept 1:   sc-2
+// (in_progress)"). The whole run of whitespace is collapsed instead, which
+// is what `sc status` does with the same text.
+func TestHeadlessFinishSummaryReadsAsOneSentence(t *testing.T) {
+	t.Parallel()
+
+	at := time.Date(2026, 3, 4, 12, 1, 13, 0, time.UTC)
+	line := tui.FormatHeadless(events.RunFinished{
+		Meta:     events.MetaAt("sc-1", at),
+		Reason:   events.FinishCompleted,
+		Duration: 73 * time.Second,
+		Summary:  "removed 1 worktree, kept 1:\n  sc-2 (in_progress)\n",
+	}, time.UTC)
+
+	require.Equal(t,
+		"12:01:13 ◇ run finished: completed after 1m13s (exit 0) — removed 1 worktree, kept 1: sc-2 (in_progress)",
+		line)
+	require.NotContains(t, line, "  ", "the report's own indentation survived the fold")
+	require.Len(t, strings.Split(line, "\n"), 1)
+
+	// A summary that is already one sentence is untouched, doubled spaces
+	// and all — the fold only collapses what a line break brought with it.
+	for _, s := range []string{"nothing to clean up", "kept sc-2"} {
+		require.Contains(t, tui.FormatHeadless(events.RunFinished{
+			Meta: events.MetaAt("sc-1", at), Reason: events.FinishStopped, Summary: s,
+		}, time.UTC), "— "+s)
+	}
+
+	// The other two free-prose summaries the renderer appends after an em
+	// dash fold the same way.
+	require.Contains(t, tui.FormatHeadless(events.VerdictReceived{
+		Meta: events.MetaAt("sc-1", at), Bead: "sc-2", Round: 1, Agent: "t-1",
+		Verdict: domain.Verdict{Outcome: domain.VerdictApprove, Summary: "looks good\n\n  ships it"},
+	}, time.UTC), "— looks good ships it")
+	require.Contains(t, tui.FormatHeadless(events.ArbitrationReceived{
+		Meta: events.MetaAt("sc-1", at), Bead: "sc-2", Round: 5, Agent: "po-1",
+		Escalation: &domain.Escalation{Outcome: domain.EscalationBlock, Summary: "a human should look\n\tat the retry"},
+	}, time.UTC), "— a human should look at the retry")
 }

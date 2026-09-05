@@ -65,7 +65,19 @@ case "$1 $2" in
     # one branch already has one (--head). Only the first is the reviewer's.
     case "$*" in
       *--head*) echo '[]' ;;
-      *) cat "$SC_FAKEBIN_DIR/prlist.json" ;;
+      *)
+        # Poll number, so a test can change what GitHub says between two
+        # of the reviewer's own listings (P8-37). Without prlist.later.json
+        # every poll answers with the same pull request.
+        n=$(cat "$SC_FAKEBIN_DIR/pollcount" 2>/dev/null || echo 0)
+        n=$((n + 1))
+        echo "$n" > "$SC_FAKEBIN_DIR/pollcount"
+        if [ "$n" -gt 1 ] && [ -f "$SC_FAKEBIN_DIR/prlist.later.json" ]; then
+          cat "$SC_FAKEBIN_DIR/prlist.later.json"
+        else
+          cat "$SC_FAKEBIN_DIR/prlist.json"
+        fi
+        ;;
     esac
     ;;
   "pr review")
@@ -117,6 +129,19 @@ const (
 func prwGH(t *testing.T, head, auth string) *testutil.Shim {
 	t.Helper()
 	sh := testutil.FakeBin(t, "gh", fmt.Sprintf(prwGHScript, auth))
+	require.NoError(t, os.WriteFile(filepath.Join(sh.Dir, "prlist.json"), prwPRList(t, head), 0o644))
+	return sh
+}
+
+// prwPRList is the `gh pr list --json …` payload for the contributor's
+// pull request at commit head, carrying labels. branch overrides the head
+// branch, so a test can rename it under the cannon's own prefix.
+func prwPRList(t *testing.T, head string, labels ...string) []byte {
+	t.Helper()
+	marks := make([]map[string]any, 0, len(labels))
+	for _, l := range labels {
+		marks = append(marks, map[string]any{"name": l})
+	}
 	list, err := json.Marshal([]map[string]any{{
 		"number":      prwPRNumber,
 		"title":       "Add a contributing note",
@@ -126,12 +151,21 @@ func prwGH(t *testing.T, head, auth string) *testutil.Shim {
 		"headRefName": prwBranch,
 		"baseRefName": "main",
 		"headRefOid":  head,
-		"labels":      []any{},
+		"labels":      marks,
 		"isDraft":     false,
 	}})
 	require.NoError(t, err)
-	require.NoError(t, os.WriteFile(filepath.Join(sh.Dir, "prlist.json"), list, 0o644))
-	return sh
+	return list
+}
+
+// prwListAfterFirstPoll makes every poll after the first answer with
+// payload instead of the pull request the run adopted. It is how the
+// P8-11 stale path is reached in a whole run: the reviewer raises a review
+// bead from the first listing and the pull request has gone (or become one
+// of the cannon's own) by the next one.
+func prwListAfterFirstPoll(t *testing.T, gh *testutil.Shim, payload []byte) {
+	t.Helper()
+	require.NoError(t, os.WriteFile(filepath.Join(gh.Dir, "prlist.later.json"), payload, 0o644))
 }
 
 // prwSetPollInterval adds `pr_poll_interval` to the run's global
@@ -341,3 +375,106 @@ func prwArg(args []string, i int) string {
 	}
 	return ""
 }
+
+// TestRunSettlesAReviewBeadWhosePullRequestGoesStale is P8-37: the P8-11
+// stale path through an assembled run, which only unit tests covered
+// before.
+//
+// `pr_poll_interval` makes the reviewer poll repeatedly inside a run that
+// lasts seconds, so the world can change between two of its own listings —
+// which is the only way this path is reachable at all. The first poll lists
+// somebody else's open pull request and raises a review bead for it; by the
+// next poll the pull request is either gone from the open listing or has
+// become one of the cannon's own (D-11). Either way the review bead must be
+// settled with the true reason and no review may be posted, because there
+// is nothing left to review.
+func TestRunSettlesAReviewBeadWhosePullRequestGoesStale(t *testing.T) {
+	cases := []struct {
+		name string
+		// later is what every poll after the first answers with.
+		later func(t *testing.T, head string) []byte
+		// reason is the sentence bd's close reason must carry.
+		reason string
+	}{
+		{
+			name:   "the pull request is closed or merged while the cannon reviews it",
+			later:  func(*testing.T, string) []byte { return []byte("[]") },
+			reason: fmt.Sprintf("pull request #%d is no longer open on GitHub", prwPRNumber),
+		},
+		{
+			name: "the pull request becomes one of the cannon's own",
+			later: func(t *testing.T, head string) []byte {
+				return prwPRList(t, head, gitx.CannonPRLabel)
+			},
+			reason: fmt.Sprintf("pull request #%d is still open but is now one of slop-cannon's own", prwPRNumber),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			env := runFireSetup(t, true)
+			head := prwContributorBranch(t, env)
+			gh := prwGH(t, head, prwAuthOK)
+			prwListAfterFirstPoll(t, gh, tc.later(t, head))
+			prwSetPollInterval(t, prwStaleInterval)
+
+			stdout, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief,
+				"--headless", "--cartridge", "mock", "--verbose")
+			require.Equal(t, 0, code, "stdout:\n%s\nstderr:\n%s", stdout, stderr)
+			require.Contains(t, stdout, "run finished: completed",
+				"a review bead going stale must not stop the run")
+
+			// The reviewer really did adopt the pull request from the first
+			// listing and really did look again, or nothing went stale.
+			var bead domain.BeadID
+			closed := map[domain.BeadID]string{}
+			for _, ev := range prwEvents(t, env.Repo.Dir) {
+				switch e := ev.(type) {
+				case events.PROpened:
+					if e.External {
+						require.Empty(t, bead, "exactly one external pull request may be announced")
+						require.Equal(t, prwPRNumber, e.Number)
+						bead = e.Bead
+					}
+				case events.BeadStateChanged:
+					if e.To == domain.BeadStateClosed {
+						closed[e.Bead] = e.Reason
+					}
+				}
+			}
+			require.NotEmpty(t, bead, "the watcher raised no review bead from the first poll")
+			var polls int
+			for _, in := range gh.Invocations(t) {
+				if prwIsPoll(in.Args) {
+					polls++
+				}
+			}
+			require.GreaterOrEqual(t, polls, 2,
+				"the reviewer must poll again, or the pull request never goes stale")
+
+			// The bead is settled — closed, which is StaleReviewClose, the
+			// default policy — and the reason is the watcher's own, so a
+			// reader is told which of the three conditions applied rather
+			// than a fixed "stale".
+			require.Contains(t, closed, bead, "the stale review bead was left open")
+			require.Contains(t, closed[bead], tc.reason)
+			require.Contains(t, closed[bead], "nothing left to review")
+			require.Contains(t, prwRunLog(t, env.Repo.Dir), "closing its review bead")
+
+			// And nothing was reviewed: a pull request that has gone, or
+			// that turns out to be one of ours, gets no review (D-11).
+			for _, in := range gh.Invocations(t) {
+				require.False(t, prwArg(in.Args, 0) == "pr" && prwArg(in.Args, 1) == "review",
+					"no review may be posted for a stale pull request: gh %v", in.Args)
+				require.False(t, prwArg(in.Args, 0) == "pr" && prwArg(in.Args, 1) == "merge",
+					"slop-cannon must never merge a pull request it did not open (D-11)")
+			}
+			require.NoFileExists(t, filepath.Join(gh.Dir, "merged"))
+		})
+	}
+}
+
+// prwStaleInterval is the `pr_poll_interval` the stale tests run with. It
+// is shorter than prwInterval so the second poll — the one that finds the
+// pull request gone — happens while the testers of the first are still
+// being fired, which is the window P8-11 is about.
+const prwStaleInterval = 100 * time.Millisecond

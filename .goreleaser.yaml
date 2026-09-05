@@ -1,0 +1,143 @@
+# Release pipeline for `sc` (P10-03).
+#
+# Local dry run (no tags, no network publish):
+#   GOBIN=$PWD/bin go install github.com/goreleaser/goreleaser/v2@v2.18.0
+#   ./bin/goreleaser check
+#   ./bin/goreleaser release --snapshot --clean --skip=publish
+#   ./dist/sc_linux_amd64_v1/sc version
+#
+# A real release is cut by pushing a tag; .github/workflows/release.yml runs
+# `goreleaser release --clean` for it. Nothing here talks to the network apart
+# from `go mod download` and the GitHub upload at the very end.
+version: 2
+
+project_name: slop-cannon
+
+before:
+  hooks:
+    # Everything else (fmt, lint, test, golden) is the CI gate in
+    # .github/workflows/release.yml; keep the build hooks offline-cheap.
+    - go mod download
+
+builds:
+  - id: sc
+    main: ./cmd/sc
+    binary: sc
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    flags:
+      - -trimpath
+    # Keep these three -X paths in sync with the Makefile's LDFLAGS and with
+    # internal/cli/version.go (P1-10): renaming a variable breaks both.
+    ldflags:
+      - -s -w
+      - -X slop-cannon/internal/cli.Version={{ if .IsSnapshot }}{{ .Version }}{{ else }}{{ .Tag }}{{ end }}
+      - -X slop-cannon/internal/cli.Commit={{ .ShortCommit }}
+      - -X slop-cannon/internal/cli.Date={{ .CommitDate }}
+    # Reproducible builds: stamp archives and binaries with the commit time
+    # rather than the wall clock, so re-running the release is byte-identical.
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: sc
+    ids:
+      - sc
+    formats:
+      - tar.gz
+    # install.sh builds this exact name; change both together.
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+      - src: docs/*.md
+        dst: docs
+        info:
+          mode: 0644
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^ci:"
+      - "^claim "
+      - "merge conflict"
+      - Merge pull request
+      - Merge branch
+  groups:
+    - title: Features
+      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
+      order: 0
+    - title: Fixes
+      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
+      order: 1
+    - title: Others
+      order: 999
+
+release:
+  # The repository has no origin remote yet, so owner/name cannot be inferred:
+  # they come from the environment (the release workflow passes GitHub's own
+  # GITHUB_REPOSITORY_OWNER / the repository name) with a default that keeps
+  # `goreleaser check` and a local snapshot working on a remote-less clone.
+  github:
+    owner: '{{ envOrDefault "SC_REPO_OWNER" "maxh213" }}'
+    name: '{{ envOrDefault "SC_REPO_NAME" "slop-cannon" }}'
+  draft: false
+  prerelease: auto
+  mode: replace
+  footer: |
+    ## Install
+
+    ```sh
+    curl -fsSL https://raw.githubusercontent.com/{{ envOrDefault "SC_REPO_OWNER" "maxh213" }}/{{ envOrDefault "SC_REPO_NAME" "slop-cannon" }}/{{ .Tag }}/install.sh | sh
+    ```
+
+    or `go install slop-cannon/cmd/sc@{{ .Tag }}`.
+
+# Homebrew tap. Uploading is off unless the release job sets
+# HOMEBREW_TAP_SKIP_UPLOAD=false and provides a token with write access to
+# {{ owner }}/homebrew-tap; the cask is still rendered into dist/ every run, so
+# the formula template is testable without a tap.
+homebrew_casks:
+  - name: slop-cannon
+    binaries:
+      - sc
+    ids:
+      - sc
+    repository:
+      owner: '{{ envOrDefault "HOMEBREW_TAP_OWNER" "maxh213" }}'
+      name: '{{ envOrDefault "HOMEBREW_TAP_REPO" "homebrew-tap" }}'
+      branch: main
+      token: '{{ envOrDefault "HOMEBREW_TAP_TOKEN" "" }}'
+    skip_upload: '{{ envOrDefault "HOMEBREW_TAP_SKIP_UPLOAD" "true" }}'
+    homepage: 'https://github.com/{{ envOrDefault "SC_REPO_OWNER" "maxh213" }}/{{ envOrDefault "SC_REPO_NAME" "slop-cannon" }}'
+    description: "Fire a cannon of coding agents at a repository and watch the feedback loop in your terminal"
+    license: "MIT"
+    commit_author:
+      name: slop-cannon-releaser
+      email: noreply@users.noreply.github.com
+    # sc drives `bd` (beads) and `git`; `gh` is needed for safety-on runs.
+    dependencies:
+      - formula: git
+    hooks:
+      post:
+        install: |
+          if system_command("/usr/bin/xattr", args: ["-h"]).exit_status == 0
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/sc"]
+          end

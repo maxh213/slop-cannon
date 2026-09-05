@@ -224,8 +224,9 @@ func classifyNotRepository(err error) error {
 func (r *Repo) IsWorktree() bool { return r.GitDir != r.CommonDir }
 
 // Git runs git with args inside the working tree and returns its standard
-// output without the trailing newline (leading whitespace is kept, so
-// porcelain status columns survive). A non-zero exit is reported as a
+// output with every trailing carriage return and newline removed (leading
+// whitespace is kept, so porcelain status columns survive); use
+// [Repo.GitRaw] where those bytes carry meaning. A non-zero exit is reported as a
 // [*GitError]; a failure to start git (missing binary) is returned as-is and
 // matches proc.IsNotFound. The child sees only PATH, HOME, the XDG_* directories,
 // the SSH agent and GnuPG variables, every GIT_* variable set in the parent
@@ -237,7 +238,31 @@ func (r *Repo) Git(ctx context.Context, args ...string) (string, error) {
 	return r.run(ctx, r.Root, args...)
 }
 
+// GitRaw runs git exactly as [Repo.Git] does but returns its standard
+// output byte for byte: no trailing newline is removed, so CRLF line
+// endings and a meaningful empty last line survive (P4-11).
+//
+// Use it for every reader whose bytes are the answer — file content from
+// "git show" or "git cat-file", a message body, the NUL-terminated
+// output of a porcelain "-z" command — and [Repo.Git] for the
+// line-oriented commands whose trailing newline is only a terminator.
+// [Repo.Diff] does not go through either: it has git write the patch to a
+// file so an oversized diff is never held in memory.
+func (r *Repo) GitRaw(ctx context.Context, args ...string) (string, error) {
+	return r.runRaw(ctx, r.Root, args...)
+}
+
+// run returns git's standard output with every trailing carriage return
+// and newline removed; see [Repo.GitRaw] for the byte-exact form.
 func (r *Repo) run(ctx context.Context, dir string, args ...string) (string, error) {
+	out, err := r.runRaw(ctx, dir, args...)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(out, "\r\n"), nil
+}
+
+func (r *Repo) runRaw(ctx context.Context, dir string, args ...string) (string, error) {
 	env := map[string]string{
 		// Stable, parseable output and no interactive stalls.
 		"LC_ALL":              "C",
@@ -273,7 +298,7 @@ func (r *Repo) run(ctx context.Context, dir string, args ...string) (string, err
 		}
 		return "", fmt.Errorf("gitx: git: %w", err)
 	}
-	return strings.TrimRight(res.Stdout, "\r\n"), nil
+	return res.Stdout, nil
 }
 
 // inheritedEnv names the parent variables git may see: enough to find its

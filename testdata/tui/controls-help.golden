@@ -21,6 +21,7 @@
                             │  [1mRun controls[0m                                               │                             
                             │  p pause / resume    r re-fire bead      S toggle safety    │                             
                             │  s stop run          x mark bead done    a change ammo      │                             
+                            │                                          b raise budget     │                             
                             │                                                             │                             
                             │  [1mGraph keys[0m                                                 │                             
                             │  ←/h prev level    enter bead detail     g first bead       │                             
@@ -36,5 +37,4 @@
                                                                                                                         
                                                                                                                         
                                                                                                                         
-                                                                                                                        
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help • q stop / quit
+? help • q stop / quit • enter bead detail  ! engineer timed out twice on demo-3 (+1 more)

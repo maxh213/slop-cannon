@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -45,9 +46,13 @@ const (
 	KeyIdleReplanInterval = "idle_replan_interval"
 	KeyGatePollInterval   = "gate_poll_interval"
 	KeyPRPollInterval     = "pr_poll_interval"
+	KeyGraphPollInterval  = "graph_poll_interval"
+	KeyMaxDiffBytes       = "max_diff_bytes"
+	KeyReReviewThreshold  = "re_review_threshold"
 	KeyMaxBeadsPerPlan    = "max_beads_per_plan"
 	KeyMaxReviewRounds    = "limits.max_review_rounds"
 	KeyMaxPushbackRounds  = "limits.max_pushback_rounds"
+	KeyMaxConflictRounds  = "limits.max_conflict_rounds"
 	KeyAgentTimeout       = "limits.agent_timeout"
 	KeyMaxTokens          = "limits.max_tokens"
 	KeyMaxCostUSD         = "limits.max_cost_usd"
@@ -182,8 +187,9 @@ func load(globalPath, repoRoot string) (*Effective, error) {
 // scalarKeys are the keys whose source is tracked one by one.
 var scalarKeys = []string{
 	KeyActiveCartridge, KeyAmmo, KeySafety, KeyVibes, KeyRules, KeyExclude, KeyCheckCommand, KeyIdleReplanInterval,
-	KeyGatePollInterval, KeyPRPollInterval, KeyMaxBeadsPerPlan,
-	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyAgentTimeout, KeyMaxTokens, KeyMaxCostUSD,
+	KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyMaxDiffBytes, KeyReReviewThreshold,
+	KeyMaxBeadsPerPlan,
+	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyMaxConflictRounds, KeyAgentTimeout, KeyMaxTokens, KeyMaxCostUSD,
 	KeyMaxPlanRejections, KeyMaxPlanFailures,
 }
 
@@ -235,7 +241,7 @@ func Parse(path string, data []byte) (*File, error) {
 	dec := toml.NewDecoder(strings.NewReader(string(data)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&f); err != nil {
-		return nil, parseError(path, err)
+		return nil, locateDuration(parseError(path, err), path, data, raw)
 	}
 	if f.SchemaVersion == 0 {
 		f.SchemaVersion = schemaVersion
@@ -288,6 +294,105 @@ func parseError(path string, err error) error {
 		return &ParseError{Path: path, Line: line, Column: col, Msg: msg}
 	}
 	return &ParseError{Path: path, Msg: strings.TrimPrefix(err.Error(), "toml: ")}
+}
+
+// durationProbe is a decode target built from [File] with every *Duration
+// field replaced by a *string, and everything else dropped. go-toml calls
+// [Duration.UnmarshalText] with the raw text of a non-string value (a TOML
+// integer, float or boolean) from a place that has no position to report,
+// so that error arrives without a line; decoding the same document into
+// the probe turns the same value into an ordinary "cannot decode TOML
+// integer into ... string" error, which does carry the key and its
+// position. It is built by reflection so a duration key added to File can
+// never be forgotten here (P1-13).
+var durationProbe = newDurationProbe(reflect.TypeOf(File{}))
+
+// durationType is the type whose fields the probe replaces with strings.
+var durationType = reflect.TypeOf(Duration{})
+
+// newDurationProbe builds the probe struct type for t: every *Duration
+// field becomes a *string with the same TOML tag, every nested struct is
+// recursed into and kept only when it contributes a field, and every other
+// field is dropped. It returns nil when t has no duration keys at all.
+func newDurationProbe(t reflect.Type) reflect.Type {
+	var fields []reflect.StructField
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue // unexported
+		}
+		switch {
+		case f.Type.Kind() == reflect.Pointer && f.Type.Elem() == durationType:
+			fields = append(fields, reflect.StructField{Name: f.Name, Type: reflect.TypeOf((*string)(nil)), Tag: f.Tag})
+		case f.Type.Kind() == reflect.Struct:
+			if inner := newDurationProbe(f.Type); inner != nil {
+				fields = append(fields, reflect.StructField{Name: f.Name, Type: inner, Tag: f.Tag})
+			}
+		}
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+	return reflect.StructOf(fields)
+}
+
+// locateDuration enriches a position-less duration error with the line and
+// column of the offending key. err is returned unchanged when it already
+// has a position, when it is not a *ParseError, or when the probe decode
+// finds nothing wrong (P1-13).
+func locateDuration(err error, path string, data []byte, raw map[string]any) error {
+	var pe *ParseError
+	if !errors.As(err, &pe) || pe.Line > 0 || durationProbe == nil {
+		return err
+	}
+	probe := reflect.New(durationProbe).Interface()
+	dec := toml.NewDecoder(strings.NewReader(string(data)))
+	probeErr := dec.Decode(probe)
+	if probeErr == nil {
+		return err
+	}
+	var de *toml.DecodeError
+	if !errors.As(probeErr, &de) {
+		return err
+	}
+	key := strings.Join(de.Key(), ".")
+	if key == "" {
+		return err
+	}
+	line, col := de.Position()
+	return &ParseError{Path: path, Line: line, Column: col, Msg: fmt.Sprintf(
+		"%s: %s", key, invalidDurationMsg(rawValueText(raw, de.Key())))}
+}
+
+// rawValueText renders the value at key (a path of TOML key segments) in
+// the decoded document the way it was written: "10" for an integer, "true"
+// for a boolean. It falls back to Go's default formatting for anything
+// else, and to the empty string when the path is not there.
+func rawValueText(raw map[string]any, key []string) string {
+	var cur any = raw
+	for _, seg := range key {
+		table, ok := cur.(map[string]any)
+		if !ok {
+			return ""
+		}
+		if cur, ok = table[seg]; !ok {
+			return ""
+		}
+	}
+	switch v := cur.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case bool:
+		return strconv.FormatBool(v)
+	case int64:
+		return strconv.FormatInt(v, 10)
+	case float64:
+		return strconv.FormatFloat(v, 'g', -1, 64)
+	default:
+		return fmt.Sprint(v)
+	}
 }
 
 // mergeLayer applies one file on top of the current values, recording src
@@ -355,6 +460,18 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 		e.PRPollInterval = *f.PRPollInterval
 		e.Sources[KeyPRPollInterval] = src
 	}
+	if f.GraphPollInterval != nil {
+		e.GraphPollInterval = *f.GraphPollInterval
+		e.Sources[KeyGraphPollInterval] = src
+	}
+	if f.MaxDiffBytes != nil {
+		e.MaxDiffBytes = *f.MaxDiffBytes
+		e.Sources[KeyMaxDiffBytes] = src
+	}
+	if f.ReReviewThreshold != nil {
+		e.ReReviewThreshold = *f.ReReviewThreshold
+		e.Sources[KeyReReviewThreshold] = src
+	}
 	if f.MaxBeadsPerPlan != nil {
 		e.MaxBeadsPerPlan = *f.MaxBeadsPerPlan
 		e.Sources[KeyMaxBeadsPerPlan] = src
@@ -366,6 +483,10 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 	if v := f.Limits.MaxPushbackRounds; v != nil {
 		e.Limits.MaxPushbackRounds = *v
 		e.Sources[KeyMaxPushbackRounds] = src
+	}
+	if v := f.Limits.MaxConflictRounds; v != nil {
+		e.Limits.MaxConflictRounds = *v
+		e.Sources[KeyMaxConflictRounds] = src
 	}
 	if v := f.Limits.AgentTimeout; v != nil {
 		e.Limits.AgentTimeout = *v
@@ -496,6 +617,22 @@ func (e *Effective) validate() error {
 	if e.PRPollInterval.Duration() <= 0 {
 		return &ValidationError{Path: e.pathOf(KeyPRPollInterval), Key: KeyPRPollInterval, Msg: "must be a positive duration"}
 	}
+	if e.GraphPollInterval.Duration() <= 0 {
+		return &ValidationError{Path: e.pathOf(KeyGraphPollInterval), Key: KeyGraphPollInterval, Msg: "must be a positive duration"}
+	}
+	if e.MaxDiffBytes < MinMaxDiffBytes {
+		// Zero would be read by gitx as "use the default", and anything
+		// under a kibibyte truncates every diff to nothing (P1-14).
+		return &ValidationError{Path: e.pathOf(KeyMaxDiffBytes), Key: KeyMaxDiffBytes,
+			Msg: fmt.Sprintf("must be at least %d (1 KiB)", MinMaxDiffBytes)}
+	}
+	if e.ReReviewThreshold <= 0 || e.ReReviewThreshold > 1 {
+		// Zero would be read by gitx.ChangeRatio.Exceeds as "use the
+		// default", and a fraction of the changed lines cannot exceed all
+		// of them (D-09).
+		return &ValidationError{Path: e.pathOf(KeyReReviewThreshold), Key: KeyReReviewThreshold,
+			Msg: "must be greater than 0 and at most 1 (a fraction of the changed lines)"}
+	}
 	if e.MaxBeadsPerPlan < 1 {
 		return &ValidationError{Path: e.pathOf(KeyMaxBeadsPerPlan), Key: KeyMaxBeadsPerPlan, Msg: "must be at least 1"}
 	}
@@ -507,6 +644,9 @@ func (e *Effective) validate() error {
 		// by the feedback loop, which gave a user who asked for no pushback
 		// the default two exchanges. It is refused instead (P9-01).
 		return &ValidationError{Path: e.pathOf(KeyMaxPushbackRounds), Key: KeyMaxPushbackRounds, Msg: "must be at least 1"}
+	}
+	if e.Limits.MaxConflictRounds < 1 {
+		return &ValidationError{Path: e.pathOf(KeyMaxConflictRounds), Key: KeyMaxConflictRounds, Msg: "must be at least 1"}
 	}
 	if e.Limits.AgentTimeout.Duration() <= 0 {
 		return &ValidationError{Path: e.pathOf(KeyAgentTimeout), Key: KeyAgentTimeout, Msg: "must be a positive duration"}
@@ -612,9 +752,13 @@ func (e *Effective) Entries() []Entry {
 	add(KeyIdleReplanInterval, e.IdleReplanInterval.String(), e.Sources[KeyIdleReplanInterval])
 	add(KeyGatePollInterval, e.GatePollInterval.String(), e.Sources[KeyGatePollInterval])
 	add(KeyPRPollInterval, e.PRPollInterval.String(), e.Sources[KeyPRPollInterval])
+	add(KeyGraphPollInterval, e.GraphPollInterval.String(), e.Sources[KeyGraphPollInterval])
+	add(KeyMaxDiffBytes, strconv.Itoa(e.MaxDiffBytes), e.Sources[KeyMaxDiffBytes])
+	add(KeyReReviewThreshold, strconv.FormatFloat(e.ReReviewThreshold, 'f', -1, 64), e.Sources[KeyReReviewThreshold])
 	add(KeyMaxBeadsPerPlan, strconv.Itoa(e.MaxBeadsPerPlan), e.Sources[KeyMaxBeadsPerPlan])
 	add(KeyMaxReviewRounds, strconv.Itoa(e.Limits.MaxReviewRounds), e.Sources[KeyMaxReviewRounds])
 	add(KeyMaxPushbackRounds, strconv.Itoa(e.Limits.MaxPushbackRounds), e.Sources[KeyMaxPushbackRounds])
+	add(KeyMaxConflictRounds, strconv.Itoa(e.Limits.MaxConflictRounds), e.Sources[KeyMaxConflictRounds])
 	add(KeyAgentTimeout, e.Limits.AgentTimeout.String(), e.Sources[KeyAgentTimeout])
 	add(KeyMaxTokens, strconv.FormatInt(e.Limits.MaxTokens, 10), e.Sources[KeyMaxTokens])
 	add(KeyMaxCostUSD, strconv.FormatFloat(e.Limits.MaxCostUSD, 'f', -1, 64), e.Sources[KeyMaxCostUSD])

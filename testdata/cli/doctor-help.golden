@@ -2,6 +2,9 @@ Check that everything a run needs is installed and configured:
 
   git        present and at least 2.30
   bd         present and at least 1.2.2 (the beads CLI with embedded Dolt)
+  dolt       the beads project uses the embedded backend (warning in server
+             mode, which sc has not been tested against; the standalone dolt
+             CLI is irrelevant in embedded mode)
   beads      bd ping answers when the repo already has a .beads/ directory
   gh         present and authenticated (warning only; needed for safety-on
              gates and external PR review)

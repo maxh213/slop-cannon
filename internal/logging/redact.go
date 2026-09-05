@@ -41,14 +41,23 @@ func DefaultPatterns() []Pattern {
 
 // Redactor rewrites strings so that anything matching its patterns is
 // masked. The zero value redacts nothing; use [NewRedactor].
+//
+// It is immutable once built and safe for concurrent use, which it has to
+// be: one redactor is shared by the publication hook, the log handler and
+// the prompt builders of a whole run.
 type Redactor struct {
 	patterns []Pattern
+	// pre answers "could any of these patterns match this string?" in one
+	// byte scan, so a clean string — which is nearly every string — never
+	// runs a regular expression at all (P9-26).
+	pre *prefilter
 }
 
 // NewRedactor returns a Redactor using [DefaultPatterns] followed by any
 // extra rules, which must follow the [Pattern] group contract.
 func NewRedactor(extra ...Pattern) *Redactor {
-	return &Redactor{patterns: append(DefaultPatterns(), extra...)}
+	pats := append(DefaultPatterns(), extra...)
+	return &Redactor{patterns: pats, pre: newPrefilter(pats)}
 }
 
 var defaultRedactor = NewRedactor()
@@ -58,12 +67,22 @@ func Redact(s string) string { return defaultRedactor.Redact(s) }
 
 // Redact masks every token in s. Strings without a match are returned
 // unchanged, without allocation.
+//
+// A string that cannot hold a token — no "sk-", no "ghp_", no "bearer", none
+// of the words the rules are built from — is recognised by one byte scan and
+// returned without a regular expression being run at all (P9-26). That is
+// the case for almost every string a run redacts, and it is what keeps the
+// publication hook cheaper than the publish beneath it.
 func (r *Redactor) Redact(s string) string {
 	if r == nil {
 		return s
 	}
-	for _, p := range r.patterns {
-		if !p.Regexp.MatchString(s) {
+	mask := r.pre.candidates(s)
+	if mask == 0 {
+		return s
+	}
+	for i, p := range r.patterns {
+		if !prefilterWants(mask, i) || !p.Regexp.MatchString(s) {
 			continue
 		}
 		s = p.Regexp.ReplaceAllStringFunc(s, func(m string) string {
@@ -128,10 +147,21 @@ func (r *Redactor) redactValue(v slog.Value) slog.Value {
 
 // ContainsSecret reports whether s has at least one token the default rules
 // would redact. It is a cheap guard for callers that want to refuse rather
-// than mask, such as prompt builders.
-func ContainsSecret(s string) bool {
-	for _, p := range defaultRedactor.patterns {
-		if p.Regexp.MatchString(s) {
+// than mask, such as prompt builders. Like [Redactor.Redact] it answers a
+// clean string from the byte scan alone (P9-26).
+func ContainsSecret(s string) bool { return defaultRedactor.contains(s) }
+
+// contains is [ContainsSecret] for a redactor with extra rules of its own.
+func (r *Redactor) contains(s string) bool {
+	if r == nil {
+		return false
+	}
+	mask := r.pre.candidates(s)
+	if mask == 0 {
+		return false
+	}
+	for i, p := range r.patterns {
+		if prefilterWants(mask, i) && p.Regexp.MatchString(s) {
 			return true
 		}
 	}

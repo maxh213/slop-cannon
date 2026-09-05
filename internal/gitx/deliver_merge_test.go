@@ -832,6 +832,24 @@ func TestManager_DeliverMerge(t *testing.T) {
 		assert.Equal(t, StagePrepare, dmStage(t, err))
 	})
 
+	// P4-12: the bead was retitled after its branch was cut, so BranchName
+	// names a branch that does not exist. The safety-off delivery must
+	// still find the work.
+	t.Run("a retitled bead delivers the branch its work is on", func(t *testing.T) {
+		f := dmSetup(t)
+		sha := f.dmBranchCommit(t, "stats/notes.md", "work\n", "Add notes")
+		retitled := wtBead
+		retitled.Title = "a much better title the PO thought of later"
+		require.NotEqual(t, f.wt.Branch, BranchName(retitled))
+
+		res, err := f.m.DeliverMerge(ctx, retitled, MergeOptions{CheckCommand: "true"})
+		require.NoError(t, err)
+		assert.Equal(t, f.wt.Branch, res.Branch)
+		assert.Equal(t, sha, res.Head)
+		assert.Equal(t, 1, res.Commits)
+		assert.Equal(t, sha, f.dmMain(t), "the work landed on the default branch")
+	})
+
 	t.Run("worktree on the wrong branch", func(t *testing.T) {
 		f := dmSetup(t)
 		_, err := f.wtRepo.Git(ctx, "checkout", "-q", "-b", "somewhere-else")

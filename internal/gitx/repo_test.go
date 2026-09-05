@@ -533,3 +533,72 @@ func TestGitError_Error(t *testing.T) {
 	assert.ErrorIs(t, e, inner)
 	assert.Empty(t, (&GitError{}).Unwrap())
 }
+
+// TestRepo_GitRaw covers P4-11: Git trims every trailing carriage return
+// and newline, which silently rewrites any output whose bytes are the
+// answer, so GitRaw hands those callers exactly what git wrote.
+func TestRepo_GitRaw(t *testing.T) {
+	ctx := context.Background()
+	r := testutil.NewFixtureRepo(t)
+	repo := repoOpen(t, r)
+
+	// A file with CRLF line endings and a meaningful empty last line.
+	const content = "first\r\nsecond\r\n\r\n"
+	r.WriteFile(t, "crlf.txt", content)
+	// --no-filters so no autocrlf or clean filter can rewrite the blob:
+	// the bytes on disk are the bytes in the object.
+	sha, err := repo.Git(ctx, "hash-object", "-w", "--no-filters", "--", "crlf.txt")
+	require.NoError(t, err)
+
+	raw, err := repo.GitRaw(ctx, "cat-file", "blob", sha)
+	require.NoError(t, err)
+	assert.Equal(t, content, raw, "GitRaw returns the blob byte for byte")
+
+	trimmed, err := repo.Git(ctx, "cat-file", "blob", sha)
+	require.NoError(t, err)
+	assert.Equal(t, "first\r\nsecond", trimmed, "Git trims the trailing CR/LF run")
+
+	t.Run("line-oriented callers are unchanged", func(t *testing.T) {
+		// Git still strips the terminator every parser in this package
+		// relies on being absent.
+		head, err := repo.Git(ctx, "rev-parse", "HEAD")
+		require.NoError(t, err)
+		assert.NotContains(t, head, "\n")
+		rawHead, err := repo.GitRaw(ctx, "rev-parse", "HEAD")
+		require.NoError(t, err)
+		assert.Equal(t, head+"\n", rawHead)
+	})
+
+	t.Run("failures classify like Git", func(t *testing.T) {
+		_, err := repo.GitRaw(ctx, "rev-parse", "--verify", "--quiet", "--end-of-options", "nope^{commit}")
+		var ge *GitError
+		require.ErrorAs(t, err, &ge)
+		assert.Equal(t, 1, ge.ExitCode)
+	})
+}
+
+// TestRepo_ByteSensitiveReaders covers the other half of P4-11: a path
+// whose own last byte is a newline survives the NUL-terminated readers,
+// which would lose it if the trailing bytes were trimmed.
+func TestRepo_ByteSensitiveReaders(t *testing.T) {
+	ctx := context.Background()
+	r := testutil.NewFixtureRepo(t)
+	repo := repoOpen(t, r)
+	const odd = "odd\nname.txt" // a newline inside the path, not at its end
+	require.NoError(t, os.WriteFile(filepath.Join(r.Dir, odd), []byte("x\n"), 0o644))
+
+	paths, err := repo.changedPaths(ctx)
+	require.NoError(t, err)
+	assert.Contains(t, paths, odd, "the -z reader keeps a newline inside a path")
+
+	base := r.Head(t)
+	_, err = repo.CommitAll(ctx, "a file with a newline in its name")
+	require.NoError(t, err)
+	stats, err := repo.diffStatsBetween(ctx, base, "HEAD")
+	require.NoError(t, err)
+	require.Len(t, stats.Changed, 1)
+	assert.Equal(t, odd, stats.Changed[0].Path)
+	statuses, err := repo.diffStatuses(ctx, base, "HEAD")
+	require.NoError(t, err)
+	assert.Equal(t, fileStatus{Status: DiffAdded}, statuses[odd])
+}

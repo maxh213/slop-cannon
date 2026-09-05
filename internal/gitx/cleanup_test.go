@@ -144,6 +144,14 @@ func cuEntry(t *testing.T, res *CleanupResult, id domain.BeadID) CleanupEntry {
 	return CleanupEntry{}
 }
 
+// cuRead reads a file under dir.
+func cuRead(t *testing.T, dir, rel string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(dir, rel))
+	require.NoError(t, err)
+	return string(b)
+}
+
 // cuResumeEntry finds the resume entry of a bead.
 func cuResumeEntry(t *testing.T, res *ResumeResult, id domain.BeadID) ResumeEntry {
 	t.Helper()
@@ -177,7 +185,7 @@ func cuGH(t *testing.T) *testutil.Shim {
 mode=$(cat "$SC_FAKEBIN_DIR/mode" 2>/dev/null || echo ok)
 case "$mode" in
   noauth) echo "You are not logged into any GitHub hosts. To log in, run:  gh auth login" >&2; exit 4 ;;
-  nohost) echo "none of the git remotes configured for this repository point to a known GitHub host." >&2; exit 1 ;;
+  nohost) echo "none of the git remotes configured for this repository point to a known GitHub host. To tell gh about a new GitHub host, please use 'gh auth login'" >&2; exit 1 ;;
   network) echo "HTTP 502: bad gateway" >&2; exit 1 ;;
 esac
 case "$1 $2" in
@@ -560,7 +568,7 @@ func TestManager_Cleanup(t *testing.T) {
 		require.NoError(t, err)
 		_, err = wtRepo.Git(ctx, "checkout", "--quiet", "--detach")
 		require.NoError(t, err)
-		require.NoError(t, f.m.DeleteBranch(ctx, bead))
+		requireDeleteBranch(t, f.m, bead)
 
 		res, err := f.m.Cleanup(ctx, []domain.Bead{bead}, CleanupOptions{Logger: quiet})
 		require.NoError(t, err)
@@ -582,7 +590,7 @@ func TestManager_Cleanup(t *testing.T) {
 		require.NoError(t, err)
 		_, err = wtRepo.Git(ctx, "checkout", "--quiet", "--detach")
 		require.NoError(t, err)
-		require.NoError(t, f.m.DeleteBranch(ctx, bead))
+		requireDeleteBranch(t, f.m, bead)
 		cuFail(t, git, "for-each-ref")
 
 		res, err := f.m.Cleanup(ctx, []domain.Bead{bead}, CleanupOptions{Logger: quiet})
@@ -731,18 +739,70 @@ func TestManager_resolveBranch(t *testing.T) {
 	})
 }
 
-func TestBeadOnBranch(t *testing.T) {
-	bead := cuBead("fx-d1", "whatever the title is now", domain.BeadStateInProgress)
-	for _, branch := range []string{"sc/fx-d1", "sc/fx-d1-the-title-it-was-created-with", BranchName(bead)} {
-		out, ok := beadOnBranch(bead, branch)
-		require.True(t, ok, branch)
-		assert.Equal(t, branch, BranchName(out), "Create must cut or check out exactly this branch")
-		assert.Equal(t, bead.ID, out.ID)
-	}
-	for _, branch := range []string{"feature/theirs", "sc/fx-d2-other-bead", "sc/fx-d1-Not A Slug", "main"} {
-		_, ok := beadOnBranch(bead, branch)
-		assert.False(t, ok, branch)
-	}
+// TestManager_BranchFor is P4-12: every gitx helper addresses the branch a
+// bead's work is really on, not the one its (mutable) title spells. The
+// product owner retitles a bead mid-run and the branch, the worktree, the
+// commits on it and the deletion must all still follow the work.
+func TestManager_BranchFor(t *testing.T) {
+	ctx := context.Background()
+	f := wtSetup(t, nil)
+	bead := cuBead("fx-d1", "the title it was created with", domain.BeadStateInProgress)
+	sha := cuWork(t, f, bead)
+	original := BranchName(bead)
+
+	retitled := bead
+	retitled.Title = "a much better title the PO thought of later"
+	require.NotEqual(t, original, BranchName(retitled), "the new title names a different branch")
+
+	t.Run("while the worktree is registered", func(t *testing.T) {
+		branch, exists, err := f.m.BranchFor(ctx, retitled)
+		require.NoError(t, err)
+		assert.Equal(t, original, branch, "git's own registration names the branch")
+		assert.True(t, exists)
+	})
+
+	require.NoError(t, f.m.Remove(ctx, bead.ID, true))
+
+	t.Run("after the worktree is gone", func(t *testing.T) {
+		branch, exists, err := f.m.BranchFor(ctx, retitled)
+		require.NoError(t, err)
+		assert.Equal(t, original, branch, "the sc/<bead-id> namespace still names it")
+		assert.True(t, exists)
+	})
+
+	t.Run("Create checks the work out instead of cutting a new branch", func(t *testing.T) {
+		wt, err := f.m.Create(ctx, retitled)
+		require.NoError(t, err)
+		assert.Equal(t, original, wt.Branch)
+		assert.Equal(t, sha, wt.Head, "the commits are still there")
+		assert.Empty(t, f.r.Git(t, "for-each-ref", "--format=%(refname:short)", "refs/heads/"+BranchName(retitled)),
+			"no branch was cut under the new title")
+	})
+
+	t.Run("DeleteBranch deletes the branch the work is on", func(t *testing.T) {
+		require.NoError(t, f.m.Remove(ctx, bead.ID, true))
+		deleted, err := f.m.DeleteBranch(ctx, retitled)
+		require.NoError(t, err)
+		assert.Equal(t, original, deleted)
+		exists, err := f.repo.BranchExists(ctx, original)
+		require.NoError(t, err)
+		assert.False(t, exists)
+
+		deleted, err = f.m.DeleteBranch(ctx, retitled)
+		require.NoError(t, err, "a bead with no branch left is not an error")
+		assert.Empty(t, deleted)
+	})
+
+	t.Run("a bead that never had one gets its title's branch", func(t *testing.T) {
+		fresh := cuBead("fx-d9", "never started", domain.BeadStateOpen)
+		branch, exists, err := f.m.BranchFor(ctx, fresh)
+		require.NoError(t, err)
+		assert.Equal(t, BranchName(fresh), branch)
+		assert.False(t, exists)
+		wt, err := f.m.Create(ctx, fresh)
+		require.NoError(t, err)
+		assert.Equal(t, BranchName(fresh), wt.Branch)
+	})
 }
 
 func TestPRNumberFromURL(t *testing.T) {
@@ -826,7 +886,7 @@ func TestResumer_Resume(t *testing.T) {
 		undeliveredSHA := cuWork(t, f, undelivered)
 		cuWork(t, f, branchGone)
 		require.NoError(t, f.m.Remove(ctx, branchGone.ID, false))
-		require.NoError(t, f.m.DeleteBranch(ctx, branchGone))
+		requireDeleteBranch(t, f.m, branchGone)
 		retitledSHA := cuWork(t, f, retitled)
 		retitledBranch := BranchName(retitled)
 		// The PO rewrote the bead's title after the worktree was created, so
@@ -1059,8 +1119,9 @@ func TestResumer_Resume(t *testing.T) {
 		require.NoError(t, err)
 		e := cuResumeEntry(t, res, bead.ID)
 		assert.Equal(t, "feature/theirs", e.Branch)
-		assert.Equal(t, WorktreeMissing, e.WorktreeStatus, "recreating would cut a new branch and orphan the work")
-		assert.ErrorContains(t, e.Err, "no longer names")
+		assert.Equal(t, WorktreeMissing, e.WorktreeStatus, "recreating would leave the work on that branch behind")
+		assert.ErrorContains(t, e.Err, "is not one of fx-p1's own")
+		assert.ErrorIs(t, e.Err, ErrBranchInUse)
 		assert.False(t, e.Changed())
 		assert.Contains(t, e.Reason, "could not be inspected")
 	})
@@ -1218,6 +1279,64 @@ func TestResumer_Resume(t *testing.T) {
 		assert.Equal(t, landedSHA, e.MergeSHA)
 	})
 
+	// P4-16: the reflog rule of P4-13 catches a branch that was cut and
+	// never committed to, but a rebase can also drop every commit a branch
+	// carried — because the same change had already landed upstream, or
+	// because the conflict was resolved in upstream's favour — which leaves
+	// the branch sitting on an upstream commit with a moved ref. That
+	// branch is an ancestor of the default branch and holds nothing of the
+	// bead's, so a crash in that window must not close it either.
+	t.Run("a delivering bead whose commits were rebased away is not closed", func(t *testing.T) {
+		f := wtSetup(t, nil)
+		dropped := cuBead("fx-r9", "delivering, rebased to nothing", domain.BeadStateDelivering)
+		landed := cuBead("fx-r8", "delivered before the crash", domain.BeadStateDelivering)
+		_, err := f.m.Create(ctx, dropped)
+		require.NoError(t, err)
+		wtRepo, err := f.m.Open(ctx, dropped.ID)
+		require.NoError(t, err)
+		acWrite(t, wtRepo.Root, "work/shared.txt", "the very same change\n")
+		c, err := wtRepo.CommitAll(ctx, "work for fx-r9")
+		require.NoError(t, err)
+		require.True(t, c.Committed)
+
+		// Somebody else lands the identical change on main, so the rebase
+		// drops the bead's only commit.
+		f.r.WriteFile(t, "work/shared.txt", "the very same change\n")
+		mainTip := f.r.Commit(t, "the same change, upstream")
+		_, err = wtRepo.Git(ctx, "-c", "commit.gpgsign=false", "rebase", "--quiet", "main")
+		require.NoError(t, err)
+		require.Equal(t, mainTip, f.r.Git(t, "rev-parse", "refs/heads/"+BranchName(dropped)),
+			"the branch now sits on the upstream commit")
+
+		landedSHA := cuWork(t, f, landed)
+		cuLand(t, f, landed)
+
+		tracker := &cuTracker{}
+		res, err := cuResumer(t, f.wtReopen(t), tracker).Resume(ctx, []domain.Bead{dropped, landed})
+		require.NoError(t, err)
+		require.NoError(t, res.Err(), res.Summary())
+
+		e := cuResumeEntry(t, res, dropped.ID)
+		require.True(t, e.BranchExists)
+		assert.Zero(t, e.Ahead)
+		assert.False(t, e.Landed, "a branch rebased to nothing landed nothing: %s", e.Reason)
+		assert.Equal(t, domain.BeadStateDelivering, e.State)
+		assert.False(t, e.Changed())
+		assert.False(t, e.Applied)
+		assert.Empty(t, e.MergeSHA)
+		assert.Contains(t, e.Reason, "rebased away")
+		assert.Contains(t, e.Reason, "deliver again")
+		assert.NotContains(t, tracker.closed, dropped.ID)
+		assert.NotContains(t, tracker.meta, dropped.ID)
+
+		// And the same pass still closes a genuine fast-forward.
+		e = cuResumeEntry(t, res, landed.ID)
+		assert.True(t, e.Landed)
+		assert.Equal(t, domain.BeadStateClosed, e.State)
+		assert.True(t, e.Applied)
+		assert.Equal(t, landedSHA, e.MergeSHA)
+	})
+
 	t.Run("a gate still blocking the close leaves the bead to the gate poller", func(t *testing.T) {
 		f := wtSetup(t, nil)
 		landed := cuBead("fx-d1", "merged by hand with a PR gate", domain.BeadStateDelivering)
@@ -1251,18 +1370,56 @@ func TestResumer_Resume(t *testing.T) {
 		assert.Contains(t, res.Summary(), "(error: applying closed: bd is down)")
 	})
 
+	// P4-15: a human's checkout is normally mid-edit, and Manager.Create
+	// refuses a dirty repository, so a crash plus a removed worktree used
+	// to leave the bead unrecoverable until the user committed or stashed.
+	// Adding a linked worktree elsewhere has nothing to do with the state
+	// of their working tree, so the resume recreates it regardless — and
+	// leaves their work exactly where it was.
+	t.Run("a wiped worktree is recreated while the user has uncommitted work", func(t *testing.T) {
+		f := wtSetup(t, nil)
+		wiped := cuBead("fx-p1", "wiped", domain.BeadStateInProgress)
+		sha := cuWork(t, f, wiped)
+		require.NoError(t, os.RemoveAll(f.m.PathFor(wiped.ID)))
+		f.r.WriteFile(t, "notes.txt", "the user is editing\n")
+		f.r.Git(t, "add", "notes.txt")
+		f.r.WriteFile(t, "README.md", "and has staged something else\n")
+
+		res, err := cuResumer(t, f.wtReopen(t), &cuTracker{}).Resume(ctx, []domain.Bead{wiped})
+		require.NoError(t, err)
+		require.NoError(t, res.Err(), res.Summary())
+		e := cuResumeEntry(t, res, wiped.ID)
+		assert.Equal(t, WorktreeRecreated, e.WorktreeStatus)
+		require.NotNil(t, e.Worktree)
+		assert.Equal(t, BranchName(wiped), e.Worktree.Branch)
+		assert.Equal(t, sha, e.Worktree.Head, "the bead's own commits are back")
+		assert.Contains(t, e.Reason, "recreated")
+		assert.False(t, e.Changed())
+
+		assert.FileExists(t, filepath.Join(f.r.Dir, "notes.txt"), "the user's own work is untouched")
+		assert.Contains(t, f.r.Status(t), "notes.txt")
+		assert.Equal(t, "and has staged something else\n", cuRead(t, f.r.Dir, "README.md"))
+	})
+
 	t.Run("recreation failures are reported per bead", func(t *testing.T) {
 		f := wtSetup(t, nil)
 		wiped := cuBead("fx-p1", "wiped", domain.BeadStateInProgress)
 		cuWork(t, f, wiped)
-		require.NoError(t, os.RemoveAll(f.m.PathFor(wiped.ID)))
-		f.r.WriteFile(t, "notes.txt", "the user is editing\n")
+		path := f.m.PathFor(wiped.ID)
+		require.NoError(t, os.RemoveAll(path))
+		// Something else took the path in the meantime.
+		require.NoError(t, os.WriteFile(path, []byte("not a worktree\n"), 0o644))
+		t.Cleanup(func() { _ = os.Remove(path) })
+
 		res, err := cuResumer(t, f.wtReopen(t), &cuTracker{}).Resume(ctx, []domain.Bead{wiped})
 		require.NoError(t, err)
 		e := cuResumeEntry(t, res, wiped.ID)
 		assert.Equal(t, WorktreeMissing, e.WorktreeStatus)
-		assert.ErrorIs(t, e.Err, ErrRepoDirty)
+		require.Error(t, e.Err)
+		assert.Contains(t, e.Err.Error(), "recreating the worktree")
 		assert.False(t, e.Changed())
+		assert.Contains(t, e.Reason, "could not be inspected")
+		assert.ErrorContains(t, res.Err(), string(wiped.ID))
 	})
 
 	t.Run("a bead without an id is an entry error", func(t *testing.T) {
@@ -1408,7 +1565,7 @@ func TestResumer_Resume_WithRemote(t *testing.T) {
 		// human tidying up) before the crash. The work is on the remote.
 		f.r.Git(t, "push", "-q", "origin", BranchName(f.bead))
 		require.NoError(t, f.m.Remove(ctx, f.bead.ID, true))
-		require.NoError(t, f.m.DeleteBranch(ctx, f.bead))
+		requireDeleteBranch(t, f.m, f.bead)
 		dpSet(t, f.gh, "prs.json", `[{"number":7,"url":"https://github.com/acme/widgets/pull/7","state":"OPEN","title":"x"}]`)
 		tracker := &cuTracker{}
 		res, err := cuResumer(t, f.wtReopen(t), tracker).Resume(ctx, []domain.Bead{f.bead})
@@ -1467,7 +1624,7 @@ func TestResumer_Resume_WithRemote(t *testing.T) {
 		// request's head branch any more.
 		f.r.Git(t, "push", "-q", "origin", branch)
 		require.NoError(t, f.m.Remove(ctx, f.bead.ID, true))
-		require.NoError(t, f.m.DeleteBranch(ctx, f.bead))
+		requireDeleteBranch(t, f.m, f.bead)
 		f.bead.Title = "a much better title"
 		require.NotEqual(t, branch, BranchName(f.bead))
 		dpSet(t, f.gh, "prs.json", `[]`)
@@ -1517,6 +1674,86 @@ func TestResumer_Resume_WithRemote(t *testing.T) {
 		assert.Equal(t, domain.BeadStateDelivering, e.State)
 		assert.Contains(t, e.Reason, "PR #9 merged")
 		assert.Empty(t, tracker.calls)
+	})
+
+	// P4-10: a PRPushOnly or PRNoRemote delivery pushes (or does not) and
+	// hands the bead to a human, recording no pull request. The human opens
+	// one; the resume has to notice and take the bead back into delivery,
+	// with the pull request written to its metadata so the re-run delivery
+	// can gate it (D-20).
+	t.Run("a hand-opened pull request takes a push-only bead back into delivery", func(t *testing.T) {
+		f := setup(t, domain.BeadStateNeedsHuman)
+		f.r.Git(t, "push", "-q", "origin", BranchName(f.bead))
+		dpSet(t, f.gh, "prs.json", `[{"number":11,"url":"https://github.com/acme/widgets/pull/11","state":"OPEN","title":"x"}]`)
+		tracker := &cuTracker{}
+		res, err := cuResumer(t, f.wtReopen(t), tracker).Resume(ctx, []domain.Bead{f.bead})
+		require.NoError(t, err)
+		require.NoError(t, res.Err(), res.Summary())
+
+		e := cuResumeEntry(t, res, f.bead.ID)
+		require.NotNil(t, e.PR)
+		assert.Equal(t, 11, e.PR.Number)
+		assert.Equal(t, "OPEN", e.PRState)
+		assert.Equal(t, domain.BeadStateDelivering, e.State)
+		assert.True(t, e.Changed())
+		assert.True(t, e.Applied)
+		assert.Contains(t, e.Reason, "PR #11 was opened by hand")
+		assert.Contains(t, e.Reason, "gate")
+
+		// The pull request is on the bead before its status moves, so the
+		// re-run delivery finds it and creates the gate.
+		assert.Equal(t, map[string]any{
+			beads.MetaPRURL:    "https://github.com/acme/widgets/pull/11",
+			beads.MetaPRNumber: 11,
+		}, tracker.meta[f.bead.ID])
+		assert.Equal(t, []string{
+			"update " + string(f.bead.ID),
+			"status " + string(f.bead.ID) + " delivering",
+		}, tracker.calls, "the metadata is written first")
+		assert.Equal(t, domain.BeadStateDelivering, tracker.statuses[f.bead.ID])
+	})
+
+	t.Run("a merged pull request does the same for a no-remote bead", func(t *testing.T) {
+		// PRNoRemote left the branch local; the human added the remote,
+		// pushed it, opened the pull request and merged it themselves.
+		f := setup(t, domain.BeadStateNeedsHuman)
+		f.r.Git(t, "push", "-q", "origin", BranchName(f.bead))
+		dpSet(t, f.gh, "prs.json", `[{"number":12,"url":"https://github.com/acme/widgets/pull/12","state":"MERGED","title":"x"}]`)
+		tracker := &cuTracker{}
+		res, err := cuResumer(t, f.wtReopen(t), tracker).Resume(ctx, []domain.Bead{f.bead})
+		require.NoError(t, err)
+		require.NoError(t, res.Err(), res.Summary())
+		e := cuResumeEntry(t, res, f.bead.ID)
+		assert.Equal(t, "MERGED", e.PRState)
+		assert.Equal(t, domain.BeadStateDelivering, e.State, "the gate poller closes it once the gate exists")
+		assert.True(t, e.Applied)
+		assert.Equal(t, 12, tracker.meta[f.bead.ID][beads.MetaPRNumber])
+	})
+
+	t.Run("a needs_human bead with no pull request is left alone", func(t *testing.T) {
+		f := setup(t, domain.BeadStateNeedsHuman)
+		dpSet(t, f.gh, "prs.json", `[]`)
+		tracker := &cuTracker{}
+		res, err := cuResumer(t, f.wtReopen(t), tracker).Resume(ctx, []domain.Bead{f.bead})
+		require.NoError(t, err)
+		require.NoError(t, res.Err())
+		e := cuResumeEntry(t, res, f.bead.ID)
+		assert.Nil(t, e.PR)
+		assert.Equal(t, domain.BeadStateNeedsHuman, e.State)
+		assert.False(t, e.Changed())
+		assert.Empty(t, tracker.calls)
+		assert.Len(t, f.gh.Invocations(t), 1, "the branch was asked about once")
+	})
+
+	t.Run("a needs_human bead without a branch is never asked about", func(t *testing.T) {
+		f := wtSetup(t, []testutil.FixtureOption{testutil.WithBareRemote()})
+		gh := cuGH(t)
+		bead := cuBead("fx-h9", "never implemented", domain.BeadStateNeedsHuman)
+		res, err := cuResumer(t, f.wtReopen(t), &cuTracker{}).Resume(ctx, []domain.Bead{bead})
+		require.NoError(t, err)
+		require.NoError(t, res.Err())
+		assert.False(t, cuResumeEntry(t, res, bead.ID).Changed())
+		assert.Empty(t, gh.Invocations(t), "no branch, nothing to look a pull request up by")
 	})
 
 	t.Run("an open pull request does not pull a bead out of its review loop", func(t *testing.T) {

@@ -7,10 +7,13 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -47,10 +50,12 @@ const (
 	// FlagRunForce takes the repository's run lock from a run that may
 	// still be alive (P9-04). It is never sc's own decision.
 	FlagRunForce = "force"
-	// FlagRunDryRun is hidden: it resolves the run and prints it without
-	// firing anything. It is how the resolution tests and `--json`'s
-	// RunConfig output survive P8-01, and it is deliberately not in the
-	// help output or docs/cli.md until someone documents it.
+	// FlagRunDryRun resolves the run and prints it without firing
+	// anything: what this repository, this configuration and these flags
+	// add up to. It is how the resolution tests and `--json`'s RunConfig
+	// output read a run without starting one, and it is the answer to
+	// "show me what this run would do" — which is why P8-21 took it out of
+	// hiding and into `sc run --help` and docs/cli.md.
 	FlagRunDryRun = "dry-run"
 )
 
@@ -99,6 +104,11 @@ override the config files for this run only; everything else comes from the
 effective configuration (sc config show). --resume continues the most
 recent run recorded for the repository instead of starting a new one.
 
+The TUI holds the finished run on screen until you press q, so the last
+graph is there to read; --headless ends when the run does, and a reader
+that closes early (sc run --headless | head) stops the run rather than
+killing it. sc stop ends a run from another terminal.
+
 This is the same as the bare form "sc PATH [flags]".`
 
 const runExamples = `sc ./repo-path
@@ -136,8 +146,7 @@ func addRunFlags(cmd *cobra.Command) {
 	f.Bool(FlagRunNoAnim, false, "disable the cannon animations in the TUI (also honours SC_NO_ANIM)")
 	f.Bool(FlagRunReviewPRs, true, "also review open pull requests sc did not create (needs gh and a remote)")
 	f.Bool(FlagRunForce, false, "start even though another run holds this repository's lock (only when you know it is gone)")
-	f.Bool(FlagRunDryRun, false, "resolve the run and print it without firing anything")
-	_ = f.MarkHidden(FlagRunDryRun)
+	f.Bool(FlagRunDryRun, false, "print the run this repository, config and flags add up to, without firing anything")
 }
 
 // runOptionsFrom reads the run flags of cmd. path is the positional target;
@@ -246,8 +255,28 @@ func ResolveRunWithNotes(opts RunOptions) (*config.RunConfig, []string, error) {
 		ReviewPRs: opts.ReviewPRs,
 		StartedAt: now,
 	}
+	var notes []string
 	if !opts.Resume {
 		settings.ID = runNewID(now)
+	} else {
+		// P8-31: `--resume` continues the newest run that actually recorded
+		// something, not simply the greatest directory name on disk.
+		target, note, err := runResumeTarget(root)
+		if err != nil {
+			return nil, nil, err
+		}
+		if note != "" {
+			notes = append(notes, note)
+		}
+		switch {
+		case target != "":
+			settings.ID = target
+		case note != "":
+			// Nothing on disk is resumable, so this is a new run under a
+			// new id; the note above says so.
+			settings.Resume = false
+			settings.ID = runNewID(now)
+		}
 	}
 	rc, err := config.NewRunConfig(root, eff, settings)
 	if errors.Is(err, config.ErrNoCartridge) {
@@ -256,14 +285,66 @@ func ResolveRunWithNotes(opts RunOptions) (*config.RunConfig, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if !opts.Resume {
-		return rc, nil, nil
+	if !settings.Resume {
+		return rc, notes, nil
 	}
 	res, err := orchestrator.RestoreRunConfig(rc)
 	if err != nil {
 		return nil, nil, err
 	}
-	return rc, res.Notes, nil
+	return rc, append(notes, res.Notes...), nil
+}
+
+// runResumeTarget picks the run `--resume` continues: the newest run
+// directory of the repository that actually holds a state.json.
+//
+// P8-31: [config.LatestRunID] takes the greatest directory name whatever is
+// in it, so a directory left behind by a kill between [logging.OpenRunLog]
+// and the first state write — or by a half-pruned state directory — was
+// adopted, and `--resume` fired a brand-new autopilot run under a dead
+// run's id. A run that never wrote a state file has nothing to resume, so
+// it is passed over.
+//
+// It returns the run to continue and, when the choice is not simply the
+// newest directory, the note explaining it. An empty id with a note means
+// nothing on disk is resumable and the caller should start a new run; an
+// empty id with no note means the repository has no runs at all, which is
+// [config.NewRunConfig]'s own refusal to phrase.
+func runResumeTarget(root string) (id domain.RunID, note string, err error) {
+	dir := filepath.Join(config.StateDir(root), config.RunsDirName)
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", "", nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("list runs: %w", err)
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	if len(names) == 0 {
+		return "", "", nil
+	}
+	// Run ids sort chronologically as text (config.NewRunID), so the last
+	// name is the newest run.
+	slices.Sort(names)
+	slices.Reverse(names)
+	for i, name := range names {
+		if _, err := os.Stat(filepath.Join(dir, name, orchestrator.StateFileName)); err != nil {
+			continue
+		}
+		if i == 0 {
+			return domain.RunID(name), "", nil
+		}
+		return domain.RunID(name), fmt.Sprintf(
+			"run %s recorded no %s, so there is nothing of it to resume; continuing run %s, the newest one that did",
+			names[0], orchestrator.StateFileName, name), nil
+	}
+	return "", fmt.Sprintf("run %s recorded no %s, and neither did any older run; starting a new run instead",
+		names[0], orchestrator.StateFileName), nil
 }
 
 // runRepoRoot makes path absolute, checks it is a directory, and returns
@@ -278,13 +359,13 @@ func runRepoRoot(path string) (string, error) {
 	}
 	info, err := os.Stat(abs)
 	if errors.Is(err, os.ErrNotExist) {
-		return "", fmt.Errorf("%s: no such directory", path)
+		return "", fmt.Errorf("%s: no such directory; sc fires at a git repository that already exists, so check the path (a relative one is resolved against the current directory) or name another: sc /path/to/repo", path)
 	}
 	if err != nil {
 		return "", err
 	}
 	if !info.IsDir() {
-		return "", fmt.Errorf("%s: not a directory", path)
+		return "", fmt.Errorf("%s: not a directory; sc fires at a repository, not at one of its files, so name the directory: sc /path/to/repo", path)
 	}
 	root, ok := config.FindRepoRoot(abs)
 	if !ok {
@@ -294,9 +375,9 @@ func runRepoRoot(path string) (string, error) {
 }
 
 // runTarget is the RunE of both `sc PATH` and `sc run [PATH]`: it resolves
-// the run and then fires it (P8-01). With the hidden --dry-run it stops at
-// the resolved configuration and prints it, which is what the resolution
-// tests and `sc --json <repo> --dry-run` read.
+// the run and then fires it (P8-01). With --dry-run it stops at the
+// resolved configuration and prints it, which is what a user asking what a
+// run would do, the resolution tests and `sc --json <repo> --dry-run` read.
 func runTarget(cmd *cobra.Command, args []string) error {
 	opts, err := GlobalOpts(cmd)
 	if err != nil {
@@ -460,6 +541,12 @@ func fireCannon(cmd *cobra.Command, gopts GlobalOptions, rc *config.RunConfig) e
 	// --json is only meaningful as a stream of event envelopes, and a TUI
 	// cannot produce one: it implies --headless (D-15, P8-12).
 	headless := rc.Run.Config.Headless || gopts.JSON
+	if headless {
+		// P9-20: a closed stdout must reach the run as an error it can stop
+		// on, not as the signal that kills the process before it can
+		// release its lock or clean its worktrees.
+		defer runIgnoreBrokenPipe()()
+	}
 	if !headless {
 		if err := runRequireTerminal(); err != nil {
 			// P8-06: the refusal goes through the same numbered fix list
@@ -646,6 +733,77 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 // construction, so reading it needs no lock.
 func (s *syncWriter) unwrap() io.Writer { return s.w }
 
+// runIgnoreBrokenPipe makes a write to a closed stdout or stderr an error
+// this process can act on rather than a signal that kills it, and returns
+// the function that puts the default behaviour back.
+//
+// P9-20: `sc run --headless | head` closes the pipe as soon as head has its
+// ten lines. The Go runtime turns EPIPE on file descriptor 1 or 2 into a
+// SIGPIPE with the default disposition, so the process died where it stood
+// — the run lock was never released and the worktrees were never cleaned,
+// and the mess stood until the next run's stale-lock notice removed it.
+// Asking for the signal on a channel (which is then simply dropped) makes
+// the runtime return EPIPE from the write instead, which
+// [closedOutputWriter] turns into an ordinary stop, so the shutdown is the
+// same one SIGTERM gets.
+func runIgnoreBrokenPipe() (restore func()) {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, syscall.SIGPIPE)
+	return func() { signal.Stop(ch) }
+}
+
+// closedOutputWriter is the screen of a headless run: it writes through
+// until the reader goes away, and then tells the run so and swallows
+// everything after that (P9-20).
+//
+// Swallowing is deliberate. The renderer is mid-stream when the pipe
+// breaks, and failing it there would end the run as an error, with no
+// summary and a non-zero exit code, for something the user did on purpose
+// (`| head`, `| grep -m1`). The run stops instead, exactly as it would on a
+// signal, and its finish reason decides the exit code.
+type closedOutputWriter struct {
+	w io.Writer
+	// onClosed is called once, the first time a write finds the reader
+	// gone.
+	onClosed func(error)
+
+	mu     sync.Mutex
+	closed bool
+}
+
+// Write implements [io.Writer].
+func (c *closedOutputWriter) Write(p []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return len(p), nil
+	}
+	n, err := c.w.Write(p)
+	if err != nil && isClosedPipe(err) {
+		c.closed = true
+		if c.onClosed != nil {
+			c.onClosed(err)
+		}
+		return len(p), nil
+	}
+	return n, err
+}
+
+// isClosedPipe reports whether err says the other end of the output has
+// gone away: EPIPE from the write, or a file this process has closed.
+func isClosedPipe(err error) bool {
+	return errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrClosed)
+}
+
+// stopOnClosedOutput wraps the run's screen so that a reader going away
+// stops the run gracefully (P9-20).
+func (c *cannon) stopOnClosedOutput(w io.Writer) io.Writer {
+	return &closedOutputWriter{w: w, onClosed: func(err error) {
+		c.set.Logger.Info("the output was closed; stopping the run", slog.Any("err", err))
+		_ = c.run.Stop("its output was closed")
+	}}
+}
+
 // runScreen is where the renderer draws: stdout.
 //
 // It is the guarded stderr writer itself when the caller passed one writer
@@ -680,9 +838,11 @@ func sameWriter(a, b io.Writer) bool {
 type cannon struct {
 	rc *config.RunConfig
 	// header is the run as it was before it started, for the renderers'
-	// headers. It is a copy on purpose: the run mutates rc.Run.Epic when
-	// the first plan lands, and a renderer reading rc.Run while the
-	// scheduler is going would race with it.
+	// headers. It is a copy on purpose: a renderer reads it on its own
+	// goroutine for the whole life of the run, so it must not be a window
+	// onto anything the scheduler writes. (The run itself stopped writing
+	// back into rc.Run with P8-23; the copy is what keeps the header
+	// stable, not what keeps it safe.)
 	header domain.Run
 	set    runSetup
 	bus    *events.Bus
@@ -701,6 +861,13 @@ type cannon struct {
 	// safety-on delivery the gate poller closed (P6-41).
 	settleq *settleQueue
 	spend   *runSpend
+	// budget is the P9-01 run budget, kept so the TUI's `b` key can raise
+	// it while the run is paused on a cap (P9-14).
+	budget *orchestrator.RunBudget
+	// vitals is the "why is nothing happening?" snapshot the run publishes
+	// into state.json (P6-29), kept so the TUI header can show it too
+	// (P6-51). It is pulled per frame, never cached.
+	vitals func() orchestrator.RunVitals
 	// gate and states are P9-06's two decorated parts, kept so the
 	// assembly can be asked what it wrapped rather than read: the gate
 	// guards `states`' store and the scheduler's firing planner, and the
@@ -785,7 +952,8 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 	if err != nil {
 		return nil, err
 	}
-	dgit := orchestrator.NewDeliveryGit(manager)
+	// P1-14: `max_diff_bytes` caps every diff a reviewer is shown.
+	dgit := orchestrator.NewDeliveryGit(manager, gitx.WithMaxDiffBytes(cfg.MaxDiffBytes))
 
 	// The prompt context every firing shares.
 	scan, err := set.Filter.Scan(rc.Run.RepoPath, prompt.ScanOptions{
@@ -1000,6 +1168,8 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 		Run:        rc.Run.ID,
 		Logger:     logger,
 		Limits:     limits,
+		// P1-14: D-09's re-review threshold comes from the configuration.
+		ReReviewThreshold: cfg.ReReviewThreshold,
 	})
 	if err != nil {
 		return nil, err
@@ -1014,6 +1184,7 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 		Restore: run.State().Spent(),
 	})
 	run.UseBudget(budget.Snapshot)
+	c.budget = budget
 	c.spend.carry(run.State().Spent().Spend)
 
 	// D-11/P8-04: external pull requests are reviewed when `gh` and a
@@ -1120,9 +1291,10 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 	// on bd.
 	// P9-06's counters ride with them, so `sc status` can say how much the
 	// rules gate refused and how many beads it is still holding.
-	run.UseVitals(func() orchestrator.RunVitals {
+	c.vitals = func() orchestrator.RunVitals {
 		return orchestrator.Vitals(run.Now(), planner, poller, foreign).WithRules(gate)
-	})
+	}
+	run.UseVitals(c.vitals)
 
 	if runOnAssemble != nil {
 		if err := runOnAssemble(c); err != nil {
@@ -1179,6 +1351,10 @@ func runDeliverer(run *orchestrator.Run, states *orchestrator.StateMachine, dgit
 	opts := orchestrator.DeliveryOptions{
 		Host: run, States: states, Git: dgit, Beads: client,
 		CheckCommand: rc.Effective.CheckCommand,
+		// P1-14 and P1-18: D-09's threshold and the conflict-round cap
+		// come from the configuration, not from the package constants.
+		ReReviewThreshold: rc.Effective.ReReviewThreshold,
+		MaxConflictRounds: rc.Effective.Limits.MaxConflictRounds,
 		// P9-05: the pull request body is the only sink of agent prose
 		// that leaves the machine.
 		Filter: filter,
@@ -1499,26 +1675,69 @@ func (s *runSpend) total() (tokens int64, cost float64, hasCost bool, firings in
 	return tokens, cost, hasCost, s.firings + s.prior.Firings
 }
 
+// runHelper is one of the goroutines that live beside the run, under the
+// name the run calls it by. P8-35: the tasks used to be anonymous
+// `func(context.Context) error` values, so a helper that would not stop
+// could only be reported as "a helper".
+type runHelper struct {
+	// Name is what the warning calls it ("the conductor").
+	Name string
+	// Run is the goroutine's body; it returns when its context is
+	// cancelled.
+	Run func(context.Context) error
+}
+
 // runHelpers are the goroutines that live beside the run — the conductor,
 // the gate poller and the external pull request reviewer (P8-04) — and the
 // bound on how long anything waits for them.
 type runHelpers struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+
+	mu sync.Mutex
+	// names is every helper, in start order; done names the ones that have
+	// returned. Together they are what [runHelpers.outstanding] reports.
+	names []string
+	done  map[string]bool
 }
 
 // startRunHelpers fires every task in its own goroutine under a context
 // this one cancels. The context is detached from ctx's cancellation on
 // purpose: a SIGINT stops the run through its own lifecycle, and the
 // helpers have to keep going until the run says it is over.
-func startRunHelpers(ctx context.Context, tasks ...func(context.Context) error) *runHelpers {
+func startRunHelpers(ctx context.Context, tasks ...runHelper) *runHelpers {
 	hctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-	h := &runHelpers{cancel: cancel}
+	h := &runHelpers{cancel: cancel, done: make(map[string]bool, len(tasks))}
 	for _, task := range tasks {
+		h.names = append(h.names, task.Name)
 		h.wg.Add(1)
-		go func() { defer h.wg.Done(); _ = task(hctx) }()
+		go func() {
+			defer h.finished(task.Name)
+			_ = task.Run(hctx)
+		}()
 	}
 	return h
+}
+
+// finished records that one helper's goroutine has returned.
+func (h *runHelpers) finished(name string) {
+	h.mu.Lock()
+	h.done[name] = true
+	h.mu.Unlock()
+	h.wg.Done()
+}
+
+// outstanding names the helpers that have not returned yet, in start order.
+func (h *runHelpers) outstanding() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var out []string
+	for _, name := range h.names {
+		if !h.done[name] {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // stop cancels the helpers and waits up to grace for them to return,
@@ -1543,6 +1762,22 @@ func (h *runHelpers) stop(grace time.Duration) bool {
 	case <-time.After(grace):
 		return false
 	}
+}
+
+// stopOrWarn is [runHelpers.stop] plus P8-35's report: a helper that will
+// not return is named, so the line says which of the conductor, the gate
+// poller and the external pull request reviewer is wedged rather than
+// leaving the reader to guess.
+func (h *runHelpers) stopOrWarn(log *slog.Logger, grace time.Duration) {
+	if h.stop(grace) {
+		return
+	}
+	if log == nil {
+		return
+	}
+	log.Warn("a helper did not stop; ending the run without it",
+		slog.String("helpers", strings.Join(h.outstanding(), ", ")),
+		slog.Duration("waited", grace))
 }
 
 // fire starts the run and everything that runs beside it, renders it, and
@@ -1579,9 +1814,14 @@ func (c *cannon) fire(cmd *cobra.Command, gopts GlobalOptions, headless bool) (i
 		c.set.Logger.Warn("could not stamp the run lock", slog.Any("err", err))
 	}
 
-	tasks := []func(context.Context) error{c.gates.Run, c.cond.Run}
+	// P8-35: every helper is named where it is started, so the warning a
+	// wedged one raises can say which it was.
+	tasks := []runHelper{
+		{Name: "the gate poller", Run: c.gates.Run},
+		{Name: "the conductor", Run: c.cond.Run},
+	}
 	if c.prs != nil {
-		tasks = append(tasks, c.prs.Run)
+		tasks = append(tasks, runHelper{Name: "the external pull request reviewer", Run: c.prs.Run})
 	}
 	helpers := startRunHelpers(ctx, tasks...)
 
@@ -1611,14 +1851,19 @@ func (c *cannon) fire(cmd *cobra.Command, gopts GlobalOptions, headless bool) (i
 		rerr error
 	)
 	if headless {
+		// P9-20: `sc run --headless | head` closes the pipe under the
+		// renderer. The screen is wrapped so that a reader going away stops
+		// the run instead of leaving it to die on SIGPIPE with its lock
+		// held and its worktrees behind it.
+		screen := c.stopOnClosedOutput(c.screen(cmd))
 		// The renderer deliberately outlives a cancelled context: a
 		// SIGINT stops the run, and the run's last events are what say so.
 		code, rerr = runHeadless(context.WithoutCancel(ctx), tui.Options{
 			Bus:    c.bus,
 			Run:    c.header,
-			Output: c.screen(cmd),
+			Output: screen,
 		}, tui.HeadlessOptions{
-			Out:  c.screen(cmd),
+			Out:  screen,
 			JSON: gopts.JSON,
 		})
 	} else {
@@ -1634,10 +1879,7 @@ func (c *cannon) fire(cmd *cobra.Command, gopts GlobalOptions, headless bool) (i
 	// cannot corrupt anything it is racing with, because the run is
 	// finished, orchestrator.Run.Publish has sealed the event stream and
 	// every writer it shares with this path is locked.
-	if !helpers.stop(runHelperGrace) {
-		c.set.Logger.Warn("a helper did not stop; ending the run without it",
-			slog.Duration("waited", runHelperGrace))
-	}
+	helpers.stopOrWarn(c.set.Logger, runHelperGrace)
 	c.closeLog()
 	if n := c.run.PublishedAfterFinish(); n > 0 {
 		// Not an error: the run was over. It is worth a line, because it
@@ -1682,19 +1924,23 @@ func (c *cannon) reports(cmd *cobra.Command) io.Writer {
 	return cmd.ErrOrStderr()
 }
 
-// renderTUI draws the run until it finishes or the user quits. Quitting the
-// TUI stops the run: the program owns the terminal, and a cannon still
-// firing with nothing watching it is not what `q` means.
+// renderTUI draws the run until the user quits. Quitting the TUI stops the
+// run: the program owns the terminal, and a cannon still firing with
+// nothing watching it is not what `q` means.
+//
+// P8-32: a finished run does *not* take the TUI down with it. The program
+// used to be cancelled the moment the orchestrator finished, so a run ended
+// with the alt screen already torn down: the user never saw the completed
+// graph, and the keys were unreachable exactly when there was something
+// worth looking at. The run's own event stream ends (the bus is closed once
+// the run is over), the header says "finished: <reason>", and `q` on a run
+// that is no longer live quits at once instead of asking whether to stop it
+// — so the last frame is held until the user asks to leave. A signal still
+// takes the program down, because ctx is the command's own context and
+// cli.Execute cancels it on SIGINT/SIGTERM.
 func (c *cannon) renderTUI(ctx context.Context, cmd *cobra.Command, gopts GlobalOptions) error {
 	tctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	go func() {
-		select {
-		case <-c.run.Done():
-			cancel()
-		case <-tctx.Done():
-		}
-	}()
 	err := runTUI(tctx, tui.Options{
 		Bus:        c.bus,
 		Run:        c.header,
@@ -1702,10 +1948,21 @@ func (c *cannon) renderTUI(ctx context.Context, cmd *cobra.Command, gopts Global
 		NoColor:    gopts.NoColor,
 		AltScreen:  true,
 		Output:     c.screen(cmd),
-		Controller: &runController{run: c.run},
+		Controller: &runController{run: c.run, budget: c.budget},
+		Vitals:     c.vitalsLine,
 	})
 	_ = c.run.Stop("the TUI was closed")
 	return err
+}
+
+// vitalsLine is the run's "why is nothing happening?" line for the TUI
+// header (P6-51). It is pulled on the render goroutine each frame, so a
+// header can never show a snapshot older than the frame it is in.
+func (c *cannon) vitalsLine() string {
+	if c.vitals == nil {
+		return ""
+	}
+	return c.vitals().Header()
 }
 
 // closeLog closes the run log once, before the summary is folded from it.
@@ -1831,9 +2088,15 @@ func runPlural(n int, thing string) string {
 // need a seam no component offers yet, so they say so rather than pretend.
 // P7-20 is the task that owns those four seams, and it is the id the
 // messages name.
-type runController struct{ run *orchestrator.Run }
+type runController struct {
+	run    *orchestrator.Run
+	budget *orchestrator.RunBudget
+}
 
-var _ tui.Controller = (*runController)(nil)
+var (
+	_ tui.Controller       = (*runController)(nil)
+	_ tui.BudgetController = (*runController)(nil)
+)
 
 // Pause implements [tui.Controller].
 func (c *runController) Pause(_ context.Context, reason string) error { return c.run.Pause(reason) }
@@ -1862,4 +2125,14 @@ func (c *runController) SetSafety(_ context.Context, _ bool) error {
 // SetAmmo implements [tui.Controller].
 func (c *runController) SetAmmo(_ context.Context, _ int) error {
 	return errors.New("changing ammo mid-run is not wired up yet (P7-20)")
+}
+
+// SetBudget implements [tui.BudgetController] (P9-14): the `b` key raises
+// the cap that stopped the run and lets it carry on. Unlike the four seams
+// above this one exists — [orchestrator.RunBudget] owns the live ceiling —
+// so the key really works, and the orchestrator's own refusals (no budget
+// set, an amount under what the run has spent) are what the footer shows.
+func (c *runController) SetBudget(_ context.Context, amount float64) error {
+	_, err := c.budget.Raise(amount)
+	return err
 }

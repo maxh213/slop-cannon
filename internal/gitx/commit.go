@@ -173,7 +173,9 @@ func (r *Repo) withIdentity(ctx context.Context) (*Repo, error) {
 // changedPaths lists the paths "git status --porcelain -z" reports as
 // modified, staged, or untracked; renames are listed under the new name.
 func (r *Repo) changedPaths(ctx context.Context) ([]string, error) {
-	out, err := r.Git(ctx, "status", "--porcelain", "-z", "--untracked-files=all")
+	// GitRaw: the entries are NUL-terminated, so a path whose last byte is
+	// a newline must not have it trimmed away (P4-11).
+	out, err := r.GitRaw(ctx, "status", "--porcelain", "-z", "--untracked-files=all")
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +219,9 @@ func (r *Repo) DiffStats(ctx context.Context, base string) (*DiffStats, error) {
 // report line counts (and therefore a D-09 change ratio) computed on
 // converted text.
 func (r *Repo) diffStatsBetween(ctx context.Context, from, to string) (*DiffStats, error) {
-	out, err := r.Git(ctx, "diff", "--numstat", "-M", "-z", "--no-ext-diff", "--no-textconv", from, to, "--")
+	// GitRaw: "-z" terminates every field with NUL, and a path may end in
+	// a newline of its own (P4-11).
+	out, err := r.GitRaw(ctx, "diff", "--numstat", "-M", "-z", "--no-ext-diff", "--no-textconv", from, to, "--")
 	if err != nil {
 		return nil, err
 	}

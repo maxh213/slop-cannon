@@ -5,6 +5,11 @@ agent id it prints that agent's log; with a bead id it prints the log of
 every agent that has worked on that bead, oldest agent first, each under a
 header naming it.
 
+With --follow it keeps printing as the logs grow, and waits for a log that
+is not there yet: follow a bead the moment the run adopts it and the output
+starts when its first agent spawns. Without --follow a bead that has no
+agent log yet is an error, because a one-shot read has nothing to print.
+
 Logs are read straight from the run directory, so this works on a finished
 run, on a crashed one, and while another sc process is still firing —
 nothing here writes anything. --run picks a run other than the most recent
@@ -21,7 +26,7 @@ Examples:
   sc logs sc-1 --follow
 
 Flags:
-  -f, --follow    keep printing as the logs grow (until interrupted)
+  -f, --follow    keep printing as the logs grow, waiting for a log that is not there yet (until interrupted)
   -h, --help      help for logs
   -n, --lines N   print the last N lines of each log (0 for all of it) (default 50)
       --run ID    read run ID instead of the most recent one

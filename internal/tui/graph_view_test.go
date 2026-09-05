@@ -788,7 +788,7 @@ var gvDirections = []struct {
 // walks the direction masks, so a route chopped in half by a box in the way
 // does not count as joined.
 func gvReaches(c *graphCanvas, from, to graphPoint) bool {
-	if !c.inside(from.x, from.y) || c.masks[from.y*c.w+from.x] == 0 {
+	if !c.inside(from.x, from.y) || c.maskAt(from.x, from.y) == 0 {
 		return false
 	}
 	seen := map[graphPoint]bool{from: true}
@@ -797,13 +797,13 @@ func gvReaches(c *graphCanvas, from, to graphPoint) bool {
 		if p == to {
 			return true
 		}
-		mask := c.masks[p.y*c.w+p.x]
+		mask := c.maskAt(p.x, p.y)
 		for _, d := range gvDirections {
 			q := graphPoint{p.x + d.dx, p.y + d.dy}
 			if mask&d.dir == 0 || !c.inside(q.x, q.y) || seen[q] {
 				continue
 			}
-			if c.masks[q.y*c.w+q.x]&d.opposite == 0 {
+			if c.maskAt(q.x, q.y)&d.opposite == 0 {
 				continue
 			}
 			seen[q] = true
@@ -829,7 +829,7 @@ func gvAssertNoEdgeOnBoxes(t *testing.T, lay GraphLayout, canvas *graphCanvas, b
 	for i, b := range boxes {
 		for y := b.y; y < b.y+b.h; y++ {
 			for x := b.x; x < b.x+b.w; x++ {
-				require.Zero(t, canvas.masks[y*canvas.w+x],
+				require.Zero(t, canvas.maskAt(x, y),
 					"an edge was routed onto the box of %s at (%d,%d)", lay.Nodes[i].ID, x, y)
 			}
 		}
@@ -1388,4 +1388,90 @@ func TestThemeGraphBoxesHoldUnderAmbiguousWidth(t *testing.T) {
 		require.Equalf(t, want, gvBoxWidth(lines[i]),
 			"row %d of the box is %d cells, not %d: %q", i, gvBoxWidth(lines[i]), want, lines[i])
 	}
+}
+
+// --- P7-24: only the pane is painted ------------------------------------
+
+// TestGraphPaintDrawsOnlyWhatThePaneCanShow pins P7-24. The paint used to
+// draw every box of every level onto a canvas the size of the whole graph
+// and let [GraphModel.boxLines] copy the visible window out of it, which
+// cost 6.8 MB and 68 000 allocations for a 200-bead frame showing a fifth of
+// the run. The canvas now holds cells for the scroll window alone and the
+// boxes and routes outside it are skipped.
+//
+// The test proves the two things that matters about the cull: the canvas is
+// no bigger than the pane, and the rows it renders are exactly the rows the
+// old, whole-graph paint rendered — a box or an edge dropped one cell too
+// early would show up as a difference here rather than only in a golden.
+func TestGraphPaintDrawsOnlyWhatThePaneCanShow(t *testing.T) {
+	t.Parallel()
+
+	beads := gvBig()
+	st := gvState(beads)
+	lay := BuildGraphLayout(st)
+	require.Equal(t, len(beads), lay.Len())
+
+	for _, tc := range []struct {
+		name     string
+		vertical bool
+		cursor   int
+	}{
+		{"left-right at the top", false, 0},
+		{"left-right at the far corner", false, lay.Len() - 1},
+		{"top-bottom at the top", true, 0},
+		{"top-bottom at the far corner", true, lay.Len() - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			const w, h = 80, 24
+			v := gvView(w, h, GraphOptions{})
+			_, vh := v.Size()
+			// The graph is drawn under the view's own summary line.
+			pane := vh - 1
+
+			canvas, boxes := v.paint(lay, tc.vertical, tc.cursor)
+			require.LessOrEqual(t, len(canvas.runes), w*pane,
+				"the canvas is bigger than the pane it is drawn for")
+			require.Greater(t, canvas.w*canvas.h, 4*len(canvas.runes),
+				"this fixture must be several panes wide, or the cull is not being exercised")
+
+			// The same graph painted whole: a view large enough that its
+			// window covers every cell.
+			whole := NewGraphModel(GraphOptions{NoColor: true}).Resize(canvas.w+GraphBoxWidth, canvas.h+GraphBoxHeight)
+			ref, refBoxes := whole.paint(lay, tc.vertical, tc.cursor)
+			require.Equal(t, boxes, refBoxes, "the cull moved a box")
+			require.Equal(t, canvas.w*canvas.h, len(ref.runes), "the reference paint is not the whole graph")
+
+			offX, offY := v.scroll(boxes[tc.cursor])
+			for y := offY; y < offY+pane; y++ {
+				require.Equalf(t, ref.row(y, offX, w), canvas.row(y, offX, w),
+					"row %d of the culled paint differs from the whole-graph paint", y)
+			}
+		})
+	}
+}
+
+// TestGraphCanvasWindowDropsWritesOutsideIt covers the windowed canvas
+// itself: a write outside the window is dropped rather than corrupting a
+// neighbouring cell, and reading such a cell back is blank.
+func TestGraphCanvasWindowDropsWritesOutsideIt(t *testing.T) {
+	t.Parallel()
+
+	c := newGraphWindow(20, 10, 5, 4, 6, 3)
+	require.Equal(t, 6*3, len(c.runes))
+	require.Equal(t, 20, c.w)
+	require.Equal(t, 10, c.h)
+
+	style := ThemeFor(ProfileNoColor).Base()
+	c.text(0, 0, "outside", &style)
+	c.text(5, 4, "in", &style)
+	c.line(0, 0, graphEast, &style, true)
+	require.Zero(t, c.maskAt(0, 0), "a mask outside the window was kept")
+	require.Equal(t, "", strings.TrimRight(c.row(0, 0, 20), " "), "a row outside the window is blank")
+	require.Equal(t, "     in", strings.TrimRight(c.row(4, 0, 20), " "))
+
+	// A window larger than the drawing is clamped to it, so the buffer is
+	// never bigger than the canvas it backs.
+	full := newGraphWindow(4, 2, 0, 0, 400, 200)
+	require.Equal(t, 8, len(full.runes))
 }

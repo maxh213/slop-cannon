@@ -186,3 +186,54 @@ func TestIntegrationConventions(t *testing.T) {
 	assert.Contains(t, ids, work.ID)
 	assert.NotContains(t, ids, other.ID)
 }
+
+// TestIntegrationSafeBeadNormalisesPlantedEscapes plants a bead whose
+// title and body carry escape sequences in the real tracker — the way
+// another tool, or a person pasting into `bd create`, would — and reads it
+// back (P3-21). bd stores the bytes verbatim, so the normalisation has to
+// be ours: the domain bead is printable, while the raw Issue still shows
+// what the database holds.
+func TestIntegrationSafeBeadNormalisesPlantedEscapes(t *testing.T) {
+	c, _ := integrationClient(t)
+	ctx := context.Background()
+
+	planted, err := c.Create(ctx, BeadInput{
+		Title:       "Fix \x1b[2JMax\x07",
+		Description: "before\rafter\x1b[31m\nkeeps\tlines",
+		// No NUL: exec itself refuses one in an argument, so the only way
+		// a NUL reaches bd is another writer's SQL. The unit test covers it.
+		Acceptance: "TestMax passes\x1b[0m",
+		Priority:   domain.PriorityDefault,
+	})
+	require.NoError(t, err)
+
+	issues, err := c.Show(ctx, planted.ID)
+	require.NoError(t, err)
+	require.Len(t, issues, 1)
+	is := issues[0]
+	require.Contains(t, is.Title, "\x1b", "bd stores the escape sequence verbatim")
+
+	m, err := c.StatusMap(ctx)
+	require.NoError(t, err)
+	b, _ := is.SafeBead(m)
+	assert.Equal(t, "Fix [2JMax", b.Title)
+	assert.Equal(t, "beforeafter[31m\nkeeps\tlines", b.Description)
+	assert.Equal(t, "TestMax passes[0m", b.Acceptance)
+	assert.NoError(t, b.ValidateText(), "nothing that reaches a prompt or a frame carries a control character")
+
+	strict, err := is.Bead()
+	require.NoError(t, err)
+	assert.NoError(t, strict.ValidateText())
+
+	// The whole listing is safe, not just the bead fetched by id.
+	all, err := c.List(ctx, ListFilter{All: true})
+	require.NoError(t, err)
+	var seen bool
+	for _, sb := range SafeBeads(all, m) {
+		assert.NoError(t, sb.ValidateText(), sb.ID)
+		if sb.ID == planted.ID {
+			seen = true
+		}
+	}
+	assert.True(t, seen, "the planted bead is in the listing")
+}

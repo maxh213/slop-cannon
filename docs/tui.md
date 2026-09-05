@@ -15,13 +15,19 @@ no network. It is the fastest way to see every view.
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log                       tabs
 ────────────────────────────────────────────────────────────────
                        the active view                            main pane
-tab next view • 1…5 jump to view • ↑/k up • ↓/j down • ? help      footer
+? help • q stop / quit • enter bead detail   ! <newest warning>  <flash>  footer
 ```
 
 The header drops fields from the left as the terminal narrows, keeping the
 run id, and the cannon fires at the graph when an agent is spawned and
 reacts to verdicts and failures (`--no-anim` or `SC_NO_ANIM=1` turns the
 animations off).
+
+The footer is negotiated rather than clipped: the keymap keeps enough room to
+name the active view's own keys, the run's newest warning or error follows it
+(shortened to a count when the line is tight), and the answer to the key just
+pressed is the one thing that is never given up. The global bindings a narrow
+terminal drops from it are all still on the `?` overlay.
 
 ## Keys
 
@@ -34,10 +40,11 @@ animations off).
 | `q` | quit; on a live run it first asks to confirm the stop |
 | `ctrl+c` | quit immediately |
 
-Views add keys of their own. The `?` overlay lists them under the view's
-name — Graph, Agents, Feedback and PRs each add some; the Log view adds
-none — and a view with room in its headings puts the important ones there
-too, so the binding is discoverable without opening the overlay.
+Views add keys of their own. The footer ends with the active view's own
+bindings and the `?` overlay lists all of them under the view's name — Graph,
+Agents, Feedback and PRs each add some; the Log view adds none — and a view
+with room in its headings puts the important ones there too, so a binding is
+discoverable without opening the overlay.
 
 ### Run controls
 
@@ -53,6 +60,7 @@ attached and the run has not finished; a recorded run leaves them out of the
 | `x` | mark the selected bead done without delivering it — asks to confirm |
 | `S` | turn safety on or off for the rest of the run — asks to confirm |
 | `a` | set ammo: a prompt pre-filled with the run's current value, `enter` applies and `esc` cancels |
+| `b` | raise the run's budget: a prompt for the new `limits.max_tokens` (or `limits.max_cost_usd`, when a cost cap is what paused the run), `enter` applies and `esc` cancels |
 
 The two bead keys act on the bead the tab that is up has under its cursor:
 the Graph view's selected bead, the bead the Agents view's selected agent is
@@ -66,6 +74,14 @@ key press.
 `S` and `a` remember the value the orchestrator accepted, so safety can be
 turned back on and ammo put back to a number it already had; the run's own
 events still win the moment they say anything.
+
+`b` is the answer to a run that paused itself on a cap. The number is the
+whole new ceiling, not an addition, and it is in the unit of the cap that
+stopped the run — tokens, or dollars when the banner named
+`limits.max_cost_usd`. It must be above what the run has already spent, and
+the footer says what that was when it is not. Applying it raises the cap and
+resumes the run in one keystroke; `p` on its own still works and still means
+"one more budget's worth" (P9-14).
 
 ## Views
 
@@ -291,3 +307,11 @@ an unset `TERM` does too.
 `sc run --headless` prints one line per event instead of drawing anything,
 and `--headless --json` prints the raw event stream as JSONL. Both are
 what CI should use; see `docs/cli.md`.
+
+## Watching a run again
+
+`sc tui-demo --replay <file>` renders a recorded run: any JSONL run log, such
+as the `events.jsonl` of a run directory or the output of `sc run --headless
+--json`. The header, the clock and every view come out of the recording, so a
+finished run can be walked through exactly as it happened; `--delay` paces
+it, and the run controls stay disabled because there is no run to act on.

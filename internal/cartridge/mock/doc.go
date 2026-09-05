@@ -28,6 +28,17 @@
 //	s.Otherwise("echo").Echo()
 //	adapter, err := mock.NewAdapter("mock", s, mock.WithClock(clock))
 //
+// Cancellation is observed at step boundaries (P2-11). The player checks
+// the run context, the session timeout and [cartridge.Session.Kill] once
+// before each step and never after the last one, so a rule with no steps —
+// or one whose last step has just finished — ends with its scripted result
+// and a nil error even when the context was already cancelled. That mirrors
+// a real CLI whose process exits before the signal arrives. A test that
+// expects a cancellation to surface as cartridge.ErrKilled must leave the
+// rule at least one step to reach: the reliable shape is a [Rule.Sleep]
+// under a [FakeClock], where [FakeClock.BlockUntil] proves the session is
+// parked at the boundary before the test cancels.
+//
 // Delays and the session timeout are measured on a [Clock]; tests pass a
 // [FakeClock] and drive it with [FakeClock.Advance] so long pauses cost no
 // wall time. Every cartridge.RunSpec the adapter receives is recorded and

@@ -163,23 +163,32 @@ func (m *Manager) PathFor(id domain.BeadID) string {
 }
 
 // Create makes a linked worktree for bead at PathFor(bead.ID) with
-// "git worktree add <path> -b <BranchName(bead)> <default branch>". When the
-// branch already exists (a previous attempt was interrupted) it is checked
-// out as is instead of being recreated. It fails with [ErrRepoDirty] when
-// the target repository is dirty (unless [AllowDirty] was given),
+// "git worktree add <path> -b <branch> <default branch>". The branch is
+// the one [Manager.BranchFor] resolves when the bead already has one — a
+// previous attempt was interrupted, or the product owner retitled the bead
+// after its branch was cut (P4-12) — and it is checked out as is rather
+// than recreated; otherwise a fresh [BranchName] is cut from the default
+// branch. It fails with [ErrRepoDirty] when the target repository is dirty
+// (unless [AllowDirty] was given),
 // [ErrWorktreeExists] when the bead already has a registered worktree,
 // [ErrPathOccupied] when the path holds something else, [ErrNestedWorktree]
 // when the path lies inside another worktree, [ErrBranchInUse] when the
 // branch is checked out elsewhere, and [ErrNoDefaultBranch] when no base
 // branch can be found.
 func (m *Manager) Create(ctx context.Context, bead domain.Bead) (*Worktree, error) {
+	return m.create(ctx, bead, m.allowDirty)
+}
+
+// create is Create with the dirty-repository guard under the caller's
+// control: the resume path recreates a wiped worktree while the user is
+// mid-edit in their own checkout (P4-15).
+func (m *Manager) create(ctx context.Context, bead domain.Bead, allowDirty bool) (*Worktree, error) {
 	if bead.ID == "" {
 		return nil, errors.New("gitx: Create: bead has no id")
 	}
 	path := m.PathFor(bead.ID)
-	branch := BranchName(bead)
 
-	if !m.allowDirty {
+	if !allowDirty {
 		clean, err := m.repo.IsClean(ctx)
 		if err != nil {
 			return nil, err
@@ -192,6 +201,27 @@ func (m *Manager) Create(ctx context.Context, bead domain.Bead) (*Worktree, erro
 	all, err := m.listAll(ctx)
 	if err != nil {
 		return nil, err
+	}
+	// The branch the bead's work is already on, whatever its title says
+	// now (P4-12): git's own registration for this path first — it
+	// outlives the directory — then the sc/<bead-id> namespace. Only when
+	// there is nothing to reuse is a branch cut under the current title.
+	// A registration parked on someone else's branch is refused rather
+	// than followed or ignored: checking the bead's own branch out again
+	// would leave whatever was committed over there behind.
+	reg := registeredBranch(all, path)
+	if reg != "" && !IsBeadBranch(bead.ID, reg) {
+		return nil, fmt.Errorf("gitx: the worktree registered at %s is on branch %s, which is not one of %s's own; %w",
+			path, reg, bead.ID, ErrBranchInUse)
+	}
+	// resolveBranch rather than BranchFor: the worktree listing is already
+	// in hand, so it needs no second one.
+	branch, exists, err := m.resolveBranch(ctx, bead, reg)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		branch = BranchName(bead)
 	}
 	for _, wt := range all {
 		switch {
@@ -217,10 +247,6 @@ func (m *Manager) Create(ctx context.Context, bead domain.Bead) (*Worktree, erro
 	}
 
 	base, err := m.baseRevision(ctx)
-	if err != nil {
-		return nil, err
-	}
-	exists, err := m.repo.BranchExists(ctx, branch)
 	if err != nil {
 		return nil, err
 	}
@@ -385,19 +411,65 @@ func (m *Manager) Remove(ctx context.Context, id domain.BeadID, force bool) erro
 	return nil
 }
 
-// DeleteBranch deletes the bead's branch from the main repository with
-// "git branch -D". It is meant for cleanup after the work landed or was
-// abandoned; the worktree must have been removed first (git refuses to
-// delete a checked-out branch). A branch that no longer exists is not an
-// error.
-func (m *Manager) DeleteBranch(ctx context.Context, bead domain.Bead) error {
-	branch := BranchName(bead)
-	exists, err := m.repo.BranchExists(ctx, branch)
-	if err != nil || !exists {
-		return err
+// BranchFor resolves the branch a bead's work is on and reports whether
+// the repository still has it (P4-12). [BranchName] slugs the bead's
+// title, which the product owner may change mid-run, so it is only the
+// last guess: git's registration of the bead's worktree names the branch
+// even when the directory is gone, and failing that the "sc/<bead-id>"
+// namespace is searched for the single branch the bead can own. When
+// nothing is found the guess is returned with exists false, so callers
+// always have a name to report or to create.
+func (m *Manager) BranchFor(ctx context.Context, bead domain.Bead) (branch string, exists bool, err error) {
+	all, err := m.listAll(ctx)
+	if err != nil {
+		return BranchName(bead), false, err
 	}
-	_, err = m.repo.Git(ctx, "branch", "-D", "--quiet", branch)
-	return err
+	// Only the bead's own branches: a worktree a human parked on a branch
+	// of their own does not make that branch the bead's work
+	// ([Manager.Create] refuses such a registration outright).
+	reg := registeredBranch(all, m.PathFor(bead.ID))
+	if !IsBeadBranch(bead.ID, reg) {
+		reg = ""
+	}
+	return m.resolveBranch(ctx, bead, reg)
+}
+
+// IsBeadBranch reports whether branch is one of the branches [BranchName]
+// can produce for the bead id: "sc/<id>", or "sc/<id>-<slug>" for any
+// title the bead ever carried. Another bead's branch never matches,
+// because the id is followed by a dash or by nothing at all.
+func IsBeadBranch(id domain.BeadID, branch string) bool {
+	rest, ok := strings.CutPrefix(branch, BranchPrefix+logging.SafeFileName(string(id)))
+	return ok && (rest == "" || strings.HasPrefix(rest, "-"))
+}
+
+// registeredBranch returns the branch git records for the worktree
+// registered at path, prunable registrations included, or "".
+func registeredBranch(all []worktreeEntry, path string) string {
+	for _, wt := range all {
+		if samePath(wt.Path, path) {
+			return wt.Branch
+		}
+	}
+	return ""
+}
+
+// DeleteBranch deletes the bead's branch from the main repository with
+// "git branch -D" and returns the branch it deleted, or "" when there was
+// nothing to delete. The branch is the one [Manager.BranchFor] resolves,
+// never one re-derived from the bead's current title (P4-12). It is meant
+// for cleanup after the work landed or was abandoned; the worktree must
+// have been removed first (git refuses to delete a checked-out branch). A
+// branch that no longer exists is not an error.
+func (m *Manager) DeleteBranch(ctx context.Context, bead domain.Bead) (string, error) {
+	branch, exists, err := m.BranchFor(ctx, bead)
+	if err != nil || !exists {
+		return "", err
+	}
+	if _, err := m.repo.Git(ctx, "branch", "-D", "--quiet", branch); err != nil {
+		return "", err
+	}
+	return branch, nil
 }
 
 // Prune drops registrations whose directories no longer exist

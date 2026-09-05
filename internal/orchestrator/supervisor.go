@@ -468,6 +468,22 @@ type AgentFiring struct {
 	// because the agent has already done the work and had its side effects
 	// (D-06).
 	Result func(payload any, tr agents.Transcript) error
+	// Spent, when set, receives the transcript of an attempt that did not
+	// deliver a usable reply: a crash, a timeout, a kill, a rate-limit
+	// retry, a reroute to another cartridge. It is how a session that spent
+	// real tokens and produced nothing is still charged against the run
+	// budget (P9-13) — [AgentFiring.Result] runs only on a session that
+	// finished and decoded, so an agent killed by `limits.agent_timeout`
+	// after twenty minutes of work used to cost the budget nothing at all.
+	//
+	// It is called once per failed attempt, on the supervising goroutine,
+	// with that attempt's own transcript (usage is per RunAgent call, so
+	// nothing is counted twice); the successful attempt of a retried firing
+	// is left to Result. It returns nothing: metering must never turn a
+	// failure into a different failure. A firing abandoned before its
+	// session started never calls it — there is no transcript and nothing
+	// was spent.
+	Spent func(tr agents.Transcript)
 	// Build returns the agent run for one attempt. It is called once per
 	// attempt with the resolved cartridge, working directory and
 	// environment; the supervisor then stamps the identity, the workdir,
@@ -791,6 +807,14 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 			return tr, err
 		}
 
+		// Every path from here on is a session that ran and did not deliver:
+		// what it spent is real, and only this hook can see it (P9-13). The
+		// post-session hook above is deliberately above this line — its
+		// session succeeded and was metered by Result.
+		if f.Spent != nil {
+			f.Spent(tr)
+		}
+
 		lastErr = err
 		failure := agents.FailureOf(err)
 		kind := cartridge.KindOf(err)
@@ -867,6 +891,13 @@ func (s *Supervisor) stamp(run *agents.AgentRun, f AgentFiring, agent domain.Age
 	run.Agent = agent
 	run.Task = f.Task
 	run.Run = h.ID()
+	if run.RunDir == "" {
+		// P5-13: the firing path files a copy of the prompt it sent under
+		// <run-dir>/prompts/<agent-id>.md. Stamping it here covers every
+		// firing in one place, the way the workdir, the environment, the
+		// shim and the timeout are stamped.
+		run.RunDir = h.Dirs().Dir
+	}
 	if prep.workdir != "" {
 		// A firing with no worktree of its own (the planning product
 		// owner, P6-05; the arbitrating product owner, P6-04) keeps the
@@ -1601,6 +1632,16 @@ func (s *Supervisor) installShim(ctx context.Context, wt string) (beads.Shim, er
 	sh, err := s.shims.InstallForWorktree(ctx, wt, s.opts.ShimOptions)
 	if err != nil {
 		return beads.Shim{}, err
+	}
+	// P9-22: the git guard shares that directory, so the one PATH entry the
+	// firing gets carries both. An engineer runs read_write — Bash with no
+	// deny list — in a linked worktree of the user's own repository, and
+	// without the guard `git push origin HEAD:main`, `git checkout main` or
+	// `git clean -fdx` from an agent would reach the user's branches. A
+	// guard that cannot be installed fails the firing rather than letting an
+	// unguarded session run.
+	if _, err := agents.InstallGitGuardForWorktree(wt, sh.Dir); err != nil {
+		return beads.Shim{}, fmt.Errorf("orchestrator: installing the git guard for %s: %w", wt, err)
 	}
 	s.mu.Lock()
 	s.shimDirs[wt] = sh

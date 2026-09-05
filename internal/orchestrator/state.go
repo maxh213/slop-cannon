@@ -176,16 +176,6 @@ func (e BeadEvent) Valid() bool {
 	return false
 }
 
-// ParseBeadEvent parses an event name, tolerating surrounding space and case
-// the way domain's enums do. An unknown name is [ErrUnknownBeadEvent].
-func ParseBeadEvent(s string) (BeadEvent, error) {
-	e := BeadEvent(strings.ToLower(strings.TrimSpace(s)))
-	if !e.Valid() {
-		return "", fmt.Errorf("%w: %q (want one of %s)", ErrUnknownBeadEvent, s, joinBeadEvents(beadEvents))
-	}
-	return e, nil
-}
-
 // BeadTransition is one edge of the D-07 table, as [BeadTransitions] reports
 // it.
 type BeadTransition struct {

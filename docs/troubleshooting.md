@@ -24,8 +24,17 @@ because they are what makes this a complete list rather than a sample:
   `agents`, `orchestrator`, `proc`, and every package under them) is
   documented or exempted the same way. What reaches you from those is the
   sentinel's own sentence, printed in front of the tool's own words: `bd
-  show: bead not found: no issues found matching the provided IDs`. Their
-  wrapped messages are not yet held to a row each — that is P9-19.
+  show: bead not found: no issues found matching the provided IDs`.
+- `TestTroubleshootingCoversEveryMessageTheWrappedPackagesBuild` — and every
+  *other* message those six packages build, each `fmt.Errorf` as well as
+  each sentinel, matches a row here or is exempted with a written reason.
+  That is where most of a run's failures are written — every run-lock
+  refusal, every delivery step, everything `bd`, `git` and `gh` are driven
+  through — so a new sentence in any of them now has to be decided about
+  rather than shipped unread. Most of the exemptions say one of three
+  things: the wrapped sentinel is what you read and this is only its detail,
+  the message names a step and hands on the error under it, or the call is
+  one `sc` assembles itself and reaching it is a bug in `sc`.
 - `TestTroubleshootingCoversEveryWarningTheRunRaises` — every warning the
   run can raise is documented or exempted the same way. A warning is not an
   error — the run carries on — but it is what says a bead has stopped being
@@ -51,8 +60,10 @@ When a run refuses to start, `sc` prints the failing rows itself as a
 numbered fix list — the same words, from the same check — and then suggests
 `sc doctor` for the rest.
 
-**Exit codes.** `0` the run finished or was stopped, `1` the run failed or a
-command was refused, `3` every cartridge is out of credits.
+**Exit codes.** `0` the run finished, was stopped, or ended on a budget you
+set (`budget_reached`), `1` the run failed or a command was refused, `3`
+every cartridge is out of credits. The full contract, and what `--headless`
+prints beside it, is in [prompts.md](prompts.md#exit-codes).
 
 **Where things are.** Nothing `sc` writes lives inside the target repository:
 logs, prompts, events and worktrees go under
@@ -61,6 +72,8 @@ logs, prompts, events and worktrees go under
 the paths. `sc status` reads the same files back, and `sc status --json`
 gives them to a script. The one thing `sc` may write inside the repository is
 `.slop-cannon/config.toml`, and only when a config command created it.
+[prompts.md](prompts.md#the-debug-copy-of-every-prompt) maps a run directory
+file by file, including the copy of every prompt an agent was fired with.
 
 ---
 
@@ -69,15 +82,26 @@ gives them to a script. The one thing `sc` may write inside the repository is
 | Message | What happened | What to do |
 |---|---|---|
 | `is not a git repository (no .git in it or any parent directory)` | The path given to `sc` is not inside a git working tree, and `sc` only fires at repositories. | `git init`, or point `sc` at the right path: `sc /path/to/repo`. |
-| `no such directory` | The path does not exist. | Check the spelling; a relative path is resolved against the current directory. |
-| `not a directory` | The path exists but is a file. | Name the repository directory, not a file inside it. |
+| `no such directory` | The path given to `sc` does not exist, and `sc` only fires at a git repository that is already there. | Check the spelling; a relative path is resolved against the current directory. Then name the repository: `sc /path/to/repo`. |
+| `not a directory` | The path exists but is a file, and `sc` fires at a repository rather than at one of its files. This is also what `--repo` says when it is given a file. | Name the repository directory: `sc /path/to/repo`, or `--repo /path/to/repo`. |
 | `must not be empty` | A flag that needs a value was given an empty one: `-m ""`, `--cartridge ""`, `sc vibes --add ""`. | Give it a value, or leave the flag out and keep the configured default. |
 | `must not be negative` | `sc tui-demo --delay` was given a negative pause between events. | Use `0` for no pause, or a duration such as `--delay 40ms`. |
 | `a resumed run keeps its original brief` | `-m` was combined with `--resume`. A resumed run continues the beads the earlier run planned, so a new brief would have nowhere to go. | Drop `-m` to resume, or drop `--resume` to start a new run from the brief. |
 | `the TUI needs a terminal: stdin and stdout are not a TTY` | The full-screen interface was asked for from a pipe, a CI job, or an editor's task runner. | Add `--headless` for log lines, or `--headless --json` for one JSON envelope per event. |
 | `tui-demo needs a terminal: stdin and stdout are not a TTY` | The same, for `sc tui-demo`. | Run it in a terminal, or use its `--json` output. |
-| `is already going in this repository` | Another `sc` process holds this repository's run lock. Only one run at a time per repository (P9-04), and a linked `git worktree` of the same repository counts as the same repository. | Wait for it to finish, or stop it: there is no `sc stop`, so press Ctrl-C in the terminal it is running in, or `kill` the pid the message (and `sc status`) names. `--force` takes the lock, and only makes sense once you are sure the other run is gone. |
+| `prints the scripted stream; a recording is already JSONL` | `sc tui-demo --events` was combined with `--replay`. The flag exists to print the demo's own scripted events; a recording already is that file. | Drop one of the two: `--events` for the script, or `cat` the recording `--replay` names. |
+| `is already going in this repository` | Another `sc` process holds this repository's run lock. Only one run at a time per repository (P9-04), and a linked `git worktree` of the same repository counts as the same repository. | Wait for it to finish, or stop it: `sc stop` interrupts it from any terminal (P9-24), and Ctrl-C in the terminal it is running in does the same. `kill` the pid the message (and `sc status`) names if neither is possible. `--force` takes the lock, and only makes sense once you are sure the other run is gone. |
+| `no run is going in` | `sc stop` was asked to stop a run in a repository whose run lock nothing holds. | Nothing is running there: `sc status` shows the last run. Check you named the right repository (`sc stop PATH`, or `--repo`). |
+| `is not going any more` | `sc stop` found a run lock whose holder has died: the run was killed or crashed, and the lock is the only thing left of it. | Nothing to stop. The next run in that repository removes the lock with a `removed a stale run lock` notice; `sc resume` continues the run itself. |
+| `which this machine cannot signal` | `sc stop` found a run lock written on another machine — a state directory on a shared file system — and cannot interrupt a process it cannot see. | Stop it on the machine the message names, or, once you are sure it is gone, start again here with `--force`. |
+| `so the run holding it cannot be named` | `sc stop` could not parse the run lock, so it does not know which process to interrupt. | `sc status` shows what the run directory says. If nothing is running, delete the `run.lock` the message names. |
+| `so it cannot stop itself` | `sc stop` found that the run lock names its own process. It only happens when a run and the stop share a process (an embedder, or a test). | Press Ctrl-C, or call `Run.Stop` in the embedding program. |
+| `could not interrupt run` | The interrupt `sc stop` sent to the run's process was refused — usually a run started by another user. | Run `sc stop` as the user the run belongs to, or `kill` the pid `sc status` names from an account that may signal it. |
+| `did not stop within` | `sc stop` interrupted the run and waited, and the run was still going when the wait ran out. A graceful stop lets the agents in flight finish their session, which can take minutes. | Wait longer (`sc stop --wait 10m`), or stop it immediately with `sc stop --now`, which interrupts twice and kills the agents where they stand. |
+| `its output was closed` | A headless run was stopped because whatever its output was going to went away: `sc run --headless` piped into `head`, a pipe whose reader exited, a terminal that closed. It ends as a user stop, so the lock is released and the worktrees are cleaned (P9-20). | Nothing. If the run should have carried on, send the output somewhere that stays — a file, or `--json` into a reader that consumes all of it. |
 | `removed an unreadable run lock` | A `run.lock` that could not be parsed was still there after the grace period (half a minute), so `sc` treated it as debris, removed it and carried on. | Nothing. It is a notice, not an error. If it repeats every run, something else is writing that file. |
+| `the run lock names no process (pid` | The lock file is there but names no live process — a pid of zero, or a record written by a crashed run before it could stamp itself. | Nothing to fix by hand: `sc` treats it as stale and takes it over. `sc status` shows what the lock says. |
+| `keeps being retaken` | `sc` removed a stale run lock and found another process had taken it in the same instant, several times over. Two `sc` runs are starting against one repository at once. | Start one run at a time. If nothing else is running, something is re-creating `<state-dir>/run.lock`; delete it while no run is going. |
 | `--force: took the run lock from run` | `--force` was given while another run's lock was still in place, so `sc` took it. | Nothing, if you were sure that run had stopped. If it is still going, stop this one and let it finish: two runs at one repository fight over the same beads and branches. |
 | `orchestrator: remove the stale run lock` | `sc` proved the lock's holder is gone but could not delete the file — usually a read-only state directory, or one owned by another user. | Check the permissions of `$XDG_STATE_HOME/slop-cannon/<repo-id>/`, then delete `run.lock` there by hand. |
 | `cannot tell whether it is still alive` | The lock was written by another machine — a state directory on a shared file system — so this host cannot probe that process. | Check the run on the machine named in the message. If it really stopped, start again with `--force`. |
@@ -91,7 +115,7 @@ gives them to a script. The one thing `sc` may write inside the repository is
 | `no run directory at` | `sc status` or `sc logs` was asked for a run whose directory has been deleted or pruned. | The runs still on disk are the directories under `$XDG_STATE_HOME/slop-cannon/<repo-id>/runs/`; `ls` it and pass one of those ids to `--run`. Without `--run` both commands read the most recent run, which is usually what you want. |
 | `no runs recorded for` | `sc status` or `sc logs` was pointed at a repository `sc` has never fired at, so there is no run to read. | Fire a run first, or point the command at the right repository with `--repo`. |
 | `the run wrote no log yet` | `sc logs` found the run directory but no `sc.log` in it: the run was killed before it wrote its first line, or the directory was made by hand. | Read `events.jsonl` in the same directory, or start a new run. |
-| `the run has no agent logs yet` | `sc logs` was given an agent or bead id, and the run has not fired its first agent (or was killed before it did). | `sc logs` with no argument tails the run's own log meanwhile; the per-agent files appear as the run fires its agents. |
+| `the run has no agent logs yet` | `sc logs` was given an agent or bead id, and the run has not fired its first agent (or was killed before it did). | Add `--follow`: it waits for the first agent log of that bead and starts printing when it appears (P8-38). `sc logs` with no argument tails the run's own log meanwhile. |
 | `this run has:` | `sc logs` was given an id no agent log matches. The message lists the agent ids the run does have. | Copy one of the ids it lists, or pass the bead id — `sc logs sc-1` prints every agent that worked on that bead. |
 | `a followed log has no end to encode` | `sc logs --follow` was combined with `--json`, and a stream that never ends cannot be one JSON document. | Pick one: `--json` for a snapshot a script can parse, `--follow` for a live tail. |
 | `orchestrator: no state file` | The run directory exists but the run never got as far as its first state write. | Read `events.jsonl` in the same directory, or start a new run. |
@@ -139,7 +163,9 @@ adapters.
 | Message | What happened | What to do |
 |---|---|---|
 | `no cartridge loaded` | The run resolved a configuration with no active cartridge. Nothing can be fired without one (D-04). | `sc cartridge --add claude --model <model>`, then fire again. |
-| `cartridge: no active cartridge configured (add one with: sc cartridge --add claude)` | The same, from the cartridge selector. | As above. |
+| `cartridge: no active cartridge configured (add one with: sc cartridge --add claude --model <model>)` | The same, from the cartridge selector. | As above. The command is the one every other message names, so following any of them gets you to the same place. |
+| `which is no longer configured` | A resumed run was started with a cartridge that has since been removed from the configuration, so the run cannot fire the agents it planned. | Add it back (`sc cartridge --add <name> --model <model>`), or start a new run instead of resuming. |
+| `is out of credits` | Every configured cartridge reported it is out of credits or rate limited, so nothing can be fired. `sc` exits 3 for this and for nothing else. | Wait for the quota to reset, or add a cartridge on another subscription with `sc cartridge --add`. |
 | `cartridge: unknown cartridge` | The configuration names a cartridge `sc` has no adapter for. | `sc cartridge --list` shows what is available; only Claude ships today (D-19). |
 | `cartridge: not built` | The active cartridge, or a per-role override, names a cartridge that was not built for this run — usually a stale `[roles]` entry. | Fix the name in the config, or remove the role override. |
 | `cartridge: not installed` | The cartridge's CLI is not on `PATH`. | Install it, or set `command` under `[cartridges.<name>]` to its absolute path. |
@@ -163,7 +189,7 @@ conventions are in [beads-conventions.md](beads-conventions.md).
 | `not a git repository` | `bd` was asked to initialise a tracker outside a git working tree. | Run `sc` against a repository; `bd` stores the database beside `.git`. |
 | `no beads project found` | The repository has no `.beads/` directory yet. | `sc` creates one on the first run (D-13); to do it by hand, `bd init` in the repository. |
 | `has no beads database yet` | `sc status <bead>` was asked about a repository that has never been fired at. | Fire a run first, or `cd` to the right repository. |
-| `status: empty bead id` | `sc status ""` — the bead argument was empty, usually an unset shell variable. | Pass a bead id (`sc status sc-1`), or drop the argument to see the whole run. |
+| `status: empty bead id` | `sc status ""` — the bead argument was empty, usually an unset shell variable. | Name the bead you want the timeline of (`sc status sc-3`), or drop the argument to see the whole run. |
 | `not found in` | `sc status <bead>` was given an id this repository's bead database does not have: a typo, or a bead from another repository. | `sc status` lists the run's beads and `bd list` every bead; `--repo` points the command at another repository. |
 | `bead not found` | No bead has that id: a typo, or a bead from another repository. | `sc status` lists this run's beads. |
 | `bd rejected the request` | `bd` refused the input — an unknown status or type, a priority out of range, an empty title. | The message carries `bd`'s own text; fix the value it names. |
@@ -180,6 +206,14 @@ conventions are in [beads-conventions.md](beads-conventions.md).
 | `dry-run node count does not match the plan` | `bd` would not create every bead the plan asked for. | As above. |
 | `bd did not return an id for every plan key` | The graph was applied but `bd` reported fewer ids than beads. | The run stops using that plan. Check the database with `bd list`; a half-applied plan is safe to close by hand. |
 | `orchestrator: bead carries a status slop-cannon did not register` | A bead is in one of the repository's own custom statuses, so it belongs to another tool and `sc` will not move it (P6-12). | Nothing: it is deliberate. Move the bead to a status `sc` knows if you want it worked on. |
+| `(no real binary on PATH)` | `sc` went looking for the genuine `bd` (or `git`) to put behind the read-only shim every agent gets, and found only shims or nothing at all. | Install the tool the message names and make sure it is on the `PATH` `sc` itself runs with; `sc doctor` reports both. |
+| `needs a POSIX shell, unsupported on` | The read-only `bd` shim and the git guard are `/bin/sh` scripts, so agents cannot be sandboxed on a platform without one (Windows). | Run `sc` under WSL, macOS or Linux. |
+| `bd init in` | `sc` tried to create the bead database in the repository and `bd init` failed; the rest of the line is `bd`'s own message. | `sc doctor` checks `bd`; running `bd init` in the repository by hand shows the same failure with more context. |
+| `malformed custom status` | The repository's `bd` configuration has a `status.custom` entry that is not `name:category`, so `sc` cannot read the D-07 registry it has to extend. | `bd config get status.custom` shows it; fix or remove the entry. |
+| `is malformed, refusing to replace it` | The same entry, found while `sc` was about to write its own statuses. It is left alone rather than overwritten, because it is the repository's own configuration. | As above: fix `status.custom` by hand, then fire again. |
+| `after setting status.custom=` | `sc` wrote the workflow statuses it needs (D-07) and `bd` did not list them back, so the tracker and `sc` disagree about what a bead may be. | Check the `bd` version (`sc doctor`; 1.2.2 or newer), then `bd config get status.custom`. |
+| `(agents must be able to read beads)` | The read-only `bd` shim failed its own self-check: it refused a read an agent needs. The run is refused rather than fired with a shim that would block its agents. | It is a bug in `sc`; report it with the line, which names the command that was refused. |
+| `was not refused` | The other half of that self-check: a write the shim must refuse went through to `bd`. The run is refused rather than fired with agents that could write the tracker (D-21). | As above — report it with the line. |
 
 ## Git, worktrees and the repository
 
@@ -244,6 +278,7 @@ is rebased and fast-forwarded onto the default branch (D-10).
 
 ## Agents and their answers
 
+
 Every agent must end its session with a structured `sc-result` block. What
 a session printed is in its own file under `<run-dir>/agents/`, which
 `sc logs <agent-id>` and `sc logs <bead-id>` read back; the run's own log is
@@ -269,8 +304,12 @@ whole files from an agent.
 | `the plan breaks a planning rule` | The product owner's plan was schema-valid but broke a planning rule: too many beads, a duplicate of an open bead, dangling dependencies, a cycle, or empty acceptance criteria. These are the words a rejected plan prints, on the end of `structured: result does not match schema (plan)`, with the rules it broke listed under it, one per line. | `sc` asks it to re-plan. Raising `max_beads_per_plan` helps when the brief is genuinely large; the duplicate and cycle rules are about the beads already in `bd`, so `bd list` shows what the plan collided with. |
 | `agents: plan rejected` | The same rejection under the name the planner matches it by. It is not usually what you read — a rejected plan reaches you as the row above — but it is what a warning's `error` field carries in `sc.log` and `events.jsonl` when the plan was rejected as it was being applied. | As above. |
 | `agents: plan proposes no beads` | The plan is empty. In autopilot that is a legitimate answer — nothing worth doing right now (D-18). | In brief mode, give a more concrete brief. In autopilot, nothing. |
+| `the brief must be decomposed into at least one` | The same empty plan in brief mode, where it is not a legitimate answer: you asked for something and the product owner proposed no work. | Say what you want in concrete terms — a file, a behaviour, a bug — and fire again. |
+| `beads, the limit is` | The plan has more beads than `limits.max_beads_per_plan` allows, so it is refused and re-planned. | Nothing, usually: the next plan is smaller. Raise `limits.max_beads_per_plan` in the config when the brief is genuinely large. |
 | `orchestrator: planning: the product owner could not produce a usable plan` | Brief mode gave up after the configured number of rejected or failed plans. | Rewrite the brief in smaller, concrete terms, or raise `limits.max_plan_rejections` and `limits.max_plan_failures`. |
 | `agents: prompt is over its token budget` | Even after dropping everything droppable, the assembled prompt exceeds the budget. | Split the bead, or trim the vibes and rules files: they are sent to every agent. |
+| `is not allowed from an agent session` | An agent ran a git command the guard on its `PATH` refuses (P9-22). Agents work in their own worktree and commit there; `sc` pushes, opens the pull request and merges. The refused verbs are the ones that could move a branch outside that worktree — `push`, `pull`, `fetch`, `checkout`, `switch`, `clean`, `branch -D`, `config`, and anything git has grown since. | Nothing: it is working as intended, and the agent is told what it may run instead. You see it in `sc logs <bead-id>`, not on your own terminal. |
+| `git may only be run inside` | The same guard, from the other side: an agent left its worktree — `cd` into the repository, say — and ran git there, where the default branch is the one checked out. | As above. |
 | `agents: cartridge has no tool controls and the copied-worktree fallback is not implemented` | A cartridge that cannot restrict its own tools was selected, and the degrade that would contain it is not built (P5-06). | Use Claude, the cartridge that ships today (D-19). |
 | `orchestrator: a rules-file violation is a hard constraint` | A verdict, an arbitration or a transition would have settled or shipped a `rules` violation in the engineer's favour. Rules files are not negotiable (D-08, P9-06). | Fix the code so the rule is met, or change the rules file if the rule itself is wrong. |
 | `orchestrator: agent panicked` | An agent's own goroutine panicked. The run survives it and re-fires the work. | Report it with the run id: this is an `sc` bug, and the stack is in the run log. |
@@ -291,6 +330,10 @@ whole files from an agent.
 | `orchestrator: conductor: worktree for` | The bead's worktree could not be created before its agent was fired. The rest of the line is git's own message. | The `gitx:` rows above name the usual causes (an occupied path, a branch checked out elsewhere). The firing is retried. |
 | `orchestrator: conductor: committing` | D-14's leftovers commit — whatever the last engineer left uncommitted, committed before the testers read it — failed. | Look in `<state-dir>/runs/<run-id>/wt/<bead-id>`: a worktree stopped mid-rebase is handled on its own, anything else is git refusing, and the line carries its words. |
 | `orchestrator: the supervisor has stopped; no new agents are fired` | The run is shutting down: you stopped it, or a limit ended it. In-flight agents finish, nothing new starts. | Nothing. `--resume` continues the work. |
+| `orchestrator: this run has no budget to raise: neither limits.max_tokens nor limits.max_cost_usd is set` | The TUI's `b` key was pressed on a run with no cap, so there is nothing to raise. | Nothing to do while it runs — an uncapped run is never held. Set one of those keys in the config file to cap the next run ([config.md](config.md)). |
+| `orchestrator: a new budget must be above what the run has already spent` | The number typed into the `b` prompt is under (or equal to) what the run has spent, so raising to it would stop the run again at once. The line says what has been spent. | Type a larger number. The prompt asks for the whole new ceiling, not the amount to add. |
+| `was written by a newer sc (state version` | The run's `state.json` was written by a newer build of `sc` than the one reading it, so resuming it could misread the run. | Use the newer `sc`, or start a new run rather than resuming this one. |
+| `belongs to run` | A state or lock file was read for one run and turned out to name another — usually two runs sharing a state directory, or a hand-edited path. | Let `sc` pick the run (`sc status` lists them) rather than pointing it at a directory by hand. |
 
 ### The run paused itself and nothing is happening
 
@@ -300,8 +343,9 @@ nothing more, and waits for you. In the TUI, `p` resumes it — and resuming
 grants another budget's worth, so it will pause again rather than run on
 unwatched. There is no way to clear that pause in `--headless` mode: `sc
 resume` restarts an *earlier* run from disk rather than the live one, so
-Ctrl-C is the answer: it finishes the run as a user stop, the banner naming
-the cap stays in the run log, and the summary still reports what was spent.
+stopping it is the answer: Ctrl-C in its own terminal, or `sc stop` from any
+other one. Either finishes the run as a user stop, the banner naming the cap
+stays in the run log, and the summary still reports what was spent.
 Until then the run holds the repository's run lock, which is why a second
 `sc` in the same repository is refused (see `sc status`).
 
@@ -313,9 +357,10 @@ Restarting the same run with `--resume` does not hand it a fresh budget. The
 spend is kept in the run's `state.json`, so a resumed run carries what the
 earlier invocations already spent; a resume over a crossed cap grants one more
 budget's worth, exactly as clearing a pause in the TUI does, and then stops
-again. If a run really needs more than that, raise `limits.max_tokens` (or
-`limits.max_cost_usd`) and start a new run — a resumed run behaves by the
-configuration it was started with (P6-11).
+again. If a run really needs more than that, `b` in the TUI raises the cap of
+the live run; otherwise raise `limits.max_tokens` (or `limits.max_cost_usd`)
+and start a new run — a resumed run behaves by the configuration it was
+started with (P6-11).
 
 ## Warnings the run prints
 
@@ -376,6 +421,9 @@ exempted in the test with a written reason.
 | `could not open the agent log` | A per-agent transcript under `<run-dir>/agents/` could not be written. | Check the state directory's permissions; the run's own `sc.log` still has the session's events. |
 | `and a contained session must not reach it (P6-20)` | A reviewing agent gets a copy of the engineer's worktree, and a symlink in it pointed outside the tree, so the copy left it out. The reviewer sees a tree that differs from the engineer's by that link. | Nothing, unless the review needs that file: then commit its contents rather than linking to them from outside the repository. |
 | `the run could not be paused over its budget` | The run crossed `limits.max_tokens` or `limits.max_cost_usd` but could not pause itself. | Stop it with Ctrl-C: it finishes as a user stop and the summary still reports what was spent. |
+| `no new work will be started` | The budget banner: the run reached `limits.max_tokens` or `limits.max_cost_usd`, and the line says which and what it has spent. An autopilot run then pauses and waits for you; a brief run lets the reviews in flight finish and ends. | See *The run paused itself and nothing is happening* below: `p` in the TUI grants another budget's worth, `b` raises the cap, Ctrl-C or `sc stop` ends it. |
+| `which slop-cannon did not register; leaving it alone` | A bead in the run's own graph carries one of the repository's custom `bd` statuses, so it belongs to another tool and the run will not move it (P6-12, D-07). The line names the bead and the status. | Nothing: it is deliberate. Move the bead to a status `sc` knows (`bd update <id> --status open`) if you want it worked on. |
+| `which slop-cannon only reads; leaving it alone` | The same, for one of the states `sc` knows but never writes — a bead somebody parked in `deferred`, say. | Nothing. `sc status <bead>` shows where it is. |
 
 ### Resuming
 
@@ -457,6 +505,8 @@ carry, rather than the errors above.
 | `not authenticated` | `gh`, or a cartridge's CLI, is installed but not logged in. | `gh auth login`, or run the cartridge's CLI once yourself (for Claude Code: `claude`). |
 | `not logged in (run: claude auth login, or set ANTHROPIC_API_KEY)` | The Claude CLI is installed but has no credentials. | Either of the two things it names. |
 | `auth probe` | `sc` could not tell whether the cartridge is logged in: the probe did not finish, printed no JSON, or could not be run. | Run the CLI once by hand. `sc` fires it anyway; a real auth failure surfaces as `cartridge: not authenticated`. |
+| `sc has only been tested against embedded mode` | The beads project is on the multi-writer Dolt **server** backend rather than the embedded one — `sc doctor`'s `dolt` row when `bd context` (or `.beads/metadata.json`) says so, and the same notice from a run. `sc` continues; it has simply never been tested there (P3-17). | Nothing, unless something misbehaves. Server mode is the only mode that needs the standalone `dolt` CLI, which beads pins at 2.2.0; embedded mode links the engine into `bd` and ignores the `dolt` on your machine. |
+| `backend unknown: bd context failed` | `sc doctor` could not ask `bd` which Dolt backend the project uses, and `.beads/metadata.json` could not stand in either. | Run `bd context --json` in the repository; the row carries what `bd` printed. It is a warning, not a refusal. |
 | `no cartridge configured` | No cartridge at all is in the configuration. | `sc cartridge --add claude --model <model>`. |
 | `no active cartridge` | Cartridges are configured but none is selected. | `sc cartridge --use claude`. |
 | `uncommitted change` | The target repository has uncommitted work. Worktrees are made from a clean tree. | Commit or stash it. It is a warning: `sc doctor` still passes. |
@@ -487,3 +537,10 @@ If none of this matches, `sc status --json` and the run's `events.jsonl` are
 the full record of what happened, and `sc doctor --json` is the full record
 of what the machine looks like. Both belong in a bug report, with the `sc`
 version from `sc version`.
+
+**See also:** the [docs index](README.md) lists every page. The ones nearest
+to this one are [cli.md](cli.md) (what each command and flag does),
+[config.md](config.md) (every key you might have set wrong),
+[prompts.md](prompts.md) (what an agent was told, where the run wrote it
+down, and the exit codes) and [performance.md](performance.md) (when the
+problem is that something is slow rather than broken).

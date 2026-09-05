@@ -2286,6 +2286,25 @@ func (f *Feedback) reviewersFor(t *fbThread) []domain.Lens {
 // when that would be one round too many (D-08).
 func (f *Feedback) nextRound(ctx context.Context, t *fbThread) error {
 	f.mu.Lock()
+	if t.restoring && t.state == domain.BeadStateChangesRequested && t.bead.Round > 0 {
+		// P6-47: bd already holds the bead in changes_requested, so the
+		// killed run had taken this edge before it died — the round it
+		// asked the engineer for is spent, and asking for one more here
+		// would spend it twice, shortening the D-08 budget by a round
+		// every time the run is resumed. The bead's own status is the
+		// evidence that the transition was made and its own round
+		// (sc_round) the record of which round it was made into, so the
+		// replay closes the round the comments describe and resumes in
+		// the one bd names rather than in the next one.
+		f.closeRound(t)
+		if t.bead.Round > t.round {
+			t.round = t.bead.Round
+		}
+		t.phase = FeedbackAddressing
+		t.kind = events.RoundReview
+		f.mu.Unlock()
+		return nil
+	}
 	if t.round >= f.rounds {
 		t.phase = FeedbackEscalating
 		round, limit := t.round, f.rounds
@@ -2335,6 +2354,23 @@ func (f *Feedback) closeRound(t *fbThread) {
 	// narrow_scope ruling in every round after the one that made it.
 	t.report = nil
 	t.escalation = nil
+}
+
+// replayOpens closes the round [Feedback.Restore] is folding and opens the
+// one the next comment belongs to (P6-48). The caller holds the lock.
+//
+// Without it the replay closes at most one round — the one plan finds open
+// when the replay ends — and every round's verdicts, answers and notes are
+// heaped into it: a thread that had two answers refused for arguing with
+// the same binding ruling repeats that note once per refusal in the round
+// it resumes in, and the prompts lose the round each piece of evidence
+// belongs to.
+func (f *Feedback) replayOpens(t *fbThread, round int) {
+	if round <= t.round {
+		return
+	}
+	f.closeRound(t)
+	t.round = round
 }
 
 // refreshDiff reads the change set the next review looks at and works out
@@ -2546,6 +2582,17 @@ func (f *Feedback) ReviewAgain(_ context.Context, bead domain.Bead, round int, r
 // so the pushback exchanges a thread has already spent are the ones it
 // resumes with and it arbitrates on the round it would have (P6-26).
 //
+// It is also a replay of the thread's rounds rather than of its comments in
+// a heap: a comment that starts the next round (a verdict that names it, a
+// second implementation report, an engineer answer where one has already
+// been given) closes the round the replay is folding and opens that one
+// ([Feedback.replayOpens]), so each round's verdicts, answers, rulings and
+// notes are filed under the round they were made in and every prompt the
+// resumed run builds carries them once, where they belong (P6-48). The
+// round numbering therefore comes from the comments; bd's own round is what
+// [Feedback.nextRound] resumes a bead already in changes_requested on
+// (P6-47).
+//
 // It does write the one status the killed run owed. A run killed between
 // the last verdict comment and the status write leaves a bead bd still
 // holds in in_review although every tester approved it; replaying that
@@ -2563,6 +2610,11 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 		return fmt.Errorf("%w: %s", ErrNoFeedbackThread, bead.ID)
 	}
 	t.restoring = true
+	// The replay numbers the rounds from the comments themselves rather
+	// than from bd's sc_round, so each round's evidence is filed under the
+	// round it was made in (P6-48). bd's own round is kept on t.bead for
+	// [Feedback.nextRound] to resume from (P6-47).
+	t.round = 0
 	// The criteria a narrow_scope ruling replaced the bead's with, if the
 	// replay finds one; bd is asked to carry them below (P6-24).
 	var narrowed string
@@ -2572,6 +2624,11 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 		}
 		switch payload := f.filter.Message(m.Payload).(type) { // P9-05
 		case domain.ImplReport:
+			if t.report != nil || len(t.verdicts) > 0 {
+				// One round has one implementation report, so a second one
+				// is the next round's: a conflict resolution (P6-06).
+				f.replayOpens(t, t.round+1)
+			}
 			rep := payload
 			t.report = &rep
 			if t.round < 1 {
@@ -2579,11 +2636,26 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 			}
 		case domain.Verdict:
 			lens := payload.Lens
-			if payload.Round > t.round {
-				t.round = payload.Round
+			if payload.Round > 0 {
+				f.replayOpens(t, payload.Round)
+			}
+			if t.round < 1 {
+				t.round = 1
 			}
 			f.applyVerdict(t, lens, f.restoredMode(t, lens, payload), payload)
 		case []domain.Response:
+			if len(t.responses) > 0 || len(t.verdicts) > 0 {
+				// One round has one engineer answer, and a round the
+				// testers have already judged is over: either way this
+				// answer belongs to the round after the open one — which
+				// is what two refused answers in a row look like, because
+				// a refusal sends the bead straight back to the engineer
+				// with no tester in between (D-08, P6-38).
+				f.replayOpens(t, t.round+1)
+			}
+			if t.round < 1 {
+				t.round = 1
+			}
 			f.applyResponses(t, payload)
 		case domain.Arbitration:
 			if i := fbFind(t, payload.ItemID); i != nil {
@@ -2609,6 +2681,15 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 					t.storedAcceptance = narrowed
 				}
 			}
+		}
+	}
+	if t.round < 1 {
+		// Nothing in the thread says which round it is in, so bd's own
+		// round stands, and a thread past the implementation is in round
+		// one at the earliest ([Feedback.newThread]).
+		t.round = t.bead.Round
+		if t.round < 1 && t.phase != FeedbackImplementing {
+			t.round = 1
 		}
 	}
 	f.mu.Unlock()
