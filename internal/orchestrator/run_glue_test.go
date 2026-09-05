@@ -291,6 +291,9 @@ type glueGit struct {
 	diffs     int
 	commitErr error
 	diff      *gitx.Diff
+	// onCommit, when set, runs inside CommitLeftovers with the fake's own
+	// lock released, so a test can watch two callers overlap.
+	onCommit func()
 }
 
 func (g *glueGit) DefaultBranch(context.Context) (string, error) { return "main", nil }
@@ -301,10 +304,15 @@ func (g *glueGit) RebaseState(context.Context, domain.BeadID) (RebaseState, erro
 
 func (g *glueGit) CommitLeftovers(_ context.Context, bead domain.Bead, _ int) (*gitx.Leftovers, error) {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 	g.leftovers = append(g.leftovers, bead.ID)
-	if g.commitErr != nil {
-		return nil, g.commitErr
+	err := g.commitErr
+	hook := g.onCommit
+	g.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	if err != nil {
+		return nil, err
 	}
 	return &gitx.Leftovers{}, nil
 }
@@ -781,6 +789,80 @@ func TestGlueBeadContextCommitsLeftoversThroughDeliveryGit(t *testing.T) {
 	_, err = rig.Cond.BeadContext(context.Background(), "sc-1")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "committing sc-1's leftovers")
+}
+
+// TestGlueBeadContextSerialisesOneBeadsWorktree is P10-12. D-05 puts two
+// lenses on one bead at a time and the scheduler fires them in parallel, so
+// two firings build their prompt for the same bead at the same moment. Both
+// go through this method, which runs `git commit` in that bead's single
+// worktree; git holds index.lock for the length of a commit, so an
+// overlapping pair leaves one of them dead with "Another git process seems
+// to be running in this repository" and the bead stalls in in_review with
+// nothing wrong with it. The fix is a lock per bead, and this test is what
+// says the two callers never overlap.
+//
+// Without the lock the two goroutines meet inside CommitLeftovers and the
+// live count reaches 2; with it the first waits out the patience window
+// alone and the second arrives after it has left.
+func TestGlueBeadContextSerialisesOneBeadsWorktree(t *testing.T) {
+	bd := newGlueBD(glueIssue("sc-1", domain.BeadTypeTask, "in_progress", "add the retry"))
+	git := &glueGit{diff: &gitx.Diff{Patch: "diff --git a/retry.go b/retry.go\n"}}
+	rig := glueSetup(t, bd, ConductorOptions{Git: git}, config.RunSettings{})
+
+	var (
+		mu       sync.Mutex
+		live     int
+		maxLive  int
+		arrived  = make(chan struct{}, 2)
+		together = make(chan struct{})
+		once     sync.Once
+	)
+	git.onCommit = func() {
+		mu.Lock()
+		live++
+		if live > maxLive {
+			maxLive = live
+		}
+		mu.Unlock()
+		// Announce, then hold the worktree long enough for the other
+		// caller to overlap if nothing stops it.
+		select {
+		case arrived <- struct{}{}:
+		default:
+		}
+		if len(arrived) == 2 {
+			once.Do(func() { close(together) })
+		}
+		select {
+		case <-together:
+		case <-time.After(testutil.Patience(250 * time.Millisecond)):
+		}
+		mu.Lock()
+		live--
+		mu.Unlock()
+	}
+
+	done := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := rig.Cond.BeadContext(context.Background(), "sc-1")
+			done <- err
+		}()
+	}
+	for range 2 {
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(testutil.Patience(30 * time.Second)):
+			t.Fatal("BeadContext did not return for both lenses")
+		}
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, maxLive,
+		"two lenses on one bead ran git in the same worktree at the same time (P10-12)")
+	assert.Len(t, git.committed(), 2, "each firing still commits the leftovers it is about to review")
 }
 
 func TestGlueBeadContextRefusesABeadBDDoesNotKnow(t *testing.T) {

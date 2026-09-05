@@ -2230,6 +2230,19 @@ type Conductor struct {
 	// only one repository-mutating delivery runs at a time (P8-14 gap 3).
 	deliver sync.Mutex
 
+	// worktreeMu guards worktrees; worktrees serialises the per-bead
+	// worktree work [Conductor.BeadContext] does, for the same reason
+	// deliver serialises a delivery. D-05 puts up to two lenses on one
+	// bead at a time and the scheduler fires them in parallel, so two
+	// firings build their prompt for the same bead at the same moment —
+	// and both would run `git commit` in that bead's single worktree.
+	// Git takes `index.lock` for the duration, so the loser dies with
+	// "Another git process seems to be running in this repository", the
+	// firing fails, and a bead that had nothing wrong with it stalls in
+	// in_review (P10-12).
+	worktreeMu sync.Mutex
+	worktrees  map[domain.BeadID]*sync.Mutex
+
 	mu       sync.Mutex
 	idle     *sync.Cond
 	feedback ConductorFeedback
@@ -3540,6 +3553,14 @@ func (c *Conductor) BeadContext(ctx context.Context, id domain.BeadID) (Feedback
 		return c.reviewBeadContext(bead, round), nil
 	}
 
+	// One worktree, one git at a time (P10-12). Everything below touches
+	// this bead's worktree: it may create it, it commits D-14's leftovers
+	// into it and it diffs it, and a second lens firing on the same bead
+	// would be doing the same thing in the same directory.
+	lock := c.worktreeLock(id)
+	lock.Lock()
+	defer lock.Unlock()
+
 	worktree := ""
 	if c.opts.Worktrees != nil {
 		worktree = c.opts.Worktrees.PathFor(id)
@@ -3611,6 +3632,24 @@ func (c *Conductor) BeadContext(ctx context.Context, id domain.BeadID) (Feedback
 // the run, and nothing about a worktree or a change set, both of which
 // [PRReview.PlanFiring] fills in from the pull request itself. Nothing here
 // touches git.
+// worktreeLock is the mutex that serialises work in one bead's worktree.
+// It is per bead rather than one lock over all of them because the beads
+// have a worktree each: two lenses on the same bead have to take turns,
+// two engineers on different beads do not (P10-12).
+func (c *Conductor) worktreeLock(id domain.BeadID) *sync.Mutex {
+	c.worktreeMu.Lock()
+	defer c.worktreeMu.Unlock()
+	if c.worktrees == nil {
+		c.worktrees = make(map[domain.BeadID]*sync.Mutex)
+	}
+	mu, ok := c.worktrees[id]
+	if !ok {
+		mu = new(sync.Mutex)
+		c.worktrees[id] = mu
+	}
+	return mu
+}
+
 func (c *Conductor) reviewBeadContext(bead domain.Bead, round int) FeedbackBeadContext {
 	return FeedbackBeadContext{
 		Bead: prompt.BeadContext{
