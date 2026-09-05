@@ -68,27 +68,33 @@ snapshot:
   version_template: "{{ incpatch .Version }}-snapshot-{{ .ShortCommit }}"
 
 changelog:
-  use: github
-  sort: asc
+  # This repository does not use conventional commits, so goreleaser's stock
+  # feat:/fix: groups and ^docs:/^chore:/^claim filters were dead configuration
+  # here: every subject is "<task ids>: <what changed>" (the Agent Protocol in
+  # IMPLEMENTATION-PROGRESS.md), and none of the 48 commits written so far
+  # matched a single one of those patterns, so the whole history landed under
+  # one "Others" heading. What the history does have is bookkeeping commits
+  # that only move the progress file: 19 of those same 48, worth dropping.
+  # internal/cli/release_artifacts_test.go fails if a pattern below stops
+  # matching real commits, so this cannot rot back into decoration.
+  #
+  # `use: git` keeps the notes identical between the documented offline dry run
+  # and the real release; `use: github` needs the compare API. There is no
+  # `sort`: goreleaser sorts by *message* when it is set, which ordered the
+  # list alphabetically (P10-* above P2-*); unset keeps git's own order.
+  # Grouping is left off deliberately - one commit closes a whole wave of
+  # tasks, so there is nothing to group by; the grouped account is CHANGELOG.md.
+  use: git
+  abbrev: 7
+  format: "{{ .SHA }} {{ .Message }}"
   filters:
     exclude:
-      - "^docs:"
-      - "^test:"
-      - "^chore:"
-      - "^ci:"
-      - "^claim "
-      - "merge conflict"
-      - Merge pull request
-      - Merge branch
-  groups:
-    - title: Features
-      regexp: '^.*?feat(\([[:word:]]+\))??!?:.+$'
-      order: 0
-    - title: Fixes
-      regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
-      order: 1
-    - title: Others
-      order: 999
+      # Progress-file bookkeeping: "<ids>: record <wave>" and "<ids>: mark
+      # <phase> done in IMPLEMENTATION-PROGRESS.md" change no shipped code.
+      - ": record "
+      - "IMPLEMENTATION-PROGRESS"
+      # No merge commit exists yet; this keeps them out if that ever changes.
+      - "^Merge "
 
 release:
   # The repository has no origin remote yet, so owner/name cannot be inferred:
@@ -98,6 +104,16 @@ release:
   github:
     owner: '{{ envOrDefault "SC_REPO_OWNER" "maxh213" }}'
     name: '{{ envOrDefault "SC_REPO_NAME" "slop-cannon" }}'
+  # The commit list goreleaser generates is raw history whose subjects are
+  # task IDs; this says where the prose account is and how to read them.
+  header: |
+    [CHANGELOG.md](https://github.com/{{ envOrDefault "SC_REPO_OWNER" "maxh213" }}/{{ envOrDefault "SC_REPO_NAME" "slop-cannon" }}/blob/{{ .Tag }}/CHANGELOG.md)
+    is the account of this release in prose.
+
+    The commits below are the raw history. Almost every subject begins with
+    the `P<phase>-<number>` task IDs that commit closes, from
+    `IMPLEMENTATION-PROGRESS.md` in the repository, so a single commit often
+    covers a whole wave of work.
   draft: false
   prerelease: auto
   mode: replace

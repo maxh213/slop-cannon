@@ -82,6 +82,13 @@
 # botched run cannot overwrite the evidence; a run that failed leaves its
 # redacted log in the temporary directory instead.
 #
+# The `gh` stand-in's own call log is recorded beside it, as
+# testdata/recorded/dogfood-gh-calls.txt: it is the only record of how many
+# times anything on the run's PATH asked gh for anything, and the claim that
+# sc issues none of them on a run that starts is only checkable against it.
+# Before this was added it lived in the temporary machine and was deleted
+# with it, which is why the run recorded here has no companion file (P10-05).
+#
 # The recording committed as testdata/recorded/dogfood-run.jsonl came from
 # claude/sonnet, ammo 4, safety on, one bead (2026-09-05), fired at a clone
 # of this repository at 5ccfce7 with the P10-09 brief above: 3m39s, 721
@@ -444,6 +451,37 @@ if [ "$record" -eq 1 ]; then
 		exit 1
 	fi
 	echo "dogfood.sh: recorded $out_lines events into $out" >&2
+
+	# Keep the gh stand-in's call log with the recording. Nothing in the
+	# event stream records a gh invocation, so without this file nobody
+	# can check afterwards who asked gh for what — the run's own tally is
+	# otherwise deleted with the temporary machine (P10-05).
+	gh_out=$(dirname "$out")/dogfood-gh-calls.txt
+	run_id=$(sed -n '1s/.*"run_id":"\([^"]*\)".*/\1/p' "$log")
+	gh_total=0
+	if [ -f "$work/gh/calls" ]; then
+		gh_total=$(wc -l <"$work/gh/calls" | tr -d ' ')
+	fi
+	# grep -c prints 0 and exits 1 on an empty file, and prints nothing at
+	# all when the file is missing, so neither may reach the arithmetic.
+	gh_count() {
+		n=$(grep -c "$1" "$work/gh/calls" 2>/dev/null | head -1)
+		echo "${n:-0}"
+	}
+	gh_version=$(gh_count '^--version')
+	gh_auth=$(gh_count '^auth status')
+	gh_other=$((gh_total - gh_version - gh_auth))
+	{
+		echo "# every gh invocation the run's PATH saw, run ${run_id:-unknown}"
+		echo "# The gh on that PATH is this script's stand-in, so this is"
+		echo "# the complete list: sc's, and every agent session's."
+		echo "# --version:   $gh_version"
+		echo "# auth status: $gh_auth"
+		echo "# other:       $gh_other"
+		echo "#"
+		cat "$work/gh/calls" 2>/dev/null || true
+	} | redact >"$gh_out"
+	echo "dogfood.sh: recorded $gh_total gh call(s) into $gh_out ($gh_version --version, $gh_auth auth status, $gh_other other)" >&2
 fi
 
 if [ "$keep" -eq 1 ]; then

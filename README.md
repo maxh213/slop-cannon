@@ -81,7 +81,7 @@ timing (and the scenario) to it.
 **From a release** (Linux and macOS, amd64 and arm64):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/maxh213/slop-cannon/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/maxh213/slop-cannon/HEAD/install.sh | sh
 ```
 
 `install.sh` downloads the archive for your platform, verifies it against the

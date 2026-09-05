@@ -2,6 +2,8 @@ package cli
 
 import (
 	"fmt"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -208,4 +210,177 @@ func TestReleaseWorkflowUsesItsInputs(t *testing.T) {
 			"release.yml declares the workflow_dispatch input %q but never reads inputs.%s, so the box does nothing", name, name)
 	}
 	require.Positive(t, names, "release.yml declares no workflow_dispatch inputs; this test is stale")
+}
+
+// bootstrapURLRe matches the raw.githubusercontent.com URL the install
+// one-liner is pasted from: owner, repo, ref, path.
+var bootstrapURLRe = regexp.MustCompile(`https://raw\.githubusercontent\.com/([^/\s]+)/([^/\s]+)/([^/\s]+)/([^\s"'` + "`" + `)]+)`)
+
+// bootstrapRefIsSafe reports whether a raw.githubusercontent ref names
+// something that exists whatever the default branch is called: HEAD, a version
+// tag (v0.1.0, or the vX.Y.Z placeholder the docs use), or a release template.
+func bootstrapRefIsSafe(ref string) bool {
+	switch {
+	case ref == "HEAD":
+		return true
+	case strings.Contains(ref, "{{"): // goreleaser renders {{ .Tag }}
+		return true
+	case regexp.MustCompile(`^v[0-9X]`).MatchString(ref):
+		return true
+	}
+	return false
+}
+
+// TestBootstrapInstallURLNamesNoBranch guards P10-03: the README shipped the
+// bootstrap one-liner as .../slop-cannon/main/install.sh while install.sh
+// itself advertised .../HEAD/install.sh. This repository's default branch is
+// master, so the README's URL 404s before it downloads anything — the Phase 10
+// exit criterion "curl | sh works on a fresh machine" fails at step one. A raw
+// URL must therefore name HEAD or a tag, never a branch, and the README must
+// quote the same URL install.sh advertises for itself.
+func TestBootstrapInstallURLNamesNoBranch(t *testing.T) {
+	files := []string{"README.md", "install.sh", "CHANGELOG.md", ".goreleaser.yaml"}
+	// Every page under docs/ as well, so a new one cannot smuggle a branch in.
+	pages, err := filepath.Glob(filepath.Join("..", "..", "docs", "*.md"))
+	require.NoError(t, err)
+	for _, page := range pages {
+		files = append(files, filepath.Join("docs", filepath.Base(page)))
+	}
+
+	seen := 0
+	installers := map[string][]string{}
+	for _, name := range files {
+		body := repoFile(t, name)
+		for _, m := range bootstrapURLRe.FindAllStringSubmatch(body, -1) {
+			url, ref, path := m[0], m[3], m[4]
+			seen++
+			require.Truef(t, bootstrapRefIsSafe(ref),
+				"%s fetches %s: the ref %q is a branch name, and this repository's default branch may not be called that "+
+					"(it is master today, so /main/ 404s). Use HEAD, like install.sh, or a tag.", name, url, ref)
+			if strings.HasSuffix(path, "install.sh") {
+				installers[name] = append(installers[name], url)
+			}
+		}
+	}
+	require.Positive(t, seen, "no raw.githubusercontent.com URL found anywhere; this test is stale")
+
+	require.NotEmpty(t, installers["install.sh"], "install.sh no longer advertises its own bootstrap URL")
+	want := installers["install.sh"][0]
+	for _, got := range installers["install.sh"] {
+		require.Equal(t, want, got, "install.sh advertises two different bootstrap URLs")
+	}
+	require.NotEmpty(t, installers["README.md"], "README.md no longer quotes the install.sh one-liner")
+	for _, got := range installers["README.md"] {
+		require.Equal(t, want, got,
+			"README.md tells the reader to curl %q but install.sh advertises %q; the command a user copies is the README's", got, want)
+	}
+}
+
+var (
+	changelogListItemRe = regexp.MustCompile(`(?m)^\s*-\s+(.+?)\s*$`)
+	changelogRegexpRe   = regexp.MustCompile(`(?m)^\s*regexp:\s*(.+?)\s*$`)
+)
+
+// unquoteYAMLScalar strips one layer of matching quotes from a YAML scalar.
+func unquoteYAMLScalar(s string) string {
+	if len(s) >= 2 && (s[0] == '"' || s[0] == '\'') && s[len(s)-1] == s[0] {
+		return s[1 : len(s)-1]
+	}
+	return s
+}
+
+// gitSubjects returns every commit subject in the repository, newest first.
+func gitSubjects(t *testing.T) []string {
+	t.Helper()
+	root := filepath.Join("..", "..")
+	// A shallow clone is not this repository's history, it is the tip of it:
+	// the CI integration job checks out at the default depth of 1, and a
+	// changelog filter judged against a single commit says nothing. Skip
+	// rather than fail there; the `make check` job fetches the full history.
+	shallow := exec.Command("git", "rev-parse", "--is-shallow-repository")
+	shallow.Dir = root
+	if out, err := shallow.Output(); err == nil && strings.TrimSpace(string(out)) == "true" {
+		t.Skip("shallow clone: the full commit history this test judges the changelog config against is not here")
+	}
+	cmd := exec.Command("git", "log", "--format=%s")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		t.Skipf("git log is unavailable here (%v); this test reads the repository's own history", err)
+	}
+	var subjects []string
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line != "" {
+			subjects = append(subjects, line)
+		}
+	}
+	require.NotEmpty(t, subjects, "git log returned no commit subjects")
+	return subjects
+}
+
+// TestChangelogConfigMatchesRealHistory guards P10-03: .goreleaser.yaml shipped
+// conventional-commit groups (feat:/fix:) and filters (^docs:, ^chore:,
+// "^claim ") that matched none of this repository's 48 commits, so every commit
+// — bookkeeping included — landed in the release body under one "Others"
+// heading. A changelog pattern that matches nothing is decoration; it must earn
+// its place against the real history.
+func TestChangelogConfigMatchesRealHistory(t *testing.T) {
+	subjects := gitSubjects(t)
+	changelog := goreleaserYAMLBlock(t, repoFile(t, ".goreleaser.yaml"), "changelog")
+
+	matchesSomething := func(pattern string) (int, error) {
+		re, err := regexp.Compile(pattern)
+		if err != nil {
+			return 0, err
+		}
+		n := 0
+		for _, s := range subjects {
+			if re.MatchString(s) {
+				n++
+			}
+		}
+		return n, nil
+	}
+
+	// Patterns that guard against a history shape this repository cannot
+	// produce yet: it has no merge commits because nothing merges into it.
+	// Everything else must match a commit that exists.
+	forwardLooking := map[string]bool{"^Merge ": true}
+
+	checked := 0
+	if strings.Contains(changelog, "exclude:") {
+		for _, m := range changelogListItemRe.FindAllStringSubmatch(goreleaserYAMLBlock(t, changelog, "exclude"), -1) {
+			pattern := unquoteYAMLScalar(m[1])
+			n, err := matchesSomething(pattern)
+			require.NoErrorf(t, err, "changelog filter %q is not a valid regexp, so goreleaser cannot use it", pattern)
+			checked++
+			if forwardLooking[pattern] {
+				continue
+			}
+			require.Positivef(t, n,
+				"changelog.filters.exclude has %q, which matches none of the %d commit subjects in this repository: "+
+					"it excludes nothing. Delete it or replace it with a pattern the real history has.", pattern, len(subjects))
+		}
+	}
+	for _, m := range changelogRegexpRe.FindAllStringSubmatch(changelog, -1) {
+		pattern := unquoteYAMLScalar(m[1])
+		n, err := matchesSomething(pattern)
+		require.NoErrorf(t, err, "changelog group regexp %q is not a valid regexp", pattern)
+		checked++
+		require.Positivef(t, n,
+			"changelog.groups has the regexp %q, which matches none of the %d commit subjects in this repository, "+
+				"so the group is always empty and everything falls through to the catch-all.", pattern, len(subjects))
+	}
+	require.Positive(t, checked, "the changelog block declares no filters or groups; this test is stale")
+
+	// The bookkeeping commits the filters exist to drop really are dropped.
+	kept := 0
+	excluded := regexp.MustCompile(`: record |IMPLEMENTATION-PROGRESS`)
+	for _, s := range subjects {
+		if !excluded.MatchString(s) {
+			kept++
+		}
+	}
+	require.Less(t, kept, len(subjects),
+		"no commit subject is bookkeeping any more; the changelog filters may be stale")
 }
