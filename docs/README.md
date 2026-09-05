@@ -29,3 +29,5 @@ introduction; these are the reference pages behind it.
 |---|---|
 | [performance.md](performance.md) | The three speed budgets (graph layout, scheduler tick, event bus), where the benchmarks live, how to run them, and what the current numbers are. |
 | [goldens.md](goldens.md) | Golden files: what is pinned, how `UPDATE_GOLDEN` works, and how to regenerate the TUI frames and prompt fixtures without breaking `make check-golden`. |
+| [releasing.md](releasing.md) | What a version number of `sc` promises and what it does not, the three independent schema numbers, the deprecation policy, the eight-step release checklist, and what to do when a release goes wrong. |
+| [CHANGELOG.md](../CHANGELOG.md) | The release notes: what changed in each version, and the `Unreleased` section every landed change is added to. |

@@ -185,11 +185,16 @@ below is done before the tag exists, because pushing the tag publishes.
 8. **Paste the changelog entry** into the GitHub release body above the
    generated notes, so the release page says what changed in prose.
 
-> The repository has no `origin` remote yet, so the owner and name come from the
-> environment (`SC_REPO_OWNER`, `SC_REPO_NAME`, defaulting to
-> `maxh213/slop-cannon`) in both `.goreleaser.yaml` and `install.sh`. When the
-> repository moves, those defaults and the changelog's link definitions move
-> with it.
+> The repository has no `origin` remote yet, so the owner and name are a guess,
+> and the two artefacts spell them differently. `.goreleaser.yaml` reads them as
+> two environment variables, `SC_REPO_OWNER` and `SC_REPO_NAME`, which the
+> release workflow fills from its GitHub context (`github.repository_owner` and
+> `github.event.repository.name`), defaulting to `maxh213` and `slop-cannon`.
+> `install.sh` takes the pair as a single value instead — `--repo <owner/name>`
+> or `SC_REPO`, defaulting to `maxh213/slop-cannon` — and does not read
+> `SC_REPO_OWNER` or `SC_REPO_NAME` at all. When the repository moves, both
+> defaults, the `install.sh` URL quoted in the README, and the changelog's link
+> definitions move with it.
 
 ## Pre-releases and patch releases
 

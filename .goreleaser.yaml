@@ -108,7 +108,15 @@ release:
     curl -fsSL https://raw.githubusercontent.com/{{ envOrDefault "SC_REPO_OWNER" "maxh213" }}/{{ envOrDefault "SC_REPO_NAME" "slop-cannon" }}/{{ .Tag }}/install.sh | sh
     ```
 
-    or `go install slop-cannon/cmd/sc@{{ .Tag }}`.
+    The Go module path is `slop-cannon`, not a URL, so no module proxy can
+    resolve it and `go install` cannot be used. To build from source, clone the
+    repository at this tag instead:
+
+    ```sh
+    git clone https://github.com/{{ envOrDefault "SC_REPO_OWNER" "maxh213" }}/{{ envOrDefault "SC_REPO_NAME" "slop-cannon" }}.git
+    cd {{ envOrDefault "SC_REPO_NAME" "slop-cannon" }} && git checkout {{ .Tag }}
+    make install
+    ```
 
 # Homebrew tap. Uploading is off unless the release job sets
 # HOMEBREW_TAP_SKIP_UPLOAD=false and provides a token with write access to

@@ -1,7 +1,10 @@
 #!/bin/sh
 # Install the `sc` (slop-cannon) binary from a GitHub release.
 #
-#   curl -fsSL https://raw.githubusercontent.com/maxh213/slop-cannon/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/maxh213/slop-cannon/HEAD/install.sh | sh
+#
+# "HEAD" is the repository's default branch whatever it is named; a released
+# copy of this script is at .../slop-cannon/<tag>/install.sh.
 #
 # Options (flags or environment variables):
 #   --version <tag>   SC_VERSION       release tag to install, or "latest" (default)
@@ -29,7 +32,8 @@ usage() {
 	cat <<'EOF'
 install.sh - install the sc (slop-cannon) binary from a GitHub release
 
-  curl -fsSL https://raw.githubusercontent.com/maxh213/slop-cannon/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/maxh213/slop-cannon/HEAD/install.sh | sh
+  (or .../slop-cannon/<tag>/install.sh for the copy that shipped with a release)
 
 Options (flag, or environment variable):
   --version <tag>   SC_VERSION       release tag to install, or "latest" (default)
@@ -108,7 +112,10 @@ detect_os() {
 	case "$os" in
 	Linux) echo linux ;;
 	Darwin) echo darwin ;;
-	*) die "unsupported operating system: $os (slop-cannon ships linux and darwin builds; try 'go install slop-cannon/cmd/sc@latest')" ;;
+	# There is no `go install` route: the module path is `slop-cannon`, not a
+	# URL, so no module proxy can resolve it. Building from a checkout is the
+	# only fallback.
+	*) die "unsupported operating system: $os (slop-cannon ships linux and darwin builds; build from source instead: git clone https://github.com/${REPO}.git && cd ${REPO#*/} && make install)" ;;
 	esac
 }
 

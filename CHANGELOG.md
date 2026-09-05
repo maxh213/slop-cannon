@@ -132,7 +132,18 @@ tag, which is phases 0 to 10 of `IMPLEMENTATION-PROGRESS.md`.
   and for external pull request review.
 - The Go module path is `slop-cannon`, so there is no `go install` from a module
   proxy yet: install from a release archive, `install.sh`, the Homebrew cask, or
-  build from a checkout with `make build`.
+  build from a checkout with `make build`. The Install footer on the GitHub
+  release page says the same, and offers a `git clone` at the tag rather than a
+  `go install`.
+- The repository has no `origin` remote yet, so its owner and name — and every
+  URL built from them, including the two link definitions below — are a guess
+  (`maxh213/slop-cannon`), and `v0.1.0` is deliberately not tagged. Both links
+  therefore resolve to nothing as shipped. They start working when the
+  repository is published under that name and the tag is pushed; if it lands
+  anywhere else, they move with it, together with the defaults in
+  `.goreleaser.yaml`, `install.sh` and the README. See
+  [docs/releasing.md § Cutting a release](docs/releasing.md#cutting-a-release).
 
+<!-- Provisional: see "Known limitations" above — no remote, no v0.1.0 tag. -->
 [Unreleased]: https://github.com/maxh213/slop-cannon/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/maxh213/slop-cannon/releases/tag/v0.1.0

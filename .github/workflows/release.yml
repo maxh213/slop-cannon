@@ -1,10 +1,12 @@
 name: Release
 
 # Tag a release with `git tag -a v0.1.0 -m v0.1.0 && git push origin v0.1.0`.
-# Run the workflow by hand (workflow_dispatch) for a dry run: it builds and
-# checksums the same artefacts, publishes nothing, and uploads dist/ so you can
-# download and inspect it. The same dry run locally is
+# Run the workflow by hand (workflow_dispatch) with `dry_run` left on for a dry
+# run: it builds and checksums the same artefacts, publishes nothing, and
+# uploads dist/ so you can download and inspect it. The same dry run locally is
 # `./bin/goreleaser release --snapshot --clean --skip=publish` (P10-03).
+# Unchecking `dry_run` publishes, and is only allowed when the workflow is run
+# from a tag ref — the usual way to publish is still to push the tag.
 
 on:
   push:
@@ -12,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: "Build the artefacts without publishing anything"
+        description: "Build the artefacts without publishing anything (uncheck only from a tag ref)"
         type: boolean
         default: true
 
@@ -75,8 +77,21 @@ jobs:
         run: ./bin/goreleaser check
       - name: Decide the goreleaser arguments
         id: args
+        # A tag push always publishes. A manual run honours the dry_run input:
+        # left on (the default) it builds a snapshot and publishes nothing;
+        # unchecked it publishes, which only makes sense from a tag ref.
+        env:
+          DRY_RUN: ${{ github.event_name == 'push' && 'false' || inputs.dry_run }}
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
+          set -eu
+          if [ "$DRY_RUN" = "false" ]; then
+            case "$GITHUB_REF" in
+            refs/tags/*) ;;
+            *)
+              echo "dry_run was unchecked but $GITHUB_REF is not a tag; re-run this workflow from a tag, or push the tag" >&2
+              exit 1
+              ;;
+            esac
             echo "value=release --clean" >> "$GITHUB_OUTPUT"
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else

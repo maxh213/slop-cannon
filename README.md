@@ -418,6 +418,7 @@ deliberately not registered in the shipped binary.
 | [docs/beads-conventions.md](docs/beads-conventions.md) | how a run uses `bd`: statuses, `sc_` metadata, labels, structured comments, gates |
 | [docs/prompts.md](docs/prompts.md) | what each agent is actually told, the headless line format, and the exit codes |
 | [docs/releasing.md](docs/releasing.md) | the versioning policy and how a release is cut |
+| [CHANGELOG.md](CHANGELOG.md) | the release notes: what changed in each version, newest first |
 
 ## FAQ
 
