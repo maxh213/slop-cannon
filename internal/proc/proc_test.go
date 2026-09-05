@@ -18,7 +18,15 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"slop-cannon/internal/testutil"
 )
+
+// Every wall-clock bound in this file is scaled by testutil.Patience: the
+// waits are for the operating system to reap a process group, and on a
+// machine running several race-instrumented test binaries at once three
+// seconds is not always enough for the reaper to be scheduled. -timeout
+// is the knob (P6-56); the assertions themselves are unchanged.
 
 // sh builds a Spec that runs script with /bin/sh.
 func sh(script string) Spec {
@@ -130,7 +138,7 @@ func TestRun_Timeout(t *testing.T) {
 	assert.True(t, res.TimedOut)
 	assert.False(t, res.Cancelled)
 	assert.Equal(t, -1, res.ExitCode)
-	assert.Less(t, time.Since(begin), 5*time.Second)
+	assert.Less(t, time.Since(begin), testutil.Patience(5*time.Second))
 	assert.Less(t, res.Duration, 5*time.Second)
 	assert.Contains(t, err.Error(), "timed out")
 }
@@ -162,7 +170,7 @@ func TestRun_GracePeriodExpiresIntoSIGKILL(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrTimeout), "got %v", err)
 	assert.Equal(t, -1, res.ExitCode)
-	assert.Less(t, time.Since(begin), 5*time.Second)
+	assert.Less(t, time.Since(begin), testutil.Patience(5*time.Second))
 }
 
 func TestRun_CancelledContext(t *testing.T) {
@@ -204,10 +212,11 @@ func TestStream_CancelKillsGrandchild(t *testing.T) {
 	case l := <-h.Lines():
 		grandchild, err = strconv.Atoi(strings.TrimSpace(l.Text))
 		require.NoError(t, err, "expected the grandchild pid, got %q", l.Text)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.Patience(5 * time.Second)):
 		t.Fatal("never received the grandchild pid")
 	}
 	require.True(t, processAlive(grandchild), "grandchild %d should be running before cancel", grandchild)
+	watch := watchProcess(grandchild)
 
 	begin := time.Now()
 	cancel()
@@ -215,13 +224,10 @@ func TestStream_CancelKillsGrandchild(t *testing.T) {
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, context.Canceled), "got %v", err)
 	assert.True(t, res.Cancelled)
-	assert.Less(t, time.Since(begin), 3*time.Second, "Wait must not stall on the grandchild's pipe")
+	assert.Less(t, time.Since(begin), testutil.Patience(3*time.Second), "Wait must not stall on the grandchild's pipe")
 
-	deadline := time.Now().Add(3 * time.Second)
-	for processAlive(grandchild) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	assert.False(t, processAlive(grandchild), "grandchild %d survived the group kill", grandchild)
+	assert.True(t, watch.waitGone(testutil.Patience(3*time.Second)),
+		"grandchild %d survived the group kill", grandchild)
 	for range h.Lines() {
 		// drain
 	}
@@ -236,14 +242,11 @@ func TestRun_OrphanHoldingPipeDoesNotStallAndIsKilled(t *testing.T) {
 	res, err := Run(context.Background(), sh("sleep 30 & echo $!"))
 	require.NoError(t, err)
 	assert.Equal(t, 0, res.ExitCode)
-	assert.Less(t, time.Since(begin), 5*time.Second)
+	assert.Less(t, time.Since(begin), testutil.Patience(5*time.Second))
 	grandchild, err := strconv.Atoi(strings.TrimSpace(res.Stdout))
 	require.NoError(t, err, "expected the grandchild pid, got %q", res.Stdout)
-	deadline := time.Now().Add(3 * time.Second)
-	for processAlive(grandchild) && time.Now().Before(deadline) {
-		time.Sleep(20 * time.Millisecond)
-	}
-	assert.False(t, processAlive(grandchild), "orphaned grandchild %d survived", grandchild)
+	assert.True(t, watchProcess(grandchild).waitGone(testutil.Patience(3*time.Second)),
+		"orphaned grandchild %d survived", grandchild)
 }
 
 func TestStream_Interleaving(t *testing.T) {
@@ -330,13 +333,13 @@ func TestStream_Kill(t *testing.T) {
 	select {
 	case l := <-h.Lines():
 		assert.Equal(t, "started", l.Text)
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.Patience(5 * time.Second)):
 		t.Fatal("no output")
 	}
 	h.Kill()
 	select {
 	case <-h.Done():
-	case <-time.After(5 * time.Second):
+	case <-time.After(testutil.Patience(5 * time.Second)):
 		t.Fatal("Done never closed after Kill")
 	}
 	res, err := h.Wait()
@@ -450,4 +453,72 @@ func processAlive(pid int) bool {
 		}
 	}
 	return true
+}
+
+// procStartTime is the process's own start time from /proc/<pid>/stat
+// (field 22, after the parenthesised command name), which together with
+// the pid identifies a process for as long as the machine is up. It is ""
+// when the process is gone, or on a platform without /proc.
+//
+// The tests below need it because a bare pid is not an identity: this
+// machine's pid_max is 4 194 304 and a run of several race-instrumented
+// test binaries forks hard enough to wrap the counter, so a grandchild
+// that died promptly can have its pid taken by something else within
+// milliseconds and a kill(pid, 0) probe then reports that stranger as
+// "the grandchild survived". Comparing the start time as well makes a
+// recycled pid read as gone, which is what it is.
+func procStartTime(pid int) string {
+	if runtime.GOOS != "linux" {
+		return ""
+	}
+	stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return ""
+	}
+	i := strings.LastIndexByte(string(stat), ')')
+	if i < 0 {
+		return ""
+	}
+	// Fields after the command name, 1-based from "state": start time is
+	// the 20th.
+	fields := strings.Fields(string(stat)[i+1:])
+	if len(fields) < 20 {
+		return ""
+	}
+	return fields[19]
+}
+
+// procWatch identifies one process so a later probe cannot be fooled by a
+// recycled pid. A zero watch (the process was already gone, or there is no
+// /proc) falls back to the bare liveness probe.
+type procWatch struct {
+	pid   int
+	start string
+}
+
+// watchProcess captures pid's identity now.
+func watchProcess(pid int) procWatch {
+	return procWatch{pid: pid, start: procStartTime(pid)}
+}
+
+// alive reports whether the process this watch was taken of is still
+// running — not merely whether something holds its pid.
+func (w procWatch) alive() bool {
+	if !processAlive(w.pid) {
+		return false
+	}
+	if w.start == "" {
+		return true
+	}
+	return procStartTime(w.pid) == w.start
+}
+
+// waitGone polls until the watched process is gone or the budget runs out,
+// and reports whether it went.
+func (w procWatch) waitGone(budget time.Duration) bool {
+	deadline := time.Now().Add(budget)
+	for w.alive() && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	return !w.alive()
 }
