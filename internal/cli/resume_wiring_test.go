@@ -35,9 +35,10 @@ import (
 // it really does run [orchestrator.Deliverer.RedeliverPR] — read back from
 // the run's event log rather than from anything the test holds.
 func TestRunWiresTheResumeHandoffsToTheDeliverer(t *testing.T) {
-	// Safety off, because that is the one branch of RedeliverPR that
-	// reaches neither gh nor bd: it warns that a pull request is a human's
-	// to finish and returns. The warning is the proof the call arrived.
+	// Safety off, with a bead whose branch does not exist: the settler
+	// cannot compare it with its pull request, so RedeliverPR warns that
+	// the pull request is a human's to finish and returns before reaching
+	// gh or bd. The warning is the proof the call arrived.
 	env := runFireSetup(t, false)
 	ctx := context.Background()
 
@@ -93,5 +94,5 @@ func TestRunWiresTheResumeHandoffsToTheDeliverer(t *testing.T) {
 		warned = append(warned, w.Message)
 	}
 	require.Lenf(t, warned, 1, "the delivery handoff answered the resume once (log: %d events)", len(evs))
-	assert.Contains(t, warned[0], "safety off")
+	assert.Contains(t, warned[0], "pull request #7 could not be compared with the local branch; leaving it to a human")
 }

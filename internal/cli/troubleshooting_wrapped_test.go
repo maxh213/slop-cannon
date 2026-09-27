@@ -234,6 +234,8 @@ var tsWrappedExempt = map[string]string{
 	"gitx: NewManager: nil repo":                                                             tsWrapInvariant,
 	"gitx: NewPRDeliverer: nil manager":                                                      tsWrapInvariant,
 	"gitx: NewPRDeliverer: nil tracker":                                                      tsWrapInvariant,
+	"gitx: NewPRSettler: nil manager":                                                        tsWrapInvariant,
+	"gitx: NewPRSettler: nil tracker":                                                        tsWrapInvariant,
 	"gitx: NewResumer: nil manager":                                                          tsWrapInvariant,
 	"gitx: PushBranch: empty remote or branch":                                               tsWrapInvariant,
 	"gitx: Reattach: empty bead id":                                                          tsWrapInvariant,

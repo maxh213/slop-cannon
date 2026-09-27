@@ -141,6 +141,7 @@ case "$1 $2" in
   "pr list") cat "$SC_FAKEBIN_DIR/prs.json" 2>/dev/null || echo '[]' ;;
   "label create") if [ "$mode" = nolabel ]; then echo "HTTP 403: Resource not accessible by integration" >&2; exit 1; fi ;;
   "pr create") echo "Creating pull request for $4 into $6 in acme/widgets"; echo '`+dpPRURL+`' ;;
+  "pr close") echo "Closed pull request acme/widgets#$3" ;;
   *) echo "gh shim: unexpected command: $*" >&2; exit 1 ;;
 esac
 `, testutil.WithStdinCapture())
@@ -491,6 +492,26 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		assert.Equal(t, PRCreated, res.Status)
 		assert.Equal(t, 7, res.PR.Number)
 		assert.Equal(t, []string{"pr list", "label create", "pr create"}, dpCalls(t, f.gh))
+	})
+
+	// A resume re-runs the delivery of a bead whose pull request a human
+	// already merged, possibly after pushing to it: the local tip is then
+	// behind the remote branch and a push could only fail. Nothing is
+	// pushed; the gate is still made, so the poller closes the bead.
+	t.Run("does not push the branch of a pull request that has already merged", func(t *testing.T) {
+		f := dpSetup(t, true)
+		dpSet(t, f.gh, "prs.json", `[{"number":2,"url":"https://github.com/acme/widgets/pull/2","state":"MERGED","title":"landed"}]`)
+		remoteBefore := dpRemoteHeads(t, f)
+
+		res, err := f.d.Deliver(ctx, dpRequest())
+		require.NoError(t, err)
+		assert.Equal(t, PRExisting, res.Status)
+		assert.Equal(t, "MERGED", res.PRState)
+		assert.False(t, res.Pushed)
+		assert.Equal(t, remoteBefore, dpRemoteHeads(t, f), "the remote is untouched")
+		assert.NotContains(t, dpRemoteHeads(t, f), f.wt.Branch)
+		assert.Equal(t, []int{2}, f.tracker.created)
+		assert.Equal(t, []string{"pr list"}, dpCalls(t, f.gh))
 	})
 
 	// P6-14/P6-22, the retry half: a gh:pr gate left behind by a pull

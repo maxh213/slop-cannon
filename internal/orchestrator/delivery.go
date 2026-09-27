@@ -188,6 +188,22 @@ type MergePath interface {
 // *gitx.Manager is the production MergePath.
 var _ MergePath = (*gitx.Manager)(nil)
 
+// PRSettler is what a run with safety off needs for a pull request a bead
+// was given while the run still had safety on: a resume with --safety off
+// finds such beads behind gh:pr gates that nothing polls any more.
+type PRSettler interface {
+	// InStep reports whether the bead's local branch holds everything the
+	// pull request's branch on the remote does.
+	InStep(ctx context.Context, bead domain.Bead) (bool, error)
+	// ClearGate resolves the gh:pr gate blocking the bead, if any.
+	ClearGate(ctx context.Context, bead domain.BeadID, reason string) error
+	// ClosePR closes the pull request with a comment saying why.
+	ClosePR(ctx context.Context, number int, comment string) error
+}
+
+// *gitx.PRSettler is the production PRSettler.
+var _ PRSettler = (*gitx.PRSettler)(nil)
+
 // RebaseState is what a worktree looks like to the delivery before it
 // commits anything: a worktree left mid-rebase by an earlier delivery must
 // never have its conflict markers committed (P6-16).
@@ -488,6 +504,9 @@ type DeliveryOptions struct {
 	PR PRPath
 	// Merge is the safety-off path; required when the run has safety off.
 	Merge MergePath
+	// Settler lets a run with safety off land or close the pull requests a
+	// resumed run opened while it had safety on; nil leaves them to a human.
+	Settler PRSettler
 	// Git is the worktree side of a delivery; nil skips the leftovers
 	// commit, the mid-rebase probe and the D-09 measurement.
 	Git DeliveryGit
@@ -527,6 +546,7 @@ type Deliverer struct {
 	states    *StateMachine
 	pr        PRPath
 	merge     MergePath
+	settler   PRSettler
 	git       DeliveryGit
 	beads     gitx.BeadCloser
 	check     string
@@ -568,6 +588,7 @@ func NewDeliverer(opts DeliveryOptions) (*Deliverer, error) {
 		states:    opts.States,
 		pr:        opts.PR,
 		merge:     opts.Merge,
+		settler:   opts.Settler,
 		git:       opts.Git,
 		beads:     opts.Beads,
 		check:     strings.TrimSpace(opts.CheckCommand),
@@ -1501,12 +1522,12 @@ func (d *Deliverer) AbandonConflict(ctx context.Context, id domain.BeadID, reaso
 
 // RedeliverPR implements [ResumeHandler]: a resumed run found a pull request
 // for a bead, so the (idempotent) pull request delivery is run again to
-// recreate its gh:pr gate (D-20). A bead the resume already settled, or a
-// run with safety off, is left alone.
+// recreate its gh:pr gate (D-20). A bead the resume already settled is left
+// alone; a run with safety off settles the pull request itself (see
+// [Deliverer.settlePR]).
 func (d *Deliverer) RedeliverPR(ctx context.Context, e gitx.ResumeEntry) error {
 	if !d.safety {
-		d.warn(e.Bead.ID, "a pull request exists but this run has safety off; leaving it to a human", nil)
-		return nil
+		return d.settlePR(ctx, e)
 	}
 	bead := e.Bead
 	bead.State = e.State
@@ -1522,6 +1543,88 @@ func (d *Deliverer) RedeliverPR(ctx context.Context, e gitx.ResumeEntry) error {
 	}
 	_, err := d.Deliver(ctx, DeliveryRequest{Bead: bead, Round: bead.Round})
 	return err
+}
+
+// settlePR is RedeliverPR with safety off: the run was started with safety
+// on, so a bead may be waiting behind a pull request, and with safety off
+// nothing polls its gate. A merged pull request closes the bead. An open one
+// is landed the safety-off way — rebased, checked and fast-forwarded like any
+// other bead — and then closed with a comment naming the commit, unless its
+// branch on the remote has commits the local one lacks: someone pushed to
+// it, and landing the local branch would leave their work behind, so it is
+// left to a human.
+func (d *Deliverer) settlePR(ctx context.Context, e gitx.ResumeEntry) error {
+	if d.settler == nil || e.PR == nil {
+		d.warn(e.Bead.ID, "a pull request exists but this run has safety off; leaving it to a human", nil)
+		return nil
+	}
+	bead := e.Bead
+	bead.State = e.State
+	bead.PRURL, bead.PRNumber = e.PR.URL, e.PR.Number
+	switch bead.State {
+	case domain.BeadStateApproved, domain.BeadStateDelivering, domain.BeadStateNeedsHuman:
+	default:
+		d.host.Log().Debug("resume: nothing to settle",
+			slog.String("bead", string(bead.ID)), slog.String("state", string(bead.State)))
+		return nil
+	}
+	n := e.PR.Number
+	merged := strings.EqualFold(e.PRState, "MERGED")
+	if !merged {
+		inStep, err := d.settler.InStep(ctx, bead)
+		if err != nil {
+			d.warn(bead.ID, fmt.Sprintf("pull request #%d could not be compared with the local branch; leaving it to a human", n), err)
+			return nil
+		}
+		if !inStep {
+			d.warn(bead.ID, fmt.Sprintf("pull request #%d has commits the local branch lacks; leaving it to a human", n), nil)
+			return nil
+		}
+	}
+	if err := d.settler.ClearGate(ctx, bead.ID, fmt.Sprintf("safety is off; settling pull request #%d directly", n)); err != nil {
+		d.warn(bead.ID, fmt.Sprintf("the gate for pull request #%d could not be cleared; leaving it to a human", n), err)
+		return nil
+	}
+	if merged {
+		return d.closeMerged(ctx, bead, n)
+	}
+	out, err := d.Deliver(ctx, DeliveryRequest{Bead: bead, Round: bead.Round})
+	if err != nil {
+		return err
+	}
+	if out.Kind != DeliveryMerged {
+		d.warn(bead.ID, fmt.Sprintf("pull request #%d stays open: the bead did not land yet (%s); close it once it has", n, out.Kind), nil)
+		return nil
+	}
+	comment := fmt.Sprintf("slop-cannon landed this bead on %s as %s with safety off (rebased, checked and fast-forwarded), so this pull request is closed.",
+		out.Target, out.MergeSHA)
+	if err := d.settler.ClosePR(ctx, n, comment); err != nil {
+		d.warn(bead.ID, fmt.Sprintf("pull request #%d landed as %s but could not be closed", n, deliveryShortSHA(out.MergeSHA)), err)
+	}
+	return nil
+}
+
+// closeMerged closes a bead whose pull request a human already merged.
+func (d *Deliverer) closeMerged(ctx context.Context, bead domain.Bead, pr int) error {
+	state, err := d.startDelivering(ctx, bead, bead.Round)
+	if err != nil {
+		return err
+	}
+	if _, err := d.states.Apply(ctx, StateRequest{
+		Bead: bead.ID, From: state, Event: BeadEventDelivered,
+		Round: bead.Round, Reason: fmt.Sprintf("pull request #%d merged", pr),
+	}); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	announced := d.merged[bead.ID]
+	d.merged[bead.ID] = true
+	d.mu.Unlock()
+	if !announced {
+		d.host.Publish(events.Merged{Meta: d.meta(), Bead: bead.ID, PRNumber: pr, Pushed: true})
+	}
+	d.forget(bead.ID)
+	return nil
 }
 
 // Redeliver implements [ResumeHandler]: a resumed run found a bead the

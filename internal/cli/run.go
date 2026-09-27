@@ -42,6 +42,7 @@ const (
 	FlagRunMessage   = "message"
 	FlagRunHeadless  = "headless"
 	FlagRunResume    = "resume"
+	FlagRunRun       = "run"
 	FlagRunAmmo      = "ammo"
 	FlagRunSafety    = "safety"
 	FlagRunCartridge = "cartridge"
@@ -71,6 +72,9 @@ type RunOptions struct {
 	Headless bool
 	// Resume continues the most recent run of the repository.
 	Resume bool
+	// RunID, with Resume, names the run to continue instead of the most
+	// recent one.
+	RunID domain.RunID
 	// NoAnim disables the TUI cannon animations.
 	NoAnim bool
 	// ReviewPRs enables reviewing open pull requests sc did not create
@@ -140,6 +144,7 @@ func addRunFlags(cmd *cobra.Command) {
 	f.StringP(FlagRunMessage, "m", "", "start work with this `BRIEF`; without it the run is full autopilot")
 	f.Bool(FlagRunHeadless, false, "no TUI: render events as log lines (for CI and scripts)")
 	f.Bool(FlagRunResume, false, "continue the most recent run of this repository instead of starting a new one")
+	f.String(FlagRunRun, "", "with --resume, continue run `ID` instead of the most recent one")
 	f.Int(FlagRunAmmo, 0, "override ammo for this run (`N` agents at once, minimum 3)")
 	f.String(FlagRunSafety, "", "override safety for this run (`on|off`): on opens PRs, off merges to the default branch")
 	f.String(FlagRunCartridge, "", "fire cartridge `NAME` instead of the active one")
@@ -166,6 +171,18 @@ func runOptionsFrom(cmd *cobra.Command, path string, opts GlobalOptions) (RunOpt
 	}
 	if ro.Resume, err = f.GetBool(FlagRunResume); err != nil {
 		return ro, err
+	}
+	if f.Changed(FlagRunRun) {
+		id, err := f.GetString(FlagRunRun)
+		if err != nil {
+			return ro, err
+		}
+		if ro.RunID = domain.RunID(strings.TrimSpace(id)); ro.RunID == "" {
+			return ro, fmt.Errorf("--%s must not be empty", FlagRunRun)
+		}
+		if !ro.Resume {
+			return ro, fmt.Errorf("--%s names a run to continue, so it needs --%s (or sc resume)", FlagRunRun, FlagRunResume)
+		}
 	}
 	if ro.NoAnim, err = f.GetBool(FlagRunNoAnim); err != nil {
 		return ro, err
@@ -256,9 +273,16 @@ func ResolveRunWithNotes(opts RunOptions) (*config.RunConfig, []string, error) {
 		StartedAt: now,
 	}
 	var notes []string
-	if !opts.Resume {
+	switch {
+	case !opts.Resume:
 		settings.ID = runNewID(now)
-	} else {
+	case opts.RunID != "":
+		if _, err := os.Stat(filepath.Join(config.RunDir(root, string(opts.RunID)), orchestrator.StateFileName)); err != nil {
+			return nil, nil, fmt.Errorf("nothing to resume: run %s of %s has no %s (sc status lists the runs)",
+				opts.RunID, root, orchestrator.StateFileName)
+		}
+		settings.ID = opts.RunID
+	default:
 		// P8-31: `--resume` continues the newest run that actually recorded
 		// something, not simply the greatest directory name on disk.
 		target, note, err := runResumeTarget(root)
@@ -1367,6 +1391,11 @@ func runDeliverer(run *orchestrator.Run, states *orchestrator.StateMachine, dgit
 		opts.PR = pr
 	} else {
 		opts.Merge = m
+		settler, err := gitx.NewPRSettler(m, client)
+		if err != nil {
+			return nil, err
+		}
+		opts.Settler = settler
 	}
 	return orchestrator.NewDeliverer(opts)
 }

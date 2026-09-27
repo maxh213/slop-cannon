@@ -37,6 +37,7 @@ Flags:
       --no-anim          disable the cannon animations in the TUI (also honours SC_NO_ANIM)
       --resume           continue the most recent run of this repository instead of starting a new one
       --review-prs       also review open pull requests sc did not create (needs gh and a remote) (default true)
+      --run ID           with --resume, continue run ID instead of the most recent one
       --safety on|off    override safety for this run (on|off): on opens PRs, off merges to the default branch
 
 Global Flags:

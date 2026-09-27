@@ -284,6 +284,27 @@ func RestoreRunConfig(rc *config.RunConfig) (RestoreResult, error) {
 	flagged := func(key string) bool {
 		return rc.Effective != nil && rc.Effective.Sources[key] == config.SourceFlag
 	}
+	// drifted says which config file now disagrees with the snapshot, so
+	// the resume can say so instead of keeping the recorded value silently.
+	drifted := func(key string, differs bool) (config.Source, bool) {
+		if !differs || rc.Effective == nil {
+			return "", false
+		}
+		src := rc.Effective.Sources[key]
+		return src, src == config.SourceGlobal || src == config.SourceRepo
+	}
+	if src, ok := drifted(config.KeyAmmo, frozen.Ammo != current.Ammo); ok {
+		res.Notes = append(res.Notes, fmt.Sprintf("the %s config now says ammo %d, but run %s keeps its recorded ammo %d; pass --ammo %d to change it",
+			src, current.Ammo, rc.Run.ID, frozen.Ammo, current.Ammo))
+	}
+	if src, ok := drifted(config.KeySafety, frozen.Safety != current.Safety); ok {
+		res.Notes = append(res.Notes, fmt.Sprintf("the %s config now says safety %s, but run %s keeps its recorded safety %s; pass --safety %s to change it",
+			src, safetyWord(current.Safety), rc.Run.ID, safetyWord(frozen.Safety), safetyWord(current.Safety)))
+	}
+	if src, ok := drifted(config.KeyActiveCartridge, frozen.Cartridge != "" && frozen.Cartridge != current.Cartridge); ok {
+		res.Notes = append(res.Notes, fmt.Sprintf("the %s config now says cartridge %s, but run %s keeps its recorded cartridge %s; pass --cartridge %s to change it",
+			src, current.Cartridge, rc.Run.ID, frozen.Cartridge, current.Cartridge))
+	}
 	if flagged(config.KeyAmmo) && frozen.Ammo != current.Ammo {
 		res.Overridden = append(res.Overridden, config.KeyAmmo)
 		res.Notes = append(res.Notes, fmt.Sprintf("--ammo %d overrides the run's recorded ammo %d", current.Ammo, frozen.Ammo))

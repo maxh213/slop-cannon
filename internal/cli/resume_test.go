@@ -191,3 +191,49 @@ func TestResumeWithNothingRecordedStartsANewRun(t *testing.T) {
 	require.False(t, rc.Resume, "there was nothing to resume")
 	require.Equal(t, domain.RunID("20260902-010203-abcd"), rc.Run.ID)
 }
+
+// ---------------------------------------------------------------------------
+// --run: continue a named run rather than the newest one
+// ---------------------------------------------------------------------------
+
+// TestResumeRunContinuesTheNamedRun: a newer run that did nothing useful —
+// an autopilot run stopped seconds after it started — no longer hides the
+// run the user wants back.
+func TestResumeRunContinuesTheNamedRun(t *testing.T) {
+	base, repo := runTestEnv(t)
+	runAddCartridge(t, "claude", "fable")
+	runWriteRunState(t, repo, "20260901-000000-1111")
+	runWriteRunState(t, repo, "20260902-000000-2222")
+
+	stdout, stderr, code := runResolve(t, "resume", repo, "--run", "20260901-000000-1111")
+	require.Equal(t, 0, code, stderr)
+	require.Contains(t, runNormalise(stdout, base, repo), "run        20260901-000000-1111 (resumed)\n")
+
+	flagOut, flagErr, code := runResolve(t, repo, "--resume", "--run", "20260901-000000-1111")
+	require.Equal(t, 0, code, flagErr)
+	require.Equal(t, stdout, flagOut)
+}
+
+// TestResumeRunRefusesARunWithNothingRecorded: a named run is continued or
+// refused, never swapped for a new run under that name.
+func TestResumeRunRefusesARunWithNothingRecorded(t *testing.T) {
+	_, repo := runTestEnv(t)
+	runAddCartridge(t, "claude", "fable")
+	runWriteRunState(t, repo, "20260901-000000-1111")
+	require.NoError(t, os.MkdirAll(config.RunDir(repo, "20260902-000000-2222"), 0o755))
+
+	for _, id := range []string{"20260902-000000-2222", "20260903-000000-3333"} {
+		_, stderr, code := runResolve(t, "resume", repo, "--run", id)
+		require.Equal(t, 1, code)
+		require.Equal(t, "sc: nothing to resume: run "+id+" of "+repo+" has no state.json (sc status lists the runs)\n", stderr)
+	}
+}
+
+// TestRunFlagNeedsResume: --run names a run to continue, so on the run form
+// it means nothing without --resume.
+func TestRunFlagNeedsResume(t *testing.T) {
+	_, repo := resumeSetup(t)
+	_, stderr, code := runResolve(t, repo, "--run", "20260901-000000-1111")
+	require.Equal(t, 1, code)
+	require.Equal(t, "sc: --run names a run to continue, so it needs --resume (or sc resume)\n", stderr)
+}

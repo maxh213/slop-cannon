@@ -21,17 +21,19 @@ const resumeLong = `Continue the most recent run of a repository.
 
 This is exactly "sc PATH --resume": the run keeps its id, its brief and the
 configuration it was started with (a config file edited since does not
-change it), its worktrees are reattached, stale leases are recovered and
-the agents that were in flight are fired again.
+change it, and a note says so), its worktrees are reattached, stale leases
+are recovered and the agents that were in flight are fired again.
 
 PATH may be the repository root or any directory inside it; without it the
---repo directory (the current one by default) is used. --ammo, --safety and
---cartridge still override the frozen configuration for this invocation and
-say so. There is nothing to resume in a repository sc has never run in.`
+--repo directory (the current one by default) is used. --run ID continues
+that run instead of the most recent one. --ammo, --safety and --cartridge
+still override the frozen configuration for this invocation and say so.
+There is nothing to resume in a repository sc has never run in.`
 
 const resumeExamples = `sc resume
 sc resume ./repo-path
-sc resume --repo ./repo-path --headless`
+sc resume --repo ./repo-path --headless
+sc resume ./repo-path --run 20260924-214444-42c0 --safety off`
 
 // newResumeCommand builds `sc resume [PATH]`.
 func newResumeCommand() *cobra.Command {

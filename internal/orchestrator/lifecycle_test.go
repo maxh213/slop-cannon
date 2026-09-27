@@ -1050,6 +1050,36 @@ func TestLifecycleResumeHonoursExplicitFlagOverrides(t *testing.T) {
 	require.False(t, resumed.Run.Config.Safety)
 	require.Equal(t, 6, resumed.Allocation.Ammo)
 	require.Contains(t, strings.Join(res.Notes, "\n"), "--ammo 6 overrides")
+	require.NotContains(t, strings.Join(res.Notes, "\n"), "config now says", "a flag is not drift")
+}
+
+// P6-11 keeps a resumed run on its recorded footing, but a config file
+// that now says otherwise is named, with the flag that would apply it: a
+// repo config switched to safety off must not be ignored silently.
+func TestLifecycleResumeNamesAConfigFileThatDrifted(t *testing.T) {
+	f := lifecycleSetup(t)
+	r, err := New(f.runConfig(t, config.RunSettings{Brief: "b"}), f.options())
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	require.NoError(t, r.Stop("crash"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+
+	f.Eff = lifecycleEffective(4, false)
+	f.Eff.Sources[config.KeySafety] = config.SourceRepo
+	f.Eff.Sources[config.KeyAmmo] = config.SourceGlobal
+	resumed := f.runConfig(t, config.RunSettings{Resume: true})
+
+	res, err := RestoreRunConfig(resumed)
+	require.NoError(t, err)
+	require.Empty(t, res.Overridden)
+	require.True(t, resumed.Run.Config.Safety, "the recorded safety still wins")
+	require.Equal(t, 10, resumed.Run.Config.Ammo)
+	notes := strings.Join(res.Notes, "\n")
+	require.Contains(t, notes, "the repo config now says safety off, but run "+string(resumed.Run.ID)+" keeps its recorded safety on; pass --safety off to change it")
+	require.Contains(t, notes, "the global config now says ammo 4")
+	require.Contains(t, notes, "pass --ammo 4")
+	require.NotContains(t, notes, "cartridge")
 }
 
 func TestLifecycleRestoreWithoutAStateFile(t *testing.T) {

@@ -277,21 +277,30 @@ func (d *PRDeliverer) Deliver(ctx context.Context, req PRRequest) (*PRResult, er
 		return nil, err
 	}
 
-	log.InfoContext(ctx, "pushing bead branch", "remote", remote, "head", head)
-	if err := repo.PushBranch(ctx, remote, branch); err != nil {
+	// The pull request is looked up before the push: once it has merged,
+	// the branch is history, and pushing a local tip that has fallen behind
+	// the remote one (a resume after the human updated the pull request)
+	// only fails as non-fast-forward.
+	pr, state, err := d.gh.FindPR(ctx, branch)
+	reason, ghDown := ghUnavailable(err)
+	if err != nil && !ghDown {
 		return nil, err
 	}
-	res.Pushed = true
+	if pr != nil && state == "MERGED" {
+		log.InfoContext(ctx, "pull request already merged; not pushing the bead branch", "number", pr.Number)
+	} else {
+		log.InfoContext(ctx, "pushing bead branch", "remote", remote, "head", head)
+		if err := repo.PushBranch(ctx, remote, branch); err != nil {
+			return nil, err
+		}
+		res.Pushed = true
+	}
 
-	pr, state, err := d.gh.FindPR(ctx, branch)
-	if reason, ok := ghUnavailable(err); ok {
+	if ghDown {
 		res.Status = PRPushOnly
 		res.Reason = reason
 		res.Instructions = manualPRInstructions(res)
 		return d.handOff(ctx, res, log)
-	}
-	if err != nil {
-		return nil, err
 	}
 	if pr != nil {
 		res.Status = PRExisting

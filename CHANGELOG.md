@@ -15,7 +15,24 @@ next version's entry.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- `sc resume --run ID` continues a named run instead of the most recent one.
+
+### Changed
+
+- A run resumed with `--safety off` settles the pull requests it opened
+  while safety was on: a merged one closes its bead, an open one is landed
+  the safety-off way and then closed with a comment naming the commit. A
+  pull request someone pushed to after `sc` opened it is left alone.
+- A resume says when the repo or global config now disagrees with the
+  run's recorded ammo, safety or cartridge, and names the flag that would
+  apply it.
+
+### Fixed
+
+- Re-delivering a bead whose pull request has already merged no longer
+  pushes the old branch tip (which failed as non-fast-forward).
 
 ## [0.1.0] - 2026-09-05
 

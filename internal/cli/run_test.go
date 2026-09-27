@@ -420,7 +420,8 @@ func TestRunResumeRestoresTheFrozenSnapshot(t *testing.T) {
 	require.Equal(t, 10, rc.Run.Config.Ammo, "the frozen snapshot wins over the edited config file")
 	require.Equal(t, domain.RunModeBrief, rc.Run.Mode)
 	require.Equal(t, "ship it", rc.Run.Brief)
-	require.Empty(t, notes)
+	require.Equal(t, []string{"the repo config now says ammo 4, but run " + id + " keeps its recorded ammo 10; pass --ammo 4 to change it"}, notes,
+		"the edit is named rather than ignored silently")
 
 	ammo := 6
 	rc, notes, err = ResolveRunWithNotes(RunOptions{

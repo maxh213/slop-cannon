@@ -88,6 +88,7 @@ sc safety off
       --repo PATH        target repository PATH (default ".")
       --resume           continue the most recent run of this repository instead of starting a new one
       --review-prs       also review open pull requests sc did not create (needs gh and a remote) (default true)
+      --run ID           with --resume, continue run ID instead of the most recent one
       --safety on|off    override safety for this run (on|off): on opens PRs, off merges to the default branch
   -v, --verbose          enable debug logging
 ```
@@ -583,13 +584,14 @@ Continue the most recent run of a repository.
 
 This is exactly "sc PATH --resume": the run keeps its id, its brief and the
 configuration it was started with (a config file edited since does not
-change it), its worktrees are reattached, stale leases are recovered and
-the agents that were in flight are fired again.
+change it, and a note says so), its worktrees are reattached, stale leases
+are recovered and the agents that were in flight are fired again.
 
 PATH may be the repository root or any directory inside it; without it the
---repo directory (the current one by default) is used. --ammo, --safety and
---cartridge still override the frozen configuration for this invocation and
-say so. There is nothing to resume in a repository sc has never run in.
+--repo directory (the current one by default) is used. --run ID continues
+that run instead of the most recent one. --ammo, --safety and --cartridge
+still override the frozen configuration for this invocation and say so.
+There is nothing to resume in a repository sc has never run in.
 
 ### Usage
 
@@ -603,6 +605,7 @@ sc resume [PATH] [flags]
 sc resume
 sc resume ./repo-path
 sc resume --repo ./repo-path --headless
+sc resume ./repo-path --run 20260924-214444-42c0 --safety off
 ```
 
 ### Options
@@ -616,6 +619,7 @@ sc resume --repo ./repo-path --headless
   -h, --help             help for resume
       --no-anim          disable the cannon animations in the TUI (also honours SC_NO_ANIM)
       --review-prs       also review open pull requests sc did not create (needs gh and a remote) (default true)
+      --run ID           with --resume, continue run ID instead of the most recent one
       --safety on|off    override safety for this run (on|off): on opens PRs, off merges to the default branch
 ```
 
@@ -751,6 +755,7 @@ sc ./repo-path --resume
       --no-anim          disable the cannon animations in the TUI (also honours SC_NO_ANIM)
       --resume           continue the most recent run of this repository instead of starting a new one
       --review-prs       also review open pull requests sc did not create (needs gh and a remote) (default true)
+      --run ID           with --resume, continue run ID instead of the most recent one
       --safety on|off    override safety for this run (on|off): on opens PRs, off merges to the default branch
 ```
 
