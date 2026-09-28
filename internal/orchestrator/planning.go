@@ -1338,6 +1338,9 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 		Notes:     p.notes(open, done),
 		Model:     p.cfg.Cartridge.Model,
 	}
+	if eff := p.cfg.Effective; eff != nil {
+		req.Research = eff.Research
+	}
 	if eff := p.cfg.Effective; eff != nil && eff.Limits.AgentTimeout.Duration() > 0 {
 		req.Timeout = eff.Limits.AgentTimeout.Duration()
 	}

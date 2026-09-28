@@ -13,6 +13,7 @@ max_diff_bytes              204800  default
 re_review_threshold         0.4     default
 max_beads_per_plan          8       default
 nice                        10      default
+research                    true    default
 limits.max_review_rounds    5       default
 limits.max_pushback_rounds  2       default
 limits.max_conflict_rounds  3       default
@@ -22,8 +23,11 @@ limits.max_cost_usd         0       default
 limits.max_plan_rejections  2       default
 limits.max_plan_failures    5       default
 roles.po.cartridge                  default
+roles.po.model                      default
 roles.engineer.cartridge            default
+roles.engineer.model                default
 roles.tester.cartridge              default
+roles.tester.model                  default
 
 global config  <tmp>/home/.config/slop-cannon/config.toml (not found)
 repo config    <tmp>/repo/.slop-cannon/config.toml (not found)

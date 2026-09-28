@@ -68,7 +68,8 @@ var ReadOnlyShell = []string{
 //   - read_exec:  --allowedTools Bash --disallowedTools <editTools>
 //   - read_write: --allowedTools Bash,<editTools>
 //
-// Read is never gated. WebFetch, WebSearch and other prompting tools stay
+// Read is never gated. WebFetch and WebSearch are allowed only when the
+// spec asks for them (RunSpec.Web, see Args); other prompting tools stay
 // denied under every policy. Note that read_exec cannot stop a shell command
 // from writing a file; the policy is about which tools are offered, and the
 // worktree is disposable.
@@ -106,9 +107,29 @@ func (a *Adapter) Args(spec cartridge.RunSpec) []string {
 	if spec.MaxTurns > 0 {
 		args = append(args, flagMaxTurns, strconv.Itoa(spec.MaxTurns))
 	}
-	args = append(args, ToolFlags(spec.ToolPolicy)...)
+	args = append(args, withWebTools(ToolFlags(spec.ToolPolicy), spec.Web)...)
 	args = append(args, a.cfg.Args...)
 	return args
+}
+
+// WebTools are the CLI's read-only web tools a RunSpec with Web set may use.
+var WebTools = []string{"WebSearch", "WebFetch"}
+
+// withWebTools adds WebTools to the allowed tools in flags when web is set.
+// They join the existing --allowedTools value rather than a second flag, so
+// no CLI version can read one list as replacing the other.
+func withWebTools(flags []string, web bool) []string {
+	if !web {
+		return flags
+	}
+	out := append([]string(nil), flags...)
+	for i := 0; i+1 < len(out); i++ {
+		if out[i] == flagAllowedTools {
+			out[i+1] += "," + strings.Join(WebTools, ",")
+			return out
+		}
+	}
+	return append(out, flagAllowedTools, strings.Join(WebTools, ","))
 }
 
 func (a *Adapter) model(spec cartridge.RunSpec) string {

@@ -56,7 +56,9 @@
         "max_plan_rejections": 2,
         "max_plan_failures": 5
       },
-      "roles": {}
+      "roles": {},
+      "role_models": {},
+      "research": true
     },
     "sources": {
       "active_cartridge": "global",
@@ -81,6 +83,7 @@
       "nice": "default",
       "pr_poll_interval": "default",
       "re_review_threshold": "default",
+      "research": "default",
       "rules": "default",
       "safety": "default",
       "vibes": "default"

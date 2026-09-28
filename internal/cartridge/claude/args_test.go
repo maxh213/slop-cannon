@@ -1,6 +1,7 @@
 package claude
 
 import (
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -218,4 +219,19 @@ func TestDocsRecordTheReadOnlyDecision(t *testing.T) {
 	assert.Contains(t, doc, "`--disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit`",
 		"the rejected alternative must be spelled out, so nobody re-opens it blind")
 	assert.Contains(t, doc, "`read_only` keeps the restricted `Bash` allow-list")
+}
+
+// RunSpec.Web adds the read-only web tools to the existing allow list, so
+// the read-only shell of the planning product owner is kept.
+func TestArgs_WebJoinsTheAllowList(t *testing.T) {
+	t.Parallel()
+	a := claudeNewAdapter(t, config.Cartridge{})
+	got := a.Args(cartridge.RunSpec{Workdir: "/w", ToolPolicy: cartridge.ToolReadOnly, Web: true})
+	i := slices.Index(got, "--allowedTools")
+	require.GreaterOrEqual(t, i, 0)
+	assert.Equal(t, strings.Join(ReadOnlyShell, ",")+",WebSearch,WebFetch", got[i+1])
+	assert.Equal(t, 1, strings.Count(strings.Join(got, " "), "--allowedTools"), "one list, not two")
+
+	without := a.Args(cartridge.RunSpec{Workdir: "/w", ToolPolicy: cartridge.ToolReadOnly})
+	assert.NotContains(t, strings.Join(without, " "), "WebSearch")
 }

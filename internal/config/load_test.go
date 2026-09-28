@@ -54,6 +54,7 @@ max_diff_bytes = 4096
 re_review_threshold = 0.5
 max_beads_per_plan = 6
 nice = 12
+research = false
 
 [limits]
 max_review_rounds = 4
@@ -73,6 +74,9 @@ env = { FOO = "bar" }
 
 [roles.tester]
 cartridge = "claude"
+
+[roles.po]
+model = "claude-opus-5-5"
 `
 
 const configRepoTOML = `
@@ -628,7 +632,10 @@ func TestEntries(t *testing.T) {
 	assert.Equal(t, Entry{Key: "roles.po.cartridge", Value: "", Source: SourceDefault}, byKey["roles.po.cartridge"])
 	assert.Equal(t, "[/abs/rules.md]", byKey[KeyRules].Value)
 	assert.Equal(t, KeyActiveCartridge, order[0])
-	assert.Equal(t, "roles.tester.cartridge", order[len(order)-1])
+	assert.Equal(t, "roles.tester.model", order[len(order)-1])
+	assert.Equal(t, Entry{Key: "roles.po.model", Value: "claude-opus-5-5", Source: SourceGlobal}, byKey["roles.po.model"])
+	assert.Equal(t, Entry{Key: "roles.tester.model", Value: "", Source: SourceDefault}, byKey["roles.tester.model"])
+	assert.Equal(t, Entry{Key: KeyResearch, Value: "false", Source: SourceGlobal}, byKey[KeyResearch])
 
 	defaults, err := load(filepath.Join(t.TempDir(), "none.toml"), "")
 	require.NoError(t, err)
@@ -645,4 +652,16 @@ func TestResolvePath(t *testing.T) {
 	assert.Equal(t, "/abs/x.md", ResolvePath("/base", "/abs/x.md"))
 	assert.Equal(t, "/home/tester/x.md", ResolvePath("/base", "~/x.md"))
 	assert.Equal(t, "/home/tester", ResolvePath("/base", "~"))
+}
+
+// roles.<role>.model is read per role and needs no second cartridge.
+func TestLoadRoleModel(t *testing.T) {
+	repoRoot, globalPath, _ := configTestEnv(t)
+	configWrite(t, globalPath, configGlobalTOML)
+	eff, err := Load(repoRoot)
+	require.NoError(t, err)
+	assert.Equal(t, map[domain.Role]string{domain.RolePO: "claude-opus-5-5"}, eff.RoleModels)
+	assert.Equal(t, SourceGlobal, eff.Sources[KeyRoles+".po.model"])
+	assert.False(t, eff.Research, "the global file turns research off")
+	assert.True(t, Defaults().Research, "research is on by default")
 }

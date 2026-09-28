@@ -1139,6 +1139,8 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 	// them.
 	sup, err = orchestrator.NewSupervisor(orchestrator.SupervisorOptions{
 		Cartridges:  sel,
+		RoleModels:  rc.Effective.RoleModels,
+		Research:    rc.Effective.Research,
 		ShimOptions: runShimOptions,
 		Bus:         run.AgentBus(),
 		Timeout:     limits.AgentTimeout.Duration(),

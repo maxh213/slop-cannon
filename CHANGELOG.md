@@ -17,6 +17,12 @@ next version's entry.
 
 ### Added
 
+- `roles.<role>.model` fires one role with its own model, e.g. the product
+  owner on Opus while engineers and testers stay on the cartridge's model.
+- `research` (default on) lets the planning product owner search and read
+  the web; in autopilot it researches comparable products (their features,
+  the quality-of-life improvements users expect, what people enjoy) before
+  pitching, and never pitches manipulative engagement mechanics.
 - `nice` (default 10) lowers a run's scheduling priority before it fires,
   so every agent, check command and test browser it starts runs niced and a
   busy run no longer starves the machine. `0` turns it off.

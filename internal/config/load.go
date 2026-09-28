@@ -51,6 +51,7 @@ const (
 	KeyReReviewThreshold  = "re_review_threshold"
 	KeyMaxBeadsPerPlan    = "max_beads_per_plan"
 	KeyNice               = "nice"
+	KeyResearch           = "research"
 	KeyMaxReviewRounds    = "limits.max_review_rounds"
 	KeyMaxPushbackRounds  = "limits.max_pushback_rounds"
 	KeyMaxConflictRounds  = "limits.max_conflict_rounds"
@@ -189,7 +190,7 @@ func load(globalPath, repoRoot string) (*Effective, error) {
 var scalarKeys = []string{
 	KeyActiveCartridge, KeyAmmo, KeySafety, KeyVibes, KeyRules, KeyExclude, KeyCheckCommand, KeyIdleReplanInterval,
 	KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyMaxDiffBytes, KeyReReviewThreshold,
-	KeyMaxBeadsPerPlan, KeyNice,
+	KeyMaxBeadsPerPlan, KeyNice, KeyResearch,
 	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyMaxConflictRounds, KeyAgentTimeout, KeyMaxTokens, KeyMaxCostUSD,
 	KeyMaxPlanRejections, KeyMaxPlanFailures,
 }
@@ -481,6 +482,10 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 		e.Nice = *f.Nice
 		e.Sources[KeyNice] = src
 	}
+	if f.Research != nil {
+		e.Research = *f.Research
+		e.Sources[KeyResearch] = src
+	}
 	if v := f.Limits.MaxReviewRounds; v != nil {
 		e.Limits.MaxReviewRounds = *v
 		e.Sources[KeyMaxReviewRounds] = src
@@ -517,6 +522,10 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 		role, err := domain.ParseRole(name)
 		if err != nil {
 			return &ValidationError{Path: path, Key: KeyRoles + "." + name, Msg: err.Error()}
+		}
+		if m := strings.TrimSpace(rc.Model); m != "" {
+			e.RoleModels[role] = m
+			e.Sources[KeyRoles+"."+role.String()+".model"] = src
 		}
 		if rc.Cartridge == "" {
 			continue
@@ -768,6 +777,7 @@ func (e *Effective) Entries() []Entry {
 	add(KeyReReviewThreshold, strconv.FormatFloat(e.ReReviewThreshold, 'f', -1, 64), e.Sources[KeyReReviewThreshold])
 	add(KeyMaxBeadsPerPlan, strconv.Itoa(e.MaxBeadsPerPlan), e.Sources[KeyMaxBeadsPerPlan])
 	add(KeyNice, strconv.Itoa(e.Nice), e.Sources[KeyNice])
+	add(KeyResearch, strconv.FormatBool(e.Research), e.Sources[KeyResearch])
 	add(KeyMaxReviewRounds, strconv.Itoa(e.Limits.MaxReviewRounds), e.Sources[KeyMaxReviewRounds])
 	add(KeyMaxPushbackRounds, strconv.Itoa(e.Limits.MaxPushbackRounds), e.Sources[KeyMaxPushbackRounds])
 	add(KeyMaxConflictRounds, strconv.Itoa(e.Limits.MaxConflictRounds), e.Sources[KeyMaxConflictRounds])
@@ -782,6 +792,12 @@ func (e *Effective) Entries() []Entry {
 			add(key, name, e.Sources[KeyRoles+"."+role.String()])
 		} else {
 			add(key, "", SourceDefault)
+		}
+		mkey := KeyRoles + "." + role.String() + ".model"
+		if m, ok := e.RoleModels[role]; ok {
+			add(mkey, m, e.Sources[mkey])
+		} else {
+			add(mkey, "", SourceDefault)
 		}
 	}
 	return out

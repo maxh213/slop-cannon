@@ -202,6 +202,10 @@ type RunSpec struct {
 	Model string `json:"model,omitempty"`
 	// ToolPolicy bounds what the model may do in Workdir. Required.
 	ToolPolicy ToolPolicy `json:"tool_policy"`
+	// Web additionally lets the model search and read the web, on top of
+	// its tool policy. Only the planning product owner is given it, for
+	// research (the `research` config key); it reads, it never writes.
+	Web bool `json:"web,omitempty"`
 	// MaxTurns caps agentic turns; zero means the adapter's default.
 	MaxTurns int `json:"max_turns,omitempty"`
 	// Timeout kills the session when it elapses; zero means no limit (the

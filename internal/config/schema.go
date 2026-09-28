@@ -84,6 +84,10 @@ const (
 	// suites open. A dozen agents running a test suite at once can saturate
 	// a machine, and at 10 the rest of the desktop stays responsive.
 	DefaultNice = 10
+	// DefaultResearch lets the planning product owner use web search and
+	// fetch: an autopilot plan that pitches features is better grounded in
+	// what comparable products do and what their users value.
+	DefaultResearch = true
 	// MaxNice is the largest niceness there is (the lowest priority).
 	MaxNice = 19
 	// DefaultMaxReviewRounds is the review-round cap before PO escalation (D-08).
@@ -224,6 +228,9 @@ func (c Cartridge) Binary(name string) string {
 type RoleConfig struct {
 	// Cartridge names the cartridge this role uses instead of the active one.
 	Cartridge string `toml:"cartridge,omitempty" json:"cartridge,omitempty"`
+	// Model is the model this role's agents are fired with instead of the
+	// cartridge's own, e.g. a stronger model for the product owner only.
+	Model string `toml:"model,omitempty" json:"model,omitempty"`
 }
 
 // LimitsFile is the [limits] table as it appears in a file. Pointer fields
@@ -286,6 +293,8 @@ type File struct {
 	MaxBeadsPerPlan *int `toml:"max_beads_per_plan,omitempty"`
 	// Nice is the niceness a run gives itself and its children; 0 leaves it.
 	Nice *int `toml:"nice,omitempty"`
+	// Research lets the planning product owner search and read the web.
+	Research *bool `toml:"research,omitempty"`
 	// Limits holds the feedback-loop and budget limits (D-08, D-18).
 	Limits LimitsFile `toml:"limits,omitempty"`
 	// Cartridges are the configured subscriptions, keyed by name (global only).
@@ -391,6 +400,12 @@ type Config struct {
 	// Roles maps a role to the cartridge it should use (D-12); roles absent
 	// from the map use ActiveCartridge.
 	Roles map[domain.Role]string `json:"roles"`
+	// RoleModels maps a role to the model its agents are fired with instead
+	// of the cartridge's own; roles absent from the map use the cartridge's.
+	RoleModels map[domain.Role]string `json:"role_models"`
+	// Research lets the planning product owner search and read the web, so
+	// an autopilot plan can be grounded in comparable products.
+	Research bool `json:"research"`
 }
 
 // Defaults returns the built-in configuration (D-04 and friends).
@@ -418,7 +433,9 @@ func Defaults() Config {
 			MaxPlanRejections: DefaultMaxPlanRejections,
 			MaxPlanFailures:   DefaultMaxPlanFailures,
 		},
-		Roles: map[domain.Role]string{},
+		Roles:      map[domain.Role]string{},
+		RoleModels: map[domain.Role]string{},
+		Research:   DefaultResearch,
 	}
 }
 

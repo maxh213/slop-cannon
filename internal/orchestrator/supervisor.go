@@ -233,6 +233,12 @@ type SupervisorOptions struct {
 	// with [Supervisor.Attach], which is what production wiring does: the
 	// run needs the supervisor as its [AgentStopper] before it exists.
 	Host SupervisorHost
+	// RoleModels overrides the model per role (roles.<role>.model): a role
+	// listed here is fired with that model whatever its builder chose.
+	RoleModels map[domain.Role]string
+	// Research gives the planning product owner web search and fetch
+	// (the `research` config key).
+	Research bool
 	// Cartridges hands out the cartridge each role fires; required before
 	// the first firing.
 	Cartridges CartridgeSource
@@ -887,6 +893,16 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 // builder cannot fire in the wrong directory, without the shim, or without
 // a timeout.
 func (s *Supervisor) stamp(run *agents.AgentRun, f AgentFiring, agent domain.Agent, prep supPrep, h SupervisorHost) {
+	// The per-role model and the planner's web access are stamped here,
+	// where every firing passes, rather than in each role's builder: the
+	// product owner is fired by the planner and by the feedback loop's
+	// arbitration, and both must use the model configured for the role.
+	if m := s.opts.RoleModels[agent.Role]; m != "" {
+		run.Spec.Model = m
+	}
+	if s.opts.Research && agent.Role == domain.RolePO && f.Task == events.TaskPlan {
+		run.Spec.Web = true
+	}
 	run.Cartridge = prep.cartridge
 	run.Agent = agent
 	run.Task = f.Task
