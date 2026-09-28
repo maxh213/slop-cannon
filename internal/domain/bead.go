@@ -431,7 +431,8 @@ type Bead struct {
 	Deps []BeadID `json:"deps,omitempty"`
 	// State is the workflow state, mirrored from the bd status.
 	State BeadState `json:"state"`
-	// Assignee is the agent id currently holding the claim, if any.
+	// Assignee is bd's raw assignee: the actor holding the claim, if any,
+	// which for sc's own agents is `sc:<agent-id>`, not the agent id.
 	Assignee string `json:"assignee,omitempty"`
 	// Labels are bd labels, used only for cheap filtering (D-06).
 	Labels []string `json:"labels,omitempty"`

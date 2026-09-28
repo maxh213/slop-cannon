@@ -333,6 +333,12 @@ const (
 	// DeliveryMerged means the work landed on the default branch and the
 	// bead is closed (safety off).
 	DeliveryMerged DeliveryKind = "merged"
+	// DeliveryAlreadySatisfied means the approved branch carried no commit
+	// and every tester's final verdict approved it: the reviewers checked
+	// the acceptance criteria against the default branch as it is, so the
+	// work is already there (another bead landed it) and the bead is closed
+	// with no merge SHA (safety off).
+	DeliveryAlreadySatisfied DeliveryKind = "already_satisfied"
 	// DeliveryHandedOff means the delivery needs a person: no remote, no
 	// usable gh, or a repository state the cannon will not touch. The bead
 	// is in needs_human and [DeliveryOutcome.Instructions] says what to do.
@@ -450,6 +456,8 @@ func (o *DeliveryOutcome) Summary() string {
 		return fmt.Sprintf("%s: waiting for the pull request gate", o.Bead)
 	case DeliveryMerged:
 		return fmt.Sprintf("%s: merged into %s as %s", o.Bead, o.Target, deliveryShortSHA(o.MergeSHA))
+	case DeliveryAlreadySatisfied:
+		return fmt.Sprintf("%s: nothing to merge, closed: %s", o.Bead, o.Reason)
 	case DeliveryHandedOff:
 		return fmt.Sprintf("%s: needs a human: %s", o.Bead, o.Reason)
 	case DeliveryConflict:
@@ -875,11 +883,62 @@ func (d *Deliverer) mergeFailure(ctx context.Context, req DeliveryRequest, out *
 			"the rebase onto the default branch stopped on conflicts", baseline)
 	case de.Stage == gitx.StageCheck:
 		return d.checkFailed(ctx, req, out, de)
+	case errors.Is(de, gitx.ErrNothingToDeliver) && approvedByAll(req.Verdicts):
+		return d.closeSatisfied(ctx, req, out)
 	case handOffStage(de):
 		return d.handOff(ctx, req, out, deliveryReason(de), "", err)
 	default:
 		return d.retryable(out, fmt.Sprintf("the delivery failed at %s", string(de.Stage)), err)
 	}
+}
+
+// holderOf is the agent behind a bead's assignee. bd records the assignee
+// as the actor `sc:<agent-id>` (beads.ActorFor), so the prefix is taken
+// off; handing the raw assignee on as an agent id made the next claim
+// write `sc:sc:<agent-id>`, which no lease renewal could match. An
+// assignee that is not an sc actor is passed through unchanged.
+func holderOf(assignee string) domain.AgentID {
+	assignee = strings.TrimSpace(assignee)
+	if agent, ok := beads.AgentOf(assignee); ok {
+		return agent
+	}
+	return domain.AgentID(assignee)
+}
+
+// approvedByAll reports whether there are final verdicts and every one of
+// them approves.
+func approvedByAll(verdicts []domain.Verdict) bool {
+	for _, v := range verdicts {
+		if v.Outcome != domain.VerdictApprove {
+			return false
+		}
+	}
+	return len(verdicts) > 0
+}
+
+// closeSatisfied closes a bead whose approved branch has nothing to merge.
+// D-20 refuses to close a bead whose code never landed, because its
+// dependents would start on work that is not there; here the testers
+// approved an empty change against the bead's acceptance criteria, which
+// is the evidence that the default branch already meets them (typically
+// another bead landed the same work). No sc_merge_sha is recorded and no
+// merge is announced, because nothing merged.
+func (d *Deliverer) closeSatisfied(ctx context.Context, req DeliveryRequest, out *DeliveryOutcome) (*DeliveryOutcome, error) {
+	target, where := d.defaultBranch(ctx), "the default branch"
+	if target != "" {
+		where = target
+	}
+	reason := "the approved branch adds no commit and every tester approved it, so its acceptance criteria already hold on " + where
+	if _, err := d.states.Apply(ctx, StateRequest{
+		Bead: req.Bead.ID, From: domain.BeadStateDelivering, Event: BeadEventDelivered,
+		Round: out.Round, Reason: reason,
+	}); err != nil {
+		return d.retryable(out, "the bead has nothing to merge but could not be closed", err)
+	}
+	out.Kind, out.State, out.Target, out.Reason = DeliveryAlreadySatisfied, domain.BeadStateClosed, target, reason
+	d.forget(req.Bead.ID)
+	d.warn(req.Bead.ID, "closed with nothing to merge: "+reason, nil)
+	return out, nil
 }
 
 // handOffStage reports whether a delivery failure needs a person rather than
@@ -1164,8 +1223,8 @@ func (d *Deliverer) engineerFor(req DeliveryRequest, round, attempt int) domain.
 	if req.Agent != "" {
 		return req.Agent
 	}
-	if a := strings.TrimSpace(req.Bead.Assignee); a != "" {
-		return domain.AgentID(a)
+	if a := holderOf(req.Bead.Assignee); a != "" {
+		return a
 	}
 	id := fmt.Sprintf("eng-%s-r%d-conflict", req.Bead.ID, round)
 	if attempt > 1 {
@@ -1359,7 +1418,7 @@ func (d *Deliverer) Demands(context.Context) ([]Demand, error) {
 			// The deliverer already moved the bead to in_progress (D-10),
 			// so the claim is a hand-over, not a transition.
 			From:    domain.BeadStateInProgress,
-			HeldBy:  domain.AgentID(strings.TrimSpace(p.Bead.Assignee)),
+			HeldBy:  holderOf(p.Bead.Assignee),
 			Agent:   p.Agent,
 			Payload: p,
 		})
@@ -1683,7 +1742,7 @@ func (d *Deliverer) ConflictRound(ctx context.Context, e gitx.ResumeEntry) error
 		// the round without moving it, so the engineer is still fired.
 		out.State = domain.BeadStateInProgress
 	}
-	req := DeliveryRequest{Bead: bead, Round: round, Agent: domain.AgentID(strings.TrimSpace(bead.Assignee))}
+	req := DeliveryRequest{Bead: bead, Round: round, Agent: holderOf(bead.Assignee)}
 	res, err := d.conflictRound(ctx, req, out, conflict,
 		"the worktree was left mid-rebase before the restart", nil)
 	if err != nil {

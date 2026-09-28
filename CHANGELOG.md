@@ -36,6 +36,11 @@ next version's entry.
 
 ### Fixed
 
+- With safety off, an approved bead whose branch has nothing to merge is
+  closed when every tester approved it (another bead already landed the
+  work), instead of being handed to a human.
+- A conflict or rework round no longer claims its bead as `sc:sc:<agent>`,
+  which made the engineer's lease renewals fail.
 - Re-delivering a bead whose pull request has already merged no longer
   pushes the old branch tip (which failed as non-fast-forward).
 

@@ -1045,14 +1045,14 @@ func (f *Feedback) demandsFor(t *fbThread, order int) []Demand {
 		d := base
 		d.Kind, d.Task, d.Claim = DemandImplement, events.TaskImplement, ClaimNew
 		d.Round = max(t.round, 1)
-		d.HeldBy = domain.AgentID(t.bead.Assignee)
+		d.HeldBy = holderOf(t.bead.Assignee)
 		d.Payload = FeedbackWork{Bead: t.id, Round: d.Round, Phase: t.phase, Engineer: agents.EngineerImplement}
 		return []Demand{d}
 
 	case FeedbackAddressing:
 		d := base
 		d.Kind, d.Claim = DemandImplement, ClaimRework
-		d.HeldBy = domain.AgentID(t.bead.Assignee)
+		d.HeldBy = holderOf(t.bead.Assignee)
 		mode := agents.EngineerAddressFeedback
 		d.Task = events.TaskAddressFeedback
 		if !f.hasEngineerWork(t) {

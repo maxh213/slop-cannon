@@ -3307,7 +3307,7 @@ func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *Del
 		if gates != nil {
 			gates.Kick()
 		}
-	case DeliveryMerged:
+	case DeliveryMerged, DeliveryAlreadySatisfied:
 		c.ship(id)
 		c.mu.Lock()
 		c.stats.Shipped++

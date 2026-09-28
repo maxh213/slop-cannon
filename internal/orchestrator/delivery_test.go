@@ -32,7 +32,7 @@ func deliveryBead(state domain.BeadState) domain.Bead {
 		ID:       "sc-68s",
 		Title:    "Add retry to the uploader",
 		State:    state,
-		Assignee: "eng-sc-68s-r1",
+		Assignee: "sc:eng-sc-68s-r1", // bd's actor form, as a real claim writes it
 		Round:    1,
 	}
 }
