@@ -130,14 +130,40 @@ func TestIsSessionMarker(t *testing.T) {
 	assert.False(t, IsSessionMarker("ANTHROPIC_API_KEY"))
 }
 
+// stubLookupEnv makes childEnv see only vars as sc's own environment. The
+// tests that use it are not parallel: lookupEnv is package state.
+func stubLookupEnv(t *testing.T, vars map[string]string) {
+	t.Helper()
+	saved := lookupEnv
+	t.Cleanup(func() { lookupEnv = saved })
+	lookupEnv = func(k string) (string, bool) { v, ok := vars[k]; return v, ok }
+}
+
 func TestChildEnv_Layering(t *testing.T) {
-	t.Parallel()
-	a := claudeNewAdapter(t, config.Cartridge{Env: map[string]string{"DISABLE_AUTOUPDATER": "0", "FROM_CFG": "c"}})
+	stubLookupEnv(t, nil)
+	a := claudeNewAdapter(t, config.Cartridge{Env: map[string]string{"DISABLE_AUTOUPDATER": "0", "FROM_CFG": "c", "BASH_MAX_TIMEOUT_MS": "60000"}})
 	env := a.childEnv(map[string]string{"FROM_CFG": "spec", "FROM_SPEC": "s"})
-	assert.Equal(t, map[string]string{"DISABLE_AUTOUPDATER": "0", "FROM_CFG": "spec", "FROM_SPEC": "s"}, env)
+	assert.Equal(t, map[string]string{
+		"DISABLE_AUTOUPDATER": "0", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+		"BASH_DEFAULT_TIMEOUT_MS": "600000", "BASH_MAX_TIMEOUT_MS": "60000",
+		"FROM_CFG": "spec", "FROM_SPEC": "s",
+	}, env, "the configuration and the spec win over every default")
 
 	plain := claudeNewAdapter(t, config.Cartridge{})
-	assert.Equal(t, map[string]string{"DISABLE_AUTOUPDATER": "1"}, plain.childEnv(nil))
+	assert.Equal(t, map[string]string{
+		"DISABLE_AUTOUPDATER": "1", "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+		"BASH_DEFAULT_TIMEOUT_MS": "600000", "BASH_MAX_TIMEOUT_MS": "1800000",
+	}, plain.childEnv(nil))
+}
+
+// A Bash timeout sc's own environment sets is inherited as it is, not
+// replaced by the default; background tasks stay off either way.
+func TestChildEnv_KeepsTheUsersBashTimeouts(t *testing.T) {
+	stubLookupEnv(t, map[string]string{"BASH_DEFAULT_TIMEOUT_MS": "120000"})
+	env := claudeNewAdapter(t, config.Cartridge{}).childEnv(nil)
+	assert.NotContains(t, env, "BASH_DEFAULT_TIMEOUT_MS", "left to the inherited value")
+	assert.Equal(t, "1800000", env["BASH_MAX_TIMEOUT_MS"])
+	assert.Equal(t, "1", env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"])
 }
 
 func TestNewAndBinary(t *testing.T) {

@@ -1315,8 +1315,10 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 	c.pub.watch(c.settleq.push)
 
 	sched = orchestrator.NewScheduler(orchestrator.SchedulerOptions{
-		Allocation:          rc.Allocation,
-		Work:                budget.Work(prReviewSources(reviewer, planner, feedback, deliverer)),
+		Allocation: rc.Allocation,
+		// The feedback loop is offered nothing on a bead the deliverer
+		// holds for a conflict round (P6-66).
+		Work:                budget.Work(prReviewSources(reviewer, planner, orchestrator.ExceptHeld(deliverer, feedback), deliverer)),
 		Fire:                orchestrator.PlanRouter(planner, sup),
 		Claims:              client,
 		Stop:                budget.Stop(planner),

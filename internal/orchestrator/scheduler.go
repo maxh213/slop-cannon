@@ -347,6 +347,37 @@ func WorkSources(sources ...WorkSource) WorkSource {
 	})
 }
 
+// BeadHolder is a work source that can hold a bead exclusively: while it
+// does, no other source may be offered work on that bead.
+type BeadHolder interface {
+	// Holds reports whether the source holds the bead right now.
+	Holds(bead domain.BeadID) bool
+}
+
+// ExceptHeld wraps src so that it offers no demand for a bead holder holds.
+// The delivery handoff holds a bead for the whole of its conflict round
+// (D-10): the worktree is mid-rebase and only the conflict engineer may
+// touch it. Without this a resumed run fired the feedback loop's review of
+// that bead as well, every tester failed for want of a diff, the review was
+// parked and the bead failed under the engineer still resolving it. A nil
+// holder or source returns src unchanged.
+func ExceptHeld(holder BeadHolder, src WorkSource) WorkSource {
+	if holder == nil || src == nil {
+		return src
+	}
+	return WorkSourceFunc(func(ctx context.Context) ([]Demand, error) {
+		ds, err := src.Demands(ctx)
+		out := ds[:0:0]
+		for _, d := range ds {
+			if d.Bead != "" && holder.Holds(d.Bead) {
+				continue
+			}
+			out = append(out, d)
+		}
+		return out, err
+	})
+}
+
 // Firing is everything a [Firer] needs to run one agent.
 type Firing struct {
 	// Agent is the agent record the scheduler minted and registered. Its

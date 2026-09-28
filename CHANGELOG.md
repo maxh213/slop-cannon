@@ -50,6 +50,15 @@ next version's entry.
 
 ### Fixed
 
+- A resumed run no longer fires reviews of a bead whose worktree is
+  mid-rebase. The delivery handoff owns a bead for the whole of its conflict
+  round; the feedback loop used to review it at the same time, every tester
+  failed for want of a diff and the bead was marked failed under the
+  engineer still resolving it.
+- Claude agents no longer move commands into the background. A headless
+  session ended "waiting" for its test run and produced no result block
+  (`bad_output`), losing the whole session. Foreground commands get a
+  10-minute default and 30-minute maximum Bash timeout instead.
 - The product owner's ruling on a bead that failed its delivery check at
   the review-round cap is applied. The conductor used to overwrite the
   escalation with the delivery's changes_requested, so every ruling was

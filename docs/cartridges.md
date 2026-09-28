@@ -114,8 +114,15 @@ XDG, TLS and proxy variables); every `ANTHROPIC_*`, `CLAUDE_*`, `AWS_*`,
 `DISABLE_TELEMETRY`, `DISABLE_ERROR_REPORTING`,
 `DISABLE_NON_ESSENTIAL_MODEL_CALLS`, `MAX_THINKING_TOKENS`,
 `BASH_DEFAULT_TIMEOUT_MS`, `BASH_MAX_TIMEOUT_MS`, `MCP_TIMEOUT` when set;
-`DISABLE_AUTOUPDATER=1` (agents never self-update mid-run; override in
-config); `cartridges.claude.env`; `RunSpec.Env`.
+`DISABLE_AUTOUPDATER=1` (agents never self-update mid-run) and
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` (a `claude -p` session ends when the
+model stops calling tools, so a command moved into the background is never
+waited for and the session ends with no result block; with this set the Bash
+tool has no `run_in_background` and every command runs in the foreground);
+`BASH_DEFAULT_TIMEOUT_MS=600000` and `BASH_MAX_TIMEOUT_MS=1800000` unless sc's
+own environment sets them, so a long test suite fits in a foreground command;
+`cartridges.claude.env`; `RunSpec.Env`. Every default can be overridden in
+config.
 
 Always dropped, even though they match `CLAUDE_*`: the markers a running
 Claude Code session sets for its children (`CLAUDECODE`,

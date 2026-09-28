@@ -168,8 +168,31 @@ var (
 )
 
 // DefaultEnv is set on every child unless the configuration or the RunSpec
-// overrides it: agents must not self-update mid-run.
-var DefaultEnv = map[string]string{"DISABLE_AUTOUPDATER": "1"}
+// overrides it: agents must not self-update mid-run, and must not move a
+// command into the background. A `claude -p` session ends as soon as the
+// model stops calling tools, so a background command is never waited for:
+// the agent ends its turn "waiting for" it and the session finishes with no
+// result block, which cost PandaJump's engineers whole sessions as
+// bad_output. With background tasks disabled the Bash tool has no
+// run_in_background and every command runs in the foreground (verified
+// against Claude Code 2.1.283).
+var DefaultEnv = map[string]string{
+	"DISABLE_AUTOUPDATER":                  "1",
+	"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+}
+
+// DefaultBashTimeouts give foreground commands room, since none can be sent
+// to the background: a full test suite plus a quality gate under load runs
+// well past the CLI's 2-minute default. They apply only when sc's own
+// environment does not set the variable, and the configuration or the
+// RunSpec still override them.
+var DefaultBashTimeouts = map[string]string{
+	"BASH_DEFAULT_TIMEOUT_MS": "600000",  // 10 minutes
+	"BASH_MAX_TIMEOUT_MS":     "1800000", // 30 minutes
+}
+
+// lookupEnv is os.LookupEnv; a test replaces it.
+var lookupEnv = os.LookupEnv
 
 // InheritEnv extends base (normally cartridge.RunSpec.EnvAllowlist) with the
 // Claude-specific variables present in sc's environment: ANTHROPIC_*,
@@ -229,9 +252,14 @@ func IsSessionMarker(name string) bool {
 // childEnv layers DefaultEnv, the configured env and the spec env, later
 // entries winning.
 func (a *Adapter) childEnv(specEnv map[string]string) map[string]string {
-	env := make(map[string]string, len(DefaultEnv)+len(a.cfg.Env)+len(specEnv))
+	env := make(map[string]string, len(DefaultEnv)+len(DefaultBashTimeouts)+len(a.cfg.Env)+len(specEnv))
 	for k, v := range DefaultEnv {
 		env[k] = v
+	}
+	for k, v := range DefaultBashTimeouts {
+		if _, set := lookupEnv(k); !set {
+			env[k] = v
+		}
 	}
 	for k, v := range a.cfg.Env {
 		env[k] = v

@@ -582,6 +582,7 @@ type Deliverer struct {
 var (
 	_ WorkSource    = (*Deliverer)(nil)
 	_ ResumeHandler = (*Deliverer)(nil)
+	_ BeadHolder    = (*Deliverer)(nil)
 )
 
 // NewDeliverer returns a delivery handoff for one run. It fails with
@@ -1424,6 +1425,17 @@ func (d *Deliverer) Demands(context.Context) ([]Demand, error) {
 		})
 	}
 	return out, nil
+}
+
+// Holds implements [BeadHolder]: the deliverer holds a bead from the moment
+// it opens a conflict round until the round is resolved, abandoned or the
+// delivery ends, so no other work source is offered that bead meanwhile.
+func (d *Deliverer) Holds(bead domain.BeadID) bool {
+	if d == nil {
+		return false
+	}
+	_, ok := d.PendingFor(bead)
+	return ok
 }
 
 // Resolved is called when the engineer of a conflict round has finished.
