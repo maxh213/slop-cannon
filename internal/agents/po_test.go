@@ -196,6 +196,12 @@ func TestPOPlanPromptAutopilot(t *testing.T) {
 	assert.Contains(t, text, "You are in autopilot")
 	assert.Contains(t, text, "at most 8 beads")
 	assert.Contains(t, text, "empty `beads` list")
+	// Autopilot's product owner pitches where the project goes next, not
+	// only what is broken, so a mature repository does not run it dry.
+	assert.Contains(t, text, "Maintenance first")
+	assert.Contains(t, text, "not only its janitor: pitch new features")
+	assert.Contains(t, text, "smallest slice that ships something a user would notice")
+	assert.Contains(t, text, "name the directions you considered")
 	assert.Contains(t, text, "## How to shape each bead")
 	assert.Contains(t, text, "`0` most urgent to `4` least")
 	assert.Contains(t, text, "`task`, `bug`, `feature`, `chore`")
@@ -232,6 +238,7 @@ func TestPOPlanPromptBrief(t *testing.T) {
 	assert.Contains(t, text, "## Notes from the orchestrator")
 	assert.Contains(t, text, "- The ready queue is empty.")
 	assert.NotContains(t, text, "You are in autopilot")
+	assert.NotContains(t, text, "pitch new features", "a brief is the whole scope; nothing is pitched beside it")
 
 	// Deterministic: the same request assembles the same bytes.
 	again, err := agents.PlanPrompt(req)

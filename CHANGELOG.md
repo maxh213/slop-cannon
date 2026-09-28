@@ -25,6 +25,11 @@ next version's entry.
   while safety was on: a merged one closes its bead, an open one is landed
   the safety-off way and then closed with a comment naming the commit. A
   pull request someone pushed to after `sc` opened it is left alone.
+- In autopilot the product owner pitches new features once the
+  maintenance work is planned, instead of only proposing what is broken, so
+  a mature repository no longer runs it dry. Each pitch says what it adds
+  for the user and is scoped to one shippable slice; an empty plan now has
+  to name the directions it considered.
 - A resume says when the repo or global config now disagrees with the
   run's recorded ammo, safety or cartridge, and names the flag that would
   apply it.
