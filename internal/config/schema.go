@@ -109,7 +109,7 @@ const (
 	// kind and the supervisor has already spent its own retries on them.
 	DefaultMaxPlanFailures = 5
 	// DefaultAgentTimeout is the per-agent session timeout.
-	DefaultAgentTimeout = 30 * time.Minute
+	DefaultAgentTimeout = 6 * time.Hour
 	// MaxPromptFileSize is the largest vibes or rules file accepted (64 KiB).
 	MaxPromptFileSize = 64 * 1024
 )

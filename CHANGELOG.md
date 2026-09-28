@@ -21,6 +21,8 @@ next version's entry.
 
 ### Changed
 
+- The default `limits.agent_timeout` is 6 hours instead of 30 minutes, so an
+  engineer on a real feature is no longer killed half-way through.
 - A run resumed with `--safety off` settles the pull requests it opened
   while safety was on: a merged one closes its bead, an open one is landed
   the safety-off way and then closed with a comment naming the commit. A

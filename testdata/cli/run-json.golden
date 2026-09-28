@@ -51,7 +51,7 @@
         "max_review_rounds": 5,
         "max_pushback_rounds": 2,
         "max_conflict_rounds": 3,
-        "agent_timeout": "30m",
+        "agent_timeout": "6h",
         "max_plan_rejections": 2,
         "max_plan_failures": 5
       },

@@ -17,7 +17,7 @@ max_beads_per_plan          8           default
 limits.max_review_rounds    3           repo
 limits.max_pushback_rounds  2           default
 limits.max_conflict_rounds  3           default
-limits.agent_timeout        30m         default
+limits.agent_timeout        6h          default
 limits.max_tokens           0           default
 limits.max_cost_usd         0           default
 limits.max_plan_rejections  2           default
