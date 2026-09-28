@@ -994,6 +994,15 @@ func (s *Scheduler) reserve(d Demand) bool {
 	if d.Kind == DemandReview && s.testersOn(d.Bead) >= s.caps.TestersPerBead() {
 		return false
 	}
+	if role == domain.RoleEngineer && d.Bead != "" && s.engineerOn(d.Bead) {
+		// A bead has one worktree, so it has one engineer at a time. Two
+		// sources can each owe it one under different keys — a resumed
+		// run found a delivery that stops on conflicts, so the deliverer
+		// offers a conflict round while the feedback loop, seeing the bead
+		// back in in_progress, offers an implement round — and both used
+		// to fire into the same worktree. The later one waits its turn.
+		return false
+	}
 	// A placeholder holds the slot until start() replaces it, so two
 	// demands of one dispatch cannot both take the last one.
 	s.byKey[d.Key()] = ""
@@ -1027,6 +1036,17 @@ func (s *Scheduler) testersOn(bead domain.BeadID) int {
 		}
 	}
 	return n
+}
+
+// engineerOn reports whether an engineer is live or reserved on the bead;
+// the caller holds the lock.
+func (s *Scheduler) engineerOn(bead domain.BeadID) bool {
+	for _, l := range s.live {
+		if l.demand.Role() == domain.RoleEngineer && l.demand.Bead == bead {
+			return true
+		}
+	}
+	return false
 }
 
 // plannedAgentID is the id the demand's agent will get, needed before the

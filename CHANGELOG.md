@@ -47,6 +47,9 @@ next version's entry.
 
 ### Fixed
 
+- A bead is never given two engineers at once. A resumed run that found a
+  delivery stopping on conflicts used to fire the conflict round and a
+  fresh implement round into the same worktree.
 - With safety off, an approved bead whose branch has nothing to merge is
   closed when every tester approved it (another bead already landed the
   work), instead of being handed to a human.

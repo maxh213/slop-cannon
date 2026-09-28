@@ -988,6 +988,30 @@ func TestSchedulerNeverFiresTheSameWorkTwice(t *testing.T) {
 	assert.Equal(t, uint64(1), f.Sched.Status().Fired)
 }
 
+// TestSchedulerFiresOneEngineerPerBead: a bead has one worktree, so two
+// engineer demands for it under different keys still fire one at a time.
+// Seen on a resumed run: the deliverer's conflict round and the feedback
+// loop's implement round for the same bead both fired into its worktree.
+func TestSchedulerFiresOneEngineerPerBead(t *testing.T) {
+	gate := newSchedGate()
+	conflict := Demand{Kind: DemandImplement, Task: events.TaskResolveConflict, Bead: "sc-1", Round: 0, Claim: ClaimRework}
+	f := schedSetup(t, 10, SchedulerOptions{
+		Work: schedStatic(conflict, schedImplement("sc-1", 1), schedImplement("sc-2", 1)),
+		Fire: gate,
+	})
+	t.Cleanup(gate.Open)
+	schedEventually(t, "both engineer slots to fill", func() bool { return len(gate.Firings()) == 2 })
+	for i := 0; i < 5; i++ {
+		f.Clock.Advance(2 * DefaultTickInterval)
+	}
+	perBead := map[domain.BeadID]int{}
+	for _, fired := range gate.Firings() {
+		perBead[fired.Agent.Bead]++
+	}
+	assert.Equal(t, map[domain.BeadID]int{"sc-1": 1, "sc-2": 1}, perBead,
+		"the second engineer slot goes to sc-2, not to a second engineer in sc-1's worktree")
+}
+
 // --- slot accounting -----------------------------------------------------
 
 // TestSchedulerFreesTheSlotOfACrashingAgent covers the "a crashing agent
