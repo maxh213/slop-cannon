@@ -869,6 +869,40 @@ func TestFeedbackEscalationNarrowsTheScope(t *testing.T) {
 	assert.Equal(t, "the loop terminates for the error path only", th.Escalation.NewAcceptance)
 }
 
+// P6-67: a resumed bead whose scope the product owner narrowed at the
+// review-round cap resumes where the live loop went after the ruling, in
+// round one of a fresh review, not at the capped round that escalated it.
+// Seen on PandaJump-1di: the replay kept round 5, filed the fresh rounds'
+// verdicts as if they had never restarted, and fired the escalation again.
+func TestFeedbackRestoreResumesANarrowedBeadInItsFreshRound(t *testing.T) {
+	sc := fbCapScenario("narrow-then-resume", domain.Escalation{
+		Outcome:       domain.EscalationNarrowScope,
+		NewAcceptance: "the loop terminates for the error path only",
+	})
+	rig := fbSetup(t, sc, func(o *FeedbackOptions) { o.Limits.MaxReviewRounds = 2 })
+	rig.setDiff("head2", 22, 0.1)
+	for i := 0; i < 5; i++ {
+		rig.step(t)
+	}
+	live := rig.Thread()
+	require.Equal(t, 1, live.Round)
+	require.Equal(t, FeedbackReviewing, live.Phase)
+
+	resumed, th, writes := fbResume(t, rig, domain.BeadStateInReview, 1)
+	assert.Equal(t, 1, th.Round, "the narrowed bead resumes in its fresh first round")
+	assert.Equal(t, FeedbackReviewing, th.Phase, "it is reviewed against the new criteria, not escalated again")
+	assert.Empty(t, th.Items, "the items raised against the old criteria are gone")
+	assert.Empty(t, th.Approved)
+	assert.Zero(t, writes)
+	assert.Equal(t, "the loop terminates for the error path only", fbCriteria(t, resumed))
+	demands, err := resumed.Demands(context.Background())
+	require.NoError(t, err)
+	for _, d := range demands {
+		assert.NotEqual(t, DemandArbitrate, d.Kind, "no second ruling is owed: %+v", d)
+	}
+	assert.NotEmpty(t, demands, "the fresh review is offered")
+}
+
 // --- (g) a big round sends every tester back (D-09) --------------------
 
 func TestFeedbackDiffRatioSendsEveryTesterBack(t *testing.T) {

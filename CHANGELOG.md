@@ -50,6 +50,9 @@ next version's entry.
 
 ### Fixed
 
+- A resumed bead whose scope the product owner narrowed resumes in its
+  fresh review round. The replay used to keep it at the capped round that
+  escalated it and escalate it again.
 - Testers no longer send a bead back because its branch is behind the
   default branch. On a busy run master moved faster than engineers could
   rebase, and one bead spent three rounds chasing it; the delivery rebases

@@ -2093,20 +2093,7 @@ func (f *Feedback) escalated(ctx context.Context, t *fbThread, agent domain.Agen
 			return err
 		}
 		f.mu.Lock()
-		f.closeRound(t)
-		t.items = nil
-		t.approved = map[domain.Lens]bool{}
-		t.looked = map[domain.Lens]int{}
-		t.lookedAt = map[domain.Lens]string{}
-		t.verdicts = map[domain.Lens]domain.Verdict{}
-		t.round = 1
-		t.notes = append(t.notes,
-			"the product owner narrowed this bead's acceptance criteria to: "+fbOneLine(e.NewAcceptance))
-		// The ruling's criteria are what every later prompt judges the bead
-		// against, so they replace the bead's own; the ruling itself stays
-		// in the round that made it.
-		t.acceptance = fbFirstNonEmpty(e.NewAcceptance, t.acceptance)
-		t.bead.Acceptance = fbFirstNonEmpty(t.acceptance, t.bead.Acceptance)
+		f.startNarrowedScope(t, e.NewAcceptance)
 		f.mu.Unlock()
 		// And they go to bd, because bd is what the bead asks for (D-06):
 		// without this the testers of the next round hold the engineer to
@@ -2124,6 +2111,33 @@ func (f *Feedback) escalated(ctx context.Context, t *fbThread, agent domain.Agen
 		f.mu.Unlock()
 		return nil
 	}
+}
+
+// startNarrowedScope is what a narrow_scope ruling does to a thread, whether
+// the live loop applies it or [Feedback.Restore] replays it: the round that
+// escalated closes with the ruling in it, every item and approval goes (they
+// were raised against the old criteria), and review starts again at round
+// one against the new criteria. The caller holds the lock.
+//
+// One definition for both paths is the point: the replay used to record the
+// ruling without this reset, so a resumed bead stayed at the round-cap round
+// that escalated it, the verdicts of its fresh rounds were filed as if they
+// had never restarted, and it was escalated a second time (P6-67).
+func (f *Feedback) startNarrowedScope(t *fbThread, newAcceptance string) {
+	f.closeRound(t)
+	t.items = nil
+	t.approved = map[domain.Lens]bool{}
+	t.looked = map[domain.Lens]int{}
+	t.lookedAt = map[domain.Lens]string{}
+	t.verdicts = map[domain.Lens]domain.Verdict{}
+	t.round = 1
+	t.notes = append(t.notes,
+		"the product owner narrowed this bead's acceptance criteria to: "+fbOneLine(newAcceptance))
+	// The ruling's criteria are what every later prompt judges the bead
+	// against, so they replace the bead's own; the ruling itself stays in
+	// the round that made it.
+	t.acceptance = fbFirstNonEmpty(newAcceptance, t.acceptance)
+	t.bead.Acceptance = fbFirstNonEmpty(t.acceptance, t.bead.Acceptance)
 }
 
 // narrowScope writes a narrow_scope ruling's acceptance criteria to the bead
@@ -2671,8 +2685,10 @@ func (f *Feedback) Restore(ctx context.Context, bead domain.Bead, msgs []beads.M
 			esc := payload
 			t.escalation, t.lastEscalation = &esc, &esc
 			if esc.Outcome == domain.EscalationNarrowScope {
-				t.acceptance = fbFirstNonEmpty(esc.NewAcceptance, t.acceptance)
-				t.bead.Acceptance = fbFirstNonEmpty(t.acceptance, t.bead.Acceptance)
+				// The same reset the live ruling made: the replay goes on
+				// in round one against the new criteria, where the
+				// verdicts of the fresh rounds are numbered from.
+				f.startNarrowedScope(t, esc.NewAcceptance)
 				narrowed = t.acceptance
 				if bead.Acceptance == narrowed {
 					// bd already carries the ruling's criteria (P6-24), so
