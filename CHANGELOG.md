@@ -50,6 +50,10 @@ next version's entry.
 
 ### Fixed
 
+- A bead whose re-delivery after a conflict round cannot be fast-forwarded
+  (the default branch moved while its check ran) is retried like any other
+  delivery, instead of being left in delivering with its engineer's session
+  marked failed.
 - Agents no longer fail to start when several fire at once. The read-only
   bd check opened the tracker for writing on every start, which failed as
   "no beads database found" while other agents were writing; bd's own

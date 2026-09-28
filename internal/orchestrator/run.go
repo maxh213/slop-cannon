@@ -3490,10 +3490,29 @@ func (c *Conductor) ConflictResolved(ctx context.Context, id domain.BeadID) erro
 		return nil
 	}
 	out, err := delivery.Resolved(ctx, id)
+	if out == nil {
+		if err != nil {
+			return fmt.Errorf("orchestrator: conductor: re-delivering %s after its conflict: %w", id, err)
+		}
+		return nil
+	}
+	// The outcome is routed even when there is an error beside it, exactly
+	// as [Conductor.deliverJob] routes a first delivery's: a retryable one
+	// (the default branch moved while the check ran, so it could not be
+	// fast-forwarded) is the conductor's to retry. Returning the error
+	// instead failed the engineer's finished session and left the bead in
+	// delivering with nothing to retry it (P6-68).
+	if applyErr := c.ApplyOutcome(ctx, id, out); applyErr != nil {
+		err = errors.Join(err, applyErr)
+	} else if out.Kind == DeliveryRetryable {
+		c.log.Info("the re-delivery after a conflict round will be retried",
+			slog.String("bead", id.String()), slog.String("reason", out.Reason), slog.Any("err", err))
+		err = nil
+	}
 	if err != nil {
 		return fmt.Errorf("orchestrator: conductor: re-delivering %s after its conflict: %w", id, err)
 	}
-	return c.ApplyOutcome(ctx, id, out)
+	return nil
 }
 
 // ChangeRatio is [FeedbackOptions.Ratio]: the D-09 measurement, taken from
