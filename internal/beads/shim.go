@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -602,7 +603,40 @@ func (s Shim) Verify(ctx context.Context, dir string) error {
 			return err
 		}
 	}
-	return s.verifyBDReadOnly(ctx, dir)
+	key, keyed := bdIdentity(s.Real)
+	if keyed {
+		if _, done := bdReadOnlyVerified.Load(key); done {
+			return nil
+		}
+	}
+	if err := s.verifyBDReadOnly(ctx, dir); err != nil {
+		return err
+	}
+	if keyed {
+		bdReadOnlyVerified.Store(key, struct{}{})
+	}
+	return nil
+}
+
+// bdReadOnlyVerified remembers the bd binaries already shown to refuse a
+// write under --readonly, keyed by [bdIdentity]. That is a property of the
+// binary, not of the shim or the directory, so it is checked once per
+// binary rather than on every install. Checking it on every install is also
+// what made it flaky: bd opens its database for writing before it looks at
+// --readonly, and while other agents and the run are writing, that open
+// fails as "no beads database found" and the probe failed the agent's
+// firing (seen on PandaJump every time a round's testers started together).
+var bdReadOnlyVerified sync.Map
+
+// bdIdentity names a bd binary by path, size and modification time, so an
+// upgrade in place is verified afresh. ok is false when it cannot be read,
+// and the caller then verifies without remembering the answer.
+func bdIdentity(path string) (key string, ok bool) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", false
+	}
+	return fmt.Sprintf("%s|%d|%d", path, fi.Size(), fi.ModTime().UnixNano()), true
 }
 
 // Retry budget for the very first execution of a freshly written

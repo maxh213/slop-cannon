@@ -50,6 +50,10 @@ next version's entry.
 
 ### Fixed
 
+- Agents no longer fail to start when several fire at once. The read-only
+  bd check opened the tracker for writing on every start, which failed as
+  "no beads database found" while other agents were writing; bd's own
+  read-only enforcement is now checked once per bd binary.
 - A resumed bead whose scope the product owner narrowed resumes in its
   fresh review round. The replay used to keep it at the capped round that
   escalated it and escalate it again.

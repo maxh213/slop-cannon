@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -856,4 +857,47 @@ func TestIsTextBusy(t *testing.T) {
 	assert.True(t, IsTextBusy(&os.PathError{Op: "fork/exec", Path: "/tmp/bd", Err: syscall.ETXTBSY}))
 	assert.True(t, IsTextBusy(fmt.Errorf("running bd: %w", syscall.ETXTBSY)))
 	assert.True(t, IsTextBusy(errors.New("/bin/sh: /tmp/bd: Text file busy")))
+}
+
+// bd's own --readonly enforcement is a property of the binary: it is proved
+// once and remembered, so a burst of installs does not each open the
+// database for writing (which failed as "no beads database found" while
+// other agents were writing). The shim's own probes still run every time,
+// a changed binary is checked afresh, and a failed check is never kept.
+func TestShimVerifyChecksBDsOwnReadOnlyOncePerBinary(t *testing.T) {
+	s, fake := shimInstall(t)
+	updates := func() int {
+		n := 0
+		for _, c := range fake.Invocations(t) {
+			if slices.Contains(c.Args, "update") {
+				n++
+			}
+		}
+		return n
+	}
+	require.NoError(t, s.Verify(context.Background(), t.TempDir()))
+	require.Equal(t, 1, updates())
+	before := len(fake.Invocations(t))
+
+	require.NoError(t, s.Verify(context.Background(), t.TempDir()))
+	assert.Equal(t, 1, updates(), "the same bd is not asked to open its database for writing again")
+	assert.Equal(t, before+3, len(fake.Invocations(t)), "the shim's version and read probes still run")
+
+	// The same path with different contents is a different binary.
+	body, err := os.ReadFile(s.Real)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(s.Real, append(body, []byte("\n# upgraded\n")...), 0o755))
+	require.NoError(t, os.Chtimes(s.Real, time.Now().Add(time.Hour), time.Now().Add(time.Hour)))
+	require.NoError(t, s.Verify(context.Background(), t.TempDir()))
+	assert.Equal(t, 2, updates(), "an upgraded bd is verified again")
+
+	// A bd that accepts the write fails every time: a failure is not kept.
+	testutil.FakeBin(t, "bd", `printf '{"schema_version":1,"data":{"version":"1.2.2"}}\n'`)
+	weak, err := WriteShim(t.TempDir(), ShimOptions{})
+	require.NoError(t, err)
+	for range 2 {
+		err := weak.Verify(context.Background(), t.TempDir())
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "does not enforce --readonly itself")
+	}
 }
