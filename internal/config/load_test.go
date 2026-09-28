@@ -53,6 +53,7 @@ graph_poll_interval = "3s"
 max_diff_bytes = 4096
 re_review_threshold = 0.5
 max_beads_per_plan = 6
+nice = 12
 
 [limits]
 max_review_rounds = 4
@@ -88,6 +89,7 @@ graph_poll_interval = "5s"
 max_diff_bytes = 8192
 re_review_threshold = 0.25
 max_beads_per_plan = 4
+nice = 5
 
 [limits]
 max_review_rounds = 6
@@ -458,6 +460,8 @@ func TestLoadValidation(t *testing.T) {
 		{"negative conflict rounds", "", "[limits]\nmax_conflict_rounds = -2\n", KeyMaxConflictRounds, "must be at least 1"},
 		{"zero beads per plan", "max_beads_per_plan = 0\n", "", KeyMaxBeadsPerPlan, "must be at least 1"},
 		{"negative beads per plan", "", "max_beads_per_plan = -3\n", KeyMaxBeadsPerPlan, "must be at least 1"},
+		{"negative nice", "nice = -1\n", "", KeyNice, "must be between 0"},
+		{"nice above 19", "", "nice = 20\n", KeyNice, "must be between 0"},
 		{"zero rounds", "", "[limits]\nmax_review_rounds = 0\n", KeyMaxReviewRounds, "must be at least 1"},
 		{"negative pushback", "", "[limits]\nmax_pushback_rounds = -1\n", KeyMaxPushbackRounds, "must be at least 1"},
 		// Zero is refused rather than accepted and then read as "unset" by

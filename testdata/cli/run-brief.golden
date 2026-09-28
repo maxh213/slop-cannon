@@ -9,6 +9,7 @@ ammo       8 → 1 PO, up to 1 engineer, up to 6 testers (from flag)
 safety     off (from flag): finished beads are rebased onto the default branch, the check command is run, then they are fast-forward merged and pushed when a remote exists
 vibes      [<tmp>/repo/vibes.md] (from repo)
 rules      [] (from default)
+nice       10: the run and every process it starts run at a lower priority (from default)
 review-prs true
 headless   true
 animation  off

@@ -8,6 +8,7 @@ ammo       12 → 1 PO, up to 2 engineers, up to 9 testers (from repo)
 safety     on (from default): finished beads are pushed to an sc/<bead-id>-<slug> branch and opened as a pull request for a human to merge; the default branch is never touched
 vibes      [<tmp>/repo/vibes.md] (from repo)
 rules      [] (from default)
+nice       10: the run and every process it starts run at a lower priority (from default)
 review-prs true
 headless   false
 animation  on

@@ -23,6 +23,7 @@
     "max_diff_bytes": 204800,
     "re_review_threshold": 0.4,
     "max_beads_per_plan": 8,
+    "nice": 10,
     "limits": {
       "max_review_rounds": 3,
       "max_pushback_rounds": 2,
@@ -55,6 +56,7 @@
     "limits.max_tokens": "default",
     "max_beads_per_plan": "default",
     "max_diff_bytes": "default",
+    "nice": "default",
     "pr_poll_interval": "default",
     "re_review_threshold": "default",
     "roles.tester": "repo",
@@ -149,6 +151,11 @@
     {
       "key": "max_beads_per_plan",
       "value": "8",
+      "source": "default"
+    },
+    {
+      "key": "nice",
+      "value": "10",
       "source": "default"
     },
     {

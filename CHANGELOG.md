@@ -17,6 +17,9 @@ next version's entry.
 
 ### Added
 
+- `nice` (default 10) lowers a run's scheduling priority before it fires,
+  so every agent, check command and test browser it starts runs niced and a
+  busy run no longer starves the machine. `0` turns it off.
 - `sc resume --run ID` continues a named run instead of the most recent one.
 
 ### Changed

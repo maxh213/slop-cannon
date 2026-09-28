@@ -79,6 +79,13 @@ const (
 	// the surplus is not an option: it would break the dependencies of the
 	// beads that stayed.
 	DefaultMaxBeadsPerPlan = 8
+	// DefaultNice is the scheduling niceness a run gives itself and so every
+	// process it starts: agents, check commands and the browsers their test
+	// suites open. A dozen agents running a test suite at once can saturate
+	// a machine, and at 10 the rest of the desktop stays responsive.
+	DefaultNice = 10
+	// MaxNice is the largest niceness there is (the lowest priority).
+	MaxNice = 19
 	// DefaultMaxReviewRounds is the review-round cap before PO escalation (D-08).
 	DefaultMaxReviewRounds = 5
 	// DefaultMaxPushbackRounds is the pushback cap per feedback item (D-08).
@@ -277,6 +284,8 @@ type File struct {
 	ReReviewThreshold *float64 `toml:"re_review_threshold,omitempty"`
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02).
 	MaxBeadsPerPlan *int `toml:"max_beads_per_plan,omitempty"`
+	// Nice is the niceness a run gives itself and its children; 0 leaves it.
+	Nice *int `toml:"nice,omitempty"`
 	// Limits holds the feedback-loop and budget limits (D-08, D-18).
 	Limits LimitsFile `toml:"limits,omitempty"`
 	// Cartridges are the configured subscriptions, keyed by name (global only).
@@ -374,6 +383,9 @@ type Config struct {
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02);
 	// always at least 1.
 	MaxBeadsPerPlan int `json:"max_beads_per_plan"`
+	// Nice is the niceness (0-19) a run applies to itself, which every
+	// process it starts inherits; 0 leaves the priority alone.
+	Nice int `json:"nice"`
 	// Limits are the feedback-loop and budget limits.
 	Limits Limits `json:"limits"`
 	// Roles maps a role to the cartridge it should use (D-12); roles absent
@@ -397,6 +409,7 @@ func Defaults() Config {
 		MaxDiffBytes:       DefaultMaxDiffBytes,
 		ReReviewThreshold:  DefaultReReviewThreshold,
 		MaxBeadsPerPlan:    DefaultMaxBeadsPerPlan,
+		Nice:               DefaultNice,
 		Limits: Limits{
 			MaxReviewRounds:   DefaultMaxReviewRounds,
 			MaxPushbackRounds: DefaultMaxPushbackRounds,

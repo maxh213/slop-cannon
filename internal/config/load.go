@@ -50,6 +50,7 @@ const (
 	KeyMaxDiffBytes       = "max_diff_bytes"
 	KeyReReviewThreshold  = "re_review_threshold"
 	KeyMaxBeadsPerPlan    = "max_beads_per_plan"
+	KeyNice               = "nice"
 	KeyMaxReviewRounds    = "limits.max_review_rounds"
 	KeyMaxPushbackRounds  = "limits.max_pushback_rounds"
 	KeyMaxConflictRounds  = "limits.max_conflict_rounds"
@@ -188,7 +189,7 @@ func load(globalPath, repoRoot string) (*Effective, error) {
 var scalarKeys = []string{
 	KeyActiveCartridge, KeyAmmo, KeySafety, KeyVibes, KeyRules, KeyExclude, KeyCheckCommand, KeyIdleReplanInterval,
 	KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyMaxDiffBytes, KeyReReviewThreshold,
-	KeyMaxBeadsPerPlan,
+	KeyMaxBeadsPerPlan, KeyNice,
 	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyMaxConflictRounds, KeyAgentTimeout, KeyMaxTokens, KeyMaxCostUSD,
 	KeyMaxPlanRejections, KeyMaxPlanFailures,
 }
@@ -476,6 +477,10 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 		e.MaxBeadsPerPlan = *f.MaxBeadsPerPlan
 		e.Sources[KeyMaxBeadsPerPlan] = src
 	}
+	if f.Nice != nil {
+		e.Nice = *f.Nice
+		e.Sources[KeyNice] = src
+	}
 	if v := f.Limits.MaxReviewRounds; v != nil {
 		e.Limits.MaxReviewRounds = *v
 		e.Sources[KeyMaxReviewRounds] = src
@@ -636,6 +641,12 @@ func (e *Effective) validate() error {
 	if e.MaxBeadsPerPlan < 1 {
 		return &ValidationError{Path: e.pathOf(KeyMaxBeadsPerPlan), Key: KeyMaxBeadsPerPlan, Msg: "must be at least 1"}
 	}
+	if e.Nice < 0 || e.Nice > MaxNice {
+		// A negative niceness needs privileges sc does not have, and would
+		// raise the run above the rest of the machine rather than below it.
+		return &ValidationError{Path: e.pathOf(KeyNice), Key: KeyNice,
+			Msg: fmt.Sprintf("must be between 0 (leave the priority alone) and %d (the lowest)", MaxNice)}
+	}
 	if e.Limits.MaxReviewRounds < 1 {
 		return &ValidationError{Path: e.pathOf(KeyMaxReviewRounds), Key: KeyMaxReviewRounds, Msg: "must be at least 1"}
 	}
@@ -756,6 +767,7 @@ func (e *Effective) Entries() []Entry {
 	add(KeyMaxDiffBytes, strconv.Itoa(e.MaxDiffBytes), e.Sources[KeyMaxDiffBytes])
 	add(KeyReReviewThreshold, strconv.FormatFloat(e.ReReviewThreshold, 'f', -1, 64), e.Sources[KeyReReviewThreshold])
 	add(KeyMaxBeadsPerPlan, strconv.Itoa(e.MaxBeadsPerPlan), e.Sources[KeyMaxBeadsPerPlan])
+	add(KeyNice, strconv.Itoa(e.Nice), e.Sources[KeyNice])
 	add(KeyMaxReviewRounds, strconv.Itoa(e.Limits.MaxReviewRounds), e.Sources[KeyMaxReviewRounds])
 	add(KeyMaxPushbackRounds, strconv.Itoa(e.Limits.MaxPushbackRounds), e.Sources[KeyMaxPushbackRounds])
 	add(KeyMaxConflictRounds, strconv.Itoa(e.Limits.MaxConflictRounds), e.Sources[KeyMaxConflictRounds])

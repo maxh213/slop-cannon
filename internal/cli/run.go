@@ -34,6 +34,7 @@ import (
 	"slop-cannon/internal/gitx"
 	"slop-cannon/internal/logging"
 	"slop-cannon/internal/orchestrator"
+	"slop-cannon/internal/proc"
 	"slop-cannon/internal/tui"
 )
 
@@ -94,6 +95,9 @@ var (
 	// failed assembly releases can be proven rather than reasoned about. It
 	// is nil in production.
 	runOnAssemble func(*cannon) error
+	// runRenice lowers the run's priority before it fires; the tests
+	// replace it so the test binary itself is never reniced.
+	runRenice = proc.Renice
 )
 
 const runLong = `Fire the cannon at a repository. PATH may be the repository root or any
@@ -437,6 +441,13 @@ func runTarget(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if !dry {
+		// Every agent, check command and test browser the run starts
+		// inherits this niceness, so a busy run does not starve the machine.
+		if err := runRenice(rc.Effective.Nice); err != nil {
+			if _, werr := fmt.Fprintf(cmd.ErrOrStderr(), "note: could not lower the run's priority to nice %d: %v\n", rc.Effective.Nice, err); werr != nil {
+				return werr
+			}
+		}
 		return fireCannon(cmd, opts, rc)
 	}
 	out := cmd.OutOrStdout()
@@ -476,6 +487,7 @@ func runWriteText(w io.Writer, rc *config.RunConfig) error {
 		[2]string{"safety", fmt.Sprintf("%s%s: %s", safetyWord(eff.Safety), src(config.KeySafety), SafetyMeaning(eff.Safety))},
 		[2]string{"vibes", runList(eff.Vibes) + src(config.KeyVibes)},
 		[2]string{"rules", runList(eff.Rules) + src(config.KeyRules)},
+		[2]string{"nice", niceText(eff.Nice) + src(config.KeyNice)},
 		[2]string{"review-prs", fmt.Sprintf("%t", rc.Run.Config.ReviewPRs)},
 		[2]string{"headless", fmt.Sprintf("%t", rc.Run.Config.Headless)},
 		[2]string{"animation", anim},
@@ -486,6 +498,14 @@ func runWriteText(w io.Writer, rc *config.RunConfig) error {
 		}
 	}
 	return nil
+}
+
+// niceText describes the niceness the run will give itself.
+func niceText(n int) string {
+	if n <= 0 {
+		return "0: the run's priority is left alone"
+	}
+	return fmt.Sprintf("%d: the run and every process it starts run at a lower priority", n)
 }
 
 // runSourceOf returns the layer that supplied key, "default" when untracked.
