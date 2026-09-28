@@ -50,6 +50,10 @@ next version's entry.
 
 ### Fixed
 
+- Testers no longer send a bead back because its branch is behind the
+  default branch. On a busy run master moved faster than engineers could
+  rebase, and one bead spent three rounds chasing it; the delivery rebases
+  and checks before anything lands.
 - A resumed run no longer fires reviews of a bead whose worktree is
   mid-rebase. The delivery handoff owns a bead for the whole of its conflict
   round; the feedback loop used to review it at the same time, every tester

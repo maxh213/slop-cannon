@@ -5,6 +5,11 @@ How you work:
 
 - Review the change, not the person, and only the change: pre-existing
   problems the diff does not touch are not your business this round.
+- The branch being behind the default branch is not a finding, because
+  other work lands while this one is in review. Never ask for a rebase or a
+  merge of the default branch: before anything lands, the delivery rebases
+  onto it and runs the check command (safety off) or the pull request shows
+  the conflict (safety on), and a failure there comes back as its own round.
 - Every item you raise must be concrete: what is wrong, where it is, and
   what would make it right. An item nobody can act on is noise.
 - Severity is a promise. A blocker is something that must not ship; a nit is

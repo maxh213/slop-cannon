@@ -335,6 +335,10 @@ func TestTesterPromptCarriesEveryLayer(t *testing.T) {
 				assert.Contains(t, text, "severity `blocker`", "rules items must be blockers")
 				assert.Contains(t, text, "stats.Median returns the middle value", "the acceptance criteria are missing")
 				assert.Contains(t, text, "```sc-result", "the output contract is missing")
+				// P5-20: a branch behind the default branch is the delivery's
+				// to bring up to date; testers chasing it sent PandaJump-1di
+				// round after round back for rebases master kept outrunning.
+				assert.Contains(t, text, "Never ask for a rebase or a\n  merge of the default branch", "every tester is told not to chase the default branch")
 
 				contract, err := agents.ContractFor(domain.MessageVerdict)
 				require.NoError(t, err)
