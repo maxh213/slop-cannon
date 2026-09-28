@@ -100,6 +100,9 @@ type PlanRequest struct {
 	MaxTurns int
 	// Timeout kills the session when it elapses; zero means no limit.
 	Timeout time.Duration
+	// MaxTimeout is the longest session limit a bead may ask for (its
+	// `timeout`); zero means beads cannot ask for one and it is not offered.
+	MaxTimeout time.Duration
 	// Env holds variables set on the cartridge process on top of the
 	// inherited allowlist, and is where the read-only bd shim goes: build
 	// it with UseShim so `bd` on the agent's PATH refuses every write
@@ -289,7 +292,7 @@ func planObjective(req PlanRequest) string {
 // orchestrator's notes.
 func planInstructions(req PlanRequest) []prompt.Section {
 	limit := req.BeadLimit()
-	secs := []prompt.Section{{Title: "What to do", Body: planWhatToDo(req, limit)}, {Title: "How to shape each bead", Body: planBeadShape(limit)}}
+	secs := []prompt.Section{{Title: "What to do", Body: planWhatToDo(req, limit)}, {Title: "How to shape each bead", Body: planBeadShape(limit, req.Timeout, req.MaxTimeout)}}
 	if body := planNotes(req.Notes); body != "" {
 		secs = append(secs, prompt.Section{Title: "Notes from the orchestrator", Body: body})
 	}
@@ -356,7 +359,7 @@ func planWhatToDo(req PlanRequest, limit int) string {
 // planBeadShape describes the bead fields in bd's own vocabulary (priorities
 // 0-4 with 2 the default, the four plannable types, S/M/L sizes stored as
 // sc_size metadata, plan-local keys and dependencies by key).
-func planBeadShape(limit int) string {
+func planBeadShape(limit int, timeout, maxTimeout time.Duration) string {
 	var b strings.Builder
 	b.WriteString("Each bead in `beads` is one engineer's job, and these are its fields:\n\n")
 	b.WriteString("- `key`: a short plan-local identifier with no whitespace, unique in this plan " +
@@ -371,6 +374,12 @@ func planBeadShape(limit int) string {
 		"reserve `0` and `1` for work that genuinely blocks the rest.\n")
 	b.WriteString("- `size`: `s` (under an hour), `m` (one to three hours) or `l` (three to eight hours), " +
 		"recorded on the bead as `sc_size`. Anything larger than `l` is two beads.\n")
+	if timeout > 0 && maxTimeout > timeout {
+		fmt.Fprintf(&b, "- `timeout`: leave it out. Every agent session has %s. Only when one engineer's session on "+
+			"this bead will genuinely need longer (a large refactor, a slow test suite it must run repeatedly) give a "+
+			"Go duration up to %s, such as `%s`, and say why in the description. It is not an estimate: that is `size`.\n",
+			durationWords(timeout), durationWords(maxTimeout), durationWords(timeout*2))
+	}
 	b.WriteString("- `deps`: the keys of the beads in this plan that must land before this one can start. " +
 		"Use a dependency only when the work genuinely cannot begin earlier: dependencies are what stops beads " +
 		"running in parallel. Every key must be a key in this plan (you cannot depend on an open bead), " +
@@ -625,4 +634,15 @@ func CreatePlanBeads(ctx context.Context, ap PlanApplier, req PlanRequest, p dom
 		return res, fmt.Errorf("agents: creating beads for run %s: %w", req.Run, err)
 	}
 	return res, nil
+}
+
+// durationWords renders a duration the way a person writes one: "6h", "90m".
+func durationWords(d time.Duration) string {
+	s := d.String()
+	s = strings.TrimSuffix(s, "0s")
+	s = strings.TrimSuffix(s, "0m")
+	if s == "" {
+		return "0s"
+	}
+	return s
 }

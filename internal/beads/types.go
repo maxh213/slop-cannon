@@ -33,6 +33,9 @@ const (
 	MetaKind = "sc_kind"
 	// MetaSize is the PO's S/M/L estimate (domain.Size).
 	MetaSize = "sc_size"
+	// MetaTimeout is the longer agent session limit the PO gave the bead
+	// in its plan (a Go duration such as "10h").
+	MetaTimeout = "sc_timeout"
 )
 
 // StatusCustomKey is the bd config key holding the custom statuses (D-07).

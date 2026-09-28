@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"sync"
 	"testing"
@@ -584,6 +585,16 @@ func TestGlueRoutesDeliveryOutcomesBackIntoTheLoops(t *testing.T) {
 			_, _, order := feedback.snapshot()
 			if tc.wantCall != "" {
 				assert.Contains(t, order, tc.wantCall)
+				// The loop records where these calls take the bead (an
+				// escalation at the round cap, for one), so the outcome's
+				// state is observed before them, never after: observing it
+				// last put an escalated bead back in changes_requested and
+				// the product owner's ruling was refused.
+				call := slices.Index(order, tc.wantCall)
+				observe := slices.Index(order, "observe:sc-1")
+				assert.GreaterOrEqual(t, observe, 0)
+				assert.Less(t, observe, call, "observed before %s, not after: %v", tc.wantCall, order)
+				assert.NotContains(t, order[call+1:], "observe:sc-1", "nothing overwrites what the loop recorded")
 			}
 			assert.Equal(t, tc.outcome.State, feedback.seen("sc-1"), "the loop is always told where the bead went")
 			assert.Equal(t, tc.wantKick, gates.n > 0)

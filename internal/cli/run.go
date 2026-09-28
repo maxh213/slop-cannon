@@ -1138,9 +1138,18 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 	// own agent bus, so state.json's sequence number and the run log see
 	// them.
 	sup, err = orchestrator.NewSupervisor(orchestrator.SupervisorOptions{
-		Cartridges:  sel,
-		RoleModels:  rc.Effective.RoleModels,
-		Research:    rc.Effective.Research,
+		Cartridges: sel,
+		RoleModels: rc.Effective.RoleModels,
+		Research:   rc.Effective.Research,
+		MaxTimeout: limits.MaxAgentTimeout.Duration(),
+		BeadTimeout: func(ctx context.Context, bead domain.BeadID) time.Duration {
+			issues, err := client.Show(ctx, bead)
+			if err != nil || len(issues) == 0 {
+				return 0
+			}
+			d, _ := issues[0].Timeout()
+			return d
+		},
 		ShimOptions: runShimOptions,
 		Bus:         run.AgentBus(),
 		Timeout:     limits.AgentTimeout.Duration(),

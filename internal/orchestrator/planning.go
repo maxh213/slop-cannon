@@ -1340,6 +1340,7 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 	}
 	if eff := p.cfg.Effective; eff != nil {
 		req.Research = eff.Research
+		req.MaxTimeout = eff.Limits.MaxAgentTimeout.Duration()
 	}
 	if eff := p.cfg.Effective; eff != nil && eff.Limits.AgentTimeout.Duration() > 0 {
 		req.Timeout = eff.Limits.AgentTimeout.Duration()

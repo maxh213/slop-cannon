@@ -29,6 +29,7 @@
       "max_pushback_rounds": 2,
       "max_conflict_rounds": 3,
       "agent_timeout": "6h",
+      "max_agent_timeout": "24h",
       "max_plan_rejections": 2,
       "max_plan_failures": 5
     },
@@ -49,6 +50,7 @@
     "graph_poll_interval": "default",
     "idle_replan_interval": "default",
     "limits.agent_timeout": "default",
+    "limits.max_agent_timeout": "default",
     "limits.max_conflict_rounds": "default",
     "limits.max_cost_usd": "default",
     "limits.max_plan_failures": "default",
@@ -184,6 +186,11 @@
     {
       "key": "limits.agent_timeout",
       "value": "6h",
+      "source": "default"
+    },
+    {
+      "key": "limits.max_agent_timeout",
+      "value": "24h",
       "source": "default"
     },
     {

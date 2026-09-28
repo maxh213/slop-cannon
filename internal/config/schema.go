@@ -121,6 +121,9 @@ const (
 	DefaultMaxPlanFailures = 5
 	// DefaultAgentTimeout is the per-agent session timeout.
 	DefaultAgentTimeout = 6 * time.Hour
+	// DefaultMaxAgentTimeout caps the longer limit the product owner may give
+	// one bead's agents (a plan bead's timeout).
+	DefaultMaxAgentTimeout = 24 * time.Hour
 	// MaxPromptFileSize is the largest vibes or rules file accepted (64 KiB).
 	MaxPromptFileSize = 64 * 1024
 )
@@ -240,6 +243,7 @@ type LimitsFile struct {
 	MaxPushbackRounds *int      `toml:"max_pushback_rounds,omitempty"`
 	MaxConflictRounds *int      `toml:"max_conflict_rounds,omitempty"`
 	AgentTimeout      *Duration `toml:"agent_timeout,omitempty"`
+	MaxAgentTimeout   *Duration `toml:"max_agent_timeout,omitempty"`
 	MaxTokens         *int64    `toml:"max_tokens,omitempty"`
 	MaxCostUSD        *float64  `toml:"max_cost_usd,omitempty"`
 	MaxPlanRejections *int      `toml:"max_plan_rejections,omitempty"`
@@ -327,6 +331,9 @@ type Limits struct {
 	MaxConflictRounds int `json:"max_conflict_rounds"`
 	// AgentTimeout bounds one agent session.
 	AgentTimeout Duration `json:"agent_timeout"`
+	// MaxAgentTimeout caps the longer session limit the product owner may
+	// give one bead in its plan; it is never below AgentTimeout.
+	MaxAgentTimeout Duration `json:"max_agent_timeout"`
 	// MaxTokens is an opt-in token budget; 0 means unlimited (D-18).
 	MaxTokens int64 `json:"max_tokens,omitempty"`
 	// MaxCostUSD is an opt-in cost budget; 0 means unlimited (D-18).
@@ -430,6 +437,7 @@ func Defaults() Config {
 			MaxPushbackRounds: DefaultMaxPushbackRounds,
 			MaxConflictRounds: DefaultMaxConflictRounds,
 			AgentTimeout:      NewDuration(DefaultAgentTimeout),
+			MaxAgentTimeout:   NewDuration(DefaultMaxAgentTimeout),
 			MaxPlanRejections: DefaultMaxPlanRejections,
 			MaxPlanFailures:   DefaultMaxPlanFailures,
 		},

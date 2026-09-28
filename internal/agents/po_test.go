@@ -820,3 +820,21 @@ func TestPOPlanPromptResearch(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, p.Text, "Research the market", "a brief is the whole scope")
 }
+
+// The product owner is offered a per-bead timeout only when the run allows
+// one longer than its default, and is told it is not an estimate.
+func TestPOPlanPromptOffersABeadTimeout(t *testing.T) {
+	t.Parallel()
+	req := poRequest(t.TempDir())
+	req.Timeout, req.MaxTimeout = 6*time.Hour, 24*time.Hour
+	p, err := agents.PlanPrompt(req)
+	require.NoError(t, err)
+	assert.Contains(t, p.Text, "- `timeout`: leave it out. Every agent session has 6h.")
+	assert.Contains(t, p.Text, "up to 24h, such as `12h`")
+	assert.Contains(t, p.Text, "It is not an estimate")
+
+	req.MaxTimeout = 0
+	p, err = agents.PlanPrompt(req)
+	require.NoError(t, err)
+	assert.NotContains(t, p.Text, "- `timeout`")
+}

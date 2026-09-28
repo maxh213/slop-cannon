@@ -86,6 +86,7 @@ var redactKeeps = map[string]string{
 	// short identifiers, not prose, and the prose beside them is rewritten.
 	"plan_produced.Plan.Beads[].Key":        "the plan's own key, which its Deps refer to",
 	"plan_produced.Plan.Beads[].Deps[]":     "an edge of the plan graph, matched against those keys",
+	"plan_produced.Plan.Beads[].Timeout":    "a Go duration Plan.Validate has parsed, not prose",
 	"verdict_received.Verdict.Items[].ID":   "the feedback item id responses and rulings answer",
 	"response_received.Responses[].ItemID":  "the verdict item this response answers",
 	"arbitration_received.Rulings[].ItemID": "the verdict item this ruling settles",

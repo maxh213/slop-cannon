@@ -239,6 +239,12 @@ type SupervisorOptions struct {
 	// Research gives the planning product owner web search and fetch
 	// (the `research` config key).
 	Research bool
+	// BeadTimeout, when set, returns the longer session limit the product
+	// owner gave a bead (sc_timeout), or zero. Every agent fired on that
+	// bead gets it, capped at MaxTimeout; it never shortens the default.
+	BeadTimeout func(ctx context.Context, bead domain.BeadID) time.Duration
+	// MaxTimeout caps a bead's own timeout (limits.max_agent_timeout).
+	MaxTimeout time.Duration
 	// Cartridges hands out the cartridge each role fires; required before
 	// the first firing.
 	Cartridges CartridgeSource
@@ -430,6 +436,21 @@ func (s *Supervisor) Timeout() time.Duration {
 		return s.timeout
 	}
 	return DefaultAgentTimeout
+}
+
+// timeoutFor is the session limit of an agent fired on bead: the run's own,
+// raised to the bead's sc_timeout when the product owner gave it a longer
+// one, and capped at MaxTimeout.
+func (s *Supervisor) timeoutFor(ctx context.Context, bead domain.BeadID) time.Duration {
+	base := s.Timeout()
+	if bead == "" || s.opts.BeadTimeout == nil {
+		return base
+	}
+	d := s.opts.BeadTimeout(ctx, bead)
+	if limit := s.opts.MaxTimeout; limit > 0 && d > limit {
+		d = limit
+	}
+	return max(base, d)
 }
 
 // Renewals counts the lease renewals the supervisor has performed.
@@ -690,6 +711,7 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 		return tr, fmt.Errorf("%w: %s", ErrSupervisorStopped, f.Agent.ID)
 	}
 
+	timeout := s.timeoutFor(ctx, f.Agent.Bead)
 	maxAttempts := 1 + s.crashRetries()
 	attempt, reroutes := 0, 0
 	var lastErr error
@@ -737,7 +759,7 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 		run, err := f.Build(ctx, FiringContext{
 			Run: h.ID(), Agent: agent, Task: f.Task, Round: f.Round,
 			Cartridge: prep.cartridge, Workdir: prep.workdir, Env: mergeEnv(prep.env, nil),
-			Timeout: s.Timeout(), Attempt: attempt, Enforcement: prep.enforcement, Shim: prep.shim,
+			Timeout: timeout, Attempt: attempt, Enforcement: prep.enforcement, Shim: prep.shim,
 		})
 		if err != nil {
 			prep.discard()
@@ -754,7 +776,10 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 		// copy, the builder — and a stop landing in that window must not
 		// leave a subprocess behind that nothing tracks or cancels.
 		start := s.now()
-		fctx, cancel := context.WithTimeout(ctx, s.Timeout()+killSlack)
+		if run.Spec.Timeout < timeout {
+			run.Spec.Timeout = timeout
+		}
+		fctx, cancel := context.WithTimeout(ctx, timeout+killSlack)
 		entry, tracked := s.track(agent, cancel)
 		if !tracked {
 			cancel()

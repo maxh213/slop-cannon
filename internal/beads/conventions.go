@@ -200,6 +200,20 @@ func (i Issue) Agent() domain.AgentID {
 	return domain.AgentID(s)
 }
 
+// Timeout returns the sc_timeout the product owner gave the bead; false
+// when absent, unparsable or not positive.
+func (i Issue) Timeout() (time.Duration, bool) {
+	s, ok := i.Metadata.String(MetaTimeout)
+	if !ok || s == "" {
+		return 0, false
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, false
+	}
+	return d, true
+}
+
 // Lease returns the sc_lease time; false when absent or unparsable.
 func (i Issue) Lease() (time.Time, bool) {
 	s, ok := i.Metadata.String(MetaLease)

@@ -190,3 +190,18 @@ func TestBeadValidateAndSanitizeText(t *testing.T) {
 
 	require.NoError(t, domain.Bead{ID: "sc-1", Title: "Clean", Description: "line\nline"}.ValidateText())
 }
+
+func TestPlanValidateChecksABeadTimeout(t *testing.T) {
+	t.Parallel()
+	bead := func(timeout string) domain.Plan {
+		return domain.Plan{Beads: []domain.PlanBead{{Key: "k", Title: "T", Acceptance: "ok", Priority: domain.PriorityDefault, Timeout: timeout}}}
+	}
+	require.NoError(t, bead("").Validate())
+	require.NoError(t, bead("10h").Validate())
+	require.NoError(t, bead("1h30m").Validate())
+	for _, bad := range []string{"soon", "10", "-2h", "0s"} {
+		err := bead(bad).Validate()
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "is not a positive Go duration")
+	}
+}

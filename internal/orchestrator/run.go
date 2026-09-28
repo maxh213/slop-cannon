@@ -3315,11 +3315,20 @@ func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *Del
 	case DeliveryCheckFailed:
 		c.release(id)
 		if feedback != nil {
+			// The loop is handed the bead and records where it goes itself —
+			// escalated, when the failed check lands on the D-08 round cap.
+			// Observing the outcome's changes_requested afterwards would put
+			// that escalation back, and the product owner's ruling would then
+			// be refused as a transition out of changes_requested.
+			feedback.Observe(id, observed)
+			observed = ""
 			err = feedback.CheckFailed(ctx, bead, out.Round, out.Items)
 		}
 	case DeliveryNeedsReview:
 		c.release(id)
 		if feedback != nil {
+			feedback.Observe(id, observed)
+			observed = ""
 			err = feedback.ReviewAgain(ctx, bead, out.Round, out.Reason)
 		}
 	case DeliveryConflict:
@@ -3349,7 +3358,7 @@ func (c *Conductor) ApplyOutcome(ctx context.Context, id domain.BeadID, out *Del
 		// is what resolving the hand-off looks like from here.
 		c.ship(id)
 	}
-	if feedback != nil {
+	if feedback != nil && observed != "" {
 		feedback.Observe(id, observed)
 	}
 	if err != nil {

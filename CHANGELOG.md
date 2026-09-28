@@ -17,6 +17,9 @@ next version's entry.
 
 ### Added
 
+- The product owner can give a bead a longer agent timeout in its plan
+  (`timeout`, up to `limits.max_agent_timeout`, default 24h) when one
+  session on it will genuinely need longer than the default.
 - `roles.<role>.model` fires one role with its own model, e.g. the product
   owner on Opus while engineers and testers stay on the cartridge's model.
 - `research` (default on) lets the planning product owner search and read
@@ -47,6 +50,10 @@ next version's entry.
 
 ### Fixed
 
+- The product owner's ruling on a bead that failed its delivery check at
+  the review-round cap is applied. The conductor used to overwrite the
+  escalation with the delivery's changes_requested, so every ruling was
+  refused and the bead ended up failed.
 - A bead is never given two engineers at once. A resumed run that found a
   delivery stopping on conflicts used to fire the conflict round and a
   fresh implement round into the same worktree.

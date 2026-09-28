@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 )
 
@@ -34,6 +35,11 @@ type PlanBead struct {
 	Size Size `json:"size,omitempty"`
 	// Deps lists the keys this bead depends on, each at most once.
 	Deps []string `json:"deps,omitempty"`
+	// Timeout, when set, is a longer agent session limit the product owner
+	// asks for because one session on this bead will need it (a Go
+	// duration such as "10h"). The run caps it at limits.max_agent_timeout
+	// and never goes below limits.agent_timeout.
+	Timeout string `json:"timeout,omitempty"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler. It decodes like the plain struct
@@ -115,6 +121,11 @@ func (p Plan) Validate() error {
 		}
 		if b.Size != "" && !b.Size.Valid() {
 			errs = append(errs, fmt.Errorf("%s: unknown size %q", where, string(b.Size)))
+		}
+		if b.Timeout != "" {
+			if d, err := time.ParseDuration(b.Timeout); err != nil || d <= 0 {
+				errs = append(errs, fmt.Errorf("%s: timeout %q is not a positive Go duration such as \"10h\"", where, b.Timeout))
+			}
 		}
 	}
 	for _, b := range p.Beads {

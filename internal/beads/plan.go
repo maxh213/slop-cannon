@@ -194,7 +194,7 @@ func buildPlan(req PlanRequest) (planBuild, error) {
 			Priority:    pb.Priority,
 			Description: pb.Description,
 			Labels:      append([]string(nil), labels...),
-			Metadata:    GraphMetadata(WorkMetadata(req.Run, pb.Size)),
+			Metadata:    GraphMetadata(planBeadMetadata(req.Run, pb)),
 			ParentKey:   b.epicKey,
 			ParentID:    domain.BeadID(epic),
 		})
@@ -372,4 +372,13 @@ func (c *Client) ApplyPlan(ctx context.Context, req PlanRequest, dryRun bool) (P
 		}
 	}
 	return out, nil
+}
+
+// planBeadMetadata is WorkMetadata plus the sc_timeout the plan asked for.
+func planBeadMetadata(run domain.RunID, pb domain.PlanBead) map[string]any {
+	m := WorkMetadata(run, pb.Size)
+	if t := strings.TrimSpace(pb.Timeout); t != "" {
+		m[MetaTimeout] = t
+	}
+	return m
 }

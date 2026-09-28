@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -406,4 +407,28 @@ func TestGraphBlockedSampleShowsTheDiamond(t *testing.T) {
 		id["f"]: {id["e"]},
 	}, blockedBy, "bd blocked after the real run: the diamond landed with the D-24 edges")
 	assert.NotContains(t, blockedBy, id["a"], "the root is ready")
+}
+
+// A plan bead's timeout is recorded as sc_timeout and read back as a
+// duration; a bead without one has none.
+func TestBuildGraphPlanRecordsABeadTimeout(t *testing.T) {
+	g, err := BuildGraphPlan(PlanRequest{Run: "r3", Plan: domain.Plan{Beads: []domain.PlanBead{
+		{Key: "long", Title: "Long", Acceptance: "ok", Priority: domain.PriorityDefault, Timeout: "10h"},
+		{Key: "plain", Title: "Plain", Acceptance: "ok", Priority: domain.PriorityDefault},
+	}}})
+	require.NoError(t, err)
+	byKey := map[string]GraphNode{}
+	for _, n := range g.Nodes {
+		byKey[n.Key] = n
+	}
+	assert.Equal(t, "10h", byKey["long"].Metadata[MetaTimeout])
+	assert.NotContains(t, byKey["plain"].Metadata, MetaTimeout)
+
+	d, ok := Issue{Metadata: Metadata{MetaTimeout: "10h"}}.Timeout()
+	assert.True(t, ok)
+	assert.Equal(t, 10*time.Hour, d)
+	for _, bad := range []string{"", "soon", "-1h", "0s"} {
+		_, ok := Issue{Metadata: Metadata{MetaTimeout: bad}}.Timeout()
+		assert.False(t, ok, bad)
+	}
 }
