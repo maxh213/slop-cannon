@@ -110,7 +110,7 @@ func TestCartridgeRejectsUnsupportedNames(t *testing.T) {
 	for _, tc := range cases {
 		out, err := cartridgeRun(t, tc.args...)
 		require.Error(t, err, tc.args)
-		require.Equal(t, `cartridge "`+tc.name+`" is not supported yet (only "claude" for now)`, err.Error(), tc.args)
+		require.Equal(t, `cartridge "`+tc.name+`" is not supported yet (only "claude", "cursor" for now)`, err.Error(), tc.args)
 		require.Empty(t, out, tc.args)
 		_, exists := cartridgeFile(t)
 		require.False(t, exists, "a rejected command must not write the config")
@@ -123,7 +123,7 @@ func TestCartridgeUnsupportedNameExitCode(t *testing.T) {
 	code := ExecuteContext(context.Background(), []string{"cartridge", "--add", "kimi", "--model", "3"}, &stdout, &stderr)
 	require.Equal(t, 1, code)
 	require.Empty(t, stdout.String())
-	require.Equal(t, "sc: cartridge \"kimi\" is not supported yet (only \"claude\" for now)\n", stderr.String())
+	require.Equal(t, "sc: cartridge \"kimi\" is not supported yet (only \"claude\", \"cursor\" for now)\n", stderr.String())
 }
 
 func TestCartridgeAddWithoutModelAndReAdd(t *testing.T) {

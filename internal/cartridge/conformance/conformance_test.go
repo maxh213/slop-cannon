@@ -16,6 +16,7 @@ import (
 
 	"slop-cannon/internal/cartridge"
 	_ "slop-cannon/internal/cartridge/claude" // registers "claude" for CARTRIDGE=claude
+	_ "slop-cannon/internal/cartridge/cursor" // registers "cursor" for CARTRIDGE=cursor
 	"slop-cannon/internal/cartridge/mock"
 	"slop-cannon/internal/config"
 )
@@ -24,6 +25,7 @@ import (
 // the driver test when SC_CONFORMANCE_MODEL is not set.
 var conformanceDefaultModels = map[string]string{
 	"claude": "claude-haiku-4-5-20251001",
+	"cursor": "auto",
 }
 
 // conformanceFastOptions are Options that make a mock run finish in well

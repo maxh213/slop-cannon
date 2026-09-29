@@ -84,7 +84,7 @@ Read it as three directions of travel:
 | `internal/beads` | every `bd` call, serialised through one writer (D-21): init, statuses, graph plans, claims, comments, gates, the read-only agent shim |
 | `internal/gitx` | git and `gh`: worktrees, branches, diffs, the leftovers commit (D-14), rebase/merge, pull requests, resume reconciliation |
 | `internal/agents` | prompts per role and round, tool policies, the JSON schemas an agent's reply must satisfy, secret filtering |
-| `internal/cartridge` | the adapter contract (`Cartridge`, `RunSpec`, `Session`, typed error kinds) plus the `claude` and `mock` adapters (D-19) |
+| `internal/cartridge` | the adapter contract (`Cartridge`, `RunSpec`, `Session`, typed error kinds) plus the `claude`, `cursor` and `mock` adapters (D-29) |
 | `internal/orchestrator` | the run itself: lifecycle, scheduler, state machine, feedback, delivery, supervision, gates, run log |
 | `internal/tui` | the bubbletea program, the headless renderer, the cannon animations |
 | `internal/proc`, `internal/logging`, `internal/textsafe` | subprocess plumbing, run and agent logs, terminal-safe text |

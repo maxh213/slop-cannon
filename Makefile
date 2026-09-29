@@ -64,7 +64,7 @@ docs-cli: ## Regenerate docs/cli.md from the sc command tree
 
 CARTRIDGE ?= mock
 
-cartridge-conformance: ## Run the cartridge conformance suite (CARTRIDGE=mock|claude; a real CLI needs a login, never run in CI)
+cartridge-conformance: ## Run the cartridge conformance suite (CARTRIDGE=mock|claude|cursor; a real CLI needs a login, never run in CI)
 	CARTRIDGE=$(CARTRIDGE) go test -count=1 -race -run '^TestConformance$$' -v ./internal/cartridge/conformance/
 
 clean: ## Remove build output and caches produced by this Makefile

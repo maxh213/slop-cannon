@@ -6,9 +6,10 @@ every agent through the `cartridge.Cartridge` interface
 in, `Run` starts one session for a `RunSpec` (prompts, workdir, model, tool
 policy, limits) and streams `SessionEvent`s until a `Done` or `Error`.
 
-Only **Claude Code** ships today (D-19). Kimi, Animus and a custom-command
-adapter are planned; the interface, registry and mock cartridge are
-adapter-agnostic so each is one package plus one registry line.
+**Claude Code** and **Cursor Agent** ship today (D-29, superseding the
+Claude-only scope of D-19). Kimi, Animus and a custom-command adapter are
+planned; the interface, registry and mock cartridge are adapter-agnostic so
+each is one package plus one registry line.
 
 ## Claude Code (`claude`)
 
@@ -216,6 +217,145 @@ It is skipped without the variable and never runs in CI. Last run against
 Claude Code session works because the adapter drops the parent session's
 markers.
 
+## Cursor Agent (`cursor`)
+
+Package `internal/cartridge/cursor` (D-29). Registered under `cursor`;
+configured by `[cartridges.cursor]` (`model`, `command`, `args`, `env`). The
+binary is `cursor-agent` unless `command` names another; the CLI also
+installs itself as `agent`, a name too generic to look up, and `cursor` is
+the IDE, not the CLI.
+
+**Verified CLI version: `2026.09.28-64d2043`** (`cursor-agent --version`,
+2026-09-29). Every flag below was checked against `cursor-agent --help` of
+that release and the fixtures in `testdata/cursor/` were captured from it.
+The CLI is versioned by date: releases below `2026.8.0` are refused, and
+releases between that and the verified one are untested.
+
+The usual reason to configure it is a per-role split, for example engineers
+and testers on Cursor's `auto` model while the product owner stays on
+Claude:
+
+```toml
+[cartridges.cursor]
+model = 'auto'
+
+[roles.engineer]
+cartridge = "cursor"
+
+[roles.tester]
+cartridge = "cursor"
+```
+
+A firing on a cartridge other than the run's active one never inherits the
+active cartridge's model: without a `roles.<role>.model` it gets the model of
+its own `[cartridges.<name>]` table (so `auto` above, never Claude's
+`sonnet`).
+
+### Invocation
+
+```
+cursor-agent -p --output-format stream-json --force --trust --sandbox disabled \
+             --workspace <workdir> [--model M] [configured args…]   < prompt
+```
+
+| Flag | Why |
+|---|---|
+| `-p` | print mode: one headless session, then exit |
+| `--output-format stream-json` | one JSON object per line (see parsing below) |
+| `--force` | run every tool call without asking; a prompt on a headless agent is a hang |
+| `--trust` | trust the workspace without the first-run prompt |
+| `--sandbox` `disabled` | the check command needs node_modules, browsers and the network |
+| `--workspace` | the agent's working directory (also the process's `cwd`) |
+| `--model` | `RunSpec.Model`, else `[cartridges.cursor] model`; omitted when both are empty (the CLI's default) |
+| `--version` | Detect's version probe |
+| `status` | Detect's auth probe: `✓ Logged in as <email>` or `Not logged in` |
+
+There is no system-prompt flag, so the system prompt is written to stdin
+ahead of the prompt, divided by a `---` line. There is no turn cap either:
+`RunSpec.MaxTurns` is ignored, and `RunSpec.Timeout` is what bounds a
+session. `RunSpec.Web` adds nothing, because the CLI's own web tool is always
+available.
+
+### Tool policy
+
+The CLI has **no per-invocation tool controls**: its permission rules live
+in the user's `cli-config.json`, shared by every session, and `--force`
+approves anything not denied there. The adapter therefore does not implement
+`agents.ToolPolicyEnforcer`, and `agents.EnforcementFor` resolves it as:
+
+| `ToolPolicy` | Who gets it | How it is held |
+|---|---|---|
+| `read_write` | engineers | nothing to restrict (`none`) |
+| `read_exec` | testers | the supervisor fires the session in a throwaway copy of the worktree (`copied_worktree`, P6-20) and deletes it afterwards |
+| `read_only` | product owner | the same copy; a product owner fired without a worktree (planning, arbitration) is **refused**, so keep the PO on a cartridge with native controls |
+
+The copy has no `.git` (P6-30 tells the agent so), so git commands fail and
+a tool that diffs against a base (such as a quality gate's changed-files
+scope) sees no changes in it. The copy also includes `node_modules` and
+other build output: on PandaJump that is about 330 MB per tester firing. The
+orchestrator's own check before delivery still runs in the real worktree.
+
+### Environment
+
+The child sees `PATH`, `cartridge.DefaultInheritEnv` (which carries `HOME`
+and the XDG directories the stored login lives under), every `CURSOR_*`
+variable (`CURSOR_API_KEY`, `CURSOR_API_ENDPOINT`, `CURSOR_CONFIG_DIR`, …),
+the configured env and the `RunSpec` env. The markers a running Cursor
+session sets for its own commands are dropped: `CURSOR_AGENT`,
+`CURSOR_AGENT_CHAT_ID`, `CURSOR_CONVERSATION_ID`, `CURSOR_AGENT_SOCKET`,
+`CURSOR_AGENT_WORKER_ID`.
+
+**Long commands.** The model chooses a timeout for each shell call (30 s
+by default, longer when it expects a slow command). When a command outlives
+it, the CLI moves it to the background and tells the model, and print mode
+**waits** for backgrounded commands: the model is woken when one finishes
+and carries on (fixture `background-shell.jsonl`). Unlike Claude Code
+(P2-15), nothing has to be switched off, so the adapter sets no extra
+environment. A backgrounded result is shown in the transcript as
+`(moved to the background: …)`.
+
+### stream-json parsing
+
+| Line | Becomes |
+|---|---|
+| `system`/`init` | session id and model |
+| `user`, `thinking`, `system`/`task_notification` | nothing |
+| `tool_call`/`started` | `ToolUse`; the name comes from the single `<kind>ToolCall` key (`shellToolCall` → `Shell`), the input is the command, pattern or path |
+| `tool_call`/`completed` | `ToolResult`; `result.success` is the output, `result.failure` (or a non-zero `exitCode`) is an error result |
+| `assistant` | `TextDelta` for each text segment |
+| `result` | the terminal line: session id and `usage` (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`). The CLI reports no cost, so `max_cost_usd` never trips for this cartridge |
+
+`Result.Output` is the assistant text after the last tool call, segments
+joined by blank lines. The `result` line's own `result` field is not used,
+because it glues every segment of the session together with no separator,
+which breaks a fenced `sc-result` block that opens a segment.
+
+### Error-kind mapping
+
+Precedence, as `cursor.Classify` implements it: the process cause (timeout,
+kill) → a `result` line (success unless `is_error` or a subtype other than
+`success`; a failing one by its text, else `crash`) → a non-zero exit with
+no result line, by stderr text, else `crash` → a zero exit with no result
+line is a `crash`. Text is matched case-insensitively, in this order:
+
+| Needle | Kind |
+|---|---|
+| `insufficient credit`, `out of credits`, `payment required`, `spending limit`, `quota exceeded`, `billing` | `credits_exhausted` |
+| `authentication required`, `not logged in`, `agent login`, `invalid api key`, `unauthorized`, `unauthenticated`, `token expired` | `auth` |
+| `rate limit`, `rate-limit`, `resource_exhausted`, `too many requests`, `overloaded`, `usage limit`, `hit your limit`, `try again later` | `rate_limited` |
+
+An unknown model exits 1 with `Cannot use this model: …` on stderr and is a
+`crash` (fixture `unknown-model.stderr`); a missing login exits 1 with
+`Error: Authentication required. Please run 'agent login' first, …` and is
+`auth` (fixture `logged-out.stderr`).
+
+### Fixtures
+
+`testdata/cursor/`, listed with the commands that produced them in its
+`README.md`. The unit tests replay them through a fake `cursor-agent`
+(`testutil.FakeBin`); `SC_CURSOR_LIVE=1 go test -run TestLive
+./internal/cartridge/cursor/` fires the real CLI once on `auto`.
+
 ## Conformance suite
 
 Package `internal/cartridge/conformance` (P2-09) runs the same fixed set of
@@ -249,7 +389,7 @@ make cartridge-conformance CARTRIDGE=claude # the installed Claude Code, about 5
 The target runs `TestConformance` in the package with `-v`; the table is
 printed to stdout and the target fails when any check fails. Knobs:
 
-- `CARTRIDGE=<name>`: the registry name to build (`mock` or `claude` today).
+- `CARTRIDGE=<name>`: the registry name to build (`mock`, `claude` or `cursor` today).
   Any name but `mock` fires the real CLI and is **skipped when `CI` is set**,
   so CI only ever runs the mock.
 - `SC_CONFORMANCE_MODEL=<model>`: the model for real cartridges; the default
@@ -349,7 +489,7 @@ check creates lives in the per-check workdir and is removed with it.
 
 ## Adding a new cartridge
 
-**Only Claude Code ships today (D-19).** Kimi (P2-04), Animus (P2-05) and a
+**Claude Code and Cursor Agent ship today (D-29).** Kimi (P2-04), Animus (P2-05) and a
 custom-command adapter (P2-06) are planned and stay blocked until the human
 reopens them; do not pick them up on your own. This guide is for the day
 they are reopened, or for any other LLM CLI: the interface, registry, mock,

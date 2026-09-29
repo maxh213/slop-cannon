@@ -300,7 +300,7 @@ func TestLoadApplyFlags(t *testing.T) {
 	low := 2
 	assert.ErrorIs(t, eff.Apply(Overrides{Ammo: &low}), ErrAmmoTooLow)
 	kimi := "kimi"
-	assert.EqualError(t, eff.Apply(Overrides{Cartridge: &kimi}), `cartridge "kimi" is not supported yet (only "claude" for now)`)
+	assert.EqualError(t, eff.Apply(Overrides{Cartridge: &kimi}), `cartridge "kimi" is not supported yet (only "claude", "cursor" for now)`)
 
 	fresh, err := load(filepath.Join(t.TempDir(), "none.toml"), "")
 	require.NoError(t, err)
@@ -449,11 +449,11 @@ func TestLoadValidation(t *testing.T) {
 	}{
 		{"ammo too low global", "ammo = 2\n", "", KeyAmmo, ErrAmmoTooLow.Error()},
 		{"ammo too low repo", "ammo = 10\n", "ammo = 1\n", KeyAmmo, ErrAmmoTooLow.Error()},
-		{"unknown cartridge name", "[cartridges.kimi]\nmodel = \"3\"\n", "", "cartridges.kimi", `cartridge "kimi" is not supported yet (only "claude" for now)`},
+		{"unknown cartridge name", "[cartridges.kimi]\nmodel = \"3\"\n", "", "cartridges.kimi", `cartridge "kimi" is not supported yet (only "claude", "cursor" for now)`},
 		{"active not configured", "active_cartridge = \"claude\"\n", "", KeyActiveCartridge, `cartridge "claude" is not configured; add it with: sc cartridge --add claude`},
-		{"active unknown", "active_cartridge = \"animus\"\n", "", KeyActiveCartridge, `cartridge "animus" is not supported yet (only "claude" for now)`},
+		{"active unknown", "active_cartridge = \"animus\"\n", "", KeyActiveCartridge, `cartridge "animus" is not supported yet (only "claude", "cursor" for now)`},
 		{"bad role", "[roles.janitor]\ncartridge = \"claude\"\n", "", "roles.janitor", `role "janitor"`},
-		{"bad role cartridge", "", "[roles.tester]\ncartridge = \"kimi\"\n", "roles.tester.cartridge", `cartridge "kimi" is not supported yet (only "claude" for now)`},
+		{"bad role cartridge", "", "[roles.tester]\ncartridge = \"kimi\"\n", "roles.tester.cartridge", `cartridge "kimi" is not supported yet (only "claude", "cursor" for now)`},
 		{"zero interval", "idle_replan_interval = \"0s\"\n", "", KeyIdleReplanInterval, "must be a positive duration"},
 		{"zero gate poll interval", "gate_poll_interval = \"0s\"\n", "", KeyGatePollInterval, "must be a positive duration"},
 		{"zero pr poll interval", "pr_poll_interval = \"0s\"\n", "", KeyPRPollInterval, "must be a positive duration"},

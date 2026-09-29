@@ -22,12 +22,13 @@ import (
 	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/cartridge"
-	// The Claude adapter is the only one a user may fire (D-19); importing
-	// it here is what puts it in cartridge.Default. The mock adapter
-	// registers itself the same way, so a test binary that imports
-	// internal/cartridge/mock can select it without loosening D-19 for
+	// The Claude and Cursor adapters are the ones a user may fire (D-29);
+	// importing them here is what puts them in cartridge.Default. The mock
+	// adapter registers itself the same way, so a test binary that imports
+	// internal/cartridge/mock can select it without loosening that for
 	// users (P8-08).
 	_ "slop-cannon/internal/cartridge/claude"
+	_ "slop-cannon/internal/cartridge/cursor"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
@@ -1138,10 +1139,11 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 	// own agent bus, so state.json's sequence number and the run log see
 	// them.
 	sup, err = orchestrator.NewSupervisor(orchestrator.SupervisorOptions{
-		Cartridges: sel,
-		RoleModels: rc.Effective.RoleModels,
-		Research:   rc.Effective.Research,
-		MaxTimeout: limits.MaxAgentTimeout.Duration(),
+		Cartridges:      sel,
+		ActiveCartridge: rc.CartridgeName,
+		RoleModels:      rc.Effective.RoleModels,
+		Research:        rc.Effective.Research,
+		MaxTimeout:      limits.MaxAgentTimeout.Duration(),
 		BeadTimeout: func(ctx context.Context, bead domain.BeadID) time.Duration {
 			issues, err := client.Show(ctx, bead)
 			if err != nil || len(issues) == 0 {

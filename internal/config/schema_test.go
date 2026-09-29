@@ -39,8 +39,9 @@ func TestAllocate(t *testing.T) {
 
 func TestValidateCartridgeName(t *testing.T) {
 	assert.NoError(t, ValidateCartridgeName("claude"))
-	assert.EqualError(t, ValidateCartridgeName("kimi"), `cartridge "kimi" is not supported yet (only "claude" for now)`)
-	assert.EqualError(t, ValidateCartridgeName("animus"), `cartridge "animus" is not supported yet (only "claude" for now)`)
+	assert.NoError(t, ValidateCartridgeName("cursor"))
+	assert.EqualError(t, ValidateCartridgeName("kimi"), `cartridge "kimi" is not supported yet (only "claude", "cursor" for now)`)
+	assert.EqualError(t, ValidateCartridgeName("animus"), `cartridge "animus" is not supported yet (only "claude", "cursor" for now)`)
 	assert.Error(t, ValidateCartridgeName(""))
 	assert.Error(t, ValidateCartridgeName("Claude"), "names are case-sensitive")
 }
@@ -134,6 +135,7 @@ func TestConfigHelpers(t *testing.T) {
 	assert.Equal(t, "claude", name)
 	assert.Equal(t, "/opt/claude", cart.Binary("claude"))
 	assert.Equal(t, "claude", Cartridge{}.Binary("claude"))
+	assert.Equal(t, "cursor-agent", Cartridge{}.Binary("cursor"))
 
 	n, ok := c.CartridgeFor(domain.RoleEngineer)
 	assert.True(t, ok)

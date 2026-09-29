@@ -128,12 +128,13 @@ const (
 	MaxPromptFileSize = 64 * 1024
 )
 
-// KnownCartridges lists every cartridge name sc can drive. Only Claude Code
-// exists for now (D-19); more adapters are planned.
-var KnownCartridges = []string{"claude"}
+// KnownCartridges lists every cartridge name sc can drive: Claude Code and
+// Cursor Agent (D-29, superseding the Claude-only scope of D-19); more
+// adapters are planned.
+var KnownCartridges = []string{"claude", "cursor"}
 
 // ValidateCartridgeName reports whether name is a cartridge sc supports. The
-// error text is the D-19 message shared by every command.
+// error text is the D-19/D-29 message shared by every command.
 func ValidateCartridgeName(name string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
@@ -211,7 +212,8 @@ func invalidDurationMsg(value string) string {
 type Cartridge struct {
 	// Model is passed to the CLI (for example "fable" for Claude Code).
 	Model string `toml:"model,omitempty" json:"model,omitempty"`
-	// Command overrides the executable name; empty means the cartridge name.
+	// Command overrides the executable name; empty means DefaultBinaries[name]
+	// or the cartridge name.
 	Command string `toml:"command,omitempty" json:"command,omitempty"`
 	// Args are extra arguments prepended to every invocation.
 	Args []string `toml:"args,omitempty" json:"args,omitempty"`
@@ -219,13 +221,22 @@ type Cartridge struct {
 	Env map[string]string `toml:"env,omitempty" json:"env,omitempty"`
 }
 
-// Binary returns the executable to run: Command when set, else name.
+// Binary returns the executable to run: Command when set, else the
+// cartridge's DefaultBinaries entry, else name.
 func (c Cartridge) Binary(name string) string {
 	if c.Command != "" {
 		return c.Command
 	}
+	if bin, ok := DefaultBinaries[name]; ok {
+		return bin
+	}
 	return name
 }
+
+// DefaultBinaries names the executable of a cartridge whose CLI is not
+// installed under the cartridge's own name. Cursor's CLI is "cursor-agent":
+// "cursor" on PATH is the editor (D-29).
+var DefaultBinaries = map[string]string{"cursor": "cursor-agent"}
 
 // RoleConfig is the per-role override table ([roles.<role>], D-12).
 type RoleConfig struct {

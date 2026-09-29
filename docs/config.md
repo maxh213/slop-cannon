@@ -77,10 +77,10 @@ line and the column of the offending value like every other parse error
 | `limits.max_plan_rejections` | integer ≥ 1 | `2` | both | How many plans in a row the planning validator may reject before the run gives up on that round of planning (P6-19). One rejection has already cost two plans: a rule failure is retried once inside the firing itself. A brief run that gives up finishes and says so; an autopilot run cools off and plans again (D-18). **The floor of 1 is deliberate**: the Go option behind this key (`orchestrator.PlannerOptions.RejectionLimit`) reads a negative value as "never give up", and the file cannot say that on purpose — a plan the validator keeps rejecting is a plan that keeps costing a product owner session, and in autopilot, which never ends on its own (D-18), "never give up" is a run that plans for ever with nothing to show. An embedder that wants it can pass the option; a config file cannot ask for it (P9-14). |
 | `limits.max_plan_failures` | integer ≥ 1 | `5` | both | How many planning firings in a row may fail for a reason that is not the plan's fault — a cartridge crash, an agent timeout, an unreadable rules file — before the run gives up on that round the same way. Looser than `max_plan_rejections` because the supervisor has already spent its own retries on those failures. Its floor of 1 is deliberate for the same reason. |
 | `cartridges.<name>.model` | string | `""` | global | Model passed to the CLI, e.g. `fable` for Claude Code. |
-| `cartridges.<name>.command` | string | `<name>` | global | Executable to run instead of the cartridge name (a full path or a different binary). |
+| `cartridges.<name>.command` | string | `<name>` (`cursor-agent` for `cursor`) | global | Executable to run instead of the default (a full path or a different binary). |
 | `cartridges.<name>.args` | string array | `[]` | global | Extra arguments prepended to every invocation. |
 | `cartridges.<name>.env` | table of strings | `{}` | global | Extra environment variables for the CLI process. |
-| `roles.<role>.cartridge` | string | `""` | both | Per-role cartridge override (`po`, `engineer`, `tester`), D-12. Parsed and validated now; it only has an effect once a second cartridge exists. |
+| `roles.<role>.cartridge` | string | `""` | both | Per-role cartridge override (`po`, `engineer`, `tester`), D-12: that role's agents fire on this configured cartridge, with its own `model`, instead of the active one. The role falls back to the active cartridge, with a warning, when this one fails its Detect probe. |
 | `roles.<role>.model` | string | `""` | both | Per-role model (`po`, `engineer`, `tester`): that role's agents are fired with this model instead of the cartridge's own, e.g. `roles.po.model = "claude-opus-5-5"` for a stronger planner while engineers and testers stay on the cartridge's model. Applies to every firing of the role, planning and arbitration alike. |
 
 A budget pause is cleared from the TUI (`p` resumes a paused run), and only
@@ -92,9 +92,27 @@ the cap stays in the run log, and the summary still reports what the run
 spent. Give a headless autopilot run a budget you are content for it to stop
 at, or run it in the TUI (P9-01, P9-14).
 
-Only `claude` is a valid cartridge name for now (D-19). Any other name, in a
-file or on the command line, fails with
-`cartridge "<name>" is not supported yet (only "claude" for now)`.
+The valid cartridge names are `claude` and `cursor` (D-29). Any other name,
+in a file or on the command line, fails with
+`cartridge "<name>" is not supported yet (only "claude", "cursor" for now)`.
+A common split puts engineers and testers on Cursor and keeps the product
+owner on Claude:
+
+```toml
+[cartridges.cursor]
+model = 'auto'
+
+[roles.engineer]
+cartridge = "cursor"
+
+[roles.tester]
+cartridge = "cursor"
+```
+
+A role on a cartridge other than the active one gets that cartridge's own
+`model` (or its `roles.<role>.model`), never the active cartridge's. See
+[cartridges.md § Cursor Agent](cartridges.md#cursor-agent-cursor) for what
+running testers on a CLI without tool controls costs.
 
 ## Secrets: withheld files and masked values
 

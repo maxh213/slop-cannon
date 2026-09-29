@@ -236,6 +236,12 @@ type SupervisorOptions struct {
 	// RoleModels overrides the model per role (roles.<role>.model): a role
 	// listed here is fired with that model whatever its builder chose.
 	RoleModels map[domain.Role]string
+	// ActiveCartridge is the run's own cartridge, the one whose model the
+	// builders stamp on every firing. A firing that lands on another
+	// cartridge (roles.<role>.cartridge, D-12/D-29) and has no role model
+	// drops that model so its adapter uses its own configured one: Cursor
+	// must not be asked for Claude's "sonnet". Empty disables the check.
+	ActiveCartridge string
 	// Research gives the planning product owner web search and fetch
 	// (the `research` config key).
 	Research bool
@@ -914,6 +920,12 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 	}
 }
 
+// foreignCartridge reports whether c is not the run's active cartridge, so
+// the model the builders took from the active one does not apply to it.
+func (s *Supervisor) foreignCartridge(c cartridge.Cartridge) bool {
+	return c != nil && s.opts.ActiveCartridge != "" && c.Name() != s.opts.ActiveCartridge
+}
+
 // stamp fills in the fields the supervisor owns on a built agent run, so a
 // builder cannot fire in the wrong directory, without the shim, or without
 // a timeout.
@@ -924,6 +936,8 @@ func (s *Supervisor) stamp(run *agents.AgentRun, f AgentFiring, agent domain.Age
 	// arbitration, and both must use the model configured for the role.
 	if m := s.opts.RoleModels[agent.Role]; m != "" {
 		run.Spec.Model = m
+	} else if s.foreignCartridge(prep.cartridge) {
+		run.Spec.Model = ""
 	}
 	if s.opts.Research && agent.Role == domain.RolePO && f.Task == events.TaskPlan {
 		run.Spec.Web = true

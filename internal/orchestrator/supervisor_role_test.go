@@ -48,3 +48,32 @@ func TestSupervisorStampsTheRoleModelAndThePlannersWebAccess(t *testing.T) {
 	assert.Equal(t, "sonnet", run.Spec.Model)
 	assert.False(t, run.Spec.Web, "research off gives nobody the web")
 }
+
+// A role routed to another cartridge (roles.<role>.cartridge) must not be
+// fired with the active cartridge's model, which the builders stamp on every
+// firing: Cursor cannot run Claude's "sonnet". Without a role model the
+// model is cleared so the adapter falls back to its own configured one; a
+// role model still wins, and the active cartridge keeps its model.
+func TestSupervisorDropsTheActiveModelOnAnotherCartridge(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+	s := f.supervisor(t, func(o *SupervisorOptions) {
+		o.ActiveCartridge = "claude"
+		o.RoleModels = map[domain.Role]string{domain.RolePO: "claude-opus-5-5"}
+	})
+	claude, err := mock.NewAdapter("claude", mock.NewScenario("claude"))
+	assert.NoError(t, err)
+	cursor, err := mock.NewAdapter("cursor", mock.NewScenario("cursor"))
+	assert.NoError(t, err)
+	stamp := func(role domain.Role, c cartridge.Cartridge) string {
+		run := agents.AgentRun{Spec: cartridge.RunSpec{Model: "sonnet"}}
+		agent := domain.Agent{ID: "a", Role: role}
+		s.stamp(&run, AgentFiring{Agent: agent, Task: events.TaskImplement}, agent, supPrep{cartridge: c}, f.Run)
+		return run.Spec.Model
+	}
+
+	assert.Equal(t, "", stamp(domain.RoleEngineer, cursor), "the cursor engineer uses [cartridges.cursor] model")
+	assert.Equal(t, "", stamp(domain.RoleTester, cursor))
+	assert.Equal(t, "sonnet", stamp(domain.RoleEngineer, claude), "the active cartridge keeps its model")
+	assert.Equal(t, "claude-opus-5-5", stamp(domain.RolePO, claude))
+	assert.Equal(t, "claude-opus-5-5", stamp(domain.RolePO, cursor), "a role model wins on any cartridge")
+}
