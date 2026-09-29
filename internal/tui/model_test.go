@@ -421,6 +421,27 @@ func TestStateAmmoAndMode(t *testing.T) {
 	require.Equal(t, 6, total)
 }
 
+func TestStateResumeEndsAgentsThePreviousProcessLeftRunning(t *testing.T) {
+	t.Parallel()
+	s := tui.NewState(domain.Run{ID: "r"})
+	s.Apply(events.RunStarted{Meta: events.NewMeta("r"), Info: domain.Run{ID: "r", Config: domain.ConfigSnapshot{Ammo: 4}}})
+	s.Apply(events.AgentSpawned{Meta: events.NewMeta("r"), Agent: domain.Agent{ID: "eng-x-1", Role: domain.RoleEngineer, Bead: "x-1"}})
+	s.Apply(events.AgentSpawned{Meta: events.NewMeta("r"), Agent: domain.Agent{ID: "eng-x-2", Role: domain.RoleEngineer, Bead: "x-2"}})
+	s.Apply(events.AgentFinished{Meta: events.NewMeta("r"), Agent: "eng-x-2", Role: domain.RoleEngineer, Bead: "x-2"})
+
+	s.Apply(events.RunStarted{Meta: events.NewMeta("r"), Info: domain.Run{ID: "r", Config: domain.ConfigSnapshot{Ammo: 4}}, Resumed: true})
+	orphan, _ := s.Agent("eng-x-1")
+	require.Equal(t, domain.AgentStateKilled, orphan.State)
+	done, _ := s.Agent("eng-x-2")
+	require.Equal(t, domain.AgentStateFinished, done.State, "an agent that exited keeps its outcome")
+	used, _ := s.Ammo()
+	require.Zero(t, used)
+
+	s.Apply(events.AgentSpawned{Meta: events.NewMeta("r"), Agent: domain.Agent{ID: "eng-x-3", Role: domain.RoleEngineer, Bead: "x-3"}})
+	used, _ = s.Ammo()
+	require.Equal(t, 1, used, "agents the resumed process fires are live")
+}
+
 func TestFormatEventCoversEveryKind(t *testing.T) {
 	t.Parallel()
 	seen := make(map[events.Kind]string, len(events.Kinds()))

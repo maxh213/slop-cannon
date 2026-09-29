@@ -282,6 +282,9 @@ func (s *State) Apply(ev events.Event) {
 		s.Run = e.Info
 		s.Resumed = e.Resumed
 		s.Live = true
+		if e.Resumed {
+			s.endOrphanedAgents()
+		}
 		if e.Info.Epic != "" {
 			s.Epic = e.Info.Epic
 		}
@@ -435,6 +438,18 @@ func (s *State) putAgent(a AgentView) {
 	}
 	s.agentAt[a.ID] = len(s.Agents)
 	s.Agents = append(s.Agents, a)
+}
+
+// endOrphanedAgents marks every agent still running as killed. A resumed run
+// is a new sc process, and it never adopts the previous process's agents: a
+// spawn with no exit before the resume ended with that process, and would
+// otherwise stay on the Agents view as live forever.
+func (s *State) endOrphanedAgents() {
+	for i, a := range s.Agents {
+		if a.Live() {
+			s.Agents[i].State = domain.AgentStateKilled
+		}
+	}
 }
 
 // round returns a copy of the (bead, number) round, creating it when the
