@@ -50,6 +50,10 @@ next version's entry.
 
 ### Fixed
 
+- A bead being re-delivered after a conflict round is never delivered a
+  second time at once. The conductor could list it while it passed through
+  approved and start another delivery in the same worktree, and both checks
+  failed.
 - A bead whose re-delivery after a conflict round cannot be fast-forwarded
   (the default branch moved while its check ran) is retried like any other
   delivery, instead of being left in delivering with its engineer's session

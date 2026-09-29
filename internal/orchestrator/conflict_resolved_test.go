@@ -58,3 +58,44 @@ func TestConflictResolvedReportsARefusedRedelivery(t *testing.T) {
 	rig.Cond.mu.Unlock()
 	assert.False(t, queued)
 }
+
+// P6-69: while the re-delivery after a conflict round is running, the bead
+// passes through approved, and a conductor pass that lists it there must
+// not start a second delivery of it (seen on PandaJump-mtd: two checks in
+// one worktree at once, both failed).
+func TestConflictResolvedHoldsTheBeadAgainstASecondDelivery(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "approved", "add the retry"),
+	)
+	entered, release := make(chan struct{}), make(chan struct{})
+	delivery := &glueDelivery{
+		resolve: func(domain.BeadID) (*DeliveryOutcome, error) {
+			close(entered)
+			<-release
+			return &DeliveryOutcome{Bead: "sc-1", Kind: DeliveryMerged, State: domain.BeadStateClosed, Round: 2}, nil
+		},
+		deliver: func(DeliveryRequest) (*DeliveryOutcome, error) {
+			return &DeliveryOutcome{Bead: "sc-1", Kind: DeliveryMerged, State: domain.BeadStateClosed}, nil
+		},
+	}
+	rig := glueSetup(t, bd, ConductorOptions{Feedback: newGlueFeedback(), Delivery: delivery}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	done := make(chan error, 1)
+	go func() { done <- rig.Cond.ConflictResolved(context.Background(), "sc-1") }()
+	<-entered
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	assert.Empty(t, delivery.sent(), "the pass saw sc-1 approved mid-re-delivery and left it alone")
+
+	close(release)
+	require.NoError(t, <-done)
+	rig.Cond.mu.Lock()
+	_, held := rig.Cond.inflight["sc-1"]
+	shipped := rig.Cond.shipped["sc-1"]
+	rig.Cond.mu.Unlock()
+	assert.False(t, held, "the outcome ends the hold")
+	assert.True(t, shipped)
+}

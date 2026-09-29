@@ -3489,8 +3489,20 @@ func (c *Conductor) ConflictResolved(ctx context.Context, id domain.BeadID) erro
 	if delivery == nil {
 		return nil
 	}
+	// The re-delivery below walks the bead through approved on its way to
+	// delivering, and a pass of the conductor that lists it there would
+	// start a second delivery of it in the same worktree (P6-69, seen on
+	// PandaJump: two checks at once, both failed). Holding the bead in
+	// flight for the duration keeps [Conductor.deliverApproved] off it;
+	// [Conductor.ApplyOutcome] ends the hold like any delivery's.
+	c.mu.Lock()
+	if _, held := c.inflight[id]; !held {
+		c.inflight[id] = deliveryJob{bead: domain.Bead{ID: id}}
+	}
+	c.mu.Unlock()
 	out, err := delivery.Resolved(ctx, id)
 	if out == nil {
+		c.release(id)
 		if err != nil {
 			return fmt.Errorf("orchestrator: conductor: re-delivering %s after its conflict: %w", id, err)
 		}
