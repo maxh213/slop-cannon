@@ -8,6 +8,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
@@ -606,7 +607,19 @@ func (v AgentsModel) heading(text string, w int) string {
 // it is on and how long it has run, then its last line of output.
 func (v AgentsModel) card(a AgentView, w int, selected bool) []string {
 	content := max(w-4, 8)
-	head := agentsRow(v.cardLeft(a, content), v.cardRight(a), content)
+	right := v.cardRight(a)
+	room := func(left string) int { return content - lipgloss.Width(left) - lipgloss.Width(right) - 1 }
+	left := v.cardLeft(a, content, true)
+	title := v.cardTitle(a, room(left))
+	if title == "" {
+		// What the agent is building says more than which cartridge it
+		// runs on, which is the same on every card of a one-cartridge run,
+		// so on a tight line the cartridge gives way to the title.
+		if lean := v.cardLeft(a, content, false); v.cardTitle(a, room(lean)) != "" {
+			left, title = lean, v.cardTitle(a, room(lean))
+		}
+	}
+	head := agentsRow(left+title, right, content)
 	tail := v.styles.Muted.Render(clip(agentsTail(a), content))
 	style := v.styles.Card
 	if selected {
@@ -619,19 +632,38 @@ func (v AgentsModel) card(a AgentView, w int, selected bool) []string {
 
 // cardLeft is the identity half of a card's first line. A narrow pane keeps
 // the fields that identify the agent and drops the rest, rather than
-// truncating every field in the middle of a word.
-func (v AgentsModel) cardLeft(a AgentView, w int) string {
+// truncating every field in the middle of a word. withCartridge false leaves
+// the cartridge out even when it would fit, to make room for the title.
+func (v AgentsModel) cardLeft(a AgentView, w int, withCartridge bool) string {
 	fields := []string{
 		v.styles.For(a).Render(agentsGlyph(a)) + " " + v.styles.Who.Render(roleOf(a.Agent)),
 		v.styles.Value.Render(orDash(string(a.Bead))),
 	}
-	if w >= agentsCartridgeWidth {
+	if withCartridge && w >= agentsCartridgeWidth {
 		fields = append(fields, v.styles.Muted.Render(cartridgeOf(a.Agent)))
 	}
 	if w >= agentsTaskWidth {
 		fields = append(fields, v.styles.Muted.Render(agentsWork(a)))
 	}
 	return strings.Join(fields, v.styles.Muted.Render(" · "))
+}
+
+// agentsMinTitle is the narrowest room a card spends on its bead's title;
+// with less, the id alone names the bead rather than a stub of its title.
+const agentsMinTitle = 12
+
+// cardTitle is the bead's title for the end of a card's first line, cut to
+// fit room columns, or "" when there is no title or no room worth using. The
+// id says which bead; the title says what the agent is actually building,
+// which is the question a watcher is asking.
+func (v AgentsModel) cardTitle(a AgentView, room int) string {
+	sep := v.styles.Muted.Render(" · ")
+	room -= lipgloss.Width(sep)
+	title := rowText(a.BeadTitle)
+	if title == "" || room < agentsMinTitle {
+		return ""
+	}
+	return sep + v.styles.Muted.Render(ansi.Truncate(title, room, "…"))
 }
 
 // The content widths at which a card or a history row can afford its

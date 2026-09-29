@@ -17,6 +17,11 @@ next version's entry.
 
 ### Added
 
+- `sc watch [PATH]` opens the run TUI on a run that is already firing, from
+  any terminal: one started with `--headless`, from a script, or in a
+  terminal that has since closed. It shows everything the run has done so far
+  and then follows it live. It only reads the run's `events.jsonl`: `q` leaves
+  while the run keeps firing, and the run controls are not offered.
 - The product owner can give a bead a longer agent timeout in its plan
   (`timeout`, up to `limits.max_agent_timeout`, default 24h) when one
   session on it will genuinely need longer than the default.
@@ -47,6 +52,15 @@ next version's entry.
 - A resume says when the repo or global config now disagrees with the
   run's recorded ammo, safety or cartridge, and names the flag that would
   apply it.
+- The TUI takes every event already waiting in one step instead of one per
+  update, so a long backlog catches up at once rather than trailing the run.
+- Graph boxes widen from 22 up to 44 columns when the whole graph fits
+  across the terminal, so bead titles are shown whole on a wide screen.
+- Agent cards show the title of the bead each agent is working on; on a
+  narrow terminal the cartridge name gives way to it.
+- The PRs view's BEAD column fits the longest bead id (up to 24 columns), so
+  a repository prefix such as `PandaJump-5c5` no longer pushes the PR number
+  out of its column.
 
 ### Fixed
 

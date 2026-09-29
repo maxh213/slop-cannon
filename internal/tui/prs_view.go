@@ -440,6 +440,22 @@ const (
 	prsNoteWidth   = 9
 )
 
+// prsMaxBeadWidth caps the BEAD column. It widens past [prsBeadWidth] to
+// fit the longest bead id in the list — a repository's bd prefix is its
+// name, so "PandaJump-5c5" is as ordinary as "sc-1a2b" — but no further than
+// this, so one odd id cannot push every other column off the pane.
+const prsMaxBeadWidth = 24
+
+// prsBeadColumn is how wide the BEAD column is for rows: wide enough for
+// the longest id, between [prsBeadWidth] and [prsMaxBeadWidth].
+func prsBeadColumn(rows []PRRow) int {
+	w := prsBeadWidth
+	for _, r := range rows {
+		w = max(w, lipgloss.Width(orDash(rowText(r.Bead.String()))))
+	}
+	return min(w, prsMaxBeadWidth)
+}
+
 // prsCursorWidth is the two cells every row spends on the cursor marker.
 const prsCursorWidth = 2
 
@@ -584,8 +600,12 @@ func (v PRsModel) View(st *State) string {
 		return fit(head+"\n"+v.theme.Muted().Render(emptyText[TabPRs]), w, h)
 	}
 
-	wide := w >= prsWideWidth
-	lines := []string{head, v.theme.Muted().Render(prsHeaderLine(wide))}
+	bead := prsBeadColumn(rows)
+	// A wider BEAD column moves every column after it, the REF field's
+	// start included, so the wide layout needs that much more pane.
+	extra := bead - prsBeadWidth
+	wide := w >= prsWideWidth+extra
+	lines := []string{head, v.theme.Muted().Render(prsHeaderLine(wide, bead))}
 	cursor := clampIndex(v.cursor, len(rows))
 	body := max(h-len(lines)-1, 1)
 	start := 0
@@ -593,7 +613,7 @@ func (v PRsModel) View(st *State) string {
 		start = cursor - body + 1
 	}
 	for i := start; i < min(start+body, len(rows)); i++ {
-		line := clip(v.rowLine(rows[i], wide), w-2)
+		line := clip(v.rowLine(rows[i], wide, bead), w-2)
 		if i == cursor {
 			lines = append(lines, v.theme.Selected().Render("▌ ")+line)
 			continue
@@ -604,7 +624,7 @@ func (v PRsModel) View(st *State) string {
 	for len(lines) < h-1 {
 		lines = append(lines, "")
 	}
-	return fit(strings.Join(append(lines, v.detail(rows[cursor], w, wide)), "\n"), w, h)
+	return fit(strings.Join(append(lines, v.detail(rows[cursor], w, wide, extra)), "\n"), w, h)
 }
 
 // summary renders the safety indicator, what safety means for a delivery,
@@ -665,9 +685,9 @@ func prsCounts(rows []PRRow) string {
 }
 
 // prsHeaderLine renders the column header, matching rowLine's widths.
-func prsHeaderLine(wide bool) string {
+func prsHeaderLine(wide bool, bead int) string {
 	cols := []string{
-		prsPad("BEAD", prsBeadWidth),
+		prsPad("BEAD", bead),
 		prsPad("PR", prsPRWidth),
 		prsPad("STATUS", prsStatusWidth),
 	}
@@ -680,7 +700,7 @@ func prsHeaderLine(wide bool) string {
 
 // rowLine renders one delivery as a column-aligned line. The narrow layout
 // drops the reference, which the detail line then carries.
-func (v PRsModel) rowLine(r PRRow, wide bool) string {
+func (v PRsModel) rowLine(r PRRow, wide bool, bead int) string {
 	status := r.Status.style(v.theme).Render(prsPad(r.Status.Glyph()+" "+r.Status.String(), prsStatusWidth))
 	note := r.Note()
 	if !r.External {
@@ -691,7 +711,7 @@ func (v PRsModel) rowLine(r PRRow, wide bool) string {
 	cols := []string{
 		// The bead id is bd's, not the cannon's: it is scrubbed like any
 		// other borrowed text, and a clean id costs one scan.
-		v.theme.Text().Render(prsPad(orDash(rowText(r.Bead.String())), prsBeadWidth)),
+		v.theme.Text().Render(prsPad(orDash(rowText(r.Bead.String())), bead)),
 		v.theme.Muted().Render(prsPad(r.PR(), prsPRWidth)),
 		status,
 		note,
@@ -702,17 +722,18 @@ func (v PRsModel) rowLine(r PRRow, wide bool) string {
 	return strings.TrimRight(strings.Join(append(cols, v.theme.Muted().Render(r.Ref())), " "), " ")
 }
 
-// detail renders the pane's last line: what the selected row is, and whether
+// detail renders the pane's last line (extra is how much wider than
+// [prsBeadWidth] the BEAD column is, which the REF column gives up): what the selected row is, and whether
 // `o` has a URL to open. The URL goes here whenever the row cannot show it in
 // full — always in the narrow layout, which has no REF column, and in the
 // wide layout when the URL is longer than the REF column — so it can always
 // be read and copied off the screen somewhere. The title gives way first when
 // the line still does not fit.
-func (v PRsModel) detail(r PRRow, w int, wide bool) string {
+func (v PRsModel) detail(r PRRow, w int, wide bool, extra int) string {
 	var tail []string
 	u, hasURL := r.OpenURL()
 	if wide {
-		if hasURL && lipgloss.Width(u) > prsRefWidth(w) {
+		if hasURL && lipgloss.Width(u) > prsRefWidth(w)-extra {
 			tail = append(tail, u)
 		}
 		// The REF column carries the rest, so spend the line on what the

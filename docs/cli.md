@@ -27,6 +27,7 @@ Every command, flag, and example of the `sc` binary, in the words of
 - [sc stop](#sc-stop) — Stop the run going in a repository
 - [sc version](#sc-version) — Print the sc version, commit, and build date
 - [sc vibes](#sc-vibes) — Manage the style files every agent is given
+- [sc watch](#sc-watch) — Open the TUI on a run that is already firing
 
 ## sc
 
@@ -109,6 +110,7 @@ sc safety off
 - [sc stop](#sc-stop) — Stop the run going in a repository
 - [sc version](#sc-version) — Print the sc version, commit, and build date
 - [sc vibes](#sc-vibes) — Manage the style files every agent is given
+- [sc watch](#sc-watch) — Open the TUI on a run that is already firing
 
 ## sc ammo
 
@@ -1032,6 +1034,66 @@ sc vibes --remove vibes.md
       --list          print the effective vibes files and their sources
       --remove FILE   remove FILE from the vibes list (repeatable)
       --show          print the concatenated content of the vibes files
+```
+
+### Options inherited from parent commands
+
+```
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging
+```
+
+### See also
+
+- [sc](#sc) — Fire LLM agents at a repository
+
+## sc watch
+
+Open the TUI on a run that is already firing
+
+### Synopsis
+
+Open the run TUI on a run that is already firing, from any terminal.
+
+PATH may be the repository root or any directory inside it; without it the
+--repo directory (the current one by default) is used. The most recent run
+is watched unless --run names another.
+
+It is the same TUI sc run draws: the bead graph, what every agent is
+working on, the review rounds and verdicts, the pull requests, and the log.
+It starts with everything the run has done so far and then follows it live,
+so it is how a run fired with --headless, from a script, or in a terminal
+that has since closed is watched.
+
+Watching only reads the run's event log. The run controls are not offered,
+and q leaves the TUI while the run keeps firing; use sc stop to stop it. A
+run that has already finished is shown as it ended.
+
+### Usage
+
+```
+sc watch [PATH] [flags]
+```
+
+### Examples
+
+```
+sc watch
+sc watch ./repo-path
+sc watch --run 20260924-214444-42c0
+sc watch --no-anim
+```
+
+### Options
+
+```
+      --alt-screen   draw on the alternate screen buffer (default true)
+  -h, --help         help for watch
+      --no-anim      disable the cannon animations (also honours SC_NO_ANIM)
+      --run ID       watch run ID instead of the most recent one
 ```
 
 ### Options inherited from parent commands

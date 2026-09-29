@@ -156,6 +156,7 @@ While it runs, from any other terminal — inside the repository, or with
 `--repo PATH`:
 
 ```sh
+sc watch                  # the full TUI, live: beads, agents, reviews, PRs
 sc status                 # phase, bead states, PRs, live agents, recent events
 sc status sc-1a2b         # one bead's whole timeline out of bd
 sc logs --follow          # the orchestrator's log; --follow works on a bead id too
@@ -177,6 +178,7 @@ repository.
 | `sc PATH` / `sc run PATH` | fire the cannon at a repository (`-m` for a brief, nothing for autopilot) |
 | `sc resume` | continue the most recent run of a repository |
 | `sc stop` | stop the run going in a repository, from another terminal |
+| `sc watch` | open the TUI on a run that is already firing, from any terminal |
 | `sc status [BEAD-ID]` | the state of a run, or one bead's timeline, reconciled with `bd` |
 | `sc logs [AGENT-ID\|BEAD-ID]` | tail the run's log, an agent's log, or every agent that touched a bead |
 | `sc doctor` | check git, bd, dolt, gh, the cartridges, the repo and its `.gitignore` |

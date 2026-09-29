@@ -1256,7 +1256,9 @@ const gvWideTitle = "修复重试逻辑"
 // a canvas that wrote one rune per cell would push the right border out.
 func TestGraphViewDoubleWidthTitles(t *testing.T) {
 	beads := []domain.Bead{
-		gvBead("sc-wide", gvWideTitle, domain.BeadStateOpen, 0),
+		// Long enough to be cut even in the widest box, so the cut lands in
+		// the middle of the double-width runes.
+		gvBead("sc-wide", strings.Repeat(gvWideTitle, 6), domain.BeadStateOpen, 0),
 		gvBead("sc-emji", "ship it 🚀 now", domain.BeadStateInProgress, 1, "sc-wide"),
 	}
 	st := gvState(beads)
@@ -1265,9 +1267,11 @@ func TestGraphViewDoubleWidthTitles(t *testing.T) {
 
 	// Lines 1…4 are the two boxes and the edge between them: every row of a
 	// box is exactly as wide as the box.
+	box := graphBoxWidth(200, 2, 1, false)
+	require.Equal(t, GraphMaxBoxWidth, box, "a 200-column pane gives two layers the widest boxes")
 	for i := 1; i <= GraphBoxHeight; i++ {
-		require.Equalf(t, GraphBoxWidth, gvBoxWidth(lines[i]),
-			"row %d of the box is not %d columns: %q", i, GraphBoxWidth, lines[i])
+		require.Equalf(t, box, gvBoxWidth(lines[i]),
+			"row %d of the box is not %d columns: %q", i, box, lines[i])
 	}
 	for i, w := range widths {
 		require.LessOrEqual(t, w, 200, "line %d: %q", i, lines[i])
@@ -1437,7 +1441,10 @@ func TestGraphPaintDrawsOnlyWhatThePaneCanShow(t *testing.T) {
 
 			// The same graph painted whole: a view large enough that its
 			// window covers every cell.
+			// Its boxes are pinned to the culled paint's width: a bigger pane
+			// would otherwise share out wider ones (graphBoxWidth).
 			whole := NewGraphModel(GraphOptions{NoColor: true}).Resize(canvas.w+GraphBoxWidth, canvas.h+GraphBoxHeight)
+			whole.boxWidth = boxes[0].w
 			ref, refBoxes := whole.paint(lay, tc.vertical, tc.cursor)
 			require.Equal(t, boxes, refBoxes, "the cull moved a box")
 			require.Equal(t, canvas.w*canvas.h, len(ref.runes), "the reference paint is not the whole graph")
@@ -1474,4 +1481,22 @@ func TestGraphCanvasWindowDropsWritesOutsideIt(t *testing.T) {
 	// never bigger than the canvas it backs.
 	full := newGraphWindow(4, 2, 0, 0, 400, 200)
 	require.Equal(t, 8, len(full.runes))
+}
+
+func TestGraphBoxWidthSharesOutThePane(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name            string
+		w, layers, span int
+		vertical        bool
+		want            int
+	}{
+		{"two layers share 80 columns", 80, 2, 5, false, (80 - GraphGutter) / 2},
+		{"too many layers keep the narrowest box", 80, 6, 1, false, GraphBoxWidth},
+		{"a wide pane stops at the cap", 300, 2, 1, false, GraphMaxBoxWidth},
+		{"top→bottom shares by the widest layer", 60, 9, 2, true, (60 - GraphColGap) / 2},
+		{"nothing to lay out", 120, 0, 0, false, GraphBoxWidth},
+	} {
+		require.Equal(t, c.want, graphBoxWidth(c.w, c.layers, c.span, c.vertical), c.name)
+	}
 }

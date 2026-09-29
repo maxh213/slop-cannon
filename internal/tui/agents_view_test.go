@@ -891,3 +891,26 @@ func TestAgentsViewLiveAgentsTranscriptKeepsItsSpinner(t *testing.T) {
 	require.True(t, a.Live())
 	require.True(t, avHasSpinner(v.View(st)), "a running agent's card still spins")
 }
+
+// TestAgentsCardTitleOutranksTheCartridge: on a line too tight for both, a
+// card names what the agent is building rather than the cartridge, which is
+// the same on every card of a one-cartridge run. A line with room for
+// everything keeps both.
+func TestAgentsCardTitleOutranksTheCartridge(t *testing.T) {
+	const title = "Scale the game to fit phone screens"
+	eng := avAgent("eng-PandaJump-0ws-r2", domain.RoleEngineer, "", "PandaJump-0ws", avStart)
+	evs := []events.Event{events.AgentSpawned{
+		Meta: events.MetaAt(avRun, avStart), Agent: eng,
+		Task: events.TaskAddressFeedback, BeadTitle: title, Round: 2,
+	}}
+
+	st, v := avFold(t, 80, 20, evs)
+	head := avPlain(avLines(v.View(st))[2])
+	require.Contains(t, head, "PandaJump-0ws · address_feedback r2 · Scale the game", head)
+	require.NotContains(t, head, "claude/fable", head)
+
+	st, v = avFold(t, 160, 20, evs)
+	head = avPlain(avLines(v.View(st))[2])
+	require.Contains(t, head, "claude/fable", head)
+	require.Contains(t, head, title, head)
+}

@@ -909,7 +909,12 @@ func TestAnimatorInTheProgramAimsAtTheBeadsNode(t *testing.T) {
 	left, right := animBoxAround([]rune(plain[target.Row]), target.Col)
 	require.GreaterOrEqual(t, left, 0, "no box border left of the target: %q", plain[target.Row])
 	require.Greater(t, right, target.Col, "no box border right of the target: %q", plain[target.Row])
-	require.Equal(t, GraphBoxWidth-1, right-left, "the target is not inside one node box")
+	// Boxes widen with the pane (GraphMaxBoxWidth), so the span is one box
+	// of whatever width this layout gave them — and no wider, which would
+	// mean the target sat between two.
+	require.GreaterOrEqual(t, right-left, GraphBoxWidth-1, "the target is not inside one node box")
+	require.LessOrEqual(t, right-left, GraphMaxBoxWidth-1, "the target is not inside one node box")
+	require.NotContains(t, string([]rune(plain[target.Row])[left+1:right]), "│", "the span crosses a border")
 	require.Contains(t, string([]rune(plain[target.Row])[left:right]), string(spawn.Agent.Bead))
 
 	// And the projectile really ends up there rather than on a tab label.

@@ -3,10 +3,10 @@ frame 000  active 1  queued 0  recoil 2  flash 0
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2        r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2                        r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 
@@ -26,13 +26,13 @@ frame 000  active 1  queued 0  recoil 2  flash 0
 
 frame 003  active 1  queued 0  recoil 1  flash -1
 ▄█▓▶   run demo-20260101-120000 · autopilot · ammo 1/10 · safety off
- 1 Grap·  2 Agents  3 Feedback  4 PRs  5 Log 
-───────•◆───────────────────────────────────────────────────────────────────────
-2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2        r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+ 1 Graph· 2 Agents  3 Feedback  4 PRs  5 Log 
+─────────•──────────────────────────────────────────────────────────────────────
+2 beads · ◆ levels · 0 ready · 1 blocked · 0 closed · left→right
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2                        r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 
@@ -55,10 +55,10 @@ frame 006  active 1  queued 0  recoil 0  flash -1
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━•━━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2        r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+┏━━━━━━━━━━━·•━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2     ◆                  r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 
@@ -81,10 +81,10 @@ frame 009  active 1  queued 0  recoil 0  flash -1
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━·•━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2        r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2      ·•                r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 
@@ -107,10 +107,10 @@ frame 012  active 1  queued 0  recoil 0  flash -1
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2 ·◆     r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2        ·◆              r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 
@@ -133,10 +133,10 @@ frame 015  active 1  queued 0  recoil 0  flash -1
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2         ·              r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 
@@ -159,10 +159,10 @@ frame 018  active 1  queued 0  recoil 0  flash -1
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2          ·             r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 
@@ -185,10 +185,10 @@ frame 021  active 1  queued 0  recoil 0  flash -1
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2          ·             r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 
@@ -211,10 +211,10 @@ frame 024  active 1  queued 0  recoil 0  flash -1
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2          ·             r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 
@@ -237,10 +237,10 @@ frame 027  active 1  queued 0  recoil 0  flash -1
  1 Graph  2 Agents  3 Feedback  4 PRs  5 Log 
 ────────────────────────────────────────────────────────────────────────────────
 2 beads · 2 levels · 0 ready · 1 blocked · 0 closed · left→right
-┏━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────┐
-┃◐ demo-2  ·     r1 ■┃────│○ demo-3            │
-┃ Retry failed HTTP …┃    │ Document the retry…│
-┗━━━━━━━━━━━━━━━━━━━━┛    └────────────────────┘
+┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓    ┌────────────────────────────────────┐
+┃◐ demo-2          ·             r1 ■┃────│○ demo-3                            │
+┃ Retry failed HTTP requests         ┃    │ Document the retry policy          │
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛    └────────────────────────────────────┘
 
 
 

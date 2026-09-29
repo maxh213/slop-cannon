@@ -50,8 +50,14 @@ const (
 	// GraphNarrowWidth is the pane width below which the boxed layouts are
 	// replaced by the indented list: two boxes and a gutter no longer fit.
 	GraphNarrowWidth = 80
-	// GraphBoxWidth is the outer width of a bead box, borders included.
+	// GraphBoxWidth is the outer width of a bead box, borders included, when
+	// the pane has no room to spare. A wider pane widens every box, up to
+	// [GraphMaxBoxWidth], so the titles are read rather than guessed at.
 	GraphBoxWidth = 22
+	// GraphMaxBoxWidth is the widest a bead box grows. Past it a title that
+	// still does not fit is long enough that the detail panel is the place
+	// to read it.
+	GraphMaxBoxWidth = 44
 	// GraphBoxHeight is the outer height of a bead box: border, the id line,
 	// the title line, border.
 	GraphBoxHeight = 4
@@ -365,6 +371,10 @@ type GraphModel struct {
 	selected      domain.BeadID
 	detail        bool
 	detailOff     int
+	// boxWidth pins every box to this outer width instead of sharing the
+	// pane out ([graphBoxWidth]); zero shares it. A paint compared cell by
+	// cell with a paint for a different pane needs the same boxes.
+	boxWidth int
 }
 
 // NewGraphModel builds the graph view. The zero [GraphOptions] is valid.
@@ -738,6 +748,8 @@ func graphEdges(lay GraphLayout) (edges []graphEdge, skips, backs int) {
 // measuring — so the view can work out which boxes the pane can actually
 // show before it pays to draw one (P7-24).
 type graphGeometry struct {
+	// bw is the outer width every box of this layout was given.
+	bw       int
 	boxes    []graphBox
 	edges    []graphEdge
 	cw, ch   int
@@ -755,12 +767,17 @@ func (v GraphModel) layout(lay GraphLayout, vertical bool) graphGeometry {
 	for _, row := range lay.Layers {
 		span = max(span, len(row))
 	}
+	bw := graphBoxWidth(v.width, len(lay.Layers), span, vertical)
+	if v.boxWidth > 0 {
+		bw = v.boxWidth
+	}
+	g.bw = bw
 	var boxW, boxH int
 	if vertical {
-		boxW = max(span*(GraphBoxWidth+GraphColGap)-GraphColGap, 1)
+		boxW = max(span*(bw+GraphColGap)-GraphColGap, 1)
 		boxH = max(len(lay.Layers)*(GraphBoxHeight+GraphLayerGap)-GraphLayerGap, 1)
 	} else {
-		boxW = max(len(lay.Layers)*(GraphBoxWidth+GraphGutter)-GraphGutter, 1)
+		boxW = max(len(lay.Layers)*(bw+GraphGutter)-GraphGutter, 1)
 		boxH = max(span*(GraphBoxHeight+GraphRowGap)-GraphRowGap, 1)
 	}
 	// The bypass lanes run past the end of the layers, where no box can ever
@@ -788,18 +805,35 @@ func (v GraphModel) layout(lay GraphLayout, vertical bool) graphGeometry {
 	}
 	for depth, row := range lay.Layers {
 		for slot, idx := range row {
-			b := graphBox{w: GraphBoxWidth, h: GraphBoxHeight}
+			b := graphBox{w: bw, h: GraphBoxHeight}
 			if vertical {
-				b.x = slot * (GraphBoxWidth + GraphColGap)
+				b.x = slot * (bw + GraphColGap)
 				b.y = depth * (GraphBoxHeight + GraphLayerGap)
 			} else {
-				b.x = depth * (GraphBoxWidth + GraphGutter)
+				b.x = depth * (bw + GraphGutter)
 				b.y = slot * (GraphBoxHeight + GraphRowGap)
 			}
 			g.boxes[idx] = b
 		}
 	}
 	return g
+}
+
+// graphBoxWidth is how wide each box of a boxed layout is in a pane w
+// columns wide: the pane shared out between the boxes across it — the
+// layers left→right, the widest layer top→bottom — less the gaps between
+// them, and never narrower than [GraphBoxWidth] or wider than
+// [GraphMaxBoxWidth]. A layout wider than the pane even at the narrowest box
+// scrolls as it always has.
+func graphBoxWidth(w, layers, span int, vertical bool) int {
+	across, gap := layers, GraphGutter
+	if vertical {
+		across, gap = span, GraphColGap
+	}
+	if across <= 0 {
+		return GraphBoxWidth
+	}
+	return min(max((w-(across-1)*gap)/across, GraphBoxWidth), GraphMaxBoxWidth)
 }
 
 // lane returns the bypass lane an edge detours through.

@@ -5,6 +5,10 @@ folded out of the event bus, so the display is a view of the run and never a
 source of truth: closing it does not stop the run, and reopening it on a
 resumed run rebuilds the same picture from the events.
 
+`sc watch` opens the same TUI on a run that is already firing — one started
+with `--headless`, from a script, or in a terminal that has since closed —
+from any other terminal. See [Watching a live run](#watching-a-live-run).
+
 `sc tui-demo` renders a scripted run with no orchestrator, no repository and
 no network. It is the fastest way to see every view.
 
@@ -37,7 +41,7 @@ terminal drops from it are all still on the `?` overlay.
 | `1`…`5` | jump straight to a view |
 | `↑`/`k`, `↓`/`j` | move the cursor inside the view |
 | `?` | help overlay: the global keys, plus the keys of the active view |
-| `q` | quit; on a live run it first asks to confirm the stop |
+| `q` | quit; on a live run it first asks to confirm the stop. Under `sc watch` it only leaves: the run keeps firing |
 | `ctrl+c` | quit immediately |
 
 Views add keys of their own. The footer ends with the active view's own
@@ -118,7 +122,10 @@ so a bead the view calls ready is a bead `bd ready` would hand out.
 Each box carries the bead's state glyph and colour, its id, the review round
 it is on (`r1`), the role glyph of the agent working on it (`■` engineer, `▲`
 tester, `◆` product owner — blank when nothing has been fired at it) and its
-title, truncated to the box. The selected bead is drawn with a heavy border,
+title, truncated to the box. The boxes share out the pane's width: when the
+whole graph fits across the pane, every box widens from 22 columns up to 44,
+so a wide terminal shows whole titles, and a graph too big for the pane keeps
+the narrow boxes and scrolls. The selected bead is drawn with a heavy border,
 so it is obvious with no colour at all. A bead the layering could not place —
 it sits on a dependency cycle, which means the repository was edited outside
 the run — is grouped into a last level whose boxes carry `cycle` in their top
@@ -183,7 +190,8 @@ LIVE · AMMO 2/6 · ENTER TRANSCRIPT ──────────────�
 
 A card carries the role glyph and role (`■` engineer, `▲` tester, `◆`
 product owner — the same glyphs the Graph view uses), the tester's lens, the
-bead it is working on, its cartridge and model, what it was fired to do with
+bead it is working on and that bead's title (on a tight line the cartridge
+gives way to it), its cartridge and model, what it was fired to do with
 its round and attempt, how long it has been running, a spinner, and its last
 line of output. A narrow pane drops the optional fields from the right
 rather than truncating them mid-word. The last line is a cartridge's own
@@ -307,6 +315,24 @@ an unset `TERM` does too.
 `sc run --headless` prints one line per event instead of drawing anything,
 and `--headless --json` prints the raw event stream as JSONL. Both are
 what CI should use; see `docs/cli.md`.
+
+## Watching a live run
+
+`sc watch` puts the TUI on a run another `sc` is firing, from any terminal:
+
+```sh
+sc watch                  # the most recent run of the repository you are in
+sc watch ./repo-path      # or of another repository
+sc watch --run <run-id>   # or a particular run
+```
+
+It reads the run's `events.jsonl` — everything the run has done so far, then
+every event as it is written — so it shows exactly what `sc run` would have
+drawn, and several can watch one run at once. It only reads: the header says
+`watching`, the run controls are not offered, and `q` leaves the TUI while
+the run keeps firing (`sc stop` stops it). A run that has already finished is
+shown as it ended; one whose process died is shown up to its last event,
+then `disconnected`.
 
 ## Watching a run again
 

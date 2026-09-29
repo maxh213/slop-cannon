@@ -92,6 +92,12 @@ type Options struct {
 	// orchestrator.Vitals take their own locks and return a value, which is
 	// exactly that.
 	Vitals func() string
+	// Watch marks a TUI attached to a run another process is firing (`sc
+	// watch`). Leaving it must never stop that run, so `q` quits at once
+	// instead of asking to stop, and the header says "watching" while the
+	// run goes on. Pair it with a nil Controller: a watcher has no
+	// orchestrator to act on.
+	Watch bool
 	// Output is where the program draws; nil means os.Stdout.
 	Output io.Writer
 	// Input is where key presses are read from; nil means os.Stdin.
@@ -109,7 +115,11 @@ func (o Options) keyMap() KeyMap {
 	if o.Keys != nil {
 		return *o.Keys
 	}
-	return DefaultKeyMap()
+	km := DefaultKeyMap()
+	if o.Watch {
+		km.Quit.SetHelp("q", "leave")
+	}
+	return km
 }
 
 // theme returns the palette every part of the TUI renders through: the one

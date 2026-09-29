@@ -45,6 +45,7 @@ Available Commands:
   stop        Stop the run going in a repository
   version     Print the sc version, commit, and build date
   vibes       Manage the style files every agent is given
+  watch       Open the TUI on a run that is already firing
 
 Flags:
       --ammo N           override ammo for this run (N agents at once, minimum 3)

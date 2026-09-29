@@ -652,6 +652,23 @@ type EventMsg struct {
 	Dropped uint64
 }
 
+// EventBatchMsg carries every event that was already waiting on the
+// subscription when the update loop asked for the next one, oldest first. A
+// stream that arrives faster than one message per round trip of the update
+// loop — the backlog `sc watch` reads when it attaches to a run, a replay at
+// full speed — is applied in [MaxEventBatch]-sized steps instead of one
+// event per step, which is what keeps it from trailing the run by seconds.
+type EventBatchMsg struct {
+	// Events are the events, in the order they were published.
+	Events []events.Event
+	// Dropped is the subscription's drop counter after the last of them.
+	Dropped uint64
+}
+
+// MaxEventBatch is the most events one [EventBatchMsg] carries, so a burst
+// still lets a key press or a frame through between batches.
+const MaxEventBatch = 512
+
 // StreamClosedMsg is delivered once, when the event subscription ends: the
 // bus was closed or the context was cancelled. The TUI keeps rendering the
 // state it has.
@@ -716,19 +733,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resizeViews()
 		return m, nil
 	case EventMsg:
-		m.state.Apply(msg.Event)
-		m.state.Dropped = msg.Dropped
-		m.agents = m.agents.Apply(msg.Event)
-		// A spawn starts the Agents view's spinner ticker, which is also
-		// what keeps the elapsed time on a live card moving (P7-03).
-		var agentsCmd tea.Cmd
-		m.agents, agentsCmd = m.agents.Wake(m.state)
-		var animCmd tea.Cmd
-		// Aim before firing: the animation layer asks the graph view where
-		// the event's bead is drawn right now (P7-06).
-		m.anim, animCmd = m.anim.SetTargets(m.animTargets()).Apply(msg.Event)
-		m.cursor = min(m.cursor, max(m.rows()-1, 0))
-		return m, tea.Batch(waitForEvent(m.sub), agentsCmd, animCmd)
+		return m.applyEvents([]events.Event{msg.Event}, msg.Dropped)
+	case EventBatchMsg:
+		return m.applyEvents(msg.Events, msg.Dropped)
 	case AgentsTickMsg:
 		a, cmd, ok := m.agents.Tick(msg, m.state)
 		if !ok {
@@ -748,6 +755,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 	}
 	return m, nil
+}
+
+// applyEvents folds evs into the model in order and asks for the next
+// events. The views' wake-ups are idempotent — a ticker already running is
+// not started twice — so a batch starts each at most once.
+func (m Model) applyEvents(evs []events.Event, dropped uint64) (tea.Model, tea.Cmd) {
+	cmds := []tea.Cmd{waitForEvent(m.sub)}
+	for _, ev := range evs {
+		m.state.Apply(ev)
+		m.agents = m.agents.Apply(ev)
+		// A spawn starts the Agents view's spinner ticker, which is also
+		// what keeps the elapsed time on a live card moving (P7-03).
+		var agentsCmd tea.Cmd
+		m.agents, agentsCmd = m.agents.Wake(m.state)
+		var animCmd tea.Cmd
+		// Aim before firing: the animation layer asks the graph view where
+		// the event's bead is drawn right now (P7-06).
+		m.anim, animCmd = m.anim.SetTargets(m.animTargets()).Apply(ev)
+		cmds = append(cmds, agentsCmd, animCmd)
+	}
+	m.state.Dropped = dropped
+	m.cursor = min(m.cursor, max(m.rows()-1, 0))
+	return m, tea.Batch(cmds...)
 }
 
 // handleKey routes a key press through the overlays first: a confirmation
@@ -800,7 +830,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, k.Help):
 		m.showHelp = true
 	case key.Matches(msg, k.Quit):
-		if m.state.Live {
+		// A watcher only leaves: the run it shows belongs to another
+		// process, which keeps firing after the TUI is gone.
+		if m.state.Live && !m.opts.Watch {
 			m.confirmStop = true
 			return m, nil
 		}
@@ -1061,6 +1093,8 @@ func (m Model) status() (long, short string) {
 		return "stopping", "stopping"
 	case m.state.Paused:
 		return "paused", "paused"
+	case m.opts.Watch:
+		return "watching", "watching"
 	default:
 		return "", ""
 	}
@@ -1543,11 +1577,30 @@ func waitForEvent(sub subscription) tea.Cmd {
 		return nil
 	}
 	return func() tea.Msg {
-		ev, ok := <-sub.Events()
+		ch := sub.Events()
+		ev, ok := <-ch
 		if !ok {
 			return StreamClosedMsg{}
 		}
-		return EventMsg{Event: ev, Dropped: sub.Dropped()}
+		batch := []events.Event{ev}
+	drain:
+		for len(batch) < MaxEventBatch {
+			select {
+			case next, ok := <-ch:
+				if !ok {
+					// The close is reported by the next wait, after this
+					// batch has been applied.
+					break drain
+				}
+				batch = append(batch, next)
+			default:
+				break drain
+			}
+		}
+		if len(batch) == 1 {
+			return EventMsg{Event: ev, Dropped: sub.Dropped()}
+		}
+		return EventBatchMsg{Events: batch, Dropped: sub.Dropped()}
 	}
 }
 

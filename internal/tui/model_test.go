@@ -269,6 +269,29 @@ func TestModelQuitIsImmediateOnceTheRunHasFinished(t *testing.T) {
 	require.Equal(t, tea.Quit(), cmd())
 }
 
+func TestModelWatchLeavesALiveRunWithoutStoppingIt(t *testing.T) {
+	t.Parallel()
+	stops := 0
+	m := tui.New(t.Context(), tui.Options{
+		NoColor: true,
+		Run:     tui.DemoRun(tui.DemoOptions{}),
+		OnStop:  func() { stops++ },
+		Watch:   true,
+	})
+	m = tuiResize(m, 100, 24)
+	require.True(t, m.State().Live)
+	view := m.View()
+	require.Contains(t, view, "watching")
+	require.Contains(t, view, "leave")
+	require.NotContains(t, view, "stop / quit")
+
+	quit, cmd := tuiUpdateCmd(m, tuiKey("q"))
+	require.False(t, quit.ConfirmingStop(), "a watcher has no run to stop")
+	require.NotNil(t, cmd)
+	require.Equal(t, tea.Quit(), cmd())
+	require.Equal(t, 0, stops)
+}
+
 func TestModelCtrlCQuitsWithoutConfirming(t *testing.T) {
 	t.Parallel()
 	m := tuiNewModel(t, nil)
@@ -291,6 +314,45 @@ func TestModelStreamClosedShowsDisconnected(t *testing.T) {
 	require.NotContains(t, m.View(), "disconnected")
 	m = tuiUpdate(m, tui.StreamClosedMsg{})
 	require.Contains(t, strings.Split(m.View(), "\n")[0], "disconnected")
+}
+
+func TestModelTakesWaitingEventsAsOneBatch(t *testing.T) {
+	t.Parallel()
+	demo := tui.DemoEvents(tui.DemoOptions{})
+	ch := make(chan events.Event, len(demo))
+	for _, ev := range demo {
+		ch <- ev
+	}
+	close(ch)
+	m := tuiNewModel(t, ch)
+
+	msg := m.Init()()
+	batch, ok := msg.(tui.EventBatchMsg)
+	require.True(t, ok, "expected a batch, got %T", msg)
+	require.Equal(t, demo[:min(len(demo), tui.MaxEventBatch)], batch.Events)
+
+	// Applying the batch folds every event and asks for more; the close is
+	// reported by that next wait, not lost inside the batch.
+	m, cmd := tuiUpdateCmd(m, batch)
+	want := tuiFeed(tuiNewModel(t, nil))
+	require.Equal(t, want.State().Beads, m.State().Beads)
+	require.NotNil(t, cmd)
+	for len(demo) > tui.MaxEventBatch {
+		demo = demo[tui.MaxEventBatch:]
+		next, ok := m.Init()().(tui.EventBatchMsg)
+		require.True(t, ok)
+		m = tuiUpdate(m, next)
+	}
+	require.Equal(t, tui.StreamClosedMsg{}, m.Init()())
+}
+
+func TestModelTakesALoneEventAsAnEventMsg(t *testing.T) {
+	t.Parallel()
+	ch := make(chan events.Event, 1)
+	ev := events.Warning{Meta: events.NewMeta(tui.DemoRunID), Message: "hi"}
+	ch <- ev
+	m := tuiNewModel(t, ch)
+	require.Equal(t, tui.EventMsg{Event: ev}, m.Init()())
 }
 
 func TestModelDroppedEventsAreReportedInTheFooter(t *testing.T) {

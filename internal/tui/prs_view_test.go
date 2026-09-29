@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/bubbles/key"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/domain"
@@ -862,4 +863,31 @@ func prsEveryStatus() []DeliveryStatus {
 		DeliveryOpen, DeliveryAwaitingMerge, DeliveryReviewing, DeliveryReviewed,
 		DeliveryMerged, DeliveryClosed, DeliveryNeedsHuman, DeliveryFailed,
 	}
+}
+
+func TestPRsBeadColumnFitsTheLongestID(t *testing.T) {
+	t.Parallel()
+	long := domain.BeadID("PandaJump-5c5")
+	evs := []events.Event{
+		events.RunStarted{Meta: prsMeta(0), Info: prsRunInfo(true)},
+		events.PROpened{Meta: prsMeta(1), Bead: long, URL: "https://example.invalid/acme/app/pull/1", Number: 1, Branch: "sc/PandaJump-5c5-pages", Base: "main"},
+		events.PROpened{Meta: prsMeta(2), Bead: "sc-1a2b", URL: "https://example.invalid/acme/app/pull/42", Number: 42, Branch: "sc/sc-1a2b-retry", Base: "main"},
+	}
+	st := prsState(true, evs)
+	for _, w := range []int{80, 130} {
+		out := ansi.Strip(prsView(w, 12, PRsOptions{}).View(st))
+		lines := strings.Split(out, "\n")
+		// Every row's PR column starts where the header's does, however long
+		// the bead id before it.
+		col := strings.Index(lines[1], "PR ")
+		require.Positive(t, col, "width %d:\n%s", w, out)
+		for _, l := range lines[2:4] {
+			require.Equal(t, "#", string([]rune(l)[col]), "width %d, row %q", w, l)
+		}
+		require.Contains(t, out, string(long)+" ")
+	}
+
+	odd := domain.BeadID(strings.Repeat("x", 60))
+	capped := prsState(true, append(evs, events.PROpened{Meta: prsMeta(3), Bead: odd, URL: "https://example.invalid/acme/app/pull/9", Number: 9, Branch: "sc/x", Base: "main"}))
+	require.Equal(t, prsMaxBeadWidth, prsBeadColumn(PRRows(capped)))
 }
