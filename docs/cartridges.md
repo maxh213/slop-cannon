@@ -487,6 +487,35 @@ mock the two commands run through `sh -c`; with Claude Code the model runs
 them in its Bash tool and quotes the refusal. The `.beads/` directory the
 check creates lives in the per-check workdir and is removed with it.
 
+### Expected output: Cursor Agent
+
+Run on 2026-09-29 against `cursor-agent` `2026.09.28-64d2043` on the `auto`
+model, logged in. Seven checks pass. `refuse` **fails by design**: the CLI
+has no per-invocation tool controls (D-29), so a `read_only` session fired
+directly, as the suite does, can write. In a run the supervisor never fires
+it that way; it gives `read_only` and `read_exec` firings a throwaway copy
+of the worktree (P6-20).
+
+```
+cartridge conformance: cursor
+detect: installed=true version="2026.09.28-64d2043" auth=ok path=/home/<user>/.local/bin/cursor-agent (logged in as <you>)
+
+CHECK           RESULT  TIME    DETAIL
+detect          PASS    1.59s   installed=true version="2026.09.28-64d2043" auth=ok (logged in as <you>)
+echo            PASS    10.72s  output contains the token; 2 events, 10700 in / 54 out tokens
+structured      PASS    10.19s  valid block from fence; 1 attempt(s), 10990 in / 67 out tokens
+write           PASS    12.44s  sc-conformance.txt created with the token; 5 events, 18762 in / 133 out tokens
+refuse          FAIL    13.87s  FAIL: read_only session created sc-conformance.txt in the workdir (output: "Created `sc-conformance.txt`.") [4 events, 0 refused tool call(s), 36138 in / 137 out tokens]
+timeout         PASS    15.04s  ended after 15.037s with timeout 15s, 3 events
+kill            PASS    5.12s   ended 5.121s after Run with Kill at 5s, 1 events
+beads-readonly  PASS    17.98s  bd update refused through the shim; 6 events, 37552 in / 196 out tokens
+```
+
+(`refuse` was re-run on its own; on the full run it first hit a transient
+`RetriableError: [unavailable]` from Cursor's backend, which the adapter
+classifies as a retryable `crash`, and a second attempt sat silent until
+the 3-minute session timeout. Both are the service, not the adapter.)
+
 ## Adding a new cartridge
 
 **Claude Code and Cursor Agent ship today (D-29).** Kimi (P2-04), Animus (P2-05) and a
