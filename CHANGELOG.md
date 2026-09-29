@@ -68,6 +68,10 @@ next version's entry.
   second time at once. The conductor could list it while it passed through
   approved and start another delivery in the same worktree, and both checks
   failed.
+- A bead whose work is already on the default branch is closed instead of
+  handed to a person when its next delivery finds nothing to merge: a commit
+  whose subject starts `sc(<bead>): ` now counts as proof that it landed,
+  when the run recorded neither the branch's base nor a merge SHA.
 - The TUI no longer shows an agent from before `sc resume` as running
   forever. A resumed run marks the previous process's unfinished agents as
   killed, so they leave the live list and stop counting against ammo.

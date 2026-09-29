@@ -739,6 +739,31 @@ func TestManager_DeliverMerge(t *testing.T) {
 		assert.Equal(t, StageMerge, dmStage(t, err))
 	})
 
+	t.Run("an empty branch whose bead's commit is already on main closes the bead", func(t *testing.T) {
+		f := dmSetup(t)
+		f.dmMainCommit(t, "pause.txt", "p\n", "sc("+string(wtBead.ID)+"): Give the pause button a bigger tap area")
+		landed := f.dmMain(t)
+		client, bd := dmBeads(t, f.repo.Root, nil)
+
+		res, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client})
+		require.NoError(t, err)
+		assert.True(t, res.AlreadyLanded)
+		assert.True(t, res.Closed)
+		assert.Equal(t, landed, f.dmMain(t), "main did not move")
+		assert.Equal(t, 1, dmCalled(t, bd, "close"))
+	})
+
+	t.Run("a commit naming another bead does not count as this bead landing", func(t *testing.T) {
+		f := dmSetup(t)
+		f.dmMainCommit(t, "other.txt", "o\n", "sc("+string(wtBead.ID)+"x): Someone else's work")
+		f.dmMainCommit(t, "mention.txt", "m\n", "Fix a test, see sc("+string(wtBead.ID)+"): in the log")
+		client, bd := dmBeads(t, f.repo.Root, nil)
+
+		_, err := f.m.DeliverMerge(ctx, wtBead, MergeOptions{CheckCommand: "true", Beads: client})
+		require.ErrorIs(t, err, ErrNothingToDeliver)
+		assert.Zero(t, dmCalled(t, bd, "close"), "the bead stays open")
+	})
+
 	// The zero-commit path is what makes a delivery idempotent: the merge
 	// and the push landed, only bd close failed. The recorded base tells
 	// that apart from a branch that never received a commit.

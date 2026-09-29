@@ -485,18 +485,52 @@ func (m *Manager) assertLinear(ctx context.Context, base, head string) error {
 //
 //   - [MergeOptions.BaseSHA] (P4-13's sc_base_sha, written when the branch
 //     was created): the branch must carry at least one commit beyond it.
-//     It is authoritative; an unknown revision is ignored.
+//     An unknown revision is ignored.
+//
 //   - failing that, the sc_merge_sha the previous attempt stamped on the
 //     bead before it called bd close: it must be contained in the default
 //     branch. A bead bd cannot find carries no such record.
 //
-// With neither, the delivery cannot prove the code landed and the bead
-// stays open (D-20).
+//   - failing both, a commit on the default branch whose subject names the
+//     bead the way an engineer's commit does, `sc(<id>): …`. Seen on
+//     PandaJump-ovf: a push reported an error, so no sc_merge_sha was
+//     stamped, yet the commits were on the default branch, and the next
+//     delivery handed a finished bead to a person.
+//
+// With none of these, the delivery cannot prove the code landed and the
+// bead stays open (D-20).
 //
 // tip is the branch's tip before the rebase (the rebase moves an empty
 // branch onto the default branch tip, which would make it look delivered),
 // and defaultTip is the default branch tip the delivery started from.
 func (m *Manager) alreadyLanded(ctx context.Context, id domain.BeadID, tip, defaultTip string, opts MergeOptions) (bool, error) {
+	landed, err := m.landedByRecord(ctx, id, tip, defaultTip, opts)
+	if err != nil || landed {
+		return landed, err
+	}
+	return m.landedByName(ctx, id, defaultTip)
+}
+
+// landedByName reports whether the default branch holds a commit whose
+// subject starts `sc(<id>): `, the prefix every engineer commit and
+// leftovers commit of the bead carries ([LeftoverMessage]).
+func (m *Manager) landedByName(ctx context.Context, id domain.BeadID, defaultTip string) (bool, error) {
+	prefix := "sc(" + string(id) + "): "
+	out, err := m.repo.Git(ctx, "log", "--format=%s", "--fixed-strings", "--grep", prefix, defaultTip)
+	if err != nil {
+		return false, stageErr(StageMerge, err, "")
+	}
+	for _, subject := range strings.Split(out, "\n") {
+		if strings.HasPrefix(subject, prefix) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// landedByRecord is the part of [Manager.alreadyLanded] that reads what the
+// run wrote down: the branch's base, then the bead's sc_merge_sha.
+func (m *Manager) landedByRecord(ctx context.Context, id domain.BeadID, tip, defaultTip string, opts MergeOptions) (bool, error) {
 	if base := strings.TrimSpace(opts.BaseSHA); base != "" {
 		sha, err := m.repo.RevParse(ctx, base)
 		switch {
