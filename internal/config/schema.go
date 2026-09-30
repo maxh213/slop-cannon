@@ -124,6 +124,9 @@ const (
 	// DefaultMaxAgentTimeout caps the longer limit the product owner may give
 	// one bead's agents (a plan bead's timeout).
 	DefaultMaxAgentTimeout = 24 * time.Hour
+	// DefaultCheckTimeout bounds the check command a delivery runs before it
+	// merges; it matches gitx.DefaultCheckTimeout.
+	DefaultCheckTimeout = 30 * time.Minute
 	// MaxPromptFileSize is the largest vibes or rules file accepted (64 KiB).
 	MaxPromptFileSize = 64 * 1024
 )
@@ -255,6 +258,7 @@ type LimitsFile struct {
 	MaxConflictRounds *int      `toml:"max_conflict_rounds,omitempty"`
 	AgentTimeout      *Duration `toml:"agent_timeout,omitempty"`
 	MaxAgentTimeout   *Duration `toml:"max_agent_timeout,omitempty"`
+	CheckTimeout      *Duration `toml:"check_timeout,omitempty"`
 	MaxTokens         *int64    `toml:"max_tokens,omitempty"`
 	MaxCostUSD        *float64  `toml:"max_cost_usd,omitempty"`
 	MaxPlanRejections *int      `toml:"max_plan_rejections,omitempty"`
@@ -345,6 +349,9 @@ type Limits struct {
 	// MaxAgentTimeout caps the longer session limit the product owner may
 	// give one bead in its plan; it is never below AgentTimeout.
 	MaxAgentTimeout Duration `json:"max_agent_timeout"`
+	// CheckTimeout bounds the repository's check command when a delivery
+	// runs it before merging (P4-19).
+	CheckTimeout Duration `json:"check_timeout"`
 	// MaxTokens is an opt-in token budget; 0 means unlimited (D-18).
 	MaxTokens int64 `json:"max_tokens,omitempty"`
 	// MaxCostUSD is an opt-in cost budget; 0 means unlimited (D-18).
@@ -449,6 +456,7 @@ func Defaults() Config {
 			MaxConflictRounds: DefaultMaxConflictRounds,
 			AgentTimeout:      NewDuration(DefaultAgentTimeout),
 			MaxAgentTimeout:   NewDuration(DefaultMaxAgentTimeout),
+			CheckTimeout:      NewDuration(DefaultCheckTimeout),
 			MaxPlanRejections: DefaultMaxPlanRejections,
 			MaxPlanFailures:   DefaultMaxPlanFailures,
 		},

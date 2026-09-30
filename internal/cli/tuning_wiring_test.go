@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/config"
+	"slop-cannon/internal/gitx"
 )
 
 // TestRunReadsTheTuningKeysFromTheConfig is the last clause of P1-14 and
@@ -27,6 +28,7 @@ func TestRunReadsTheTuningKeysFromTheConfig(t *testing.T) {
 		config.KeyMaxDiffBytes:      "gitx.WithMaxDiffBytes(cfg.MaxDiffBytes)",
 		config.KeyReReviewThreshold: "ReReviewThreshold: rc.Effective.ReReviewThreshold",
 		config.KeyMaxConflictRounds: "MaxConflictRounds: rc.Effective.Limits.MaxConflictRounds",
+		config.KeyCheckTimeout:      "CheckTimeout: rc.Effective.Limits.CheckTimeout.Duration()",
 	} {
 		assert.Contains(t, string(src), read,
 			"%s is a configuration key the run must read, not a package constant", key)
@@ -44,4 +46,6 @@ func TestTuningDefaultsAreWhatTheRunFallsBackOn(t *testing.T) {
 	assert.Equal(t, config.DefaultReReviewThreshold, d.ReReviewThreshold)
 	assert.Equal(t, config.DefaultMaxConflictRounds, d.Limits.MaxConflictRounds)
 	assert.Equal(t, config.DefaultGraphPollInterval, d.GraphPollInterval.Duration())
+	assert.Equal(t, gitx.DefaultCheckTimeout, d.Limits.CheckTimeout.Duration(),
+		"limits.check_timeout defaults to the timeout gitx used before it was configurable (P4-19)")
 }

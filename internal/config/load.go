@@ -57,6 +57,7 @@ const (
 	KeyMaxConflictRounds  = "limits.max_conflict_rounds"
 	KeyAgentTimeout       = "limits.agent_timeout"
 	KeyMaxAgentTimeout    = "limits.max_agent_timeout"
+	KeyCheckTimeout       = "limits.check_timeout"
 	KeyMaxTokens          = "limits.max_tokens"
 	KeyMaxCostUSD         = "limits.max_cost_usd"
 	KeyMaxPlanRejections  = "limits.max_plan_rejections"
@@ -192,7 +193,7 @@ var scalarKeys = []string{
 	KeyActiveCartridge, KeyAmmo, KeySafety, KeyVibes, KeyRules, KeyExclude, KeyCheckCommand, KeyIdleReplanInterval,
 	KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyMaxDiffBytes, KeyReReviewThreshold,
 	KeyMaxBeadsPerPlan, KeyNice, KeyResearch,
-	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyMaxConflictRounds, KeyAgentTimeout, KeyMaxAgentTimeout, KeyMaxTokens, KeyMaxCostUSD,
+	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyMaxConflictRounds, KeyAgentTimeout, KeyMaxAgentTimeout, KeyCheckTimeout, KeyMaxTokens, KeyMaxCostUSD,
 	KeyMaxPlanRejections, KeyMaxPlanFailures,
 }
 
@@ -507,6 +508,10 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 		e.Limits.MaxAgentTimeout = *v
 		e.Sources[KeyMaxAgentTimeout] = src
 	}
+	if v := f.Limits.CheckTimeout; v != nil {
+		e.Limits.CheckTimeout = *v
+		e.Sources[KeyCheckTimeout] = src
+	}
 	if v := f.Limits.MaxTokens; v != nil {
 		e.Limits.MaxTokens = *v
 		e.Sources[KeyMaxTokens] = src
@@ -680,6 +685,9 @@ func (e *Effective) validate() error {
 		return &ValidationError{Path: e.pathOf(KeyMaxAgentTimeout), Key: KeyMaxAgentTimeout,
 			Msg: fmt.Sprintf("must be at least limits.agent_timeout (%s)", e.Limits.AgentTimeout.String())}
 	}
+	if e.Limits.CheckTimeout.Duration() <= 0 {
+		return &ValidationError{Path: e.pathOf(KeyCheckTimeout), Key: KeyCheckTimeout, Msg: "must be a positive duration"}
+	}
 	if e.Limits.MaxTokens < 0 {
 		return &ValidationError{Path: e.pathOf(KeyMaxTokens), Key: KeyMaxTokens, Msg: "must not be negative (0 means unlimited)"}
 	}
@@ -792,6 +800,7 @@ func (e *Effective) Entries() []Entry {
 	add(KeyMaxConflictRounds, strconv.Itoa(e.Limits.MaxConflictRounds), e.Sources[KeyMaxConflictRounds])
 	add(KeyAgentTimeout, e.Limits.AgentTimeout.String(), e.Sources[KeyAgentTimeout])
 	add(KeyMaxAgentTimeout, e.Limits.MaxAgentTimeout.String(), e.Sources[KeyMaxAgentTimeout])
+	add(KeyCheckTimeout, e.Limits.CheckTimeout.String(), e.Sources[KeyCheckTimeout])
 	add(KeyMaxTokens, strconv.FormatInt(e.Limits.MaxTokens, 10), e.Sources[KeyMaxTokens])
 	add(KeyMaxCostUSD, strconv.FormatFloat(e.Limits.MaxCostUSD, 'f', -1, 64), e.Sources[KeyMaxCostUSD])
 	add(KeyMaxPlanRejections, strconv.Itoa(e.Limits.MaxPlanRejections), e.Sources[KeyMaxPlanRejections])

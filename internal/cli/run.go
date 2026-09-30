@@ -1410,6 +1410,9 @@ func runDeliverer(run *orchestrator.Run, states *orchestrator.StateMachine, dgit
 	opts := orchestrator.DeliveryOptions{
 		Host: run, States: states, Git: dgit, Beads: client,
 		CheckCommand: rc.Effective.CheckCommand,
+		// P4-19: a full check under load can outrun gitx's 30-minute
+		// default, and a killed check fails every delivery.
+		CheckTimeout: rc.Effective.Limits.CheckTimeout.Duration(),
 		// P1-14 and P1-18: D-09's threshold and the conflict-round cap
 		// come from the configuration, not from the package constants.
 		ReReviewThreshold: rc.Effective.ReReviewThreshold,

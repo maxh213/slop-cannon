@@ -88,12 +88,12 @@ func TestDurationText(t *testing.T) {
 	assert.EqualError(t, d.UnmarshalText([]byte("10x")), `invalid duration "10x" (use a Go duration such as "10m" or "1h30m")`)
 
 	// JSON uses the same text form.
-	js, err := json.Marshal(Limits{AgentTimeout: NewDuration(DefaultAgentTimeout), MaxAgentTimeout: NewDuration(DefaultMaxAgentTimeout), MaxReviewRounds: 5, MaxPushbackRounds: 2,
+	js, err := json.Marshal(Limits{AgentTimeout: NewDuration(DefaultAgentTimeout), MaxAgentTimeout: NewDuration(DefaultMaxAgentTimeout), CheckTimeout: NewDuration(DefaultCheckTimeout), MaxReviewRounds: 5, MaxPushbackRounds: 2,
 		MaxConflictRounds: DefaultMaxConflictRounds,
 		MaxPlanRejections: DefaultMaxPlanRejections, MaxPlanFailures: DefaultMaxPlanFailures})
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"max_review_rounds":5,"max_pushback_rounds":2,"max_conflict_rounds":3,"agent_timeout":"6h",`+
-		`"max_agent_timeout":"24h","max_plan_rejections":2,"max_plan_failures":5}`, string(js))
+		`"max_agent_timeout":"24h","check_timeout":"30m","max_plan_rejections":2,"max_plan_failures":5}`, string(js))
 }
 
 func TestDefaultsMatchD04(t *testing.T) {
@@ -114,6 +114,7 @@ func TestDefaultsMatchD04(t *testing.T) {
 	assert.Equal(t, 8, d.MaxBeadsPerPlan)
 	assert.Equal(t, Limits{MaxReviewRounds: 5, MaxPushbackRounds: 2, MaxConflictRounds: 3,
 		AgentTimeout: NewDuration(6 * time.Hour), MaxAgentTimeout: NewDuration(24 * time.Hour),
+		CheckTimeout:      NewDuration(30 * time.Minute),
 		MaxPlanRejections: 2, MaxPlanFailures: 5}, d.Limits)
 	assert.Empty(t, d.Roles)
 }

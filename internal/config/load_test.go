@@ -62,6 +62,7 @@ max_pushback_rounds = 1
 max_conflict_rounds = 2
 agent_timeout = "20m"
 max_agent_timeout = "12h"
+check_timeout = "40m"
 max_tokens = 1000
 max_cost_usd = 2.5
 max_plan_rejections = 3
@@ -102,6 +103,7 @@ max_pushback_rounds = 3
 max_conflict_rounds = 4
 agent_timeout = "45m"
 max_agent_timeout = "18h"
+check_timeout = "90m"
 max_tokens = 2000
 max_cost_usd = 9
 max_plan_rejections = 4
@@ -186,7 +188,7 @@ func TestLoadGlobalOnly(t *testing.T) {
 	assert.InEpsilon(t, 0.5, eff.ReReviewThreshold, 1e-9)
 	assert.Equal(t, 6, eff.MaxBeadsPerPlan)
 	assert.Equal(t, Limits{MaxReviewRounds: 4, MaxPushbackRounds: 1, MaxConflictRounds: 2, AgentTimeout: NewDuration(20 * time.Minute),
-		MaxAgentTimeout: NewDuration(12 * time.Hour), MaxTokens: 1000, MaxCostUSD: 2.5, MaxPlanRejections: 3, MaxPlanFailures: 7}, eff.Limits)
+		MaxAgentTimeout: NewDuration(12 * time.Hour), CheckTimeout: NewDuration(40 * time.Minute), MaxTokens: 1000, MaxCostUSD: 2.5, MaxPlanRejections: 3, MaxPlanFailures: 7}, eff.Limits)
 	assert.Equal(t, map[domain.Role]string{domain.RoleTester: "claude"}, eff.Roles)
 
 	for _, key := range scalarKeys {
@@ -216,7 +218,7 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 	assert.Equal(t, 8192, eff.MaxDiffBytes, "the repo's diff cap wins")
 	assert.InEpsilon(t, 0.25, eff.ReReviewThreshold, 1e-9, "the repo's re-review threshold wins")
 	assert.Equal(t, Limits{MaxReviewRounds: 6, MaxPushbackRounds: 3, MaxConflictRounds: 4, AgentTimeout: NewDuration(45 * time.Minute),
-		MaxAgentTimeout: NewDuration(18 * time.Hour), MaxTokens: 2000, MaxCostUSD: 9, MaxPlanRejections: 4, MaxPlanFailures: 9}, eff.Limits)
+		MaxAgentTimeout: NewDuration(18 * time.Hour), CheckTimeout: NewDuration(90 * time.Minute), MaxTokens: 2000, MaxCostUSD: 9, MaxPlanRejections: 4, MaxPlanFailures: 9}, eff.Limits)
 	// Lists union across layers, global first, deduplicated by absolute path.
 	globalDir, repoDir := filepath.Dir(globalPath), filepath.Dir(repoPath)
 	assert.Equal(t, []string{
@@ -369,7 +371,7 @@ func TestLoadMalformedDurationReportsPosition(t *testing.T) {
 	// One case per duration key in the schema; durationKeysOfFile below
 	// fails the test if a key is added to File and forgotten here.
 	keys := []string{
-		KeyIdleReplanInterval, KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyAgentTimeout, KeyMaxAgentTimeout,
+		KeyIdleReplanInterval, KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyAgentTimeout, KeyMaxAgentTimeout, KeyCheckTimeout,
 	}
 	assert.ElementsMatch(t, keys, durationKeysOfFile(reflect.TypeOf(File{}), ""), "every duration key needs a case here")
 
@@ -474,6 +476,7 @@ func TestLoadValidation(t *testing.T) {
 		// the feedback loop, which is the default two exchanges (P9-01).
 		{"zero pushback", "[limits]\nmax_pushback_rounds = 0\n", "", KeyMaxPushbackRounds, "must be at least 1"},
 		{"zero timeout", "[limits]\nagent_timeout = \"0s\"\n", "", KeyAgentTimeout, "must be a positive duration"},
+		{"zero check timeout", "[limits]\ncheck_timeout = \"0s\"\n", "", KeyCheckTimeout, "must be a positive duration"},
 		{"negative tokens", "[limits]\nmax_tokens = -5\n", "", KeyMaxTokens, "must not be negative"},
 		{"negative cost", "", "[limits]\nmax_cost_usd = -0.5\n", KeyMaxCostUSD, "must not be negative"},
 		{"no plan rejections", "[limits]\nmax_plan_rejections = 0\n", "", KeyMaxPlanRejections, "must be at least 1"},
