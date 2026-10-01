@@ -254,6 +254,7 @@ func (s RunSpec) EnvAllowlist() []string {
 
 // ProcSpec builds the internal/proc invocation for command and args with the
 // spec's workdir, timeout and clean environment (the allowlist plus Env).
+// Every agent session reaps what it leaves running (proc.Spec.ReapDescendants).
 // Adapters set Stdin and GracePeriod themselves.
 func (s RunSpec) ProcSpec(command string, args ...string) proc.Spec {
 	env := make(map[string]string, len(s.Env))
@@ -261,12 +262,13 @@ func (s RunSpec) ProcSpec(command string, args ...string) proc.Spec {
 		env[k] = v
 	}
 	return proc.Spec{
-		Command:    command,
-		Args:       append([]string(nil), args...),
-		Dir:        s.Workdir,
-		Env:        env,
-		InheritEnv: s.EnvAllowlist(),
-		Timeout:    s.Timeout,
+		Command:         command,
+		Args:            append([]string(nil), args...),
+		Dir:             s.Workdir,
+		Env:             env,
+		InheritEnv:      s.EnvAllowlist(),
+		Timeout:         s.Timeout,
+		ReapDescendants: true,
 	}
 }
 

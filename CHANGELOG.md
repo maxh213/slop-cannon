@@ -64,6 +64,13 @@ next version's entry.
 
 ### Fixed
 
+- An agent no longer leaves processes running after it finishes. A tester
+  that drove a TUI with `script -c "npm start"` left the app running for good,
+  because `script` moves it out of the agent's process group, and one long
+  run piled up 162 dashboards and over 20 GiB of memory. Every agent session
+  and the delivery check now tag their environment, and when they exit the
+  run kills their process group and, on Linux, every process still carrying
+  the tag.
 - A bead being re-delivered after a conflict round is never delivered a
   second time at once. The conductor could list it while it passed through
   approved and start another delivery in the same worktree, and both checks

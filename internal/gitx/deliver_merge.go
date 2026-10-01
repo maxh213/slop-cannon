@@ -844,12 +844,13 @@ func (r *Repo) runCheck(ctx context.Context, command string, timeout time.Durati
 		inherit = append(inherit, name)
 	}
 	spec := proc.Spec{
-		Command:    "sh",
-		Args:       []string{"-c", command},
-		Dir:        r.Root,
-		Env:        env,
-		InheritEnv: inherit,
-		Timeout:    timeout,
+		Command:         "sh",
+		Args:            []string{"-c", command},
+		Dir:             r.Root,
+		Env:             env,
+		InheritEnv:      inherit,
+		Timeout:         timeout,
+		ReapDescendants: true,
 	}
 	result, err := proc.Run(ctx, spec)
 	check := &CheckResult{

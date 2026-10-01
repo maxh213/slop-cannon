@@ -11,6 +11,10 @@
 //   - The child is the leader of its own process group. On timeout,
 //     cancellation, or [Handle.Kill] the whole group is signalled, so shells
 //     and the grandchildren they spawn die together.
+//   - With [Spec.ReapDescendants] nothing the child started outlives it:
+//     once it exits, its group is killed and, on Linux, so is every process
+//     still carrying its environment tag, even one that left the group with
+//     setsid. Agent sessions and the delivery check run this way.
 //   - [Run] captures stdout and stderr and returns them in [Result].
 //     [Stream] delivers each line as it arrives on [Handle.Lines], tagged
 //     with the stream it came from, so callers can log or render output live.

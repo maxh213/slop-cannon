@@ -51,6 +51,15 @@ type Spec struct {
 	// Unix) sent on timeout, cancellation, or Kill, and the SIGKILL that
 	// follows if the group is still alive. Zero kills immediately.
 	GracePeriod time.Duration
+	// ReapDescendants cleans up after the child once it has exited, however
+	// it exited: the process group is killed, and every process still
+	// carrying the child's reap tag (a unique variable added to its
+	// environment, which descendants inherit) is stopped as well. That
+	// catches what a group kill cannot: a tester's `script -c "npm start"`
+	// or anything else that moved itself into a new session with setsid and
+	// would otherwise outlive the agent that started it. The tag sweep reads
+	// /proc and runs on Linux only; elsewhere only the group is killed.
+	ReapDescendants bool
 }
 
 // Result records what a finished process did.
@@ -259,6 +268,9 @@ type process struct {
 	// is none). The context's cause distinguishes a timeout from an outer
 	// cancellation.
 	stopTimeout context.CancelFunc
+	// reapTag is the environment variable name that marks the child and its
+	// descendants when Spec.ReapDescendants is set; empty otherwise.
+	reapTag string
 }
 
 // start validates spec, wires the writers, and starts the process in its own
@@ -287,6 +299,11 @@ func start(ctx context.Context, spec Spec, stdout, stderr io.Writer) (*process, 
 	cmd := exec.CommandContext(runCtx, path, spec.Args...)
 	cmd.Dir = spec.Dir
 	cmd.Env = spec.Environ()
+	var reapTag string
+	if spec.ReapDescendants {
+		reapTag = newReapTag()
+		cmd.Env = append(cmd.Env, reapTag+"=1")
+	}
 	cmd.Stdin = spec.Stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -296,7 +313,7 @@ func start(ctx context.Context, spec Spec, stdout, stderr io.Writer) (*process, 
 		return stopGroup(cmd.Process, spec.GracePeriod)
 	}
 
-	p := &process{spec: spec, cmd: cmd, ctx: runCtx, cancel: cancel, stopTimeout: stopTimeout}
+	p := &process{spec: spec, cmd: cmd, ctx: runCtx, cancel: cancel, stopTimeout: stopTimeout, reapTag: reapTag}
 	p.started = time.Now()
 	if err := cmd.Start(); err != nil {
 		stopTimeout()
@@ -314,6 +331,10 @@ func (p *process) wait() (Result, error) {
 		// The child exited but something in its group kept the pipes open.
 		// Clean up the stragglers; the exit status itself was fine.
 		killGroup(p.cmd.Process)
+	}
+	if p.reapTag != "" {
+		killGroup(p.cmd.Process)
+		reapTagged(p.reapTag, p.spec.GracePeriod)
 	}
 	cause := context.Cause(p.ctx)
 	p.stopTimeout()
