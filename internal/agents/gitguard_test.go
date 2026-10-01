@@ -239,7 +239,7 @@ func TestInstallGitGuardForWorktreeUsesTheShimDirectory(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, shimDir, g.Dir, "the guard shares the per-agent PATH entry the bd shim already has")
 	assert.Equal(t, filepath.Join(shimDir, "git"), g.Path)
-	assert.Equal(t, wt, g.Worktree, "a firing's git is always confined to its own worktree")
+	assert.Equal(t, testutil.RealPath(t, wt), g.Worktree, "a firing's git is always confined to its own worktree")
 
 	_, err = InstallGitGuardForWorktree("", "")
 	require.ErrorContains(t, err, "empty worktree path")
@@ -341,7 +341,7 @@ func TestAFiringCannotMoveTheDefaultBranch(t *testing.T) {
 	assert.Contains(t, text, GitGuardDeniedMessage("push"))
 	assert.Contains(t, text, GitGuardDeniedMessage("checkout"))
 	assert.Contains(t, text, GitGuardDeniedMessage("clean"))
-	assert.Contains(t, text, GitGuardOutsideMessage(wt))
+	assert.Contains(t, text, GitGuardOutsideMessage(testutil.RealPath(t, wt)))
 
 	assert.Equal(t, mainBefore, strings.TrimSpace(repo.Git(t, "rev-parse", "main")),
 		"the local default branch moved")

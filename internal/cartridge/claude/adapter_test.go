@@ -216,7 +216,7 @@ func TestRun_TextReply(t *testing.T) {
 
 	calls := shim.Invocations(t)
 	require.Len(t, calls, 1)
-	assert.Equal(t, spec.Workdir, calls[0].Dir, "cwd is the workdir")
+	assert.Equal(t, testutil.RealPath(t, spec.Workdir), calls[0].Dir, "cwd is the workdir")
 	assert.Equal(t, spec.Prompt, calls[0].Stdin, "the prompt arrives on stdin")
 	assert.Equal(t, []string{
 		"-p", "--output-format", "stream-json", "--verbose",

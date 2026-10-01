@@ -175,7 +175,7 @@ func TestRun_ReplaysToolsFixture(t *testing.T) {
 	calls := shim.Invocations(t)
 	require.Len(t, calls, 1)
 	assert.Equal(t, "You are a test."+SystemPromptSeparator+"Reply with exactly the word OK", calls[0].Stdin)
-	assert.Equal(t, spec.Workdir, calls[0].Dir)
+	assert.Equal(t, testutil.RealPath(t, spec.Workdir), calls[0].Dir)
 	assert.Contains(t, calls[0].Args, "auto")
 }
 

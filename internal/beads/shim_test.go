@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -231,7 +232,7 @@ func TestShimPrependsReadonlyAndPassesEverythingThrough(t *testing.T) {
 	calls := fake.Invocations(t)
 	require.Len(t, calls, 1)
 	assert.Equal(t, []string{"--readonly", "-C", "/repo", "ready", "--json", "-n", "0", "--parent", "sc-1", "it's odd"}, calls[0].Args)
-	assert.Equal(t, dir, calls[0].Dir, "runs in the agent's cwd")
+	assert.Equal(t, testutil.RealPath(t, dir), calls[0].Dir, "runs in the agent's cwd")
 
 	// No arguments at all still reaches bd.
 	out, _, code = shimRun(t, s, dir, env)
@@ -552,7 +553,7 @@ func TestShimVerify(t *testing.T) {
 		assert.Equal(t, []string{"--readonly", "update", "sc-shim-probe", "-s", "open"}, calls[3].Args,
 			"bd itself is checked directly, because the shim refuses the write first")
 		for _, c := range calls {
-			assert.Equal(t, dir, c.Dir, "runs where the agent would")
+			assert.Equal(t, testutil.RealPath(t, dir), c.Dir, "runs where the agent would")
 		}
 	})
 	t.Run("fails when bd accepts the write", func(t *testing.T) {
@@ -810,6 +811,9 @@ func TestInstallForWorktree(t *testing.T) {
 // died on it: "shim … cannot run bd: fork/exec …/bd: text file busy".
 func TestShimVerifyRetriesWhileTheShimIsOpenForWriting(t *testing.T) {
 	t.Run("a held descriptor really does make exec fail", func(t *testing.T) {
+		if runtime.GOOS != "linux" {
+			t.Skip("ETXTBSY is Linux's: macOS runs a file that is open for writing")
+		}
 		s, _ := shimInstall(t)
 		f, err := os.OpenFile(s.Path, os.O_WRONLY, 0)
 		require.NoError(t, err)
