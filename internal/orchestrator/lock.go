@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -456,11 +457,21 @@ func StampRunLock(stateDir string, opts LockOptions) error {
 	return stampLockRecord(path, seen, rec)
 }
 
+// lockSnapshot identifies the lock file a stamp was read from: the file
+// itself and the exact bytes it held. Both must still match before the
+// stamp is written back, because a filesystem may hand a just-freed inode
+// number to the very next file it creates, so a takeover's fresh lock can
+// pass [os.SameFile] on ext4 and friends.
+type lockSnapshot struct {
+	info os.FileInfo
+	data []byte
+}
+
 // readLockToStamp is the read half of [StampRunLock]: it returns the record
-// to write back and the identity of the file it came from, or a nil
-// os.FileInfo when there is nothing to do (no lock, somebody else's lock,
-// or one this process already stamped).
-func readLockToStamp(path string, self int, stamp string) (LockRecord, os.FileInfo, error) {
+// to write back and a snapshot of the file it came from, or a nil snapshot
+// when there is nothing to do (no lock, somebody else's lock, or one this
+// process already stamped).
+func readLockToStamp(path string, self int, stamp string) (LockRecord, *lockSnapshot, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
@@ -483,11 +494,12 @@ func readLockToStamp(path string, self int, stamp string) (LockRecord, os.FileIn
 		return LockRecord{}, nil, nil // somebody else's lock, or already stamped.
 	}
 	rec.Started = stamp
-	return rec, info, nil
+	return rec, &lockSnapshot{info: info, data: data}, nil
 }
 
 // stampLockRecord writes rec back over the lock at path — but only while
-// that path is still the very file seen was read from.
+// that path is still the very file, with the very content, seen was read
+// from.
 //
 // The re-check is P9-04's answer to a takeover racing the stamp (a `--force`
 // run removes the lock and publishes its own record in its place). Without
@@ -496,15 +508,20 @@ func readLockToStamp(path string, self int, stamp string) (LockRecord, os.FileIn
 // that no longer names it, and a third sc would read a record naming a
 // process that may by then be dead, call the lock stale and start alongside
 // a live run — the one thing this file exists to prevent. A replaced file
-// has a different identity, so the stamp is simply abandoned; the record
-// the takeover published stands, and it carries its own stamp already.
-func stampLockRecord(path string, seen os.FileInfo, rec LockRecord) error {
+// has a different identity or, when the filesystem reused the inode, a
+// different record, so the stamp is simply abandoned; the record the
+// takeover published stands, and it carries its own stamp already.
+func stampLockRecord(path string, seen *lockSnapshot, rec LockRecord) error {
 	out, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return fmt.Errorf("orchestrator: encode the run lock: %w", err)
 	}
 	now, err := os.Stat(path)
-	if err != nil || !os.SameFile(seen, now) {
+	if err != nil || !os.SameFile(seen.info, now) {
+		return nil
+	}
+	current, err := os.ReadFile(path) //nolint:gosec // the path is sc's own state directory (D-23).
+	if err != nil || !bytes.Equal(current, seen.data) {
 		return nil
 	}
 	if err := config.WriteAtomic(path, append(out, '\n'), runFilePerm); err != nil {

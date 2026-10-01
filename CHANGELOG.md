@@ -64,6 +64,12 @@ next version's entry.
 
 ### Fixed
 
+- A run that stamps its lock just as `sc --force` takes the lock over no
+  longer writes its own record back over the takeover's. The check that the
+  lock is still the file it read compared only device and inode, and ext4
+  and other filesystems hand a freed inode number to the next new file, so a
+  third `sc` could find a lock naming a dead process and start next to a
+  live run. The stamp now also requires the file's content to be unchanged.
 - An agent no longer leaves processes running after it finishes. A tester
   that drove a TUI with `script -c "npm start"` left the app running for good,
   because `script` moves it out of the agent's process group, and one long

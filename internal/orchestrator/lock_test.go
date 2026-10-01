@@ -1196,6 +1196,35 @@ func TestAcquireLockPublishesTheStartStamp(t *testing.T) {
 //
 // The two halves are called by hand, which is the takeover happening in
 // exactly the wrong instant; StampRunLock itself runs them back to back.
+// A takeover's new lock can land on the inode the removed one freed (ext4
+// reuses them at once), so it passes os.SameFile. Rewriting the file in
+// place reproduces that on any filesystem: same identity, another record.
+func TestStampDoesNotClobberATakeoverThatReusedTheInode(t *testing.T) {
+	f := lockSetup(t)
+	path := writeLock(t, f.State, LockRecord{LockHolder: LockHolder{
+		Run: "20260904-100000-0103", PID: 4242, Host: "sc-host", TakenAt: lockEpoch,
+	}})
+
+	rec, seen, err := readLockToStamp(path, 4242, "5150")
+	require.NoError(t, err)
+	require.NotNil(t, seen)
+
+	forced := LockRecord{LockHolder: LockHolder{
+		Run: "20260904-100500-0104", PID: 4343, Host: "sc-host", TakenAt: lockEpoch.Add(time.Minute),
+	}, Started: "9999"}
+	data, err := json.MarshalIndent(forced, "", "  ")
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, append(data, '\n'), 0o600))
+	now, err := os.Stat(path)
+	require.NoError(t, err)
+	require.True(t, os.SameFile(seen.info, now), "the rewrite must keep the inode for this test to mean anything")
+
+	require.NoError(t, stampLockRecord(path, seen, rec))
+	got, err := readLockRecord(path)
+	require.NoError(t, err)
+	require.Equal(t, forced, got, "the record the takeover published stands")
+}
+
 func TestStampDoesNotClobberATakeover(t *testing.T) {
 	f := lockSetup(t)
 	path := writeLock(t, f.State, LockRecord{LockHolder: LockHolder{
