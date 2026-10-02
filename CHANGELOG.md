@@ -75,8 +75,9 @@ next version's entry.
   because `script` moves it out of the agent's process group, and one long
   run piled up 162 dashboards and over 20 GiB of memory. Every agent session
   and the delivery check now tag their environment, and when they exit the
-  run kills their process group and, on Linux, every process still carrying
-  the tag.
+  run stops their process group and, on Linux, every process still carrying
+  the tag: SIGTERM first, so a git can finish and remove its lock, then
+  SIGKILL after the grace period.
 - A bead being re-delivered after a conflict round is never delivered a
   second time at once. The conductor could list it while it passed through
   approved and start another delivery in the same worktree, and both checks

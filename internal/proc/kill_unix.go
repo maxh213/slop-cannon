@@ -38,6 +38,31 @@ func killGroup(p *os.Process) {
 	_ = signalGroup(p, syscall.SIGKILL)
 }
 
+// reapGroup clears out whatever is left in the child's process group after
+// the leader has exited: SIGTERM, then SIGKILL for anything still there once
+// grace (capped at reapGraceCap) has passed. The wait matters: a git the
+// agent started may be finishing a commit, and SIGTERM lets it remove its
+// index.lock before it goes, where an immediate SIGKILL would leave the lock
+// behind and wedge the worktree. A zero grace period kills at once.
+func reapGroup(p *os.Process, grace time.Duration) {
+	grace = reapGrace(grace)
+	if grace <= 0 {
+		killGroup(p)
+		return
+	}
+	if signalGroup(p, syscall.SIGTERM) != nil {
+		return // empty group, or nothing to signal
+	}
+	deadline := time.Now().Add(grace)
+	for time.Now().Before(deadline) {
+		time.Sleep(reapPoll)
+		if signalGroup(p, 0) != nil {
+			return
+		}
+	}
+	killGroup(p)
+}
+
 func signalGroup(p *os.Process, sig syscall.Signal) error {
 	if p == nil {
 		return os.ErrProcessDone

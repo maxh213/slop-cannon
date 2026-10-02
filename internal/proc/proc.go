@@ -333,7 +333,7 @@ func (p *process) wait() (Result, error) {
 		killGroup(p.cmd.Process)
 	}
 	if p.reapTag != "" {
-		killGroup(p.cmd.Process)
+		reapGroup(p.cmd.Process, p.spec.GracePeriod)
 		reapTagged(p.reapTag, p.spec.GracePeriod)
 	}
 	cause := context.Cause(p.ctx)

@@ -27,3 +27,9 @@ func killGroup(p *os.Process) {
 		_ = p.Kill()
 	}
 }
+
+// reapGroup kills the direct child, ignoring errors; there is no group to
+// sweep on this platform.
+func reapGroup(p *os.Process, _ time.Duration) {
+	killGroup(p)
+}

@@ -86,3 +86,21 @@ func TestReapTagged_SparesProcessesWithoutTheTag(t *testing.T) {
 	reapTagged(newReapTag(), 0)
 	assert.True(t, alive(other.Process.Pid), "a sweep only stops processes carrying its own tag")
 }
+
+// A straggler in the group gets SIGTERM and the grace period before
+// SIGKILL, so a git finishing a commit can remove its index.lock instead of
+// leaving it behind to wedge the worktree.
+func TestReapDescendants_LetsAStragglerCleanUpOnSIGTERM(t *testing.T) {
+	lock := t.TempDir() + "/index.lock"
+	_, err := Run(context.Background(), Spec{
+		Command: "sh",
+		Args: []string{"-c", `(trap 'rm -f "$LOCK"; exit 0' TERM; touch "$LOCK"; while :; do sleep 0.05; done) </dev/null >/dev/null 2>&1 &
+while [ ! -e "$LOCK" ]; do sleep 0.01; done`},
+		Env:             map[string]string{"LOCK": lock},
+		GracePeriod:     2 * time.Second,
+		ReapDescendants: true,
+	})
+	require.NoError(t, err)
+	_, statErr := os.Stat(lock)
+	assert.True(t, os.IsNotExist(statErr), "the straggler must have had the chance to remove its lock")
+}
