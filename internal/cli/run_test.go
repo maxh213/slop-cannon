@@ -333,7 +333,7 @@ func TestRunCartridgeFlag(t *testing.T) {
 
 	_, stderr, code := runResolve(t, repo, "--cartridge", "kimi")
 	require.Equal(t, 1, code)
-	require.Equal(t, "sc: cartridge \"kimi\" is not supported yet (only \"claude\", \"cursor\", \"mock\" for now)\n", stderr)
+	require.Equal(t, "sc: cartridge \"kimi\" is not supported yet (only \"claude\", \"cursor\", \"dandelion\", \"mock\" for now)\n", stderr)
 
 	_, stderr, code = runResolve(t, repo, "--cartridge", "")
 	require.Equal(t, 1, code)

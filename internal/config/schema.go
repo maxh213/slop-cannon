@@ -132,9 +132,35 @@ const (
 )
 
 // KnownCartridges lists every cartridge name sc can drive: Claude Code and
-// Cursor Agent (D-29, superseding the Claude-only scope of D-19); more
-// adapters are planned.
-var KnownCartridges = []string{"claude", "cursor"}
+// Cursor Agent (D-29, superseding the Claude-only scope of D-19), and the
+// dandelion quota router in front of them (D-30); more adapters are planned.
+var KnownCartridges = []string{"claude", "cursor", "dandelion"}
+
+// DandelionModes are the values [cartridges.dandelion] model may take
+// (D-30): "high" asks the router for the strongest model that still has
+// quota ("dandelion route --high"), "standard" (or nothing) for its everyday
+// route. The router names the real model, so nothing else is meaningful.
+var DandelionModes = []string{"high", "standard"}
+
+// ValidateCartridgeModel reports whether model is a value the cartridge
+// name accepts. Only dandelion constrains it (DandelionModes, compared
+// trimmed and case-insensitively; empty means "standard"); every other
+// cartridge passes its model to its CLI unchecked.
+func ValidateCartridgeModel(name, model string) error {
+	if strings.TrimSpace(name) != "dandelion" {
+		return nil
+	}
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return nil
+	}
+	for _, ok := range DandelionModes {
+		if m == ok {
+			return nil
+		}
+	}
+	return fmt.Errorf("cartridge %q takes model %q or %q, not %q: the router picks the real model", name, DandelionModes[0], DandelionModes[1], model)
+}
 
 // ValidateCartridgeName reports whether name is a cartridge sc supports. The
 // error text is the D-19/D-29 message shared by every command.

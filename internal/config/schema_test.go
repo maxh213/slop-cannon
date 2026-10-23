@@ -40,10 +40,22 @@ func TestAllocate(t *testing.T) {
 func TestValidateCartridgeName(t *testing.T) {
 	assert.NoError(t, ValidateCartridgeName("claude"))
 	assert.NoError(t, ValidateCartridgeName("cursor"))
-	assert.EqualError(t, ValidateCartridgeName("kimi"), `cartridge "kimi" is not supported yet (only "claude", "cursor" for now)`)
-	assert.EqualError(t, ValidateCartridgeName("animus"), `cartridge "animus" is not supported yet (only "claude", "cursor" for now)`)
+	assert.NoError(t, ValidateCartridgeName("dandelion"))
+	assert.EqualError(t, ValidateCartridgeName("kimi"), `cartridge "kimi" is not supported yet (only "claude", "cursor", "dandelion" for now)`)
+	assert.EqualError(t, ValidateCartridgeName("animus"), `cartridge "animus" is not supported yet (only "claude", "cursor", "dandelion" for now)`)
 	assert.Error(t, ValidateCartridgeName(""))
 	assert.Error(t, ValidateCartridgeName("Claude"), "names are case-sensitive")
+}
+
+func TestValidateCartridgeModel(t *testing.T) {
+	for _, m := range []string{"", "high", "standard", " High "} {
+		assert.NoError(t, ValidateCartridgeModel("dandelion", m), m)
+	}
+	assert.EqualError(t, ValidateCartridgeModel("dandelion", "claude-opus-5-5"),
+		`cartridge "dandelion" takes model "high" or "standard", not "claude-opus-5-5": the router picks the real model`)
+	// Every other cartridge passes its model to its CLI unchecked.
+	assert.NoError(t, ValidateCartridgeModel("claude", "anything"))
+	assert.NoError(t, ValidateCartridgeModel("cursor", "high"))
 }
 
 func TestParseSafety(t *testing.T) {
