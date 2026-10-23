@@ -336,6 +336,14 @@ type PlannerOptions struct {
 	SettleInterval time.Duration
 	// MaxBeads overrides `max_beads_per_plan` (P1-16).
 	MaxBeads int
+	// Signals takes one reading of the production signals command (P6-71,
+	// D-32). Nil means [RunSignals] over the configured `signals_command`,
+	// `limits.signals_timeout` and [PlannerOptions.Filter], in the
+	// repository root; with no command configured the run takes no signals.
+	// Brief mode never takes any.
+	Signals SignalsRunner
+	// SignalsInterval overrides the configured `signals_interval`.
+	SignalsInterval time.Duration
 	// Logger receives one line per planning decision; nil means the run's,
 	// else slog.Default().
 	Logger *slog.Logger
@@ -379,6 +387,9 @@ type PlanningStatus struct {
 	NextAt time.Time `json:"next_at,omitempty"`
 	// LastError is the last planning failure, if any.
 	LastError string `json:"last_error,omitempty"`
+	// Signals is the production signals command's last reading and when it
+	// is next due (P6-71); nil when the run takes no signals.
+	Signals *SignalsStatus `json:"signals,omitempty"`
 }
 
 // Planner is the run's planning loop: a [WorkSource] that asks for a
@@ -440,6 +451,14 @@ type Planner struct {
 	shim      beads.Shim
 	shimReady bool
 	shimFails int
+
+	// signalsRun takes a production signals reading (P6-71); nil when the
+	// run takes none. sigMu guards sig and is taken after mu, never
+	// before it: nothing that holds sigMu takes mu or calls into the run.
+	signalsRun  SignalsRunner
+	sigInterval time.Duration
+	sigMu       sync.Mutex
+	sig         signalsState
 }
 
 // Compile-time proof that a planner is all three hooks the scheduler needs.
@@ -502,7 +521,32 @@ func NewPlanner(opts PlannerOptions) (*Planner, error) {
 	if p.settle <= 0 {
 		p.settle = DefaultSettleInterval
 	}
+	p.signalsRun, p.sigInterval = p.signalsRunner()
 	return p, nil
+}
+
+// signalsRunner resolves the production signals runner and its interval
+// from the options and the effective configuration (P6-71).
+func (p *Planner) signalsRunner() (SignalsRunner, time.Duration) {
+	interval := p.opts.SignalsInterval
+	eff := p.cfg.Effective
+	if interval <= 0 {
+		interval = config.DefaultSignalsInterval
+		if eff != nil && eff.SignalsInterval.Duration() > 0 {
+			interval = eff.SignalsInterval.Duration()
+		}
+	}
+	if p.opts.Signals != nil {
+		return p.opts.Signals, interval
+	}
+	if eff == nil || strings.TrimSpace(eff.SignalsCommand) == "" {
+		return nil, interval
+	}
+	o := SignalsOptions{
+		Command: eff.SignalsCommand, Dir: p.cfg.Run.RepoPath,
+		Timeout: eff.Limits.SignalsTimeout.Duration(), Filter: p.opts.Filter, Now: p.opts.Now,
+	}
+	return func(ctx context.Context) SignalsReading { return RunSignals(ctx, o) }, interval
 }
 
 // Attach gives the planner the run it belongs to, for events, warnings and
@@ -547,6 +591,7 @@ func (p *Planner) Status() PlanningStatus {
 		Deprioritised: p.deprioritised,
 		Running:       p.running, Finished: p.finished, NextAt: p.nextAt,
 		ResumedPlan: p.resumedPlan,
+		Signals:     p.signalsStatusLocked(),
 	}
 	if p.lastErr != nil {
 		st.LastError = p.lastErr.Error()
@@ -572,7 +617,7 @@ func (p *Planner) Status() PlanningStatus {
 // from is still being carried out. The demand is the lowest-priority kind
 // (D-05), so offering it never takes a slot an engineer, tester or
 // arbitration wanted.
-func (p *Planner) Demands(_ context.Context) ([]Demand, error) {
+func (p *Planner) Demands(ctx context.Context) ([]Demand, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if p.finished {
@@ -597,14 +642,17 @@ func (p *Planner) Demands(_ context.Context) ([]Demand, error) {
 		return []Demand{planDemand()}, nil // ... and retries until it has one
 	}
 	st := p.statusLocked()
-	if st.ByRole[domain.RoleEngineer] > 0 {
-		return nil, nil // an engineer is still carrying out the last plan
-	}
-	if !st.Quiet && !st.Idle {
-		return nil, nil // the last dispatch still found work to fire
-	}
 	if p.replanHeldLocked(st, now) {
 		return nil, nil // the plan that just landed has not been acted on yet
+	}
+	if st.ByRole[domain.RoleEngineer] > 0 || (!st.Quiet && !st.Idle) {
+		// An engineer is still carrying out the last plan, or the last
+		// dispatch still found work to fire. Only a changed production
+		// signals reading plans anyway (P6-71, D-32).
+		if p.signalsOn() && p.signalsWantLocked(ctx, now) {
+			return []Demand{planDemand()}, nil
+		}
+		return nil, nil
 	}
 	return []Demand{planDemand()}, nil
 }
@@ -891,6 +939,7 @@ func (p *Planner) Fire(ctx context.Context, f Firing) (FireResult, error) {
 	}
 
 	created, err := p.fire(ctx, f)
+	p.signalsPlanned(created, err)
 	p.record(f, created, err)
 
 	res := FireResult{Produced: domain.MessagePlan}
@@ -1337,6 +1386,7 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 		MaxBeads:  p.maxBeads,
 		Notes:     p.notes(open, done),
 		Model:     p.cfg.Cartridge.Model,
+		Signals:   p.signalsForPlan(ctx),
 	}
 	if eff := p.cfg.Effective; eff != nil {
 		req.Research = eff.Research
