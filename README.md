@@ -337,8 +337,12 @@ The keys worth knowing first: `ammo`, `safety`, `rules` and `vibes` (files
 appended to every prompt as MUST and as preferences), `check_command` (run in
 the worktree before a safety-off merge; autodetected when blank),
 `exclude` (path globs no agent is ever shown, on top of the always-on `.env`,
-`*.pem` and `id_*` patterns), and `limits.max_tokens` / `limits.max_cost_usd`
-(opt-in budgets that stop new work and pause an autopilot run).
+`*.pem` and `id_*` patterns), `limits.max_tokens` / `limits.max_cost_usd`
+(opt-in budgets that stop new work and pause an autopilot run), and
+`signals_command` (autopilot only: a read-only command — a log query, an
+error tracker's CLI — that sc runs every `signals_interval` and whose output
+the product owner is given as untrusted production evidence, so real errors
+get fixed first).
 
 Every key, its type, its default and its exact meaning — plus secrets
 hygiene, the state-directory layout and schema migration — is in

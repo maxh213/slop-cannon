@@ -158,7 +158,12 @@ is simply closed — and a bead a person marked done with the TUI's `x` key.
 A **brief** run (`sc <repo> -m "…"`) finishes when every bead it planned has
 settled. An **autopilot** run (a bare repository path) never stops on its own
 (D-18): when the ready queue empties the product owner plans more, and the
-run ends only when you stop it or every cartridge is out of credits. Either
+run ends only when you stop it or every cartridge is out of credits. With a
+`signals_command` configured (D-32), the planner also runs that command
+itself — never the product owner, whose shell stays read-only — at most once
+per `signals_interval`, and hands every autopilot plan the last reading,
+fenced as untrusted production evidence; a reading that changed since the
+last plan saw one may ask for a plan while engineers are still busy. Either
 way the lifecycle recorded in `state.json` is `new` → `running`
 (⇄ `paused`) → `stopping` → `finished`.
 

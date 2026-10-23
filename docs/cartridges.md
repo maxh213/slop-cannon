@@ -102,7 +102,10 @@ allow-list is a superset of the alternative for planning. Both mappings pass
 the conformance `refuse` check (a write is refused under `read_only`), so the
 suite does not decide it; the planning prompt does, and it now states that the
 shell is an allow-list of read-only commands and that builds and tests will be
-refused (P5-16). `claude.ToolFlags` implements this mapping and
+refused (P5-16). Production evidence (`signals_command`, D-32) does not widen
+it: the cannon runs that command itself and hands the product owner its
+output, so no error-tracker CLI, log tool or credential ever joins the
+allow-list. `claude.ToolFlags` implements this mapping and
 `claude.ReadOnlyShell` is the list; changing either without changing this
 paragraph fails `TestDocs_MappingTableMatchesCode` and
 `TestReadOnlyKeepsTheShellAllowList`.
