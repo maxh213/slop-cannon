@@ -153,6 +153,10 @@ func prwPRList(t *testing.T, head string, labels ...string) []byte {
 		"headRefOid":  head,
 		"labels":      marks,
 		"isDraft":     false,
+		// Opened while the cannon fires: one that predates the run is never
+		// reviewed (D-31). The rig runs on the wall clock, so "later" is
+		// measured from it.
+		"createdAt": time.Now().UTC().Add(time.Hour).Format(time.RFC3339),
 	}})
 	require.NoError(t, err)
 	return list

@@ -1541,7 +1541,7 @@ func TestResumer_Resume_WithRemote(t *testing.T) {
 		assert.Empty(t, tracker.calls)
 		calls := f.gh.Invocations(t)
 		require.Len(t, calls, 1)
-		assert.Equal(t, []string{"pr", "list", "--head", BranchName(f.bead), "--state", "all", "--limit", "50", "--json", "number,url,state,title"}, calls[0].Args)
+		assert.Equal(t, []string{"pr", "list", "--head", BranchName(f.bead), "--state", "all", "--limit", "50", "--json", ghFindPRFields}, calls[0].Args)
 	})
 
 	t.Run("merged pull request waits for its gate", func(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"slop-cannon/internal/beads"
@@ -118,12 +119,18 @@ func (e *GHError) Unwrap() []error {
 // the repository from the working tree's remotes, so a GH bound to a
 // [Repo] acts on that repository's project.
 //
-// A GH never merges anything. D-11 forbids merging pull requests the cannon
-// did not open, and the cannon's own pull requests are merged by humans
-// (D-10), so no merge method exists.
+// A GH merges exactly one kind of pull request: the run's own, when the run
+// was started with auto_merge (D-31), through [GH.MergePR] and nothing else.
+// D-11 forbids merging a pull request the cannon did not open, and the
+// caller proves ownership with [OwnedByRun] before it asks; with auto_merge
+// off the cannon's own pull requests are merged by humans (D-10) and no
+// caller reaches the merge at all.
 type GH struct {
 	repo *Repo
 	exec func(context.Context, proc.Spec) (proc.Result, error)
+
+	mu    sync.Mutex
+	login string // cached by [GH.Login]
 }
 
 // NewGH returns a GH that runs gh inside repo with the repository's
@@ -381,27 +388,32 @@ func ParsePRList(data []byte) ([]PullRequest, error) {
 	}
 	prs := make([]PullRequest, 0, len(raw))
 	for _, r := range raw {
-		pr := PullRequest{
-			Number:    r.Number,
-			Title:     r.Title,
-			URL:       r.URL,
-			Body:      r.Body,
-			Author:    r.Author.Login,
-			HeadRef:   r.HeadRefName,
-			BaseRef:   r.BaseRefName,
-			HeadSHA:   r.HeadRefOid,
-			IsDraft:   r.IsDraft,
-			CreatedAt: r.CreatedAt,
-			UpdatedAt: r.UpdatedAt,
-		}
-		for _, l := range r.Labels {
-			if l.Name != "" {
-				pr.Labels = append(pr.Labels, l.Name)
-			}
-		}
-		prs = append(prs, pr)
+		prs = append(prs, r.pullRequest())
 	}
 	return prs, nil
+}
+
+// pullRequest converts the raw gh shape.
+func (r ghPR) pullRequest() PullRequest {
+	pr := PullRequest{
+		Number:    r.Number,
+		Title:     r.Title,
+		URL:       r.URL,
+		Body:      r.Body,
+		Author:    r.Author.Login,
+		HeadRef:   r.HeadRefName,
+		BaseRef:   r.BaseRefName,
+		HeadSHA:   r.HeadRefOid,
+		IsDraft:   r.IsDraft,
+		CreatedAt: r.CreatedAt,
+		UpdatedAt: r.UpdatedAt,
+	}
+	for _, l := range r.Labels {
+		if l.Name != "" {
+			pr.Labels = append(pr.Labels, l.Name)
+		}
+	}
+	return pr
 }
 
 // ListOpenPRs returns every open pull request of the repository (`gh pr
@@ -701,6 +713,10 @@ type PollResult struct {
 	// Skipped are the open pull requests the cannon opened itself
 	// (IsCannonPR), never reviewed as external.
 	Skipped []PullRequest
+	// PreRun are the open pull requests the cannon did not open that were
+	// created before the run started ([WithRunStarted]). They are never
+	// reviewed (D-31): nothing that existed when the run began is touched.
+	PreRun []PullRequest
 	// New are the review beads created by this poll, one per pull request
 	// that had none.
 	New []ReviewBead
@@ -733,6 +749,10 @@ const (
 	// StaleUnknownPR: the review bead records neither a pull request
 	// number nor a URL, so no listing could ever match it.
 	StaleUnknownPR StaleReason = "unknown_pr"
+	// StalePreRun: the pull request is still open, but it was created
+	// before this run started, so this run does not review it (D-31).
+	// Every later run starts later still, so none ever will.
+	StalePreRun StaleReason = "pre_run"
 )
 
 // StaleReview is one review bead the poll could not match to an open
@@ -778,6 +798,10 @@ func StaleSentence(reason StaleReason, number int, foreign bool) string {
 	switch {
 	case reason == StaleUnknownPR:
 		msg = "the review bead records no pull request number or URL, so no pull request could be matched to it"
+	case number <= 0 && reason == StalePreRun:
+		msg = "the review bead's pull request was opened before this run started, so this run does not review it"
+	case reason == StalePreRun:
+		msg = fmt.Sprintf("pull request #%d was opened before this run started, so this run does not review it", number)
 	case number <= 0 && reason == StaleCannonPR:
 		msg = "the review bead's pull request is still open but is now one of slop-cannon's own, so it is not reviewed as an external pull request"
 	case reason == StaleCannonPR:
@@ -802,6 +826,7 @@ type PRWatcher struct {
 	store    BeadStore
 	interval time.Duration
 	run      domain.RunID
+	started  time.Time
 	logger   *slog.Logger
 }
 
@@ -822,6 +847,15 @@ func WithPollInterval(d time.Duration) WatcherOption {
 // sc_run metadata, so `bd list` can show the run's external reviews.
 func WithRun(run domain.RunID) WatcherOption {
 	return func(w *PRWatcher) { w.run = run }
+}
+
+// WithRunStarted makes the watcher pass over every pull request created
+// before start — the run's original start, not a resume's (D-31). Such a
+// pull request is reported in [PollResult.PreRun], gets no review bead,
+// and a review bead an earlier run left for it is reported stale with
+// [StalePreRun]. The zero time keeps every open pull request.
+func WithRunStarted(start time.Time) WatcherOption {
+	return func(w *PRWatcher) { w.started = start }
 }
 
 // WithWatcherLogger sets the logger for poll outcomes; nil keeps
@@ -861,9 +895,12 @@ func (w *PRWatcher) Poll(ctx context.Context) (*PollResult, error) {
 	}
 	res := &PollResult{}
 	for _, pr := range prs {
-		if IsCannonPR(pr) {
+		switch {
+		case IsCannonPR(pr):
 			res.Skipped = append(res.Skipped, pr)
-		} else {
+		case !w.started.IsZero() && CreatedBefore(pr, w.started):
+			res.PreRun = append(res.PreRun, pr)
+		default:
 			res.External = append(res.External, pr)
 		}
 	}
@@ -924,11 +961,27 @@ func (w *PRWatcher) Poll(ctx context.Context) (*PollResult, error) {
 			}
 		}
 	}
+	preRun := map[int]PullRequest{}
+	preRunURL := map[string]PullRequest{}
+	for _, pr := range res.PreRun {
+		preRun[pr.Number] = pr
+		if pr.URL != "" {
+			preRunURL[pr.URL] = pr
+		}
+	}
 	for _, is := range existing {
 		if open[is.ID] || is.Status == string(domain.BeadStateClosed) {
 			continue
 		}
-		res.Stale = append(res.Stale, w.staleReview(is, skipped, skippedURL))
+		st := w.staleReview(is, skipped, skippedURL)
+		if st.Reason == StaleClosed {
+			if pr, ok := preRun[is.PRNumber()]; ok && is.PRNumber() > 0 {
+				st.Reason, st.PR = StalePreRun, pr
+			} else if pr, ok := preRunURL[is.PRURL()]; ok && is.PRURL() != "" {
+				st.Reason, st.PR = StalePreRun, pr
+			}
+		}
+		res.Stale = append(res.Stale, st)
 	}
 	return res, firstErr
 }
