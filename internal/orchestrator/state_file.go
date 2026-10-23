@@ -134,6 +134,9 @@ func cloneSnapshot(c domain.ConfigSnapshot) domain.ConfigSnapshot {
 	if len(c.Rules) > 0 {
 		out.Rules = append([]string(nil), c.Rules...)
 	}
+	if len(c.AutoMergeChecks) > 0 {
+		out.AutoMergeChecks = append([]string(nil), c.AutoMergeChecks...)
+	}
 	return out
 }
 
@@ -323,6 +326,25 @@ func RestoreRunConfig(rc *config.RunConfig) (RestoreResult, error) {
 			current.Cartridge, frozen.Cartridge))
 		frozen.Cartridge = current.Cartridge
 		frozen.Model = current.Model
+	}
+	// D-31: what the run may merge is frozen like safety, and --auto-merge
+	// overrides it like --safety. Turning it on now takes the checks and the
+	// spacing the configuration has now: a run that never merged recorded
+	// neither.
+	if src, ok := drifted(config.KeyAutoMerge, frozen.AutoMerge != current.AutoMerge); ok {
+		res.Notes = append(res.Notes, fmt.Sprintf("the %s config now says auto_merge %t, but run %s keeps its recorded auto_merge %t; pass --auto-merge=%t to change it",
+			src, current.AutoMerge, rc.Run.ID, frozen.AutoMerge, current.AutoMerge))
+	}
+	if flagged(config.KeyAutoMerge) && frozen.AutoMerge != current.AutoMerge {
+		res.Overridden = append(res.Overridden, config.KeyAutoMerge)
+		res.Notes = append(res.Notes, fmt.Sprintf("--auto-merge=%t overrides the run's recorded auto_merge %t", current.AutoMerge, frozen.AutoMerge))
+		frozen.AutoMerge = current.AutoMerge
+		frozen.AutoMergeChecks = append([]string(nil), current.AutoMergeChecks...)
+		frozen.AutoMergeSpacing = current.AutoMergeSpacing
+	}
+	if frozen.AutoMerge && !frozen.Safety {
+		return res, fmt.Errorf("orchestrator: run %s merges its own pull requests (auto_merge), which %w; pass --auto-merge=false with --safety off",
+			rc.Run.ID, config.ErrAutoMergeNeedsSafety)
 	}
 
 	alloc, err := config.Allocate(frozen.Ammo)

@@ -55,6 +55,10 @@ re_review_threshold = 0.5
 max_beads_per_plan = 6
 nice = 12
 research = false
+auto_merge = false
+auto_merge_checks = ["test", " "]
+auto_merge_spacing = "15m"
+conventional_pr_titles = true
 
 [limits]
 max_review_rounds = 4
@@ -96,6 +100,10 @@ max_diff_bytes = 8192
 re_review_threshold = 0.25
 max_beads_per_plan = 4
 nice = 5
+auto_merge = true
+auto_merge_checks = ["build", "test"]
+auto_merge_spacing = "20m"
+conventional_pr_titles = false
 
 [limits]
 max_review_rounds = 6
@@ -246,11 +254,46 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 		KeyAgentTimeout: SourceRepo,
 		KeyMaxTokens:    SourceRepo, KeyMaxCostUSD: SourceRepo,
 		KeyRoles + ".tester": SourceGlobal, KeyRoles + ".engineer": SourceRepo,
+		KeyAutoMerge: SourceRepo, KeyAutoMergeChecks: SourceMerged, KeyAutoMergeSpacing: SourceRepo,
+		KeyConventionalTitles: SourceRepo,
 	}
 	for key, src := range want {
 		assert.Equal(t, src, eff.Sources[key], key)
 	}
 	assert.True(t, eff.RepoExists)
+
+	// D-31: the repo turns auto-merge on over a global "off"; the required
+	// checks union global-then-repo, blanks dropped, so a repository can
+	// ask for more checks but never for fewer than the global file does.
+	assert.True(t, eff.AutoMerge)
+	assert.Equal(t, []string{"test", "build"}, eff.AutoMergeChecks)
+	assert.Equal(t, 20*time.Minute, eff.AutoMergeSpacing.Duration())
+	assert.False(t, eff.ConventionalPRTitles, "the repo's conventional_pr_titles wins")
+	snap := eff.Snapshot()
+	assert.True(t, snap.AutoMerge)
+	assert.Equal(t, []string{"test", "build"}, snap.AutoMergeChecks)
+	assert.Equal(t, 20*time.Minute, snap.AutoMergeSpacing)
+}
+
+// TestAutoMergeDefaultsAndSnapshot pins D-31's defaults: off, no named
+// checks, ten minutes between merges, plain titles; a run that does not
+// auto-merge freezes neither checks nor spacing into its snapshot.
+func TestAutoMergeDefaultsAndSnapshot(t *testing.T) {
+	d := Defaults()
+	assert.False(t, d.AutoMerge)
+	assert.Empty(t, d.AutoMergeChecks)
+	assert.Equal(t, 10*time.Minute, d.AutoMergeSpacing.Duration())
+	assert.False(t, d.ConventionalPRTitles)
+	snap := d.Snapshot()
+	assert.False(t, snap.AutoMerge)
+	assert.Nil(t, snap.AutoMergeChecks)
+	assert.Zero(t, snap.AutoMergeSpacing)
+
+	d.AutoMerge, d.ConventionalPRTitles = true, true
+	snap = d.Snapshot()
+	assert.True(t, snap.AutoMerge)
+	assert.True(t, snap.ConventionalPRTitles)
+	assert.Equal(t, DefaultAutoMergeSpacing, snap.AutoMergeSpacing)
 }
 
 func TestLoadRepoOnlyKeepsDefaultsForUnsetKeys(t *testing.T) {
@@ -307,6 +350,21 @@ func TestLoadApplyFlags(t *testing.T) {
 	fresh, err := load(filepath.Join(t.TempDir(), "none.toml"), "")
 	require.NoError(t, err)
 	assert.EqualError(t, fresh.Apply(Overrides{Cartridge: &cart}), `cartridge "claude" is not configured; add it with: sc cartridge --add claude`)
+
+	// D-31: --auto-merge is an override like --safety, and the pair is
+	// judged after both flags are applied, whichever of them came from
+	// the command line.
+	on, off := true, false
+	am, err := load(filepath.Join(t.TempDir(), "none.toml"), "")
+	require.NoError(t, err)
+	require.NoError(t, am.Apply(Overrides{AutoMerge: &on}))
+	assert.True(t, am.AutoMerge)
+	assert.Equal(t, SourceFlag, am.Sources[KeyAutoMerge])
+	assert.ErrorIs(t, am.Apply(Overrides{Safety: &off}), ErrAutoMergeNeedsSafety, "--safety off under an auto_merge that is on")
+	noSafety, err := load(filepath.Join(t.TempDir(), "none.toml"), "")
+	require.NoError(t, err)
+	assert.ErrorIs(t, noSafety.Apply(Overrides{Safety: &off, AutoMerge: &on}), ErrAutoMergeNeedsSafety)
+	require.NoError(t, noSafety.Apply(Overrides{Safety: &off, AutoMerge: &off}), "--auto-merge=false lets --safety off through")
 }
 
 func TestLoadMalformedTOMLReportsLine(t *testing.T) {
@@ -371,7 +429,7 @@ func TestLoadMalformedDurationReportsPosition(t *testing.T) {
 	// One case per duration key in the schema; durationKeysOfFile below
 	// fails the test if a key is added to File and forgotten here.
 	keys := []string{
-		KeyIdleReplanInterval, KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyAgentTimeout, KeyMaxAgentTimeout, KeyCheckTimeout,
+		KeyIdleReplanInterval, KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyAgentTimeout, KeyMaxAgentTimeout, KeyCheckTimeout, KeyAutoMergeSpacing,
 	}
 	assert.ElementsMatch(t, keys, durationKeysOfFile(reflect.TypeOf(File{}), ""), "every duration key needs a case here")
 
@@ -481,6 +539,12 @@ func TestLoadValidation(t *testing.T) {
 		{"negative cost", "", "[limits]\nmax_cost_usd = -0.5\n", KeyMaxCostUSD, "must not be negative"},
 		{"no plan rejections", "[limits]\nmax_plan_rejections = 0\n", "", KeyMaxPlanRejections, "must be at least 1"},
 		{"negative plan failures", "", "[limits]\nmax_plan_failures = -1\n", KeyMaxPlanFailures, "must be at least 1"},
+		// D-31: a run only merges its own pull requests, and safety off has
+		// none, so the pair is refused wherever either half comes from.
+		{"auto merge with safety off", "safety = false\nauto_merge = true\n", "", KeyAutoMerge, "needs safety = true"},
+		{"auto merge with the repo turning safety off", "auto_merge = true\n", "safety = false\n", KeyAutoMerge, "needs safety = true"},
+		{"zero auto merge spacing", "auto_merge_spacing = \"0s\"\n", "", KeyAutoMergeSpacing, "must be a positive duration"},
+		{"negative auto merge spacing", "", "auto_merge_spacing = \"-1m\"\n", KeyAutoMergeSpacing, "must be a positive duration"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

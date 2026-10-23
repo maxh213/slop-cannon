@@ -76,6 +76,7 @@ sc safety off
 
 ```
       --ammo N           override ammo for this run (N agents at once, minimum 3)
+      --auto-merge       override auto_merge for this run: squash-merge the run's own pull requests once green (needs safety on)
       --cartridge NAME   fire cartridge NAME instead of the active one
       --dry-run          print the run this repository, config and flags add up to, without firing anything
       --force            start even though another run holds this repository's lock (only when you know it is gone)
@@ -614,6 +615,7 @@ sc resume ./repo-path --run 20260924-214444-42c0 --safety off
 
 ```
       --ammo N           override ammo for this run (N agents at once, minimum 3)
+      --auto-merge       override auto_merge for this run: squash-merge the run's own pull requests once green (needs safety on)
       --cartridge NAME   fire cartridge NAME instead of the active one
       --dry-run          print the run this repository, config and flags add up to, without firing anything
       --force            start even though another run holds this repository's lock (only when you know it is gone)
@@ -748,6 +750,7 @@ sc ./repo-path --resume
 
 ```
       --ammo N           override ammo for this run (N agents at once, minimum 3)
+      --auto-merge       override auto_merge for this run: squash-merge the run's own pull requests once green (needs safety on)
       --cartridge NAME   fire cartridge NAME instead of the active one
       --dry-run          print the run this repository, config and flags add up to, without firing anything
       --force            start even though another run holds this repository's lock (only when you know it is gone)

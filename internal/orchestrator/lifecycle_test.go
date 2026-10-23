@@ -1082,6 +1082,52 @@ func TestLifecycleResumeNamesAConfigFileThatDrifted(t *testing.T) {
 	require.NotContains(t, notes, "cartridge")
 }
 
+// D-31: what a run may merge is frozen like safety. A config file edited
+// between the invocations does not change it, --auto-merge does, and a
+// resume that would leave auto-merge on with safety off is refused.
+func TestLifecycleResumeKeepsTheRecordedAutoMerge(t *testing.T) {
+	f := lifecycleSetup(t)
+	f.Eff.AutoMerge = true
+	f.Eff.AutoMergeChecks = []string{"test"}
+	f.Eff.AutoMergeSpacing = config.NewDuration(15 * time.Minute)
+	r, err := New(f.runConfig(t, config.RunSettings{Brief: "b"}), f.options())
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	require.NoError(t, r.Stop("crash"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+
+	// The repo config turns it off again: the run keeps merging, and says so.
+	f.Eff = lifecycleEffective(10, true)
+	f.Eff.Sources[config.KeyAutoMerge] = config.SourceRepo
+	resumed := f.runConfig(t, config.RunSettings{Resume: true})
+	res, err := RestoreRunConfig(resumed)
+	require.NoError(t, err)
+	require.True(t, resumed.Run.Config.AutoMerge, "the recorded auto_merge wins over the edited file")
+	require.Equal(t, []string{"test"}, resumed.Run.Config.AutoMergeChecks)
+	require.Equal(t, 15*time.Minute, resumed.Run.Config.AutoMergeSpacing)
+	require.Contains(t, strings.Join(res.Notes, "\n"), "keeps its recorded auto_merge true; pass --auto-merge=false to change it")
+
+	// --auto-merge=false is a deliberate act and wins.
+	f.Eff = lifecycleEffective(10, true)
+	off := false
+	require.NoError(t, f.Eff.Apply(config.Overrides{AutoMerge: &off}))
+	resumed = f.runConfig(t, config.RunSettings{Resume: true})
+	res, err = RestoreRunConfig(resumed)
+	require.NoError(t, err)
+	require.Contains(t, res.Overridden, config.KeyAutoMerge)
+	require.False(t, resumed.Run.Config.AutoMerge)
+	require.Empty(t, resumed.Run.Config.AutoMergeChecks)
+
+	// --safety off alone would leave the recorded auto-merge on with no
+	// pull requests to merge, so it is refused.
+	f.Eff = lifecycleEffective(10, true)
+	require.NoError(t, f.Eff.Apply(config.Overrides{Safety: &off}))
+	resumed = f.runConfig(t, config.RunSettings{Resume: true})
+	_, err = RestoreRunConfig(resumed)
+	require.ErrorIs(t, err, config.ErrAutoMergeNeedsSafety)
+}
+
 func TestLifecycleRestoreWithoutAStateFile(t *testing.T) {
 	f := lifecycleSetup(t)
 	dir := config.RunDir(f.Repo, "20260903-110000-0001")

@@ -50,6 +50,10 @@ const (
 	FlagRunCartridge = "cartridge"
 	FlagRunNoAnim    = "no-anim"
 	FlagRunReviewPRs = "review-prs"
+	// FlagRunAutoMerge overrides auto_merge for this run (D-31): with
+	// safety on, the run squash-merges the pull requests it opened itself
+	// once they are green.
+	FlagRunAutoMerge = "auto-merge"
 	// FlagRunForce takes the repository's run lock from a run that may
 	// still be alive (P9-04). It is never sc's own decision.
 	FlagRunForce = "force"
@@ -155,6 +159,7 @@ func addRunFlags(cmd *cobra.Command) {
 	f.String(FlagRunCartridge, "", "fire cartridge `NAME` instead of the active one")
 	f.Bool(FlagRunNoAnim, false, "disable the cannon animations in the TUI (also honours SC_NO_ANIM)")
 	f.Bool(FlagRunReviewPRs, true, "also review open pull requests sc did not create (needs gh and a remote)")
+	f.Bool(FlagRunAutoMerge, false, "override auto_merge for this run: squash-merge the run's own pull requests once green (needs safety on)")
 	f.Bool(FlagRunForce, false, "start even though another run holds this repository's lock (only when you know it is gone)")
 	f.Bool(FlagRunDryRun, false, "print the run this repository, config and flags add up to, without firing anything")
 }
@@ -221,6 +226,13 @@ func runOptionsFrom(cmd *cobra.Command, path string, opts GlobalOptions) (RunOpt
 			return ro, fmt.Errorf("--%s: %w", FlagRunSafety, err)
 		}
 		ro.Overrides.Safety = &on
+	}
+	if f.Changed(FlagRunAutoMerge) {
+		on, err := f.GetBool(FlagRunAutoMerge)
+		if err != nil {
+			return ro, err
+		}
+		ro.Overrides.AutoMerge = &on
 	}
 	if f.Changed(FlagRunCartridge) {
 		name, err := f.GetString(FlagRunCartridge)
@@ -490,6 +502,7 @@ func runWriteText(w io.Writer, rc *config.RunConfig) error {
 		[2]string{"rules", runList(eff.Rules) + src(config.KeyRules)},
 		[2]string{"nice", niceText(eff.Nice) + src(config.KeyNice)},
 		[2]string{"review-prs", fmt.Sprintf("%t", rc.Run.Config.ReviewPRs)},
+		[2]string{"auto-merge", autoMergeText(rc.Run.Config) + src(config.KeyAutoMerge)},
 		[2]string{"headless", fmt.Sprintf("%t", rc.Run.Config.Headless)},
 		[2]string{"animation", anim},
 	)
@@ -499,6 +512,18 @@ func runWriteText(w io.Writer, rc *config.RunConfig) error {
 		}
 	}
 	return nil
+}
+
+// autoMergeText describes what the run may merge (D-31).
+func autoMergeText(c domain.ConfigSnapshot) string {
+	if !c.AutoMerge || !c.Safety {
+		return "off: a human merges every pull request"
+	}
+	checks := "every check present"
+	if len(c.AutoMergeChecks) > 0 {
+		checks += " and " + strings.Join(c.AutoMergeChecks, ", ")
+	}
+	return fmt.Sprintf("on: squash-merges its own pull requests once %s passed, %s apart", checks, config.NewDuration(c.AutoMergeSpacing).String())
 }
 
 // niceText describes the niceness the run will give itself.
