@@ -133,6 +133,13 @@ func TestPOPlanRequestValidate(t *testing.T) {
 		{"negative cap", func(r *agents.PlanRequest) { r.MaxBeads = -1 }, "max beads per plan -1 is negative"},
 		{"no root", func(r *agents.PlanRequest) { r.Repo.Root = "" }, "no repository root"},
 		{"relative workdir", func(r *agents.PlanRequest) { r.Workdir = "repo" }, "is not absolute"},
+		{"brief with signals", func(r *agents.PlanRequest) {
+			r.Mode, r.Brief = domain.RunModeBrief, "Add a --json flag."
+			r.Signals = &agents.PlanSignals{Command: "true"}
+		}, "brief mode takes no production signals"},
+		{"signals over the cap", func(r *agents.PlanRequest) {
+			r.Signals = &agents.PlanSignals{Command: "cat log", Output: strings.Repeat("x", agents.MaxSignalsBytes+1)}
+		}, "signals output is 32769 bytes"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
