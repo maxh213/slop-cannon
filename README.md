@@ -383,13 +383,15 @@ A cartridge is an LLM CLI adapter plus its model: the CLI you already log
 into, driven as a subprocess. `sc` makes no API calls of its own and wants no
 API key.
 
-**Claude Code and Cursor Agent ship today** (D-29): Claude verified against
+**Claude Code and Cursor Agent ship today** (D-29), plus the dandelion
+router in front of them (D-30): Claude verified against
 `2.1.258 (Claude Code)` and refusing anything below 2.0.0, Cursor against
 `cursor-agent` `2026.09.28-64d2043`:
 
 ```sh
 sc cartridge --add claude --model fable
 sc cartridge --add cursor --model auto
+sc cartridge --add dandelion --model high
 sc cartridge --list
 sc cartridge --use claude
 ```
@@ -398,9 +400,17 @@ Roles can use different cartridges (`[roles.engineer] cartridge = "cursor"`),
 for example engineers and testers on Cursor while the product owner stays on
 Claude; see [docs/config.md](docs/config.md).
 
+`dandelion` is a quota router rather than a CLI of its own (D-30): before
+every firing it asks `dandelion route --high` (model `high`) or
+`dandelion route` (model `standard`) which account still has quota, and fires
+Claude Code or Cursor Agent on it with the model the router names, so
+`roles.<role>.model` is ignored for it. Only Claude Code accounts and
+`cursor` are used; product owners and testers only ever land on Claude Code.
+See [docs/cartridges.md § Dandelion](docs/cartridges.md#dandelion-dandelion).
+
 Kimi, Animus and a custom-command adapter are planned; until then
 `sc cartridge --add kimi` fails with
-`cartridge "kimi" is not supported yet (only "claude", "cursor" for now)`. The
+`cartridge "kimi" is not supported yet (only "claude", "cursor", "dandelion" for now)`. The
 interface, the registry and the conformance suite are adapter-agnostic, so
 each new one is a package and a registry line: the whole recipe — the
 contract, the error-kind and tool-policy mapping tables to fill in, the
