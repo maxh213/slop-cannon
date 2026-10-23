@@ -47,6 +47,8 @@ rules = ["/abs/rules.md"]
 exclude = ["secrets/*.key"]
 check_command = "make check"
 idle_replan_interval = "5m"
+signals_command = "sentry-cli issues list"
+signals_interval = "15m"
 gate_poll_interval = "30s"
 pr_poll_interval = "45s"
 graph_poll_interval = "3s"
@@ -63,6 +65,7 @@ max_conflict_rounds = 2
 agent_timeout = "20m"
 max_agent_timeout = "12h"
 check_timeout = "40m"
+signals_timeout = "2m"
 max_tokens = 1000
 max_cost_usd = 2.5
 max_plan_rejections = 3
@@ -89,6 +92,8 @@ rules = ["docs/rules.md"]
 exclude = ["private/**", "secrets/*.key"]
 check_command = "go test ./..."
 idle_replan_interval = "1h"
+signals_command = "./scripts/signals.sh"
+signals_interval = "45m"
 gate_poll_interval = "2m"
 pr_poll_interval = "3m"
 graph_poll_interval = "5s"
@@ -104,6 +109,7 @@ max_conflict_rounds = 4
 agent_timeout = "45m"
 max_agent_timeout = "18h"
 check_timeout = "90m"
+signals_timeout = "3m"
 max_tokens = 2000
 max_cost_usd = 9
 max_plan_rejections = 4
@@ -181,6 +187,8 @@ func TestLoadGlobalOnly(t *testing.T) {
 	assert.Equal(t, []string{"/abs/rules.md"}, eff.Rules)
 	assert.Equal(t, "make check", eff.CheckCommand)
 	assert.Equal(t, 5*time.Minute, eff.IdleReplanInterval.Duration())
+	assert.Equal(t, "sentry-cli issues list", eff.SignalsCommand)
+	assert.Equal(t, 15*time.Minute, eff.SignalsInterval.Duration())
 	assert.Equal(t, 30*time.Second, eff.GatePollInterval.Duration())
 	assert.Equal(t, 45*time.Second, eff.PRPollInterval.Duration())
 	assert.Equal(t, 3*time.Second, eff.GraphPollInterval.Duration())
@@ -188,7 +196,7 @@ func TestLoadGlobalOnly(t *testing.T) {
 	assert.InEpsilon(t, 0.5, eff.ReReviewThreshold, 1e-9)
 	assert.Equal(t, 6, eff.MaxBeadsPerPlan)
 	assert.Equal(t, Limits{MaxReviewRounds: 4, MaxPushbackRounds: 1, MaxConflictRounds: 2, AgentTimeout: NewDuration(20 * time.Minute),
-		MaxAgentTimeout: NewDuration(12 * time.Hour), CheckTimeout: NewDuration(40 * time.Minute), MaxTokens: 1000, MaxCostUSD: 2.5, MaxPlanRejections: 3, MaxPlanFailures: 7}, eff.Limits)
+		MaxAgentTimeout: NewDuration(12 * time.Hour), CheckTimeout: NewDuration(40 * time.Minute), SignalsTimeout: NewDuration(2 * time.Minute), MaxTokens: 1000, MaxCostUSD: 2.5, MaxPlanRejections: 3, MaxPlanFailures: 7}, eff.Limits)
 	assert.Equal(t, map[domain.Role]string{domain.RoleTester: "claude"}, eff.Roles)
 
 	for _, key := range scalarKeys {
@@ -212,13 +220,15 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 	assert.True(t, eff.Safety)
 	assert.Equal(t, "go test ./...", eff.CheckCommand)
 	assert.Equal(t, time.Hour, eff.IdleReplanInterval.Duration())
+	assert.Equal(t, "./scripts/signals.sh", eff.SignalsCommand, "the repo's signals command wins")
+	assert.Equal(t, 45*time.Minute, eff.SignalsInterval.Duration())
 	assert.Equal(t, 2*time.Minute, eff.GatePollInterval.Duration(), "the repo's gate poll interval wins")
 	assert.Equal(t, 3*time.Minute, eff.PRPollInterval.Duration(), "the repo's pull request poll interval wins")
 	assert.Equal(t, 5*time.Second, eff.GraphPollInterval.Duration(), "the repo's graph poll interval wins")
 	assert.Equal(t, 8192, eff.MaxDiffBytes, "the repo's diff cap wins")
 	assert.InEpsilon(t, 0.25, eff.ReReviewThreshold, 1e-9, "the repo's re-review threshold wins")
 	assert.Equal(t, Limits{MaxReviewRounds: 6, MaxPushbackRounds: 3, MaxConflictRounds: 4, AgentTimeout: NewDuration(45 * time.Minute),
-		MaxAgentTimeout: NewDuration(18 * time.Hour), CheckTimeout: NewDuration(90 * time.Minute), MaxTokens: 2000, MaxCostUSD: 9, MaxPlanRejections: 4, MaxPlanFailures: 9}, eff.Limits)
+		MaxAgentTimeout: NewDuration(18 * time.Hour), CheckTimeout: NewDuration(90 * time.Minute), SignalsTimeout: NewDuration(3 * time.Minute), MaxTokens: 2000, MaxCostUSD: 9, MaxPlanRejections: 4, MaxPlanFailures: 9}, eff.Limits)
 	// Lists union across layers, global first, deduplicated by absolute path.
 	globalDir, repoDir := filepath.Dir(globalPath), filepath.Dir(repoPath)
 	assert.Equal(t, []string{
@@ -240,6 +250,7 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 		KeyActiveCartridge: SourceGlobal, KeyCartridges: SourceGlobal,
 		KeyAmmo: SourceRepo, KeySafety: SourceRepo, KeyVibes: SourceMerged, KeyRules: SourceMerged, KeyExclude: SourceMerged,
 		KeyCheckCommand: SourceRepo, KeyIdleReplanInterval: SourceRepo, KeyGatePollInterval: SourceRepo,
+		KeySignalsCommand: SourceRepo, KeySignalsInterval: SourceRepo, KeySignalsTimeout: SourceRepo,
 		KeyPRPollInterval: SourceRepo, KeyGraphPollInterval: SourceRepo, KeyMaxDiffBytes: SourceRepo,
 		KeyReReviewThreshold: SourceRepo,
 		KeyMaxReviewRounds:   SourceRepo, KeyMaxPushbackRounds: SourceRepo, KeyMaxConflictRounds: SourceRepo,
@@ -372,6 +383,7 @@ func TestLoadMalformedDurationReportsPosition(t *testing.T) {
 	// fails the test if a key is added to File and forgotten here.
 	keys := []string{
 		KeyIdleReplanInterval, KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyAgentTimeout, KeyMaxAgentTimeout, KeyCheckTimeout,
+		KeySignalsInterval, KeySignalsTimeout,
 	}
 	assert.ElementsMatch(t, keys, durationKeysOfFile(reflect.TypeOf(File{}), ""), "every duration key needs a case here")
 
@@ -477,6 +489,8 @@ func TestLoadValidation(t *testing.T) {
 		{"zero pushback", "[limits]\nmax_pushback_rounds = 0\n", "", KeyMaxPushbackRounds, "must be at least 1"},
 		{"zero timeout", "[limits]\nagent_timeout = \"0s\"\n", "", KeyAgentTimeout, "must be a positive duration"},
 		{"zero check timeout", "[limits]\ncheck_timeout = \"0s\"\n", "", KeyCheckTimeout, "must be a positive duration"},
+		{"zero signals interval", "signals_interval = \"0s\"\n", "", KeySignalsInterval, "must be a positive duration"},
+		{"negative signals timeout", "", "[limits]\nsignals_timeout = \"-1m\"\n", KeySignalsTimeout, "must be a positive duration"},
 		{"negative tokens", "[limits]\nmax_tokens = -5\n", "", KeyMaxTokens, "must not be negative"},
 		{"negative cost", "", "[limits]\nmax_cost_usd = -0.5\n", KeyMaxCostUSD, "must not be negative"},
 		{"no plan rejections", "[limits]\nmax_plan_rejections = 0\n", "", KeyMaxPlanRejections, "must be at least 1"},
