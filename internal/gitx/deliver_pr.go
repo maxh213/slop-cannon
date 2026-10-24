@@ -398,8 +398,9 @@ func (d *PRDeliverer) Deliver(ctx context.Context, req PRRequest) (*PRResult, er
 	res.PR, res.PRState = pr, state
 
 	// sc_pr_head is the tip the testers approved: auto-merge merges that
-	// commit, or GitHub's clean update merges on top of it, and nothing
-	// else pushed to the branch (D-31).
+	// commit, or GitHub's merges of the base that slop-cannon itself asked
+	// for (gh pr update-branch, recorded in state.json), and nothing else
+	// pushed to the branch (D-31).
 	meta := beads.PRMetadata(pr.URL, pr.Number)
 	meta[beads.MetaPRHead] = head
 	if _, err := d.tracker.SetMetadata(ctx, bead.ID, meta); err != nil {

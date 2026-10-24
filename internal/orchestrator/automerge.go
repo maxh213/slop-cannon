@@ -32,6 +32,9 @@ import (
 //	          never merged, updated or sent back — it waits for a human,
 //	          exactly as with auto_merge off
 //	open      not OPEN, or a draft → wait
+//	ahead     the bead's local branch has commits past the head: a
+//	          re-delivery is under way (the testers approved a fix that
+//	          is not pushed yet) → wait, whatever the old head's checks say
 //	approved  the head is the tip delivered to the pull request after
 //	          the testers approved it (sc_pr_head), or that tip plus the
 //	          clean merges of the default branch GitHub made because this
@@ -47,8 +50,13 @@ import (
 //	failed    a check failed → back to the engineer through the same edge,
 //	          one qa item per failed check with its URL (once per head
 //	          commit and check)
-//	behind    BEHIND → `gh pr update-branch <n>` (once per head commit
-//	          GitHub accepted it for), then wait for the checks again
+//	behind    BEHIND, or a head that does not contain the default
+//	          branch's tip on the remote (`git merge-base --is-ancestor`,
+//	          checked by the run itself because GitHub reports BEHIND only
+//	          when branch protection requires branches to be up to date)
+//	          → `gh pr update-branch <n>` (once per head commit GitHub
+//	          accepted it for), then wait for the checks again: no pull
+//	          request is squashed onto a base its checks never saw
 //	checks    no checks at all, one still running, or a required name
 //	          (auto_merge_checks) missing → wait
 //	clean     anything but CLEAN (BLOCKED by a required review, UNSTABLE,
@@ -100,6 +108,12 @@ type AutoMergeBranches interface {
 	ReviewedHead(ctx context.Context, reviewed, head, base string, updatedFrom []string) (bool, string, error)
 	// BranchTip is the commit the bead's local branch is at.
 	BranchTip(ctx context.Context, bead domain.Bead) (string, error)
+	// BranchAhead reports whether the bead's local branch has commits
+	// past head: a re-delivery that has not pushed yet.
+	BranchAhead(ctx context.Context, bead domain.Bead, head string) (bool, error)
+	// ContainsBase reports whether head already contains the tip of base
+	// on the remote, so its checks ran against the base as it is now.
+	ContainsBase(ctx context.Context, head, base string) (bool, error)
 }
 
 // AutoMergeLedger is where the time of the run's last merge, the heads
@@ -374,6 +388,13 @@ func (p *GatePoller) autoMergeBead(ctx context.Context, g beads.Gate, issue bead
 		p.amUpdate(ctx, id, number, head)
 		return
 	}
+	if contains, err := am.opts.Branches.ContainsBase(ctx, head, p.branch); err != nil {
+		p.amFailure(id, number, "base", fmt.Sprintf("could not show that pull request #%d's head %s contains %s", number, shortHead(head), p.branch), err)
+		return
+	} else if !contains {
+		p.amUpdate(ctx, id, number, head)
+		return
+	}
 	switch {
 	case checks.Total == 0:
 		p.amStatus(id, number, AutoMergeWaiting, fmt.Sprintf("pull request #%d has no checks yet", number), false)
@@ -419,7 +440,12 @@ func (p *GatePoller) autoMergeBead(ctx context.Context, g beads.Gate, issue bead
 		slog.String("bead", string(id)), slog.Int("pr", number), slog.String("head", head))
 }
 
-// amReviewed is the approved-tip guard (D-31). Ownership is judged per
+// amReviewed is the approved-tip guard (D-31). It first waits while the
+// bead's local branch is ahead of the pull request: a re-delivery moved the
+// bead to delivering before pushing the fix its testers approved, and until
+// the push lands the old head (which sc_pr_head still names) must not be
+// merged, sent back or handed off — merging it would close the bead with
+// the fix never shipped. Ownership is judged per
 // pull request, so the head is judged too: it must be the tip delivered to
 // the pull request after the testers approved it (sc_pr_head), or that tip
 // plus the clean merges of the default branch GitHub made because this run
@@ -435,6 +461,13 @@ func (p *GatePoller) amReviewed(ctx context.Context, issue beads.Issue, bead dom
 	id, number, head := issue.ID, view.Number, view.HeadSHA
 	reviewed := issue.PRHead()
 	key := "reviewed:" + reviewed + ":" + head
+	if ahead, err := p.auto.opts.Branches.BranchAhead(ctx, bead, head); err != nil {
+		p.amFailure(id, number, "ahead", fmt.Sprintf("could not compare the branch of %s with pull request #%d's head", id, number), err)
+		return false
+	} else if ahead {
+		p.amStatus(id, number, AutoMergeWaiting, fmt.Sprintf("the branch of %s has approved commits that are not on pull request #%d yet; waiting for its re-delivery to push them", id, number), false)
+		return false
+	}
 	switch {
 	case reviewed == "":
 		p.amStatus(id, number, AutoMergeNotOwned, fmt.Sprintf("pull request #%d: no reviewed commit is recorded for %s (sc_pr_head); it is left for a human to merge", number, id), true)

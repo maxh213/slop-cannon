@@ -120,6 +120,13 @@ type amFakeBranches struct {
 	Reviews   []string // "<reviewed>..<head> on <base>"
 	// tip is the bead's local branch tip; "" is a commit nobody pushed.
 	tip string
+	// ahead holds the heads the local tip has commits past: a fix
+	// committed and approved on top of them, not pushed yet.
+	ahead map[string]bool
+	// stale holds the heads that do not contain the base's tip: their
+	// checks ran against an older base.
+	stale   map[string]bool
+	baseErr error
 }
 
 func (b *amFakeBranches) BranchFor(_ context.Context, bead domain.Bead) (string, bool, error) {
@@ -179,6 +186,41 @@ func (b *amFakeBranches) BranchTip(context.Context, domain.Bead) (string, error)
 		return amHead, nil
 	}
 	return b.tip, nil
+}
+
+func (b *amFakeBranches) BranchAhead(_ context.Context, _ domain.Bead, head string) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.ahead[head], nil
+}
+
+func (b *amFakeBranches) ContainsBase(_ context.Context, head, _ string) (bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.baseErr != nil {
+		return false, b.baseErr
+	}
+	return !b.stale[head], nil
+}
+
+// markStale makes head one whose checks ran against an older base.
+func (b *amFakeBranches) markStale(head string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.stale == nil {
+		b.stale = map[string]bool{}
+	}
+	b.stale[head] = true
+}
+
+// markAhead makes the bead's local branch hold commits past head.
+func (b *amFakeBranches) markAhead(tip, head string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ahead == nil {
+		b.ahead = map[string]bool{}
+	}
+	b.tip, b.ahead[head] = tip, true
 }
 
 // markUpdate makes head GitHub's merge of the base into from.
@@ -741,10 +783,120 @@ func TestAutoMergeSpacesMergesAndMergesOnePerPoll(t *testing.T) {
 	lines := strings.Join(Vitals(h.Clock.Now(), nil, h.P, nil).Lines(), "\n")
 	assert.Contains(t, lines, "fx-two waiting: green; the next merge is allowed at 2026-09-03 12:10:00Z (auto_merge_spacing 10m)")
 
-	// Once it has passed, the second one merges, and only it.
+	// Once it has passed, the second one merges, and only it. (Its head
+	// already holds the main #7 made: the fake's default.)
 	h.Clock.Advance(time.Minute)
 	h.poll()
 	assert.Equal(t, []string{"7@" + amHead, "9@4444444444444444444444444444444444444444"}, h.GH.Merges)
+}
+
+// A default branch without "require branches to be up to date" (no branch
+// protection at all, as on otwarteklatki/animus-chat) never makes GitHub
+// report BEHIND: a pull request whose checks ran before the run merged
+// another one stays CLEAN. The run checks the ancestry itself, and has
+// GitHub update the branch and the checks run again before it merges.
+func TestAutoMergeUpdatesAPullRequestTestedAgainstAnOlderBase(t *testing.T) {
+	t.Parallel()
+	h := newAMHarness(t, nil)
+	const other = domain.BeadID("fx-two")
+	const otherHead = "4444444444444444444444444444444444444444"
+	const updated = "6666666666666666666666666666666666666666"
+	h.BD.AddGate("fx-gt2", other, 9)
+	h.BD.AddBead(other, domain.BeadStateDelivering, 9)
+	h.BD.SetMeta(other, beads.MetaPRHead, otherHead)
+	h.Branches.others = map[domain.BeadID]string{other: "sc/fx-two-second"}
+	h.GH.set(amOwnedView(amHead))
+	v2 := amOwnedView(otherHead)
+	v2.Number, v2.HeadRef = 9, "sc/fx-two-second"
+	v2.Body = "<!-- slop-cannon bead=fx-two run=" + string(gateRun) + " branch=sc/fx-two-second -->"
+	h.GH.set(v2)
+	two := beads.GateCheck{Checked: 2, Results: []beads.GateResult{
+		{GateID: amGate, Outcome: beads.GatePending}, {GateID: "fx-gt2", Outcome: beads.GatePending},
+	}}
+	h.BD.Answer(two)
+
+	h.poll()
+	require.Equal(t, []string{"7@" + amHead}, h.GH.Merges)
+	h.Branches.markStale(otherHead) // #7 landed on main; #9's checks never saw it
+
+	h.Clock.Advance(11 * time.Minute)
+	h.poll()
+	assert.Equal(t, []string{"7@" + amHead}, h.GH.Merges, "#9 is green only against the main before #7")
+	assert.Equal(t, []int{9}, h.GH.Updates, "it is brought up to date first, though GitHub says CLEAN")
+	assert.Contains(t, h.Ledger.AutoMergeUpdates(), AutoMergeUpdateKey(other, otherHead), "recorded before it was asked for")
+	h.poll()
+	assert.Equal(t, []int{9}, h.GH.Updates, "once per head")
+
+	// GitHub merged main in; the checks run again on the new head.
+	h.Branches.markUpdate(updated, otherHead)
+	v2.HeadSHA, v2.Checks = updated, []gitx.PRCheck{amCheck("test", "")}
+	h.GH.set(v2)
+	h.poll()
+	assert.Len(t, h.GH.Merges, 1, "waits for the checks on the updated head")
+	v2.Checks = []gitx.PRCheck{amCheck("test", "SUCCESS")}
+	h.GH.set(v2)
+	h.poll()
+	assert.Equal(t, []string{"7@" + amHead, "9@" + updated}, h.GH.Merges)
+}
+
+// A head whose ancestry git cannot show is not merged.
+func TestAutoMergeWaitsWhenItCannotShowTheHeadContainsTheBase(t *testing.T) {
+	t.Parallel()
+	h := newAMHarness(t, nil)
+	h.Branches.baseErr = errors.New("fetch failed")
+	h.GH.set(amOwnedView(amHead))
+	h.pending()
+	h.poll()
+	assert.Empty(t, h.GH.Merges)
+	assert.Empty(t, h.GH.Updates)
+	assert.Equal(t, AutoMergeWaiting, h.status().State)
+	assert.Contains(t, h.status().Reason, "fetch failed")
+}
+
+// A failed check sends the bead back; its engineer commits a fix, the
+// testers approve it, and the delivery moves the bead to delivering again
+// before it pushes. Until the push lands the pull request still shows the
+// old head, which sc_pr_head still names. Even when the failed check has
+// been re-run green on it meanwhile (a flake), the old head must not be
+// merged: the bead would close with the approved fix never shipped. Nor is
+// it handed to a person for failing again while the fix is on its way.
+func TestAutoMergeWaitsWhileARedeliveryHasNotPushed(t *testing.T) {
+	t.Parallel()
+	const fix = "5555555555555555555555555555555555555555"
+	for _, tc := range []struct {
+		name  string
+		check string
+	}{
+		{"the old head re-run green", "SUCCESS"},
+		{"the old head still failing", "FAILURE"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newAMHarness(t, nil)
+			h.GH.set(amOwnedView(amHead, amCheck("test", "FAILURE")))
+			h.pending()
+			h.poll()
+			require.Equal(t, string(domain.BeadStateChangesRequested), h.BD.State(amBead))
+
+			h.Branches.markAhead(fix, amHead)
+			h.GH.set(amOwnedView(amHead, amCheck("test", tc.check)))
+			h.redeliver()
+			h.pending()
+			h.poll()
+			assert.Empty(t, h.GH.Merges, "the approved fix is not on the pull request yet")
+			assert.Len(t, h.Outcomes.all(), 1, "not sent back again")
+			assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State(amBead), "not handed off")
+			assert.Equal(t, AutoMergeWaiting, h.status().State)
+			assert.Contains(t, h.status().Reason, "waiting for its re-delivery to push them")
+
+			// The push lands and the delivery records it.
+			h.BD.SetMeta(amBead, beads.MetaPRHead, fix)
+			h.GH.set(amOwnedView(fix))
+			h.pending()
+			h.poll()
+			assert.Equal(t, []string{"7@" + fix}, h.GH.Merges)
+		})
+	}
 }
 
 // The one-merge-per-poll guard holds on its own, even with a ledger that

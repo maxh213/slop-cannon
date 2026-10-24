@@ -596,6 +596,60 @@ func (d *PRDeliverer) BranchTip(ctx context.Context, bead domain.Bead) (string, 
 	return d.m.Repo().RevParse(ctx, "refs/heads/"+branch)
 }
 
+// ContainsBase reports whether head, a pull request's head commit, already
+// contains the tip of base on the default remote (D-31): `git merge-base
+// --is-ancestor <remote>/<base> <head>` after fetching the tracking refs.
+// A head that does not was tested against an older base: its checks say
+// nothing about the squash of it onto the base as it is now, and GitHub
+// only reports such a pull request BEHIND when branch protection requires
+// branches to be up to date. Auto-merge asks GitHub to update it first.
+func (d *PRDeliverer) ContainsBase(ctx context.Context, head, base string) (bool, error) {
+	if strings.TrimSpace(head) == "" {
+		return false, ErrNoHeadCommit
+	}
+	repo := d.m.Repo()
+	if err := repo.Fetch(ctx); err != nil {
+		return false, err
+	}
+	ref, err := d.TrackingRef(ctx, base)
+	if err != nil {
+		return false, err
+	}
+	ref = "refs/remotes/" + ref
+	if _, err := repo.RevParse(ctx, ref); err != nil {
+		return false, fmt.Errorf("gitx: the remote has no %s: %w", base, err)
+	}
+	if _, err := repo.RevParse(ctx, head); err != nil {
+		return false, fmt.Errorf("gitx: the pull request's head %s is not on the remote: %w", shortSHA(head), err)
+	}
+	return repo.isAncestor(ctx, ref, head)
+}
+
+// BranchAhead reports whether the bead's local branch has moved past head,
+// a pull request's head commit: head is a strict ancestor of the branch
+// tip. In delivering that means a re-delivery is under way — the engineer
+// committed a fix the testers approved, and the push that puts it on the
+// pull request has not happened yet — so the pull request's head is not
+// the work the run means to ship. A head the local repository does not
+// have, or one that has diverged from the branch, is not "ahead": the
+// approved-tip guard judges those.
+func (d *PRDeliverer) BranchAhead(ctx context.Context, bead domain.Bead, head string) (bool, error) {
+	tip, err := d.BranchTip(ctx, bead)
+	if err != nil {
+		return false, err
+	}
+	if tip == head || strings.TrimSpace(head) == "" {
+		return false, nil
+	}
+	repo := d.m.Repo()
+	if _, err := repo.RevParse(ctx, head); errors.Is(err, ErrUnknownRevision) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	return repo.isAncestor(ctx, head, tip)
+}
+
 // Conventional Commit types a pull request title may carry, the ones the
 // common title checks accept (amannn/action-semantic-pull-request's
 // defaults).

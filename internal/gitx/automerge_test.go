@@ -560,6 +560,10 @@ func TestPRDelivererReviewedHead(t *testing.T) {
 		require.NoError(t, err)
 		assert.False(t, ok, "the second update was never asked for")
 		assert.Contains(t, why, "is not an update slop-cannon asked for")
+		ok, why, err = f.d.ReviewedHead(ctx, f.head, second, "release", []string{first})
+		require.NoError(t, err)
+		assert.False(t, ok, "an asked-for link on top is not enough: the walk must reach the approved commit")
+		assert.Contains(t, why, "is not an update slop-cannon asked for")
 	})
 
 	t.Run("a commit pushed onto the approved tip is not", func(t *testing.T) {
@@ -646,4 +650,78 @@ func TestPRDelivererBranchTip(t *testing.T) {
 	tip, err := f.d.BranchTip(ctx, wtBead)
 	require.NoError(t, err)
 	assert.Equal(t, f.head, tip)
+}
+
+// TestPRDelivererContainsBase covers the check that a pull request's head
+// already holds the base's tip, which GitHub only reports (as BEHIND) when
+// branch protection requires branches to be up to date.
+func TestPRDelivererContainsBase(t *testing.T) {
+	ctx := context.Background()
+	f := dpSetup(t, true)
+	require.NoError(t, f.repo.PushBranch(ctx, "origin", f.wt.Branch))
+	// "release" stands in for the default branch, as in
+	// TestPRDelivererReviewedHead, so the fixture's main stays put.
+	clone := filepath.Join(t.TempDir(), "clone")
+	f.r.Git(t, "clone", "--quiet", f.r.RemoteDir, clone)
+	f.r.Git(t, "-C", clone, "config", "user.name", "Someone")
+	f.r.Git(t, "-C", clone, "config", "user.email", "someone@example.com")
+	f.r.Git(t, "-C", clone, "checkout", "--quiet", "-b", "release", "origin/main")
+	f.r.Git(t, "-C", clone, "push", "--quiet", "origin", "release")
+
+	ok, err := f.d.ContainsBase(ctx, f.head, "release")
+	require.NoError(t, err)
+	assert.True(t, ok, "the branch was cut from the base, which has not moved")
+
+	// Another pull request lands on the base.
+	acWrite(t, clone, "OTHER.md", "another pull request\n")
+	f.r.Git(t, "-C", clone, "add", "-A")
+	f.r.Git(t, "-C", clone, "commit", "--quiet", "-m", "another pull request")
+	f.r.Git(t, "-C", clone, "push", "--quiet", "origin", "release")
+
+	ok, err = f.d.ContainsBase(ctx, f.head, "release")
+	require.NoError(t, err)
+	assert.False(t, ok, "the head was tested against the base before the other merge")
+
+	// GitHub's update merges the base in.
+	f.r.Git(t, "-C", clone, "checkout", "--quiet", f.wt.Branch)
+	f.r.Git(t, "-C", clone, "merge", "--quiet", "--no-edit", "origin/release")
+	f.r.Git(t, "-C", clone, "push", "--quiet", "origin", f.wt.Branch)
+	updated := f.r.Git(t, "-C", clone, "rev-parse", "HEAD")
+	ok, err = f.d.ContainsBase(ctx, updated, "release")
+	require.NoError(t, err)
+	assert.True(t, ok)
+
+	_, err = f.d.ContainsBase(ctx, strings.Repeat("d", 40), "release")
+	require.Error(t, err, "a head the remote does not have")
+	_, err = f.d.ContainsBase(ctx, f.head, "no-such-branch")
+	require.Error(t, err, "a base the remote does not have")
+	_, err = f.d.ContainsBase(ctx, "", "release")
+	require.ErrorIs(t, err, ErrNoHeadCommit)
+}
+
+// TestPRDelivererBranchAhead covers the re-delivery check: the bead's
+// branch has a commit the pull request's head does not.
+func TestPRDelivererBranchAhead(t *testing.T) {
+	ctx := context.Background()
+	f := dpSetup(t, true)
+
+	ahead, err := f.d.BranchAhead(ctx, wtBead, f.head)
+	require.NoError(t, err)
+	assert.False(t, ahead, "the branch is at the head")
+
+	acWrite(t, f.wt.Path, "stats/FIX.md", "the fix\n")
+	f.r.Git(t, "-C", f.wt.Path, "add", "-A")
+	f.r.Git(t, "-C", f.wt.Path, "commit", "--quiet", "-m", "the fix")
+	ahead, err = f.d.BranchAhead(ctx, wtBead, f.head)
+	require.NoError(t, err)
+	assert.True(t, ahead, "the approved fix is not on the pull request yet")
+
+	tip := f.r.Git(t, "rev-parse", "refs/heads/"+f.wt.Branch)
+	ahead, err = f.d.BranchAhead(ctx, wtBead, tip)
+	require.NoError(t, err)
+	assert.False(t, ahead, "once pushed, the head is the tip")
+
+	ahead, err = f.d.BranchAhead(ctx, wtBead, strings.Repeat("d", 40))
+	require.NoError(t, err)
+	assert.False(t, ahead, "a commit the repository does not have is for the guard to judge")
 }
