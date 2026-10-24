@@ -367,6 +367,10 @@ func RestoreRunConfig(rc *config.RunConfig) (RestoreResult, error) {
 		return res, fmt.Errorf("orchestrator: run %s merges its own pull requests (auto_merge), which %w; pass --auto-merge=false with --safety off",
 			rc.Run.ID, config.ErrAutoMergeNeedsSafety)
 	}
+	if frozen.AutoMerge && len(frozen.AutoMergeChecks) == 0 {
+		return res, fmt.Errorf("orchestrator: run %s merges its own pull requests (auto_merge), which %w; set auto_merge_checks and pass --auto-merge, or pass --auto-merge=false",
+			rc.Run.ID, config.ErrAutoMergeNeedsChecks)
+	}
 
 	alloc, err := config.Allocate(frozen.Ammo)
 	if err != nil {

@@ -729,8 +729,17 @@ func (e *Effective) validate() error {
 	if e.AutoMerge && !e.Safety {
 		return &ValidationError{Path: e.pathOf(KeyAutoMerge), Key: KeyAutoMerge, Msg: ErrAutoMergeNeedsSafety.Error()}
 	}
+	if e.AutoMerge && len(e.AutoMergeChecks) == 0 {
+		return &ValidationError{Path: e.pathOf(KeyAutoMerge), Key: KeyAutoMerge, Msg: ErrAutoMergeNeedsChecks.Error()}
+	}
 	return nil
 }
+
+// ErrAutoMergeNeedsChecks refuses auto_merge without a name in
+// auto_merge_checks (D-31): the rollup only lists the checks GitHub has
+// created so far, so with nothing required a fast check that finishes
+// before CI has registered the tests would read as all green.
+var ErrAutoMergeNeedsChecks = errors.New("needs at least one auto_merge_checks name: without one, a pull request whose quick checks finish before its tests have even started reads as green")
 
 // ErrAutoMergeNeedsSafety refuses auto_merge with safety off (D-31): the
 // run only ever merges a pull request it opened itself, and safety off
@@ -780,6 +789,9 @@ func (e *Effective) Apply(o Overrides) error {
 		// Either half may come from a flag, so the pair is judged after
 		// both are applied (D-31).
 		return fmt.Errorf("auto_merge is on but safety is off: %w", ErrAutoMergeNeedsSafety)
+	}
+	if e.AutoMerge && len(e.AutoMergeChecks) == 0 {
+		return fmt.Errorf("auto_merge is on: %w", ErrAutoMergeNeedsChecks)
 	}
 	return nil
 }

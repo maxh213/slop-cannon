@@ -1128,6 +1128,30 @@ func TestLifecycleResumeKeepsTheRecordedAutoMerge(t *testing.T) {
 	require.ErrorIs(t, err, config.ErrAutoMergeNeedsSafety)
 }
 
+// D-31: a run recorded with auto-merge on and no required check (an older
+// sc allowed it) is not resumed as one that merges on whatever checks
+// happen to have registered.
+func TestLifecycleResumeRefusesAutoMergeWithoutARequiredCheck(t *testing.T) {
+	f := lifecycleSetup(t)
+	f.Eff.AutoMerge = true
+	r, err := New(f.runConfig(t, config.RunSettings{Brief: "b"}), f.options())
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	require.NoError(t, r.Stop("crash"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+
+	f.Eff = lifecycleEffective(10, true)
+	_, err = RestoreRunConfig(f.runConfig(t, config.RunSettings{Resume: true}))
+	require.ErrorIs(t, err, config.ErrAutoMergeNeedsChecks)
+
+	off := false
+	f.Eff = lifecycleEffective(10, true)
+	require.NoError(t, f.Eff.Apply(config.Overrides{AutoMerge: &off}))
+	_, err = RestoreRunConfig(f.runConfig(t, config.RunSettings{Resume: true}))
+	require.NoError(t, err, "--auto-merge=false resumes it without merging")
+}
+
 // D-31: the time of the run's last auto-merge is in state.json before the
 // merge is asked for, and a resumed run reads it back, so
 // auto_merge_spacing is kept between invocations.

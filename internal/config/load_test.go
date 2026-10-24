@@ -357,12 +357,15 @@ func TestLoadApplyFlags(t *testing.T) {
 	on, off := true, false
 	am, err := load(filepath.Join(t.TempDir(), "none.toml"), "")
 	require.NoError(t, err)
+	assert.ErrorIs(t, am.Apply(Overrides{AutoMerge: &on}), ErrAutoMergeNeedsChecks, "--auto-merge with no auto_merge_checks")
+	am.AutoMergeChecks = []string{"test"}
 	require.NoError(t, am.Apply(Overrides{AutoMerge: &on}))
 	assert.True(t, am.AutoMerge)
 	assert.Equal(t, SourceFlag, am.Sources[KeyAutoMerge])
 	assert.ErrorIs(t, am.Apply(Overrides{Safety: &off}), ErrAutoMergeNeedsSafety, "--safety off under an auto_merge that is on")
 	noSafety, err := load(filepath.Join(t.TempDir(), "none.toml"), "")
 	require.NoError(t, err)
+	noSafety.AutoMergeChecks = []string{"test"}
 	assert.ErrorIs(t, noSafety.Apply(Overrides{Safety: &off, AutoMerge: &on}), ErrAutoMergeNeedsSafety)
 	require.NoError(t, noSafety.Apply(Overrides{Safety: &off, AutoMerge: &off}), "--auto-merge=false lets --safety off through")
 }
@@ -543,6 +546,10 @@ func TestLoadValidation(t *testing.T) {
 		// none, so the pair is refused wherever either half comes from.
 		{"auto merge with safety off", "safety = false\nauto_merge = true\n", "", KeyAutoMerge, "needs safety = true"},
 		{"auto merge with the repo turning safety off", "auto_merge = true\n", "safety = false\n", KeyAutoMerge, "needs safety = true"},
+		// D-31: with no required check, a quick check that finishes before
+		// the tests have registered would read as all green.
+		{"auto merge with no required check", "auto_merge = true\n", "", KeyAutoMerge, "needs at least one auto_merge_checks name"},
+		{"only a blank required check", "auto_merge = true\n", "auto_merge_checks = [\" \"]\n", KeyAutoMerge, "needs at least one auto_merge_checks name"},
 		{"zero auto merge spacing", "auto_merge_spacing = \"0s\"\n", "", KeyAutoMergeSpacing, "must be a positive duration"},
 		{"negative auto merge spacing", "", "auto_merge_spacing = \"-1m\"\n", KeyAutoMergeSpacing, "must be a positive duration"},
 	}
