@@ -294,6 +294,29 @@ func TestPRDelivererNeverAdoptsAPullRequestThatIsNotTheRunsOwn(t *testing.T) {
 		assert.Empty(t, f.tracker.statuses)
 	})
 
+	t.Run("a login gh rejects as unauthenticated hands off, and nothing is pushed", func(t *testing.T) {
+		// The pull request list worked a moment earlier, so the branch has
+		// a pull request nobody has shown is the run's: gh being "down" now
+		// must not turn the delivery into a push-only one onto it.
+		f := dpSetup(t, true)
+		dpSet(t, f.gh, "prs.json", dpPRs(dpPR(t, 5, "OPEN", f.wt.Branch, func(pr map[string]any) {
+			pr["author"] = map[string]string{"login": "mallory"}
+			pr["createdAt"] = dpStarted.Add(-24 * time.Hour).Format(time.RFC3339)
+		})))
+		dpSet(t, f.gh, "login-fails", "HTTP 401: Bad credentials (https://api.github.com/user)")
+		remoteBefore := dpRemoteHeads(t, f)
+		res, err := f.d.Deliver(ctx, dpRequest())
+		require.NoError(t, err)
+		assert.Equal(t, PRForeign, res.Status)
+		assert.Equal(t, domain.BeadStateNeedsHuman, res.State)
+		assert.Contains(t, res.Reason, "could not confirm pull request #5")
+		assert.Contains(t, res.Reason, "not authenticated")
+		assert.False(t, res.Pushed)
+		assert.Equal(t, remoteBefore, dpRemoteHeads(t, f), "nothing is pushed to a branch the run has not shown it owns")
+		assert.Empty(t, f.tracker.meta)
+		assert.Equal(t, []domain.BeadState{domain.BeadStateNeedsHuman}, f.tracker.statuses)
+	})
+
 	t.Run("the run's own pull request with no number recorded yet is reused", func(t *testing.T) {
 		// The delivery that opened it died before sc_pr_number was written;
 		// every other clause ties it to this run.

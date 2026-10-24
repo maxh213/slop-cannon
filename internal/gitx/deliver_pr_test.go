@@ -179,6 +179,7 @@ case "$1 $2" in
   "pr create") echo "Creating pull request for $4 into $6 in acme/widgets"; echo '`+dpPRURL+`' ;;
   "pr close") echo "Closed pull request acme/widgets#$3" ;;
   "api user")
+    if [ -s "$SC_FAKEBIN_DIR/login-fails" ]; then cat "$SC_FAKEBIN_DIR/login-fails" >&2; exit 1; fi
     if [ -f "$SC_FAKEBIN_DIR/login-fails" ]; then echo "HTTP 502: Bad Gateway" >&2; exit 1; fi
     cat "$SC_FAKEBIN_DIR/login" 2>/dev/null || echo `+dpLogin+` ;;
   "pr view") cat "$SC_FAKEBIN_DIR/view.json" ;;

@@ -327,11 +327,17 @@ func (d *PRDeliverer) Deliver(ctx context.Context, req PRRequest) (*PRResult, er
 		// merged: a person decides what happens to it.
 		owned, why, err := d.owned(ctx, req, *pr, branch, base)
 		if r, down := ghUnavailable(err); down {
-			reason, ghDown, pr = r, true, nil
+			// The branch has a pull request nobody has shown is this
+			// run's: gh failing now is no licence to push onto it.
+			res.Status = PRForeign
+			res.PR, res.PRState = pr, state
+			res.Reason = fmt.Sprintf("could not confirm pull request #%d on %s is this run's own: %s", pr.Number, branch, r)
+			res.Instructions = fmt.Sprintf("slop-cannon will not push to, reuse or merge it unconfirmed; fix gh and retry the bead, or close the pull request (or move it off %s) if it is not this run's", branch)
+			return d.handOff(ctx, res, log)
 		} else if err != nil {
 			return nil, err
 		}
-		if pr != nil && !owned {
+		if !owned {
 			res.Status = PRForeign
 			res.PR, res.PRState = pr, state
 			res.Reason = fmt.Sprintf("pull request #%d on %s is not this run's own: %s", pr.Number, branch, why)
