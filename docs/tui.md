@@ -258,7 +258,7 @@ line saying what safety means for this run and how the deliveries are doing.
 |---|---|
 | `BEAD` | the bead delivered, or the review bead of an external pull request |
 | `PR` | `#42`, `ext #77` for a pull request the cannon only reviews (D-11), `-` for work that went straight to the default branch |
-| `STATUS` | `open`, `awaiting merge` (safety on: a human merges it, D-20), `reviewing`, `reviewed`, `merged`, `closed`, `needs human`, `failed` — each with its own glyph |
+| `STATUS` | `open`, `awaiting merge` (safety on: a human merges it, D-20, or the run does with `auto_merge`, D-31), `reviewing`, `reviewed`, `merged`, `closed`, `needs human`, `failed` — each with its own glyph |
 | `CHECKS` | what is known about the pull request's checks; for an external pull request, the review the cannon posted on it |
 | `REF` | the pull request URL, or the short merge sha |
 
