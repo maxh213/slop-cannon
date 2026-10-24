@@ -1182,6 +1182,19 @@ func TestLifecycleAutoMergeLedgerSurvivesAResume(t *testing.T) {
 	require.True(t, at.Equal(r2.LastAutoMerge()), "the resumed run spaces its merges from the last one")
 	require.NoError(t, r2.RecordAutoMerge(at.Add(time.Hour), "fx-2", 8))
 	require.Equal(t, 2, r2.State().AutoMerge.Merges)
+
+	// The heads sent back are durable too, and bounded.
+	require.NoError(t, r2.RecordAutoMergeSentBack([]string{"check:abc:test"}))
+	st, err = LoadState(resumed.Run.StateDir)
+	require.NoError(t, err)
+	require.Equal(t, []string{"check:abc:test"}, st.AutoMerge.SentBack)
+	require.Equal(t, 2, st.AutoMerge.Merges, "the merge record is kept")
+	for i := range autoMergeSentBackLimit {
+		require.NoError(t, r2.RecordAutoMergeSentBack([]string{fmt.Sprintf("conflict:%d", i)}))
+	}
+	keys := r2.AutoMergeSentBack()
+	require.Len(t, keys, autoMergeSentBackLimit)
+	require.Equal(t, "conflict:0", keys[0], "the oldest key went first")
 	require.NoError(t, r2.Close())
 }
 

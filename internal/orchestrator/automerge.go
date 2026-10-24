@@ -95,13 +95,18 @@ type AutoMergeBranches interface {
 	ReviewedHead(ctx context.Context, reviewed, head, base string) (bool, string, error)
 }
 
-// AutoMergeLedger is where the time of the run's last merge lives, so the
-// spacing holds across a resume. *Run satisfies it.
+// AutoMergeLedger is where the time of the run's last merge and the heads
+// already sent back live, so the spacing and the once-per-head send-back
+// hold across a resume. *Run satisfies it.
 type AutoMergeLedger interface {
 	// LastAutoMerge is when the run last merged; zero for never.
 	LastAutoMerge() time.Time
 	// RecordAutoMerge durably records a merge about to be asked for.
 	RecordAutoMerge(at time.Time, bead domain.BeadID, pr int) error
+	// AutoMergeSentBack are the send-back keys recorded so far.
+	AutoMergeSentBack() []string
+	// RecordAutoMergeSentBack durably records heads sent back.
+	RecordAutoMergeSentBack(keys []string) error
 }
 
 // DeliveryOutcomeApplier hands a delivery outcome to whoever owns the
@@ -220,6 +225,31 @@ func (am *autoMerger) once(key string) bool {
 	}
 	am.done[key] = true
 	return true
+}
+
+// sentBack reports whether the head behind key was already sent back, by
+// this invocation or, through the ledger, an earlier one of the run.
+func (am *autoMerger) sentBack(key string) bool {
+	if am.done[key] {
+		return true
+	}
+	for _, k := range am.opts.Ledger.AutoMergeSentBack() {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// amRecordSentBack marks keys as sent back, in memory and in state.json; a
+// failed write only costs a resume one more round for these heads.
+func (p *GatePoller) amRecordSentBack(id domain.BeadID, keys ...string) {
+	for _, k := range keys {
+		p.auto.once(k)
+	}
+	if err := p.auto.opts.Ledger.RecordAutoMergeSentBack(keys); err != nil {
+		p.warn(id, fmt.Sprintf("auto-merge: could not record in state.json that %s was sent back", id), err)
+	}
 }
 
 // autoMerge is the D-31 step for one pending gate. It never returns an
@@ -412,7 +442,7 @@ func (p *GatePoller) amUpdate(ctx context.Context, id domain.BeadID, number int,
 func (p *GatePoller) amConflict(ctx context.Context, issue beads.Issue, bead domain.Bead, branch string, view *gitx.PRView) {
 	number, head := view.Number, view.HeadSHA
 	key := "conflict:" + head
-	if p.auto.done[key] {
+	if p.auto.sentBack(key) {
 		p.amHandOff(ctx, issue, number, fmt.Sprintf("pull request #%d still conflicts with %s at %s after its engineer had a round to resolve it", number, p.branch, shortHead(head)))
 		return
 	}
@@ -435,7 +465,7 @@ func (p *GatePoller) amConflict(ctx context.Context, issue beads.Issue, bead dom
 		Status: domain.ItemOpen,
 	}
 	if p.amSendBack(ctx, issue, number, []domain.FeedbackItem{item}, item.Title) {
-		p.auto.once(key)
+		p.amRecordSentBack(issue.ID, key)
 	}
 }
 
@@ -445,7 +475,7 @@ func (p *GatePoller) amChecksFailed(ctx context.Context, issue beads.Issue, bead
 	number, head := view.Number, view.HeadSHA
 	var fresh []gitx.PRCheck
 	for _, c := range failed {
-		if !p.auto.done["check:"+head+":"+c.Name] {
+		if !p.auto.sentBack("check:" + head + ":" + c.Name) {
 			fresh = append(fresh, c)
 		}
 	}
@@ -474,9 +504,11 @@ func (p *GatePoller) amChecksFailed(ctx context.Context, issue beads.Issue, bead
 		})
 	}
 	if p.amSendBack(ctx, issue, number, items, items[0].Title) {
+		keys := make([]string, 0, len(fresh))
 		for _, c := range fresh {
-			p.auto.once("check:" + head + ":" + c.Name)
+			keys = append(keys, "check:"+head+":"+c.Name)
 		}
+		p.amRecordSentBack(issue.ID, keys...)
 	}
 }
 

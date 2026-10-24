@@ -168,16 +168,33 @@ func (b *amFakeBranches) markUpdate(head string) {
 
 // amFakeLedger is the run's state.json half.
 type amFakeLedger struct {
-	mu      sync.Mutex
-	last    time.Time
-	err     error
-	Records []string
+	mu       sync.Mutex
+	last     time.Time
+	err      error
+	Records  []string
+	sentBack []string
 }
 
 func (l *amFakeLedger) LastAutoMerge() time.Time {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.last
+}
+
+func (l *amFakeLedger) AutoMergeSentBack() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.sentBack...)
+}
+
+func (l *amFakeLedger) RecordAutoMergeSentBack(keys []string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return l.err
+	}
+	l.sentBack = append(l.sentBack, keys...)
+	return nil
 }
 
 func (l *amFakeLedger) RecordAutoMerge(at time.Time, bead domain.BeadID, pr int) error {
@@ -718,6 +735,8 @@ type forgetfulLedger struct{}
 
 func (forgetfulLedger) LastAutoMerge() time.Time                            { return time.Time{} }
 func (forgetfulLedger) RecordAutoMerge(time.Time, domain.BeadID, int) error { return nil }
+func (forgetfulLedger) AutoMergeSentBack() []string                         { return nil }
+func (forgetfulLedger) RecordAutoMergeSentBack([]string) error              { return nil }
 
 // The spacing is measured from the ledger, which is the run's state.json:
 // a resumed run's poller waits out the rest of it.
@@ -902,4 +921,40 @@ func TestAutoMergeNeverMergesCommitsTheRunDidNotReview(t *testing.T) {
 		assert.Equal(t, []string{"7@" + pushed}, h.GH.Merges)
 		assert.Len(t, h.Branches.Reviews, 1, "a head shown to be reviewed is remembered")
 	})
+}
+
+// The once-per-head send-back holds across a resume: a new poller (a new
+// invocation) over the same ledger hands a head that comes back with the
+// same failure to a person instead of sending it round again.
+func TestAutoMergeSendBackSurvivesAResume(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		view func() *gitx.PRView
+	}{
+		{"a failed check", func() *gitx.PRView { return amOwnedView(amHead, amCheck("test", "FAILURE")) }},
+		{"a conflict", func() *gitx.PRView {
+			v := amOwnedView(amHead)
+			v.MergeStateStatus, v.Mergeable, v.Checks = "DIRTY", "CONFLICTING", nil
+			return v
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			first := newAMHarness(t, nil)
+			first.GH.set(tc.view())
+			first.pending()
+			first.poll()
+			require.Len(t, first.Outcomes.all(), 1)
+			require.Len(t, first.Ledger.AutoMergeSentBack(), 1)
+
+			resumed := newAMHarness(t, func(o *AutoMergeOptions) { o.Ledger = first.Ledger })
+			resumed.GH.set(tc.view())
+			resumed.pending()
+			resumed.poll()
+			assert.Empty(t, resumed.Outcomes.all(), "not sent round again")
+			assert.Equal(t, string(domain.BeadStateNeedsHuman), resumed.BD.State(amBead))
+			assert.Equal(t, AutoMergeHandedOff, resumed.status().State)
+		})
+	}
 }

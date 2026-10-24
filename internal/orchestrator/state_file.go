@@ -121,7 +121,15 @@ type AutoMergeState struct {
 	LastPR   int           `json:"last_pr,omitempty"`
 	// Merges counts the merges asked for over the life of the run.
 	Merges int `json:"merges,omitempty"`
+	// SentBack are the heads already sent back to their engineer, as
+	// "conflict:<sha>" and "check:<sha>:<name>", the newest
+	// [autoMergeSentBackLimit] of them: a head that comes back the same
+	// after a resume goes to a person, not round again.
+	SentBack []string `json:"sent_back,omitempty"`
 }
+
+// autoMergeSentBackLimit bounds [AutoMergeState.SentBack].
+const autoMergeSentBackLimit = 256
 
 // Spent is the run's budget state, or the zero value for a state file that
 // carries none.
@@ -141,6 +149,7 @@ func (s State) clone() State {
 	out.Run.Config = cloneSnapshot(s.Run.Config)
 	if s.AutoMerge != nil {
 		am := *s.AutoMerge
+		am.SentBack = append([]string(nil), s.AutoMerge.SentBack...)
 		out.AutoMerge = &am
 	}
 	return out

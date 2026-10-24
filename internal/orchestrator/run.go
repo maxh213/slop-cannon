@@ -1435,6 +1435,38 @@ func (r *Run) RecordAutoMerge(at time.Time, bead domain.BeadID, pr int) error {
 	return nil
 }
 
+// AutoMergeSentBack returns the send-back keys state.json records (D-31).
+func (r *Run) AutoMergeSentBack() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.st.AutoMerge == nil {
+		return nil
+	}
+	return append([]string(nil), r.st.AutoMerge.SentBack...)
+}
+
+// RecordAutoMergeSentBack adds keys to the send-back record in state.json,
+// synchronously, keeping the newest [autoMergeSentBackLimit].
+func (r *Run) RecordAutoMergeSentBack(keys []string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	am := AutoMergeState{}
+	if r.st.AutoMerge != nil {
+		am = *r.st.AutoMerge
+	}
+	am.SentBack = append(append([]string(nil), am.SentBack...), keys...)
+	if n := len(am.SentBack) - autoMergeSentBackLimit; n > 0 {
+		am.SentBack = am.SentBack[n:]
+	}
+	prev := r.st.AutoMerge
+	r.st.AutoMerge = &am
+	if err := r.persistLocked(); err != nil {
+		r.st.AutoMerge = prev
+		return err
+	}
+	return nil
+}
+
 // UseVitals names the function that snapshots the run's vitals — what the
 // planner is doing and what the gate poller has seen — for every state.json
 // the run writes (P6-29). It may be set at any time, including after the
