@@ -25,9 +25,14 @@ import (
 // [Deliverer] takes it from there, exactly once per attempt, along the path
 // the run's safety setting chooses (D-10):
 //
-//	safety on   push the branch, open (or find) the pull request, and leave
-//	            the bead in delivering behind its gh:pr gate; the gate poll
-//	            (P6-10) closes it when the human merges (D-20).
+//	safety on   push the branch, open (or reuse the run's own) pull
+//	            request, and leave the bead in delivering behind its gh:pr
+//	            gate; the gate poll (P6-10) closes it when the pull request
+//	            merges (D-20). A human merges it, unless the run was started
+//	            with auto_merge: then the gate poll merges the run's own
+//	            pull request itself once it is green (D-31), and a failed
+//	            check or a conflict found there comes back here as the same
+//	            check-failed edge below.
 //	safety off  rebase onto the default branch, run the check command,
 //	            fast-forward, push, then close the bead with sc_merge_sha
 //	            (D-20).
@@ -328,7 +333,8 @@ type DeliveryKind string
 // The delivery outcomes.
 const (
 	// DeliveryPending means the pull request is open and the bead stays in
-	// delivering behind its gh:pr gate until a human merges it (D-20).
+	// delivering behind its gh:pr gate until it merges (D-20): by a human,
+	// or by the gate poller when the run auto-merges (D-31).
 	DeliveryPending DeliveryKind = "pending_gate"
 	// DeliveryMerged means the work landed on the default branch and the
 	// bead is closed (safety off).
@@ -543,6 +549,11 @@ type DeliveryOptions struct {
 	// comments — so it is guarded here as well as at the point the agent
 	// replied. A nil filter still applies the built-in rules.
 	Filter *agents.SecretFilter
+	// RunStarted is when the run first started (a resume keeps the
+	// original). The safety-on path reuses an existing pull request only
+	// when it is the run's own, and one created before this is not
+	// (D-31); zero means no existing pull request is ever reused.
+	RunStarted time.Time
 }
 
 // Deliverer is the delivery handoff (P6-06): it ships approved beads, keeps
@@ -563,6 +574,7 @@ type Deliverer struct {
 	maxRounds int
 	safety    bool
 	filter    *agents.SecretFilter
+	started   time.Time
 
 	mu       sync.Mutex
 	pending  map[domain.BeadID]PendingConflict
@@ -605,6 +617,7 @@ func NewDeliverer(opts DeliveryOptions) (*Deliverer, error) {
 		threshold: opts.ReReviewThreshold,
 		maxRounds: opts.MaxConflictRounds,
 		filter:    opts.Filter,
+		started:   opts.RunStarted,
 		safety:    opts.Host.Snapshot().Safety,
 		pending:   map[domain.BeadID]PendingConflict{},
 		attempts:  map[domain.BeadID]int{},
@@ -788,6 +801,9 @@ func (d *Deliverer) deliverPR(ctx context.Context, req DeliveryRequest, out *Del
 		Verdicts: d.filter.Verdicts(req.Verdicts),
 		Rounds:   out.Round,
 		Base:     req.Base,
+		// D-31: an existing pull request is reused only when it is the
+		// run's own.
+		RunStarted: d.started,
 	})
 	if err != nil {
 		return d.retryable(out, "the pull request could not be delivered", err)

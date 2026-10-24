@@ -17,7 +17,9 @@ import (
 // (D-20). With safety on, `sc` opens a pull request for a bead, keeps the
 // bead in `delivering`, and creates a `gh:pr` gate that blocks it; the gate
 // keeps the bead out of `bd ready` and `bd close` for its dependents until
-// the human merges. `bd gate check --type=gh:pr` asks `gh pr view <n>
+// the pull request merges — by a human, or, for a run started with
+// auto_merge, by the run itself once its own pull request is green (D-31);
+// either way the gate is what notices. `bd gate check --type=gh:pr` asks `gh pr view <n>
 // --json state,title` and closes the gate when the PR is MERGED, reports
 // ESCALATE when it is CLOSED without merging (or no longer exists), and
 // reports an error per gate when `gh` is missing, not authenticated or

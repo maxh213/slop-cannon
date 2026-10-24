@@ -378,8 +378,10 @@ func TestPRDelivererSyncBranch(t *testing.T) {
 		require.NoError(t, err)
 		head := pushRemote(t, f)
 
+		mainBefore := f.r.Git(t, "rev-parse", "refs/remotes/origin/main")
 		require.NoError(t, f.d.SyncBranch(ctx, wtBead, head))
 		assert.Equal(t, head, f.r.Git(t, "rev-parse", "refs/heads/"+f.wt.Branch))
+		assert.Equal(t, mainBefore, f.r.Git(t, "rev-parse", "refs/remotes/origin/main"), "only tracking refs are fetched")
 		assert.Equal(t, head, f.r.Git(t, "-C", f.wt.Path, "rev-parse", "HEAD"), "the worktree follows its branch")
 		assert.Empty(t, f.r.Git(t, "-C", f.wt.Path, "status", "--porcelain"))
 

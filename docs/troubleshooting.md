@@ -273,6 +273,7 @@ is rebased and fast-forwarded onto the default branch (D-10).
 | `the pull request at` | The same, with both commits named. | As above. |
 | `checked out, not` | The bead's worktree is on another branch than the bead's own, so its branch could not be brought up to the pull request's head. | `git switch` the worktree back to the `sc/` branch the message names. |
 | `gitx: the pull request's head` | The pull request's head commit could not be fetched from the remote while the bead's branch was being brought up to it. | Usually the network: the next poll tries again. |
+| `orchestrator: auto-merge needs a run scope, a bead reader, the default branch, the run's start, gh, the branches, a ledger and an outcome applier` | The run was started with `auto_merge` on, but a part the merge is guarded by could not be assembled (D-31): the run id, the bead reader, the default branch, the run's start time, `gh`, the pull request path, `state.json` or the conductor. The run refuses to start rather than merge with a guard missing. | It is a bug in `sc`, not your configuration: report it. Until it is fixed, run with `--auto-merge=false` and merge by hand. |
 | `gitx: no verdicts to post` | A review was posted with no verdicts in it. | Nothing to do: nothing was written to the pull request. |
 
 ## GitHub (`gh`)
@@ -478,6 +479,39 @@ exempted in the test with a written reason.
 | `names no bead it blocks; leaving it alone` | A gate in the database blocks nothing, so there is nothing for `sc` to close. | Nothing: it is someone else's gate. `bd gate list` shows them. |
 | `needs a human` | A gate was raised that only a person can clear — an escalation, or a pull request `sc` will not merge for you. | `sc status` lists what is waiting and why. |
 | `gates but printed no per-gate verdict` | `bd` checked the gates and reported no result for any of them. | Usually a `bd` older than 1.2.2: `sc doctor`. |
+
+### Auto-merge (D-31)
+
+Only a run started with `safety = true` and `auto_merge = true` prints
+these. Every one names the bead, and the latest one per bead is also the
+`auto-merge:` line of `sc status`. Waiting is the normal state: the run
+looks again on every gate poll and merges as soon as everything holds.
+
+| Message | What happened | What to do |
+|---|---|---|
+| `auto-merge:` | What auto-merge last decided about a bead's pull request, with the reason. The rows below are the reasons worth looking up. | Read the reason; most of them clear on their own. |
+| `it is left for a human to merge` | The pull request behind the bead's gate fails the ownership check (D-31): another head or base, no `slop-cannon` label, no marker naming this run and bead, another number, created before the run started, or opened by another login. It is never merged, updated or sent back; the bead stays in `delivering` for a human. | Merge or close it yourself. If it should be the run's, the clause named says what is different. |
+| `but the bead records #` | The gate waits on another pull request than the one the bead recorded in `sc_pr_number`, so the run cannot tell which is its own and merges neither. | Look at both with `bd show <bead-id>` and `gh pr view`; merge the right one by hand. |
+| `GitHub reports pull request #` | Everything else holds but GitHub does not report the pull request `CLEAN`. `BLOCKED` is a branch-protection requirement such as a required review, `UNSTABLE` a failing check that is not required, `HAS_HOOKS` a pending merge hook, `UNKNOWN` GitHub still working it out. Auto-merge never bypasses any of them. | For `BLOCKED`, give the review the branch protection asks for; the next poll merges. The rest usually clear by themselves. |
+| `has no checks yet` | The pull request's head has no checks or statuses at all. An empty rollup is never read as green. | Nothing while CI starts. If the repository has no CI on pull requests, auto-merge will never merge: merge by hand, or add a check. |
+| `still running` | At least one check has not finished (or finished with a result `sc` does not know, such as `STALE`). | Nothing: the next poll looks again. |
+| `not reported as successful` | A name in `auto_merge_checks` is not among the checks that succeeded on the head: not reported yet, or only skipped or neutral. | Nothing while CI runs. If it never appears, the name in `auto_merge_checks` does not match the check's name on GitHub. |
+| `is a draft` | The pull request was marked as a draft, by hand. | Mark it ready for review if it should merge. |
+| `GitHub reported no head commit for pull request #` | `gh pr view` printed no `headRefOid`, and a merge must name the head commit it was judged on. | Nothing: the next poll reads it again. |
+| `green; the next merge is allowed at` | The pull request is ready, but the run merged another one less than `auto_merge_spacing` ago, so the deploy that merge started can finish first. A resumed run counts from the last merge any invocation made. | Nothing. Lower `auto_merge_spacing` if your deploys are faster. |
+| `green; another pull request was merged in this poll` | The run merges at most one pull request per poll. | Nothing. |
+| `squash-merged pull request #` | The run merged its own pull request. The bead closes when the next gate poll sees the merge. | Nothing. |
+| `waiting for the update GitHub was asked for` | The pull request is behind the default branch and GitHub was already asked to merge the default branch into it once for this head. | Nothing while GitHub updates it. If it stays behind, run `gh pr update-branch <n>` yourself. |
+| `GitHub is merging it in, and the checks run again` | The pull request was behind the default branch, so the run asked GitHub to merge the default branch into it (`gh pr update-branch`, a server-side merge, never a force push). | Nothing: the checks run on the new head and the next green poll merges. |
+| `back to its engineer` | A check failed, or the pull request conflicts with the default branch. The bead went back to its engineer as a change request: one qa item per failed check with its URL, or one item to merge the default branch in and resolve. The engineer's push goes to the same pull request. | Nothing. A head that comes back with the same failure or conflict goes to a person instead (`it needs a human`). |
+| `was sent back to its engineer but the feedback loop could not take it` | The bead moved to `changes_requested`, but the run could not hand it to its engineer. | `sc status <bead-id>`; resuming the run hands it over again. |
+| `could not bring the bead's branch up to its pull request's head` | Before sending the bead back, the run fetches and fast-forwards the bead's branch onto the pull request's head, and that failed. The bead stays where it is. | Usually the network: the next poll tries again. The rest of the line names the git error. |
+| `could not read the gh login, so no pull request can be shown to be the run's own` | `gh api user --jq .login` failed, so the author clause of the ownership check cannot be judged and nothing merges. | `gh auth status`; the next poll reads it again. |
+| `could not read pull request #` | `gh pr view` failed for the bead's pull request. | Usually GitHub being unreachable: the next poll reads it again. |
+| `could not find the branch of` | The bead's `sc/` branch is gone from the repository, so the head clause of the ownership check cannot be judged and nothing merges. | Check nothing outside `sc` is pruning `sc/` branches; merge the pull request by hand. |
+| `could not record the merge in state.json, so it was not made` | The time of a merge is written to `state.json` before the merge, so the spacing holds across a resume; the write failed, so no merge was asked for. | Check the disk under the state directory. The next poll tries again. |
+| `gh could not merge pull request #` | `gh pr merge --squash --match-head-commit` failed: GitHub refused it (the head moved after the poll read it, or a requirement changed) or could not be reached. The spacing starts anyway. | Nothing usually: the next poll judges the new state. The rest of the line is GitHub's reason. |
+| `gh could not update pull request #` | `gh pr update-branch` failed. | Run it yourself to see GitHub's reason; the next poll tries again. |
 
 ### The review loop
 

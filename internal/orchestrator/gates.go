@@ -22,14 +22,19 @@ import (
 // With safety on, a delivered bead does not close when its pull request is
 // opened: the cannon creates a native `gh:pr` gate that blocks the bead
 // (D-20), so the bead stays `delivering` and its dependents stay out of
-// `bd ready` until a human merges. Something has to notice the merge, and
-// that is [GatePoller]: every [GatePollerOptions.Interval] it runs
-// `bd gate check --type=gh:pr`, which asks `gh pr view` about every open
-// gate, and then acts on the verdicts:
+// `bd ready` until the pull request merges. Something has to notice the
+// merge, and that is [GatePoller]: every [GatePollerOptions.Interval] it
+// runs `bd gate check --type=gh:pr`, which asks `gh pr view` about every
+// open gate, and then acts on the verdicts:
 //
 //	resolved  → the PR merged; bd closed the gate, so the bead is closed
 //	            (delivered → closed) and an [events.Merged] is published
-//	pending   → the PR is still open; nothing happens
+//	pending   → the PR is still open; a human merges it, so nothing
+//	            happens — unless the run was started with auto_merge
+//	            (D-31, [GatePollerOptions.AutoMerge], automerge.go): then
+//	            the run's own pull request is merged here once it is
+//	            green, CLEAN and auto_merge_spacing has passed, and it
+//	            resolves like any other merge on a later poll
 //	ESCALATE  → the PR was closed without merging; the bead is moved to
 //	            needs_human and the gate is resolved (see below)
 //	error     → the check itself failed; one Warning, retried next poll
@@ -225,6 +230,11 @@ type GatePollerOptions struct {
 	// Logger overrides the host's logger; nil means the host's, else
 	// slog.Default().
 	Logger *slog.Logger
+	// AutoMerge, when set, lets the poller merge the run's own pull
+	// requests once they are green (D-31, see automerge.go). Nil — the
+	// default, and the only value with auto_merge off — never merges
+	// anything: the poller only waits for a human.
+	AutoMerge *AutoMergeOptions
 }
 
 // GatePollStats counts what the poller has done, for `sc status`, the TUI
@@ -264,6 +274,20 @@ type GatePollStats struct {
 	// how long `gh` has been away without following the run log back to the
 	// Warning (P6-29). It is zero whenever GHDown is false.
 	GHDownSince time.Time `json:"gh_down_since,omitempty"`
+	// AutoMergeOn is true when the poller may merge the run's own pull
+	// requests (D-31).
+	AutoMergeOn bool `json:"auto_merge_on,omitempty"`
+	// AutoMerged, AutoMergeUpdates and AutoMergeSentBack count the merges
+	// asked for, the branch updates asked for and the beads sent back to
+	// their engineer by auto-merge.
+	AutoMerged        int `json:"auto_merged,omitempty"`
+	AutoMergeUpdates  int `json:"auto_merge_updates,omitempty"`
+	AutoMergeSentBack int `json:"auto_merge_sent_back,omitempty"`
+	// LastAutoMergeAt is when this process last asked for a merge.
+	LastAutoMergeAt time.Time `json:"last_auto_merge_at,omitempty"`
+	// AutoMerge is what auto-merge last decided about every bead behind a
+	// pending gate, in bead order.
+	AutoMerge []AutoMergeStatus `json:"auto_merge,omitempty"`
 }
 
 // GatePollResult is what one poll did.
@@ -341,6 +365,11 @@ type GatePoller struct {
 	warned  map[string]bool
 	cache   map[domain.BeadID]beads.Gate
 	pending map[domain.BeadID]gatePendingClose
+
+	// auto is the D-31 auto-merge, nil when it is off. Its own state is
+	// only touched under pollMu; amStatuses is under mu.
+	auto       *autoMerger
+	amStatuses map[domain.BeadID]AutoMergeStatus
 }
 
 // gatePendingClose is a merge the poller has been told about but has not
@@ -385,6 +414,9 @@ func NewGatePoller(opts GatePollerOptions) (*GatePoller, error) {
 	if opts.Scope != "" && opts.Beads == nil {
 		return nil, fmt.Errorf("%w: scope %s", ErrScopeNeedsBeads, opts.Scope)
 	}
+	if err := validAutoMerge(opts); err != nil {
+		return nil, err
+	}
 	p := &GatePoller{
 		gates:    opts.Gates,
 		reader:   opts.Beads,
@@ -405,7 +437,11 @@ func NewGatePoller(opts GatePollerOptions) (*GatePoller, error) {
 		warned:   map[string]bool{},
 		cache:    map[domain.BeadID]beads.Gate{},
 		pending:  map[domain.BeadID]gatePendingClose{},
+
+		auto:       newAutoMerger(opts.AutoMerge),
+		amStatuses: map[domain.BeadID]AutoMergeStatus{},
 	}
+	p.stats.AutoMergeOn = p.auto != nil
 	if p.interval <= 0 {
 		p.interval = DefaultGatePollInterval
 	}
@@ -456,7 +492,9 @@ func (p *GatePoller) Foreign() *ForeignStatusReporter { return p.foreign }
 func (p *GatePoller) Stats() GatePollStats {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.stats
+	st := p.stats
+	st.AutoMerge = p.autoMergeStatusesLocked()
+	return st
 }
 
 // Kick makes the loop poll at once instead of waiting for the next
@@ -564,6 +602,10 @@ func (p *GatePoller) Poll(ctx context.Context) (GatePollResult, error) {
 	}
 
 	seen := make(map[domain.BeadID]bool, len(check.Results))
+	watched := map[domain.BeadID]bool{}
+	if p.auto != nil {
+		p.auto.mergedThisPoll = false
+	}
 	for _, r := range check.Results {
 		if ctx.Err() != nil {
 			p.record(&res)
@@ -575,10 +617,22 @@ func (p *GatePoller) Poll(ctx context.Context) (GatePollResult, error) {
 			p.merged(ctx, r, &res)
 		case beads.GateEscalated:
 			p.escalated(ctx, r, &res)
-		case beads.GatePending, beads.GateError:
-			// Pending is the normal case and needs nothing; an errored
-			// check is already in check.Warnings and is retried next poll.
+		case beads.GatePending:
+			// Pending is the normal case: a human merges, unless the run
+			// was started with auto_merge (D-31) and the pull request is
+			// its own and green.
+			if p.auto != nil {
+				if id := p.autoMerge(ctx, r); id != "" {
+					watched[id] = true
+				}
+			}
+		case beads.GateError:
+			// An errored check is already in check.Warnings and is retried
+			// next poll.
 		}
+	}
+	if p.auto != nil {
+		p.amForget(watched)
 	}
 	p.retryPendingCloses(ctx, seen, &res)
 	p.record(&res)
@@ -1192,6 +1246,9 @@ func Vitals(at time.Time, plan PlanningReporter, gates GateReporter, foreign *Fo
 // anything.
 func (v RunVitals) Lines() []string {
 	out := []string{v.PlanningLine(), v.GatesLine()}
+	if l := v.AutoMergeLine(); l != "" {
+		out = append(out, l)
+	}
 	if l := v.ForeignLine(); l != "" {
 		out = append(out, l)
 	}
@@ -1285,6 +1342,32 @@ func (v RunVitals) GatesLine() string {
 	return "gates: " + strings.Join(parts, " · ")
 }
 
+// AutoMergeLine says what auto-merge (D-31) has done and what it is waiting
+// for, bead by bead, or "" for a run that does not auto-merge.
+func (v RunVitals) AutoMergeLine() string {
+	g := v.Gates
+	if !g.AutoMergeOn {
+		return ""
+	}
+	parts := []string{"on"}
+	if g.AutoMerged > 0 {
+		parts = append(parts, fmt.Sprintf("%d merged", g.AutoMerged))
+	}
+	if !g.LastAutoMergeAt.IsZero() {
+		parts = append(parts, "last merge "+v.when(g.LastAutoMergeAt))
+	}
+	if g.AutoMergeUpdates > 0 {
+		parts = append(parts, fmt.Sprintf("%d branch updates", g.AutoMergeUpdates))
+	}
+	if g.AutoMergeSentBack > 0 {
+		parts = append(parts, fmt.Sprintf("%d sent back", g.AutoMergeSentBack))
+	}
+	for _, st := range g.AutoMerge {
+		parts = append(parts, fmt.Sprintf("%s %s: %s", st.Bead, st.State, st.Reason))
+	}
+	return "auto-merge: " + strings.Join(parts, " · ")
+}
+
 // ForeignLine reports the beads the run is leaving alone (P6-28), or "" if
 // there are none.
 func (v RunVitals) ForeignLine() string {
@@ -1316,10 +1399,33 @@ func (v RunVitals) Header() string {
 	if n := v.Gates.Pending; n > 0 {
 		parts = append(parts, fmt.Sprintf("%d pending", n))
 	}
+	if l := v.autoMergeHeader(); l != "" {
+		parts = append(parts, l)
+	}
 	if v.Foreign > 0 {
 		parts = append(parts, fmt.Sprintf("%d left alone", v.Foreign))
 	}
 	return strings.Join(parts, " · ")
+}
+
+// autoMergeHeader counts the auto-merge decisions for the TUI header, the
+// ones a person may have to act on first: "auto-merge 1 blocked, 2 waiting".
+func (v RunVitals) autoMergeHeader() string {
+	if !v.Gates.AutoMergeOn || len(v.Gates.AutoMerge) == 0 {
+		return ""
+	}
+	counts := map[AutoMergeDecision]int{}
+	for _, st := range v.Gates.AutoMerge {
+		counts[st.State]++
+	}
+	var parts []string
+	for _, d := range []AutoMergeDecision{AutoMergeNotOwned, AutoMergeHandedOff, AutoMergeBlocked, AutoMergeSentBack,
+		AutoMergeUpdating, AutoMergeWaiting, AutoMergeMerging} {
+		if n := counts[d]; n > 0 {
+			parts = append(parts, fmt.Sprintf("%d %s", n, strings.ReplaceAll(string(d), "_", " ")))
+		}
+	}
+	return "auto-merge " + strings.Join(parts, ", ")
 }
 
 // when phrases a time relative to the snapshot: "in 30s", "5m0s ago", or

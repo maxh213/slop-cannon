@@ -21,8 +21,12 @@ import (
 // Safety-on delivery (D-10, D-20): the bead's branch is pushed to the
 // default remote and a pull request is opened with gh. The default branch
 // is never touched. The bead stays in `delivering`, records the PR in its
-// metadata, and gets a gh:pr gate that blocks it until a human merges;
-// dependents therefore wait for the merge, which is the point of safety.
+// metadata, and gets a gh:pr gate that blocks it until the pull request
+// merges — by a human, or by the run's gate poller when it auto-merges its
+// own (D-31); dependents therefore wait for the merge, which is the point
+// of safety. An existing pull request for the branch is reused only when
+// [OwnedByRun] says it is the run's own; anything else on the branch is
+// neither pushed to nor reused, and the bead goes to a person.
 // When gh cannot be used (not installed, not authenticated, or the remote
 // is not on GitHub) the branch is still pushed, the human gets the compare
 // URL, and the bead moves to `needs_human` because no gate can be checked.

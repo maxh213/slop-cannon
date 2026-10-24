@@ -1128,6 +1128,39 @@ func TestLifecycleResumeKeepsTheRecordedAutoMerge(t *testing.T) {
 	require.ErrorIs(t, err, config.ErrAutoMergeNeedsSafety)
 }
 
+// D-31: the time of the run's last auto-merge is in state.json before the
+// merge is asked for, and a resumed run reads it back, so
+// auto_merge_spacing is kept between invocations.
+func TestLifecycleAutoMergeLedgerSurvivesAResume(t *testing.T) {
+	f := lifecycleSetup(t)
+	rc := f.runConfig(t, config.RunSettings{Brief: "b"})
+	r, err := New(rc, f.options())
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	require.True(t, r.LastAutoMerge().IsZero())
+	at := lifecycleEpoch.Add(3 * time.Minute)
+	require.NoError(t, r.RecordAutoMerge(at, "fx-1", 7))
+
+	// Durable at once, not at the next transition.
+	st, err := LoadState(rc.Run.StateDir)
+	require.NoError(t, err)
+	require.NotNil(t, st.AutoMerge)
+	require.Equal(t, AutoMergeState{LastAt: at, LastBead: "fx-1", LastPR: 7, Merges: 1}, *st.AutoMerge)
+
+	require.NoError(t, r.Stop("crash"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+
+	resumed := f.runConfig(t, config.RunSettings{Resume: true})
+	resumed.Resume = true
+	r2, err := New(resumed, f.options())
+	require.NoError(t, err)
+	require.True(t, at.Equal(r2.LastAutoMerge()), "the resumed run spaces its merges from the last one")
+	require.NoError(t, r2.RecordAutoMerge(at.Add(time.Hour), "fx-2", 8))
+	require.Equal(t, 2, r2.State().AutoMerge.Merges)
+	require.NoError(t, r2.Close())
+}
+
 func TestLifecycleRestoreWithoutAStateFile(t *testing.T) {
 	f := lifecycleSetup(t)
 	dir := config.RunDir(f.Repo, "20260903-110000-0001")

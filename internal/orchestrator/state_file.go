@@ -104,6 +104,23 @@ type State struct {
 	// It is absent for a run assembled without a budget and for a state
 	// file written by an older sc.
 	Budget *BudgetState `json:"budget,omitempty"`
+	// AutoMerge is the run's auto-merge ledger (D-31): when it last merged
+	// one of its own pull requests. It is written before the merge is
+	// asked for, so a resumed run waits out auto_merge_spacing from the
+	// last merge any invocation of it made. Absent for a run that never
+	// auto-merged.
+	AutoMerge *AutoMergeState `json:"auto_merge,omitempty"`
+}
+
+// AutoMergeState is what [State.AutoMerge] records.
+type AutoMergeState struct {
+	// LastAt is when the run last asked GitHub to merge a pull request.
+	LastAt time.Time `json:"last_at"`
+	// LastBead and LastPR are the bead and pull request it merged.
+	LastBead domain.BeadID `json:"last_bead,omitempty"`
+	LastPR   int           `json:"last_pr,omitempty"`
+	// Merges counts the merges asked for over the life of the run.
+	Merges int `json:"merges,omitempty"`
 }
 
 // Spent is the run's budget state, or the zero value for a state file that
@@ -122,6 +139,10 @@ func (s State) clone() State {
 		out.Agents = append([]domain.Agent(nil), s.Agents...)
 	}
 	out.Run.Config = cloneSnapshot(s.Run.Config)
+	if s.AutoMerge != nil {
+		am := *s.AutoMerge
+		out.AutoMerge = &am
+	}
 	return out
 }
 

@@ -416,12 +416,15 @@ var ErrBranchDiverged = errors.New("gitx: the bead's branch and its pull request
 // head — the pull request's head commit, which GitHub may have moved by
 // merging the base into it ([GH.UpdateBranch]). Without it the engineer's
 // next commits would sit on the old tip and their push would be refused as
-// a non-fast-forward. head is fetched from the default remote first. A
-// branch that already contains head is left alone; one that has diverged
-// from it fails with [ErrBranchDiverged], and nothing is changed. The
-// fast-forward is `git reset --keep`, run in the bead's worktree only after
-// head is proven to descend from the branch tip, so it can only move the
-// bead's branch forward and refuses to touch uncommitted work.
+// a non-fast-forward. The default remote's tracking refs are fetched first
+// ([Repo.Fetch]), which is also what gives an engineer sent back to resolve
+// a conflict a current <remote>/<default> to merge: agents may merge but
+// not fetch. A branch that already contains head is left alone; one that
+// has diverged from it fails with [ErrBranchDiverged], and nothing is
+// changed. The fast-forward is `git reset --keep`, run in the bead's
+// worktree only after head is proven to descend from the branch tip, so it
+// can only move the bead's branch forward and refuses to touch uncommitted
+// work.
 func (d *PRDeliverer) SyncBranch(ctx context.Context, bead domain.Bead, head string) error {
 	if strings.TrimSpace(head) == "" {
 		return ErrNoHeadCommit
@@ -434,6 +437,9 @@ func (d *PRDeliverer) SyncBranch(ctx context.Context, bead domain.Bead, head str
 	if !exists {
 		return fmt.Errorf("%w: %s in %s", ErrBranchMissing, branch, repo.Root)
 	}
+	if err := repo.Fetch(ctx); err != nil {
+		return err
+	}
 	local, err := repo.RevParse(ctx, "refs/heads/"+branch)
 	if err != nil {
 		return err
@@ -442,17 +448,7 @@ func (d *PRDeliverer) SyncBranch(ctx context.Context, bead domain.Bead, head str
 		return nil
 	}
 	if _, err := repo.RevParse(ctx, head); err != nil {
-		remote, rerr := repo.DefaultRemote(ctx)
-		if rerr != nil {
-			return rerr
-		}
-		ref := "refs/heads/" + branch
-		if _, err := repo.Git(ctx, "fetch", "--quiet", "--", remote, ref); err != nil {
-			return err
-		}
-		if _, err := repo.RevParse(ctx, head); err != nil {
-			return fmt.Errorf("gitx: the pull request's head %s is not on %s/%s: %w", shortSHA(head), remote, branch, err)
-		}
+		return fmt.Errorf("gitx: the pull request's head %s is not on the remote's %s: %w", shortSHA(head), branch, err)
 	}
 	if contains, err := repo.isAncestor(ctx, head, local); err != nil {
 		return err
@@ -522,4 +518,21 @@ func isConventionalType(t string) bool {
 		}
 	}
 	return false
+}
+
+// BranchFor is [Manager.BranchFor] of the deliverer's manager: the branch
+// the bead's work is on, which is the head its pull request must have.
+func (d *PRDeliverer) BranchFor(ctx context.Context, bead domain.Bead) (string, bool, error) {
+	return d.m.BranchFor(ctx, bead)
+}
+
+// TrackingRef names branch as the default remote's tracking ref
+// ("origin/main"), the spelling an engineer merges after [PRDeliverer.SyncBranch]
+// has fetched it.
+func (d *PRDeliverer) TrackingRef(ctx context.Context, branch string) (string, error) {
+	remote, err := d.m.Repo().DefaultRemote(ctx)
+	if err != nil {
+		return "", err
+	}
+	return remote + "/" + branch, nil
 }

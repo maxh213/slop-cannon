@@ -389,6 +389,9 @@ func New(cfg *config.RunConfig, opts Options) (*Run, error) {
 			// `limits.max_cost_usd` cap the run rather than one invocation
 			// of it. [RunBudgetOptions.Restore] is where it is read back.
 			r.st.Budget = prev.Budget
+			// D-31: auto_merge_spacing is between this run's merges, not
+			// this invocation's.
+			r.st.AutoMerge = prev.AutoMerge
 			if r.st.Run.Epic == "" {
 				r.st.Run.Epic = prev.Run.Epic
 			}
@@ -1394,6 +1397,41 @@ func (r *Run) UseBeads(src BeadSource) error {
 		return ErrAlreadyStarted
 	}
 	r.beadSrc = src
+	return nil
+}
+
+// LastAutoMerge is when the run last asked GitHub to merge one of its own
+// pull requests (D-31), across every invocation of it; zero when it never
+// has. It is the [AutoMergeLedger] the gate poller spaces merges by.
+func (r *Run) LastAutoMerge() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.st.AutoMerge == nil {
+		return time.Time{}
+	}
+	return r.st.AutoMerge.LastAt
+}
+
+// RecordAutoMerge writes the merge the gate poller is about to ask for into
+// state.json, synchronously, before the merge is made: a run killed between
+// the two still waits out auto_merge_spacing when it is resumed, which is
+// the safe direction. An error means the record is not durable, and the
+// caller must not merge.
+func (r *Run) RecordAutoMerge(at time.Time, bead domain.BeadID, pr int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	am := AutoMergeState{}
+	if r.st.AutoMerge != nil {
+		am = *r.st.AutoMerge
+	}
+	am.LastAt, am.LastBead, am.LastPR = at, bead, pr
+	am.Merges++
+	prev := r.st.AutoMerge
+	r.st.AutoMerge = &am
+	if err := r.persistLocked(); err != nil {
+		r.st.AutoMerge = prev
+		return err
+	}
 	return nil
 }
 

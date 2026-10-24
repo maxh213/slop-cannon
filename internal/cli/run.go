@@ -1324,7 +1324,8 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 	}
 	planner.Attach(run)
 
-	deliverer, err = runDeliverer(run, states, dgit, client, manager, rc, set.Filter, logger)
+	var prPath *gitx.PRDeliverer
+	deliverer, prPath, err = runDeliverer(run, states, dgit, client, manager, rc, set.Filter, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -1358,6 +1359,7 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 		Gates: client, Beads: client, States: states, Host: run,
 		Scope: rc.Run.ID, Statuses: statusMap, Foreign: foreign,
 		Branch: branch, Interval: cfg.GatePollInterval.Duration(), Logger: logger,
+		AutoMerge: runAutoMerge(rc, prPath, run, cond),
 	})
 	if err != nil {
 		return nil, err
@@ -1426,12 +1428,31 @@ func runResumer(m *gitx.Manager, client *beads.Client, statuses beads.StatusMap,
 	return gitx.NewResumer(m, tracker, gitx.WithResumeLogger(logger))
 }
 
+// runAutoMerge is the D-31 auto-merge for the gate poller, or nil — never
+// merge anything — unless the run's frozen snapshot has both safety and
+// auto_merge on and there is a pull request path to merge through. The
+// poller merges through the deliverer's own gh, so the login is read once,
+// spaces merges by the run's state.json, and hands a bead it sends back to
+// the conductor, which gives it to the feedback loop.
+func runAutoMerge(rc *config.RunConfig, pr *gitx.PRDeliverer, run *orchestrator.Run, cond *orchestrator.Conductor) *orchestrator.AutoMergeOptions {
+	snap := rc.Run.Config
+	if !snap.Safety || !snap.AutoMerge || pr == nil {
+		return nil
+	}
+	return &orchestrator.AutoMergeOptions{
+		GH: pr.GH(), Branches: pr, Ledger: run, Outcomes: cond,
+		Checks: snap.AutoMergeChecks, Spacing: snap.AutoMergeSpacing,
+		RunStarted: rc.Run.StartedAt,
+	}
+}
+
 // runDeliverer builds the delivery handoff with the path the run's safety
 // setting needs (D-10): a pull request with safety on, a rebase and
-// fast-forward merge with safety off.
+// fast-forward merge with safety off. With safety on it also returns the
+// pull request path, which auto-merge (D-31) merges through.
 func runDeliverer(run *orchestrator.Run, states *orchestrator.StateMachine, dgit orchestrator.DeliveryGit,
 	client *beads.Client, m *gitx.Manager, rc *config.RunConfig, filter *agents.SecretFilter,
-	logger *slog.Logger) (*orchestrator.Deliverer, error) {
+	logger *slog.Logger) (*orchestrator.Deliverer, *gitx.PRDeliverer, error) {
 	opts := orchestrator.DeliveryOptions{
 		Host: run, States: states, Git: dgit, Beads: client,
 		CheckCommand: rc.Effective.CheckCommand,
@@ -1445,22 +1466,29 @@ func runDeliverer(run *orchestrator.Run, states *orchestrator.StateMachine, dgit
 		// P9-05: the pull request body is the only sink of agent prose
 		// that leaves the machine.
 		Filter: filter,
+		// D-31: an existing pull request is reused only when it was opened
+		// by this run, which started then (a resume keeps the original).
+		RunStarted: rc.Run.StartedAt,
 	}
+	var pr *gitx.PRDeliverer
 	if rc.Run.Config.Safety {
-		pr, err := gitx.NewPRDeliverer(m, client, gitx.WithPRLogger(logger))
+		var err error
+		pr, err = gitx.NewPRDeliverer(m, client, gitx.WithPRLogger(logger),
+			gitx.WithConventionalTitles(rc.Run.Config.ConventionalPRTitles))
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		opts.PR = pr
 	} else {
 		opts.Merge = m
 		settler, err := gitx.NewPRSettler(m, client)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		opts.Settler = settler
 	}
-	return orchestrator.NewDeliverer(opts)
+	d, err := orchestrator.NewDeliverer(opts)
+	return d, pr, err
 }
 
 // stopperFunc adapts a function to [orchestrator.AgentStopper]. It is how
