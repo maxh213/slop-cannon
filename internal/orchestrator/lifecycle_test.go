@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/beads"
@@ -1225,13 +1226,50 @@ func TestLifecycleAutoMergeUpdateRequestsSurviveAResume(t *testing.T) {
 	r2, err := New(resumed, f.options())
 	require.NoError(t, err)
 	require.Equal(t, []string{key}, r2.AutoMergeUpdates(), "the resumed run still knows what it asked for")
-	for i := range autoMergeSentBackLimit {
+	for i := range autoMergeUpdatesPerBead + 5 {
 		require.NoError(t, r2.RecordAutoMergeUpdate(AutoMergeUpdateKey("fx-1", fmt.Sprint(i))))
 	}
 	keys := r2.AutoMergeUpdates()
-	require.Len(t, keys, autoMergeSentBackLimit)
-	require.Equal(t, AutoMergeUpdateKey("fx-1", "0"), keys[0], "the oldest request went first")
+	require.Len(t, keys, autoMergeUpdatesPerBead, "bounded per bead")
+	require.Equal(t, AutoMergeUpdateKey("fx-1", "5"), keys[0], "the bead's oldest requests went first")
 	require.NoError(t, r2.Close())
+}
+
+// The update record is not a run-wide FIFO: with many pull requests queued
+// every merge makes each of the others stale and asks for an update of
+// each, and a pull request still waiting must keep the request its update
+// merge rests on, or the approved-tip guard would send it to needs_human.
+func TestLifecycleAutoMergeUpdateRecordKeepsAWaitingPullRequest(t *testing.T) {
+	f := lifecycleSetup(t)
+	rc := f.runConfig(t, config.RunSettings{Brief: "b"})
+	r, err := New(rc, f.options())
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	defer func() { _ = r.Stop("over"); _, _ = r.Wait() }()
+
+	require.NoError(t, r.RecordAutoMergeUpdate(AutoMergeUpdateKey(amBead, amHead)))
+	for i := range 2 * autoMergeSentBackLimit {
+		require.NoError(t, r.RecordAutoMergeUpdate(AutoMergeUpdateKey(domain.BeadID(fmt.Sprintf("fx-o%d", i%20)), fmt.Sprintf("%040d", i))))
+	}
+
+	const pushed = "5555555555555555555555555555555555555555"
+	h := newAMHarness(t, nil)
+	h.Ledger.updated = r.AutoMergeUpdates() // what state.json now holds
+	h.Branches.markUpdate(pushed, amHead)   // GitHub's update the run asked for
+	h.GH.set(amOwnedView(pushed))
+	h.pending()
+	h.poll()
+	assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State(amBead), h.status().Reason)
+	assert.Equal(t, []string{"7@" + pushed}, h.GH.Merges)
+}
+
+func TestPruneAutoMergeUpdatesDropsTheLeastRecentlyUpdatedBead(t *testing.T) {
+	keys := []string{"a@1", "b@1", "a@2", "c@1", "b@2", "a@3"}
+	assert.Equal(t, []string{"b@1", "a@2", "c@1", "b@2", "a@3"}, pruneAutoMergeUpdates(keys, 2, 10), "a keeps its newest two")
+	assert.Equal(t, []string{"a@1", "b@1", "a@2", "b@2", "a@3"}, pruneAutoMergeUpdates(keys, 5, 5),
+		"c's newest request is the oldest of any bead's, so c goes, whole")
+	assert.Equal(t, []string{"a@1", "a@2", "a@3"}, pruneAutoMergeUpdates(keys, 5, 3), "then b")
+	assert.Equal(t, keys, pruneAutoMergeUpdates(keys, 5, 10))
 }
 
 func TestLifecycleRestoreWithoutAStateFile(t *testing.T) {

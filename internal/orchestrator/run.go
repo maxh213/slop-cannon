@@ -1478,9 +1478,14 @@ func (r *Run) AutoMergeUpdates() []string {
 }
 
 // RecordAutoMergeUpdate adds key to the update requests in state.json,
-// synchronously, before the update is asked for, keeping the newest
-// [autoMergeSentBackLimit]. A key already recorded is not added again. An
-// error means the record is not durable, and the caller must not ask.
+// synchronously, before the update is asked for. A key already recorded is
+// not added again. The record is bounded per bead and in all
+// ([pruneAutoMergeUpdates]), never by dropping the oldest key of the whole
+// run: with many pull requests queued every merge makes each of the others
+// stale, and a FIFO would evict the first request of a pull request that is
+// still waiting, whose update merge would then fail the approved-tip guard
+// and send it to needs_human. An error means the record is not durable,
+// and the caller must not ask.
 func (r *Run) RecordAutoMergeUpdate(key string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -1493,10 +1498,8 @@ func (r *Run) RecordAutoMergeUpdate(key string) error {
 			return nil
 		}
 	}
-	am.Updated = append(append([]string(nil), am.Updated...), key)
-	if n := len(am.Updated) - autoMergeSentBackLimit; n > 0 {
-		am.Updated = am.Updated[n:]
-	}
+	am.Updated = pruneAutoMergeUpdates(append(append([]string(nil), am.Updated...), key),
+		autoMergeUpdatesPerBead, autoMergeUpdatedLimit)
 	prev := r.st.AutoMerge
 	r.st.AutoMerge = &am
 	if err := r.persistLocked(); err != nil {
@@ -4106,4 +4109,44 @@ func (c *Conductor) warn(err error) {
 		return
 	}
 	c.run.Warn(SourceConductor, "a run-level sync with bd failed; the run carries on and retries", err)
+}
+
+// pruneAutoMergeUpdates bounds a list of [AutoMergeUpdateKey]s, oldest
+// first: each bead keeps its newest perBead keys, and while more than limit
+// remain the bead whose newest key is the oldest is dropped whole.
+func pruneAutoMergeUpdates(keys []string, perBead, limit int) []string {
+	beadOf := func(k string) string { b, _, _ := strings.Cut(k, "@"); return b }
+	count := map[string]int{}
+	for _, k := range keys {
+		count[beadOf(k)]++
+	}
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		b := beadOf(k)
+		if count[b] > perBead {
+			count[b]--
+			continue
+		}
+		out = append(out, k)
+	}
+	for len(out) > limit {
+		newest := map[string]int{}
+		for i, k := range out {
+			newest[beadOf(k)] = i
+		}
+		victim, at := "", len(out)
+		for b, i := range newest {
+			if i < at {
+				victim, at = b, i
+			}
+		}
+		kept := out[:0]
+		for _, k := range out {
+			if beadOf(k) != victim {
+				kept = append(kept, k)
+			}
+		}
+		out = kept
+	}
+	return out
 }

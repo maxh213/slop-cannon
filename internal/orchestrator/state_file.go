@@ -128,17 +128,31 @@ type AutoMergeState struct {
 	// after a resume goes to a person, not round again.
 	SentBack []string `json:"sent_back,omitempty"`
 	// Updated are the pull request heads the run asked GitHub to update
-	// (`gh pr update-branch`), as [AutoMergeUpdateKey]s, the newest
-	// [autoMergeSentBackLimit] of them. Each is written before the update
+	// (`gh pr update-branch`), as [AutoMergeUpdateKey]s: the newest
+	// [autoMergeUpdatesPerBead] of each bead, and at most
+	// [autoMergeUpdatedLimit] in all, the beads least recently updated
+	// dropped first (see [Run.RecordAutoMergeUpdate]). Each is written before the update
 	// is asked for: only a merge GitHub made on top of one of these passes
 	// the approved-tip guard, so a resumed run still merges the update it
 	// asked for and still refuses one it never asked for.
 	Updated []string `json:"updated,omitempty"`
 }
 
-// autoMergeSentBackLimit bounds [AutoMergeState.SentBack] and
-// [AutoMergeState.Updated].
+// autoMergeSentBackLimit bounds [AutoMergeState.SentBack].
 const autoMergeSentBackLimit = 256
+
+// autoMergeUpdatesPerBead is how many update requests [AutoMergeState.Updated]
+// keeps per bead. The approved-tip guard walks at most twenty update merges
+// back from a head (gitx's maxUpdateMerges), each on top of a head the run
+// asked to update, so older requests of the same bead can never be needed.
+const autoMergeUpdatesPerBead = 32
+
+// autoMergeUpdatedLimit bounds [AutoMergeState.Updated] across beads. It is
+// not a FIFO of keys: when it is exceeded the bead whose newest request is
+// the oldest loses all of its requests, so a pull request that is still
+// waiting — and so still being updated after each merge — keeps its record
+// while beads whose pull requests merged long ago make room.
+const autoMergeUpdatedLimit = 1024
 
 // Spent is the run's budget state, or the zero value for a state file that
 // carries none.
