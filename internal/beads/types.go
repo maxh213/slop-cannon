@@ -23,6 +23,9 @@ const (
 	MetaPRURL = "sc_pr_url"
 	// MetaPRNumber is the pull request number.
 	MetaPRNumber = "sc_pr_number"
+	// MetaPRHead is the bead branch's tip the run delivered to its pull
+	// request: the commit the testers approved (D-31).
+	MetaPRHead = "sc_pr_head"
 	// MetaMergeSHA is the commit that landed on the default branch.
 	MetaMergeSHA = "sc_merge_sha"
 	// MetaAgent is the agent id holding the claim.

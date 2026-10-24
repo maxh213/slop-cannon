@@ -111,6 +111,10 @@ type amFakeBranches struct {
 	others  map[domain.BeadID]string
 	syncErr error
 	Syncs   []string // "<bead>@<head>"
+
+	updates   map[string]bool
+	reviewErr error
+	Reviews   []string // "<reviewed>..<head> on <base>"
 }
 
 func (b *amFakeBranches) BranchFor(_ context.Context, bead domain.Bead) (string, bool, error) {
@@ -134,6 +138,31 @@ func (b *amFakeBranches) SyncBranch(_ context.Context, bead domain.Bead, head st
 
 func (b *amFakeBranches) TrackingRef(_ context.Context, branch string) (string, error) {
 	return "origin/" + branch, nil
+}
+
+// ReviewedHead accepts only the heads the test marked as clean updates of
+// the reviewed tip; the poller itself handles a head equal to it.
+func (b *amFakeBranches) ReviewedHead(_ context.Context, reviewed, head, base string) (bool, string, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.Reviews = append(b.Reviews, fmt.Sprintf("%s..%s on %s", reviewed, head, base))
+	if b.reviewErr != nil {
+		return false, "", b.reviewErr
+	}
+	if b.updates[head] {
+		return true, "", nil
+	}
+	return false, "commit " + head[:7] + " is not a merge of " + base, nil
+}
+
+// markUpdate makes head a clean update merge of the reviewed tip.
+func (b *amFakeBranches) markUpdate(head string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.updates == nil {
+		b.updates = map[string]bool{}
+	}
+	b.updates[head] = true
 }
 
 // amFakeLedger is the run's state.json half.
@@ -206,6 +235,7 @@ func newAMHarness(t *testing.T, tweak func(*AutoMergeOptions)) *amHarness {
 	})
 	h.BD.AddGate(amGate, amBead, amPR)
 	h.BD.AddBead(amBead, domain.BeadStateDelivering, amPR)
+	h.BD.SetMeta(amBead, beads.MetaPRHead, amHead)
 	return &amHarness{gateHarness: h, GH: gh, Branches: br, Ledger: led, Outcomes: outs}
 }
 
@@ -406,6 +436,7 @@ func TestAutoMergeSendsAFailedCheckBackToTheEngineerOnce(t *testing.T) {
 
 	// A new head with the same check failing is a new round.
 	h.redeliver()
+	h.BD.SetMeta(amBead, beads.MetaPRHead, "2222222222222222222222222222222222222222")
 	h.GH.set(amOwnedView("2222222222222222222222222222222222222222", amCheck("test", "FAILURE")))
 	h.poll()
 	assert.Len(t, h.Outcomes.all(), 2)
@@ -427,6 +458,7 @@ func TestAutoMergeUpdatesABranchThatIsBehindOncePerHead(t *testing.T) {
 	assert.Equal(t, AutoMergeUpdating, h.status().State)
 
 	// GitHub merged the base in: a new head, checks running again.
+	h.Branches.markUpdate("3333333333333333333333333333333333333333")
 	next := amOwnedView("3333333333333333333333333333333333333333", amCheck("test", ""))
 	h.GH.set(next)
 	h.poll()
@@ -599,6 +631,7 @@ func TestAutoMergeSpacesMergesAndMergesOnePerPoll(t *testing.T) {
 	const other = domain.BeadID("fx-two")
 	h.BD.AddGate("fx-gt2", other, 9)
 	h.BD.AddBead(other, domain.BeadStateDelivering, 9)
+	h.BD.SetMeta(other, beads.MetaPRHead, "4444444444444444444444444444444444444444")
 	h.GH.set(amOwnedView(amHead))
 	v2 := amOwnedView("4444444444444444444444444444444444444444")
 	v2.Number, v2.HeadRef = 9, "sc/fx-two-second"
@@ -636,6 +669,7 @@ func TestAutoMergeMergesAtMostOncePerPollWhateverTheLedgerSays(t *testing.T) {
 	const other = domain.BeadID("fx-two")
 	h.BD.AddGate("fx-gt2", other, 9)
 	h.BD.AddBead(other, domain.BeadStateDelivering, 9)
+	h.BD.SetMeta(other, beads.MetaPRHead, "4444444444444444444444444444444444444444")
 	h.Branches.others = map[domain.BeadID]string{other: "sc/fx-two-second"}
 	h.GH.set(amOwnedView(amHead))
 	v2 := amOwnedView("4444444444444444444444444444444444444444")
@@ -763,4 +797,83 @@ func TestAutoMergeOffNeverMerges(t *testing.T) {
 	assert.Nil(t, h.P.auto)
 	assert.Empty(t, h.P.Stats().AutoMerge)
 	assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State(amBead))
+}
+
+// TestAutoMergeNeverMergesCommitsTheRunDidNotReview: ownership is judged
+// per pull request, so the head is judged too — a commit pushed onto the
+// run's own branch after delivery is never merged, updated or sent back,
+// whatever GitHub says about it.
+func TestAutoMergeNeverMergesCommitsTheRunDidNotReview(t *testing.T) {
+	t.Parallel()
+	const pushed = "5555555555555555555555555555555555555555"
+	for _, tc := range []struct {
+		name string
+		edit func(*gitx.PRView)
+	}{
+		{"green and clean", func(*gitx.PRView) {}},
+		{"behind", func(v *gitx.PRView) { v.MergeStateStatus = "BEHIND" }},
+		{"conflicting", func(v *gitx.PRView) { v.MergeStateStatus, v.Mergeable = "DIRTY", "CONFLICTING" }},
+		{"failing", func(v *gitx.PRView) { v.Checks = []gitx.PRCheck{amCheck("test", "FAILURE")} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			h := newAMHarness(t, nil)
+			v := amOwnedView(pushed)
+			tc.edit(v)
+			h.GH.set(v)
+			h.pending()
+
+			h.poll()
+			assert.Empty(t, h.GH.Merges)
+			assert.Empty(t, h.GH.Updates)
+			assert.Empty(t, h.Branches.Syncs)
+			assert.Empty(t, h.Outcomes.all())
+			assert.Equal(t, []string{amHead + ".." + pushed + " on " + gateBranch}, h.Branches.Reviews)
+			assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State(amBead), "it waits for a human")
+			st := h.status()
+			assert.Equal(t, AutoMergeNotOwned, st.State)
+			assert.Contains(t, st.Reason, "holds commits the run did not review")
+		})
+	}
+
+	t.Run("nothing recorded", func(t *testing.T) {
+		t.Parallel()
+		h := newAMHarness(t, nil)
+		h.BD.SetMeta(amBead, beads.MetaPRHead, "")
+		h.GH.set(amOwnedView(amHead))
+		h.pending()
+		h.poll()
+		assert.Empty(t, h.GH.Merges)
+		assert.Empty(t, h.Branches.Reviews)
+		assert.Contains(t, h.status().Reason, "no reviewed commit is recorded")
+	})
+
+	t.Run("git cannot tell", func(t *testing.T) {
+		t.Parallel()
+		h := newAMHarness(t, nil)
+		h.Branches.reviewErr = errors.New("fetch failed")
+		h.GH.set(amOwnedView(pushed))
+		h.pending()
+		h.poll()
+		assert.Empty(t, h.GH.Merges)
+		assert.Equal(t, AutoMergeWaiting, h.status().State)
+		assert.Contains(t, h.status().Reason, "fetch failed")
+	})
+
+	t.Run("a clean update merge is merged, and judged once", func(t *testing.T) {
+		t.Parallel()
+		h := newAMHarness(t, func(o *AutoMergeOptions) { o.Ledger = forgetfulLedger{} })
+		h.Branches.markUpdate(pushed)
+		v := amOwnedView(pushed, amCheck("test", ""))
+		h.GH.set(v)
+		h.pending()
+		h.poll()
+		assert.Empty(t, h.GH.Merges, "checks still running")
+		v.Checks = []gitx.PRCheck{amCheck("test", "SUCCESS")}
+		h.GH.set(v)
+		h.pending()
+		h.poll()
+		assert.Equal(t, []string{"7@" + pushed}, h.GH.Merges)
+		assert.Len(t, h.Branches.Reviews, 1, "a head shown to be reviewed is remembered")
+	})
 }

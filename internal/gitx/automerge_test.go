@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -460,5 +461,111 @@ func TestPRDelivererSyncBranch(t *testing.T) {
 		require.Error(t, err)
 		assert.False(t, errors.Is(err, ErrBranchDiverged))
 		require.ErrorIs(t, f.d.SyncBranch(ctx, wtBead, ""), ErrNoHeadCommit)
+	})
+}
+
+// TestPRDelivererReviewedHead covers the D-31 check that a pull request's
+// head holds only what the run reviewed: the delivered tip itself, or that
+// tip plus GitHub's clean update merges of the base. "release" stands in
+// for the default branch so the fixture's main stays where it started.
+func TestPRDelivererReviewedHead(t *testing.T) {
+	ctx := context.Background()
+
+	// setup pushes the reviewed tip and a "release" base one commit ahead
+	// of it on the remote, and returns a clone on the bead's branch.
+	setup := func(t *testing.T, baseFile, baseContent string) (*dpFixture, string) {
+		t.Helper()
+		f := dpSetup(t, true)
+		require.NoError(t, f.repo.PushBranch(ctx, "origin", f.wt.Branch))
+		clone := filepath.Join(t.TempDir(), "clone")
+		f.r.Git(t, "clone", "--quiet", f.r.RemoteDir, clone)
+		f.r.Git(t, "-C", clone, "config", "user.name", "Someone")
+		f.r.Git(t, "-C", clone, "config", "user.email", "someone@example.com")
+		f.r.Git(t, "-C", clone, "checkout", "--quiet", "-b", "release", "origin/main")
+		acWrite(t, clone, baseFile, baseContent)
+		f.r.Git(t, "-C", clone, "add", "-A")
+		f.r.Git(t, "-C", clone, "commit", "--quiet", "-m", "release work")
+		f.r.Git(t, "-C", clone, "push", "--quiet", "origin", "release")
+		f.r.Git(t, "-C", clone, "checkout", "--quiet", f.wt.Branch)
+		return f, clone
+	}
+	push := func(t *testing.T, f *dpFixture, clone string) string {
+		t.Helper()
+		f.r.Git(t, "-C", clone, "push", "--quiet", "origin", f.wt.Branch)
+		return f.r.Git(t, "-C", clone, "rev-parse", "HEAD")
+	}
+
+	t.Run("the reviewed tip itself", func(t *testing.T) {
+		f := dpSetup(t, true)
+		ok, why, err := f.d.ReviewedHead(ctx, f.head, f.head, "main")
+		require.NoError(t, err)
+		assert.True(t, ok, why)
+	})
+
+	t.Run("nothing recorded is not reviewed", func(t *testing.T) {
+		f := dpSetup(t, true)
+		ok, why, err := f.d.ReviewedHead(ctx, "", f.head, "main")
+		require.NoError(t, err)
+		assert.False(t, ok)
+		assert.Contains(t, why, "no reviewed commit")
+	})
+
+	t.Run("a clean update merge of the base is the reviewed work", func(t *testing.T) {
+		f, clone := setup(t, "RELEASE.md", "release\n")
+		f.r.Git(t, "-C", clone, "merge", "--quiet", "--no-edit", "origin/release")
+		head := push(t, f, clone)
+		ok, why, err := f.d.ReviewedHead(ctx, f.head, head, "release")
+		require.NoError(t, err)
+		assert.True(t, ok, why)
+	})
+
+	t.Run("a commit pushed on top is not", func(t *testing.T) {
+		f, clone := setup(t, "RELEASE.md", "release\n")
+		f.r.Git(t, "-C", clone, "merge", "--quiet", "--no-edit", "origin/release")
+		acWrite(t, clone, "stats/EVIL.md", "unreviewed\n")
+		f.r.Git(t, "-C", clone, "add", "-A")
+		f.r.Git(t, "-C", clone, "commit", "--quiet", "-m", "fixup")
+		head := push(t, f, clone)
+		ok, why, err := f.d.ReviewedHead(ctx, f.head, head, "release")
+		require.NoError(t, err)
+		assert.False(t, ok)
+		assert.Contains(t, why, "is not a merge of release")
+	})
+
+	t.Run("a merge that changes more than its parents is not", func(t *testing.T) {
+		f, clone := setup(t, "RELEASE.md", "release\n")
+		f.r.Git(t, "-C", clone, "merge", "--quiet", "--no-commit", "origin/release")
+		acWrite(t, clone, "stats/EVIL.md", "smuggled in the merge\n")
+		f.r.Git(t, "-C", clone, "add", "-A")
+		f.r.Git(t, "-C", clone, "commit", "--quiet", "--no-edit")
+		head := push(t, f, clone)
+		ok, why, err := f.d.ReviewedHead(ctx, f.head, head, "release")
+		require.NoError(t, err)
+		assert.False(t, ok)
+		assert.Contains(t, why, "changes more than merging its parents")
+	})
+
+	t.Run("a merge that resolved conflicts is not", func(t *testing.T) {
+		f, clone := setup(t, "stats/NOTES.md", "the release says otherwise\n")
+		require.Error(t, exec.Command("git", "-C", clone, "merge", "--quiet", "--no-edit", "origin/release").Run(), "the merge conflicts")
+		acWrite(t, clone, "stats/NOTES.md", "resolved by someone\n")
+		f.r.Git(t, "-C", clone, "add", "-A")
+		f.r.Git(t, "-C", clone, "commit", "--quiet", "--no-edit")
+		head := push(t, f, clone)
+		ok, why, err := f.d.ReviewedHead(ctx, f.head, head, "release")
+		require.NoError(t, err)
+		assert.False(t, ok)
+		assert.Contains(t, why, "resolves conflicts")
+	})
+
+	t.Run("a head without the reviewed commit is not", func(t *testing.T) {
+		f, clone := setup(t, "RELEASE.md", "release\n")
+		f.r.Git(t, "-C", clone, "reset", "--quiet", "--hard", "origin/release")
+		f.r.Git(t, "-C", clone, "push", "--quiet", "--force", "origin", f.wt.Branch)
+		head := f.r.Git(t, "-C", clone, "rev-parse", "HEAD")
+		ok, why, err := f.d.ReviewedHead(ctx, f.head, head, "release")
+		require.NoError(t, err)
+		assert.False(t, ok)
+		assert.Contains(t, why, "does not contain the reviewed commit")
 	})
 }

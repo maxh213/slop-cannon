@@ -480,7 +480,7 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		}
 
 		// Bead bookkeeping: metadata, gate, and no status change.
-		assert.Equal(t, map[string]any{beads.MetaPRURL: dpPRURL, beads.MetaPRNumber: 7}, f.tracker.meta[wtBead.ID])
+		assert.Equal(t, map[string]any{beads.MetaPRURL: dpPRURL, beads.MetaPRNumber: 7, beads.MetaPRHead: f.head}, f.tracker.meta[wtBead.ID], "sc_pr_head is the tip the testers approved")
 		assert.Equal(t, []int{7}, f.tracker.created)
 		assert.Equal(t, wtBead.ID, f.tracker.gates[0].Blocks)
 		assert.Contains(t, f.tracker.gates[0].Description, "Reason: PR #7: Fix the mean() bug!")
@@ -502,7 +502,7 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		assert.Equal(t, domain.BeadStateDelivering, res.State)
 		assert.Empty(t, res.Warnings)
 		assert.Equal(t, []string{"pr list", "api user"}, dpCalls(t, f.gh), "nothing is created; the login is read to judge the pull request")
-		assert.Equal(t, map[string]any{beads.MetaPRURL: "https://github.com/acme/widgets/pull/5", beads.MetaPRNumber: 5}, f.tracker.meta[wtBead.ID])
+		assert.Equal(t, map[string]any{beads.MetaPRURL: "https://github.com/acme/widgets/pull/5", beads.MetaPRNumber: 5, beads.MetaPRHead: f.head}, f.tracker.meta[wtBead.ID])
 		assert.Empty(t, f.tracker.created)
 		assert.Contains(t, res.Summary(), "reusing PR #5")
 

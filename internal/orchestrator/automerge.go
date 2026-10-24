@@ -32,6 +32,11 @@ import (
 //	          never merged, updated or sent back — it waits for a human,
 //	          exactly as with auto_merge off
 //	open      not OPEN, or a draft → wait
+//	reviewed  the head is the tip delivered to the pull request
+//	          (sc_pr_head) or that tip plus GitHub's clean update merges
+//	          of the default branch ([gitx.PRDeliverer.ReviewedHead]);
+//	          a commit anybody else pushed → waits for a human, like a
+//	          pull request that is not the run's own
 //	conflict  DIRTY / CONFLICTING → back to the engineer through the
 //	          check-failed edge, one item: merge the default branch in and
 //	          resolve (once per head commit)
@@ -85,6 +90,9 @@ type AutoMergeBranches interface {
 	SyncBranch(ctx context.Context, bead domain.Bead, head string) error
 	// TrackingRef names a branch as the remote's tracking ref.
 	TrackingRef(ctx context.Context, branch string) (string, error)
+	// ReviewedHead reports whether head is reviewed, or reviewed plus
+	// clean update merges of base, and why not.
+	ReviewedHead(ctx context.Context, reviewed, head, base string) (bool, string, error)
 }
 
 // AutoMergeLedger is where the time of the run's last merge lives, so the
@@ -288,6 +296,8 @@ func (p *GatePoller) autoMergeBead(ctx context.Context, g beads.Gate, issue bead
 	case head == "":
 		p.amStatus(id, number, AutoMergeWaiting, fmt.Sprintf("GitHub reported no head commit for pull request #%d", number), false)
 		return
+	case !p.amReviewed(ctx, issue, view):
+		return
 	case view.MergeStateStatus == "DIRTY" || view.Mergeable == "CONFLICTING":
 		p.amConflict(ctx, issue, bead, branch, view)
 		return
@@ -344,6 +354,37 @@ func (p *GatePoller) autoMergeBead(ctx context.Context, g beads.Gate, issue bead
 	p.amStatus(id, number, AutoMergeMerging, fmt.Sprintf("squash-merged pull request #%d at %s; the bead closes when bd sees the merge", number, shortHead(head)), false)
 	p.log.Info("auto-merged the run's own pull request",
 		slog.String("bead", string(id)), slog.Int("pr", number), slog.String("head", head))
+}
+
+// amReviewed reports whether the pull request's head holds only what the
+// run reviewed: the tip delivered to it (sc_pr_head), or that tip plus
+// GitHub's clean update merges of the default branch. Anything else — a
+// commit somebody pushed to the branch after delivery — is never merged,
+// updated or sent back; like a pull request that is not the run's own, it
+// waits for a human. A head shown to be reviewed is remembered, so the
+// fetch behind the check is not repeated every poll.
+func (p *GatePoller) amReviewed(ctx context.Context, issue beads.Issue, view *gitx.PRView) bool {
+	id, number, head := issue.ID, view.Number, view.HeadSHA
+	reviewed := issue.PRHead()
+	key := "reviewed:" + reviewed + ":" + head
+	switch {
+	case reviewed == "":
+		p.amStatus(id, number, AutoMergeNotOwned, fmt.Sprintf("pull request #%d: no reviewed commit is recorded for %s (sc_pr_head); it is left for a human to merge", number, id), true)
+		return false
+	case reviewed == head, p.auto.done[key]:
+		return true
+	}
+	ok, why, err := p.auto.opts.Branches.ReviewedHead(ctx, reviewed, head, p.branch)
+	if err != nil {
+		p.amFailure(id, number, "reviewed", fmt.Sprintf("could not show that pull request #%d's head %s is the work the run reviewed", number, shortHead(head)), err)
+		return false
+	}
+	if !ok {
+		p.amStatus(id, number, AutoMergeNotOwned, fmt.Sprintf("pull request #%d holds commits the run did not review (%s); it is left for a human to merge", number, why), true)
+		return false
+	}
+	p.auto.once(key)
+	return true
 }
 
 // amUpdate asks GitHub to merge the default branch into a pull request that

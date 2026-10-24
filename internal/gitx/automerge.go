@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -471,6 +472,81 @@ func (d *PRDeliverer) SyncBranch(ctx context.Context, bead domain.Bead, head str
 	}
 	_, err = wt.Git(ctx, "reset", "--keep", "--quiet", head)
 	return err
+}
+
+// maxUpdateMerges bounds how many commits [PRDeliverer.ReviewedHead]
+// walks between the reviewed commit and a pull request's head: GitHub's
+// update merges come one per `gh pr update-branch`, and auto-merge asks
+// for at most one per head.
+const maxUpdateMerges = 20
+
+// ReviewedHead reports whether head, a pull request's head commit, holds
+// only work the run reviewed (D-31): it is reviewed itself — the bead
+// branch's tip at delivery, sc_pr_head — or it descends from reviewed and
+// every commit since that is not on base is a clean, automatic merge of its
+// two parents, which is what `gh pr update-branch` makes. A commit someone
+// else pushed onto the branch, or a merge whose tree is not the automatic
+// result of its parents, makes it false, and why says which. The default
+// remote's tracking refs are fetched first, so head and base are current.
+func (d *PRDeliverer) ReviewedHead(ctx context.Context, reviewed, head, base string) (bool, string, error) {
+	switch {
+	case strings.TrimSpace(reviewed) == "":
+		return false, "no reviewed commit is recorded for the bead", nil
+	case strings.TrimSpace(head) == "":
+		return false, "GitHub reported no head commit", nil
+	case head == reviewed:
+		return true, "", nil
+	}
+	repo := d.m.Repo()
+	if err := repo.Fetch(ctx); err != nil {
+		return false, "", err
+	}
+	ref, err := d.TrackingRef(ctx, base)
+	if err != nil {
+		return false, "", err
+	}
+	ref = "refs/remotes/" + ref
+	if _, err := repo.RevParse(ctx, head); err != nil {
+		return false, "", fmt.Errorf("gitx: the pull request's head %s is not on the remote: %w", shortSHA(head), err)
+	}
+	if ok, err := repo.isAncestor(ctx, reviewed, head); err != nil {
+		return false, "", err
+	} else if !ok {
+		return false, fmt.Sprintf("its head %s does not contain the reviewed commit %s", shortSHA(head), shortSHA(reviewed)), nil
+	}
+	out, err := repo.Git(ctx, "rev-list", "--parents", "--max-count", strconv.Itoa(maxUpdateMerges+1), head, "^"+reviewed, "^"+ref)
+	if err != nil {
+		return false, "", err
+	}
+	out = strings.TrimSpace(out)
+	if out == "" {
+		// Every commit since the reviewed one is already on base.
+		return true, "", nil
+	}
+	commits := strings.Split(out, "\n")
+	if len(commits) > maxUpdateMerges {
+		return false, fmt.Sprintf("more than %d commits since the reviewed commit %s", maxUpdateMerges, shortSHA(reviewed)), nil
+	}
+	for _, line := range commits {
+		f := strings.Fields(line)
+		if len(f) != 3 {
+			return false, fmt.Sprintf("commit %s since the reviewed commit %s is not a merge of %s", shortSHA(f[0]), shortSHA(reviewed), base), nil
+		}
+		tree, err := repo.Git(ctx, "rev-parse", "--verify", "--end-of-options", f[0]+"^{tree}")
+		if err != nil {
+			return false, "", err
+		}
+		merged, err := repo.Git(ctx, "merge-tree", "--write-tree", "--no-messages", f[1], f[2])
+		if isExit(err, 1) {
+			return false, fmt.Sprintf("merge commit %s resolves conflicts the run did not review", shortSHA(f[0])), nil
+		} else if err != nil {
+			return false, "", err
+		}
+		if tree0, _, _ := strings.Cut(strings.TrimSpace(merged), "\n"); tree0 != tree {
+			return false, fmt.Sprintf("merge commit %s changes more than merging its parents", shortSHA(f[0])), nil
+		}
+	}
+	return true, "", nil
 }
 
 // Conventional Commit types a pull request title may carry, the ones the

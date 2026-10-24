@@ -114,7 +114,7 @@ func TestConventionsMetadataBuilders(t *testing.T) {
 
 	// Every sc_ key the decisions name has a builder or an accessor, and
 	// none uses a reserved prefix.
-	for _, key := range []string{MetaRun, MetaRound, MetaPRURL, MetaPRNumber, MetaMergeSHA, MetaAgent, MetaLease, MetaKind, MetaSize} {
+	for _, key := range []string{MetaRun, MetaRound, MetaPRURL, MetaPRNumber, MetaPRHead, MetaMergeSHA, MetaAgent, MetaLease, MetaKind, MetaSize} {
 		assert.True(t, strings.HasPrefix(key, "sc_"), key)
 		assert.False(t, strings.HasPrefix(key, "bd:") || strings.HasPrefix(key, "_"), key)
 	}
@@ -166,6 +166,8 @@ func TestConventionsIssueAccessors(t *testing.T) {
 	assert.Equal(t, domain.SizeL, size)
 	assert.True(t, Issue{ID: "z", Labels: []string{LabelExternalPR}}.IsExternalPR())
 	assert.Equal(t, "https://example.com/pr/7", Issue{Metadata: Metadata{MetaMergeSHA: "abc", MetaPRURL: "https://example.com/pr/7"}}.PRURL())
+	assert.Equal(t, "abc", Issue{Metadata: Metadata{MetaPRHead: "abc"}}.PRHead())
+	assert.Empty(t, Issue{}.PRHead())
 	assert.Equal(t, "abc", Issue{Metadata: Metadata{MetaMergeSHA: "abc"}}.MergeSHA())
 }
 

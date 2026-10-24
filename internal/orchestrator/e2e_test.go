@@ -222,13 +222,14 @@ _pr() {
   printf '{"number":%s,"url":"`+e2ePRHost+`/pull/%s","state":"%s","title":"Pull request %s","headRefName":"%s","baseRefName":"%s","labels":[{"name":"slop-cannon"}],"body":"%s","author":{"login":"`+e2eLogin+`"},"createdAt":"%s"}' "$1" "$1" "$3" "$1" "$2" "$_b" "$_m" "$_c"
 }
 # _view prints everything auto-merge reads about pull request $1: green,
-# CLEAN, and at a head commit named after it.
+# CLEAN, and at the head its branch has on the remote.
 _view() {
   _h=$(cat "$SC_FAKEBIN_DIR/num.$1" 2>/dev/null || echo '')
   _m=$(cat "$SC_FAKEBIN_DIR/marker.$1" 2>/dev/null || echo '')
   _b=$(cat "$SC_FAKEBIN_DIR/base.$1" 2>/dev/null || echo main)
   _c=$(cat "$SC_FAKEBIN_DIR/created.$1" 2>/dev/null || echo 2000-01-01T00:00:00Z)
-  printf '{"number":%s,"state":"%s","isDraft":false,"headRefName":"%s","headRefOid":"e2e-head-%s","baseRefName":"%s","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://ci.example/test"}],"labels":[{"name":"slop-cannon"}],"body":"%s","createdAt":"%s","author":{"login":"`+e2eLogin+`"}}' "$1" "$(_state "$1")" "$_h" "$1" "$_b" "$_m" "$_c"
+  _o=$(git ls-remote origin "refs/heads/$_h" 2>/dev/null | cut -f1)
+  printf '{"number":%s,"state":"%s","isDraft":false,"headRefName":"%s","headRefOid":"%s","baseRefName":"%s","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://ci.example/test"}],"labels":[{"name":"slop-cannon"}],"body":"%s","createdAt":"%s","author":{"login":"`+e2eLogin+`"}}' "$1" "$(_state "$1")" "$_h" "${_o:-e2e-head-$1}" "$_b" "$_m" "$_c"
 }
 case "$1 $2" in
   "label create")
@@ -1310,10 +1311,13 @@ func TestE2EBriefRunWithSafetyOnAndAutoMerge(t *testing.T) {
 		}
 		require.Len(t, inv.Args, 6, "gh %s", strings.Join(inv.Args, " "))
 		n := inv.Args[2]
-		assert.Equal(t, []string{"pr", "merge", n, "--squash", "--match-head-commit", "e2e-head-" + n}, inv.Args)
 		head, err := os.ReadFile(filepath.Join(rig.GH.Dir, "num."+n))
 		require.NoError(t, err, "pull request #%s was opened by this run", n)
-		assert.True(t, created[strings.TrimSpace(string(head))], "#%s is one of the run's own", n)
+		branch := strings.TrimSpace(string(head))
+		assert.True(t, created[branch], "#%s is one of the run's own", n)
+		tip := strings.Fields(rig.Repo.Git(t, "ls-remote", rig.Repo.RemoteDir, "refs/heads/"+branch))
+		require.NotEmpty(t, tip)
+		assert.Equal(t, []string{"pr", "merge", n, "--squash", "--match-head-commit", tip[0]}, inv.Args, "the tip the run delivered and reviewed")
 		merged = append(merged, n)
 	}
 	assert.Len(t, merged, 2, "both of the run's pull requests were merged, once each")
