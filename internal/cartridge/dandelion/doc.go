@@ -26,6 +26,8 @@
 //     running dandelion dashboard answer from its snapshot.
 //   - Errors: "none" is a rate limit with [NoRouteRetryAfter]; a bad
 //     routes.json is not_installed (a human must fix it); an account that
-//     runs out of credits is a short rate limit, never credits_exhausted,
-//     because the supervisor retires a cartridge by name.
+//     runs out of credits or is logged out is a short rate limit, never
+//     credits_exhausted or auth, because the supervisor retires or fails a
+//     cartridge by name. Such an account is benched (left out of routing)
+//     until its reset time, or [BenchFor].
 package dandelion

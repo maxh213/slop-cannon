@@ -50,6 +50,8 @@ func TestDocs_SectionMatchesCode(t *testing.T) {
 	mentions("no-route pause", "`RetryAfter` 5 min")
 	assert.Equal(t, time.Minute, AccountRetryAfter)
 	mentions("account pause", "`RetryAfter` 1 min")
+	assert.Equal(t, 5*time.Minute, BenchFor)
+	mentions("bench", "5 minutes (`dandelion.BenchFor`)")
 	assert.Equal(t, 90*time.Second, RouteTimeout)
 	mentions("router timeout", "(90 s)")
 }

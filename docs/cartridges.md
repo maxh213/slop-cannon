@@ -418,7 +418,10 @@ accepts (`low`, `medium`, `high`, `xhigh`, `max`; anything else is dropped
 with a warning). The variables are looked up in the configured `env` first,
 then sc's environment. Everything the Claude and Cursor sections say about
 their invocation, parsing and errors applies to the delegated session; its
-errors and events carry the name `dandelion`.
+errors and events carry the name `dandelion`. The delegated CLIs are always
+`claude` and `cursor-agent` from `PATH`: a `command` set under
+`[cartridges.claude]` or `[cartridges.cursor]` does not apply to dandelion's
+firings (the factory sees only `[cartridges.dandelion]`).
 
 The router is given the user's whole environment, minus the markers a
 parent Claude Code session sets: it probes every provider the way the user's
@@ -451,13 +454,24 @@ seconds, so:
   share one, and `read_write` has its own;
 - concurrent firings with the same key share **one** router call, and a
   firing whose context ends while it waits gives up without cancelling the
-  call the others are waiting for;
+  call the others are waiting for; when the last waiter gives up (the run is
+  stopping) the call is cancelled, so no probe round outlives the run;
 - `--max-age 120` lets a running dandelion dashboard answer from its own
   snapshot without probing;
-- a delegated session that ends `rate_limited` or `credits_exhausted` drops
-  the cached route for its key, and the next call for that key leaves out
-  `--max-age` so the router probes afresh instead of answering from a
-  snapshot that still shows the empty account.
+- a delegated session that ends `rate_limited`, `credits_exhausted` or
+  `auth` **benches** the account: until the reset time the CLI reported, or
+  5 minutes (`dandelion.BenchFor`) when it reported none, the account is left
+  out of the allowed set, so it is in `DANDELION_DISABLE` and a route that
+  still names it is refused. This holds even when dandelion's probe still
+  sees headroom the CLI does not (a weekly or model-specific cap). When every
+  account the firing may use is benched, the firing is a `rate_limited` until
+  the first one is back (at most 5 minutes) and the router is not asked;
+- the same failures, a delegated `not_installed`, and a refused route drop
+  every cached route naming that account, and the next call for every key
+  leaves out `--max-age` so the router probes afresh instead of answering
+  from a snapshot that still shows the failed account. A call already in
+  flight when an account fails is not cached, and the next call stays fresh
+  until a fresh one succeeds.
 
 Failures are never cached.
 
@@ -465,14 +479,18 @@ Failures are never cached.
 
 | What happened | Kind | Why |
 |---|---|---|
-| router exits 1, or prints `none` | `rate_limited`, `RetryAfter` 5 min | nothing has quota now; the supervisor pauses the cartridge and asks again |
+| router prints `none` (exit 1, or exit 0) | `rate_limited`, `RetryAfter` 5 min | nothing has quota now; the supervisor pauses the cartridge and asks again |
+| router exits 1 without printing `none` | `crash`, with dandelion's first stderr line | Node exits 1 on an uncaught exception too; a broken router must not look like empty quota |
 | router exits 2 (`routes.json` unreadable or invalid) | `not_installed`, with dandelion's stderr reason | a human must fix the file. The closest kind that neither retries (`crash` would) nor retires the cartridge for the run (`credits_exhausted` would) |
 | `dandelion` not on `PATH` | `not_installed` | |
 | a line that is not `<model>[ <effort>] <account>`, or more than one line | `crash`, with the line | |
 | any other exit, a timeout (90 s), a cancelled wait | `crash`, `timeout`, `killed` | |
-| route names an account sc cannot drive, or one the policy does not allow | `rate_limited`, `RetryAfter` 5 min | treated as no route |
-| delegated session: `credits_exhausted` | **`rate_limited`**, `RetryAfter` 1 min, cache dropped | the supervisor retires a cartridge *by name*; one empty account must not retire every other account behind the router |
-| delegated session: `rate_limited` | `rate_limited`, `RetryAfter` 1 min, cache dropped | the pause is per name too, so the account's own (possibly hours-long) back-off is shortened; when every account is out the next route says `none` |
+| route names an account sc cannot drive, one the policy does not allow, or a benched one | `rate_limited`, `RetryAfter` 5 min | treated as no route |
+| every account the firing may use is benched | `rate_limited`, `RetryAfter` until the first is back (at most 5 min) | the router is not asked |
+| delegated session: `credits_exhausted` | **`rate_limited`**, `RetryAfter` 1 min, account benched | the supervisor retires a cartridge *by name*; one empty account must not retire every other account behind the router |
+| delegated session: `auth` | **`rate_limited`**, `RetryAfter` 1 min, account benched | the supervisor fails an `auth` firing without a retry; one logged-out account must not fail firings another account can serve |
+| delegated session: `rate_limited` | `rate_limited`, `RetryAfter` the CLI's own but at most 1 min, account benched until the CLI's reset | the pause is per name too, so an account's (possibly hours-long) back-off would pause every account; the bench keeps that account out instead. When every account is out the next route says `none` |
+| delegated session: `not_installed` | unchanged, cached route dropped | |
 | delegated session: anything else | unchanged | |
 
 Every delegated failure's message names the account and model, for example

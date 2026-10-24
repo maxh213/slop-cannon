@@ -63,11 +63,14 @@ const (
 	RouteTimeout = 90 * time.Second
 	// NoRouteRetryAfter is the pause asked for when no account has quota.
 	NoRouteRetryAfter = 5 * time.Minute
-	// AccountRetryAfter is the pause asked for when the account a firing
-	// was routed to runs out of quota or is rate limited. It is short
-	// because the supervisor pauses the whole cartridge by name, and the
-	// next route most likely names another account.
+	// AccountRetryAfter is the longest pause asked for when the account a
+	// firing was routed to runs out of quota, is rate limited or is logged
+	// out. It is short because the supervisor pauses the whole cartridge by
+	// name, and the account is benched, so the next route names another.
 	AccountRetryAfter = time.Minute
+	// BenchFor is how long an account that failed a firing is kept out of
+	// routing when the failure gave no reset time of its own.
+	BenchFor = 5 * time.Minute
 )
 
 // Adapter is the dandelion cartridge: every firing asks the router which
@@ -88,7 +91,15 @@ type Adapter struct {
 	mu      sync.Mutex
 	cache   map[routeKey]cachedRoute
 	flights map[routeKey]*flight
-	fresh   map[routeKey]bool
+	// epoch counts invalidations; clean[key] is the epoch at the start of
+	// key's last successful fresh router call. A key whose clean epoch is
+	// behind is probed afresh.
+	epoch uint64
+	clean map[routeKey]uint64
+	// benched maps an account that failed a firing to when it may be
+	// routed to again: until then it is left out of the allowed set, so
+	// the router is told to skip it even when its own probe disagrees.
+	benched map[string]time.Time
 }
 
 var (
@@ -115,7 +126,8 @@ func New(name string, cfg config.Cartridge) (cartridge.Cartridge, error) {
 	a := &Adapter{
 		name: name, cfg: cfg, mode: mode,
 		now: time.Now, homeDir: os.UserHomeDir,
-		cache: map[routeKey]cachedRoute{}, flights: map[routeKey]*flight{}, fresh: map[routeKey]bool{},
+		cache: map[routeKey]cachedRoute{}, flights: map[routeKey]*flight{},
+		clean: map[routeKey]uint64{}, benched: map[string]time.Time{},
 	}
 	a.lookupEnv = a.envLookup
 	return a, nil
@@ -230,7 +242,6 @@ func (a *Adapter) ToolPolicyEnforcement(p cartridge.ToolPolicy) (agents.Enforcem
 
 // fired is what one firing was routed to, for the outcome translation.
 type fired struct {
-	key   routeKey
 	route Route
 }
 
@@ -243,7 +254,12 @@ func (a *Adapter) Run(ctx context.Context, spec cartridge.RunSpec) (cartridge.Se
 	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
-	allowed := Allowed(spec.ToolPolicy, cursorInstalled())
+	allowed, wait := a.unbenched(Allowed(spec.ToolPolicy, cursorInstalled()))
+	if len(allowed) == 0 {
+		e := a.noRoute("every account sc can use for this firing failed recently and is benched")
+		e.RetryAfter = min(wait, NoRouteRetryAfter)
+		return nil, e
+	}
 	key := routeKey{mode: a.mode, allowed: strings.Join(allowed, ",")}
 	user, _ := a.lookupEnv(disableEnv)
 	r, cached, err := a.route(ctx, key, Disabled(allowed, user))
@@ -252,9 +268,11 @@ func (a *Adapter) Run(ctx context.Context, spec cartridge.RunSpec) (cartridge.Se
 	}
 	p, known := providerByID(r.Account)
 	if !known || !slices.Contains(allowed, r.Account) {
-		a.invalidate(key, r)
+		a.invalidate(r)
 		msg := fmt.Sprintf("dandelion routed to %q (%s), which is not one sc can drive", r.Account, r)
 		switch {
+		case a.isBenched(r.Account):
+			msg = fmt.Sprintf("dandelion routed to %q (%s), which failed recently and is benched", r.Account, r)
 		case known && p.allows(spec.ToolPolicy):
 			msg = fmt.Sprintf("dandelion routed to %q (%s), which needs cursor-agent on PATH", r.Account, r)
 		case known && p.Driver != DriverNone:
@@ -275,9 +293,9 @@ func (a *Adapter) Run(ctx context.Context, spec cartridge.RunSpec) (cartridge.Se
 
 	s, err := inner.Run(ctx, spec)
 	if err != nil {
-		return nil, a.translate(err, fired{key, r})
+		return nil, a.translate(err, fired{r})
 	}
-	return a.watch(s, fired{key, r}), nil
+	return a.watch(s, fired{r}), nil
 }
 
 // delegate builds the adapter for p and points spec at the routed model
@@ -334,28 +352,39 @@ func (a *Adapter) watch(s cartridge.Session, f fired) cartridge.Session {
 	return pipe
 }
 
-// translate is relabel plus its side effects: a quota failure drops the
-// cached route so the next firing asks the router again.
+// translate is relabel plus its side effects. A failure that belongs to
+// the account (quota, credits, login) drops the cached route so the next
+// firing asks the router again, afresh, and benches the account: until its
+// reset time (or BenchFor) it is left out of routing, so the router cannot
+// name it again even when its own probe still sees headroom. A delegated
+// CLI that has gone missing only drops the route: Run stops routing to
+// cursor once cursor-agent is off PATH, and a missing claude is not one
+// account's fault.
 func (a *Adapter) translate(err error, f fired) error {
 	if err == nil {
 		return nil
 	}
 	switch cartridge.KindOf(err) {
-	case cartridge.KindCreditsExhausted, cartridge.KindRateLimited:
-		a.invalidate(f.key, f.route)
-		a.log().Warn("dandelion account out of quota; the next firing is routed again",
-			slog.String("account", f.route.Account), slog.String("model", f.route.Model), slog.Any("err", err))
+	case cartridge.KindCreditsExhausted, cartridge.KindRateLimited, cartridge.KindAuth:
+		until := a.bench(f.route.Account, retryAfterOf(err))
+		a.invalidate(f.route)
+		a.log().Warn("dandelion account failed; benched, and the next firing is routed again",
+			slog.String("account", f.route.Account), slog.String("model", f.route.Model),
+			slog.Time("until", until), slog.Any("err", err))
+	case cartridge.KindNotInstalled:
+		a.invalidate(f.route)
 	}
 	return a.relabel(err, f)
 }
 
 // relabel names the account in a delegated failure and turns an account's
-// exhausted credits into a short rate limit. The supervisor retires a
-// cartridge whose credits are exhausted for the rest of the run, by name:
-// one empty account must not take every other account behind the router
-// with it. A rate limit is shortened to AccountRetryAfter for the same
-// reason; when every account is out the next route says so ("none", a
-// NoRouteRetryAfter pause).
+// exhausted credits or failed login into a short rate limit. The supervisor
+// retires a cartridge whose credits are exhausted for the rest of the run,
+// by name, and fails an auth error without a retry: one account must not
+// take every other account behind the router with it. A rate limit is
+// shortened to at most AccountRetryAfter for the same reason; when every
+// account is out the next route says so ("none", a NoRouteRetryAfter
+// pause).
 func (a *Adapter) relabel(err error, f fired) error {
 	if err == nil {
 		return nil
@@ -367,13 +396,71 @@ func (a *Adapter) relabel(err error, f fired) error {
 		e.Kind = cartridge.KindRateLimited
 		e.Msg = joinMsg(prefix+" is out of credits; routing again", e.Msg)
 		e.RetryAfter = AccountRetryAfter
+	case cartridge.KindAuth:
+		e.Kind = cartridge.KindRateLimited
+		e.Msg = joinMsg(prefix+" is not logged in; routing again", e.Msg)
+		e.RetryAfter = AccountRetryAfter
 	case cartridge.KindRateLimited:
 		e.Msg = joinMsg(prefix+" is rate limited; routing again", e.Msg)
-		e.RetryAfter = AccountRetryAfter
+		if e.RetryAfter <= 0 || e.RetryAfter > AccountRetryAfter {
+			e.RetryAfter = AccountRetryAfter
+		}
 	default:
 		e.Msg = joinMsg(prefix, e.Msg)
 	}
 	return &e
+}
+
+// retryAfterOf is the reset time a delegated failure carried, or zero.
+func retryAfterOf(err error) time.Duration {
+	if e := cartridge.AsError("", err); e != nil {
+		return e.RetryAfter
+	}
+	return 0
+}
+
+// bench keeps account out of routing for d, or BenchFor when d is zero,
+// and returns until when.
+func (a *Adapter) bench(account string, d time.Duration) time.Time {
+	if d <= 0 {
+		d = BenchFor
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	until := a.now().Add(d)
+	if until.After(a.benched[account]) {
+		a.benched[account] = until
+	}
+	return a.benched[account]
+}
+
+func (a *Adapter) isBenched(account string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.now().Before(a.benched[account])
+}
+
+// unbenched returns ids without the accounts still benched, and when none
+// is left, how long until the first of them may be routed to again.
+func (a *Adapter) unbenched(ids []string) ([]string, time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	now := a.now()
+	var out []string
+	var wait time.Duration
+	for _, id := range ids {
+		until, ok := a.benched[id]
+		switch {
+		case !ok:
+			out = append(out, id)
+		case !now.Before(until):
+			delete(a.benched, id)
+			out = append(out, id)
+		case wait == 0 || until.Sub(now) < wait:
+			wait = until.Sub(now)
+		}
+	}
+	return out, wait
 }
 
 func joinMsg(a, b string) string {

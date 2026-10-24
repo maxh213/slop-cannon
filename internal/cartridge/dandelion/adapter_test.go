@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -32,6 +33,7 @@ d="$SC_FAKEBIN_DIR"
 printf '%s' "$DANDELION_DISABLE" > "$d/disable.$SC_FAKEBIN_SEQ"
 printf '%s' "${CLAUDECODE-unset}" > "$d/marker.$SC_FAKEBIN_SEQ"
 printf '%s' "${SC_ROUTER_KNOB-unset}" > "$d/knob.$SC_FAKEBIN_SEQ"
+printf '%s' "$$" > "$d/pid.$SC_FAKEBIN_SEQ"
 if [ -f "$d/sleep" ]; then sleep "$(cat "$d/sleep")"; fi
 if [ -f "$d/stderr" ]; then cat "$d/stderr" >&2; fi
 if [ -f "$d/line" ]; then cat "$d/line"; fi
@@ -386,6 +388,13 @@ func TestRun_ReadOnlyNeverReachesCursor(t *testing.T) {
 		assert.Contains(t, e.Error(), `dandelion routed to "cursor" (auto cursor), which cannot hold `+string(policy))
 	}
 	assert.Empty(t, f.cursor.ArgLists(t), "cursor-agent was started for a read-only firing")
+	// The refused route is not cached: the next firing asks again, afresh.
+	a, _, _ := newAdapter(t, config.Cartridge{})
+	_ = fire(t, a, spec(t, cartridge.ToolReadOnly, nil))
+	_ = fire(t, a, spec(t, cartridge.ToolReadOnly, nil))
+	calls := f.router.ArgLists(t)
+	require.Len(t, calls, 4)
+	assert.Equal(t, []string{"route"}, calls[3])
 	assert.Empty(t, firings(t, f.claude))
 }
 
@@ -445,6 +454,9 @@ func TestRun_RouterErrors(t *testing.T) {
 		{"unparseable line", func(t *testing.T, r *testutil.Shim) { say(t, r, "garbage") }, cartridge.KindCrash, 0, `route line "garbage"`},
 		{"two lines", func(t *testing.T, r *testutil.Shim) { say(t, r, "a claude\nb claude") }, cartridge.KindCrash, 0, "more than one line"},
 		{"other exit", func(t *testing.T, r *testutil.Shim) { fail(t, r, 3, "boom") }, cartridge.KindCrash, 0, "dandelion route failed"},
+		{"exit 1 without none is a crash", func(t *testing.T, r *testutil.Shim) {
+			fail(t, r, 1, "TypeError: Cannot read properties of undefined (reading 'usage')\n    at probe (/x/src/probes/claude.ts:12:3)\n")
+		}, cartridge.KindCrash, 0, "dandelion route failed: TypeError: Cannot read properties of undefined (reading 'usage')"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -475,22 +487,46 @@ func TestRun_RouterMissing(t *testing.T) {
 	assert.Contains(t, e.Error(), "no-such-dandelion not found on PATH")
 }
 
-func TestRun_RouterTimeoutOrCancelIsKilled(t *testing.T) {
+func TestRun_CancelledWaitStopsTheRouter(t *testing.T) {
 	f := isolate(t, false)
 	say(t, f.router, "claude-opus-5-5 high claude")
-	writeFile(t, filepath.Join(f.router.Dir, "sleep"), "1")
+	writeFile(t, filepath.Join(f.router.Dir, "sleep"), "30")
 	a, _, _ := newAdapter(t, config.Cartridge{})
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		require.Eventually(t, func() bool { return len(f.router.ArgLists(t)) == 1 },
+			testutil.Patience(5*time.Second), 10*time.Millisecond)
+		cancel()
+	}()
+	_, err := a.Run(ctx, spec(t, cartridge.ToolReadOnly, okEnv(t)))
+	assert.Equal(t, cartridge.KindKilled, cerr(t, err).Kind)
+
+	// The last waiter gave up, so the probe round is stopped rather than
+	// left running after the run, and nothing is cached.
+	pid, err := strconv.Atoi(recorded(t, f.router, "pid", 1))
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return syscall.Kill(pid, 0) != nil },
+		testutil.Patience(5*time.Second), 20*time.Millisecond, "the router is still running")
+	require.NoError(t, os.Remove(filepath.Join(f.router.Dir, "sleep")))
+	require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
+	assert.Len(t, f.router.ArgLists(t), 2, "the next firing starts a new call")
+}
+
+func TestRoute_WaiterGivingUpKeepsTheSharedCall(t *testing.T) {
+	f := isolate(t, false)
+	say(t, f.router, "claude-opus-5-5 high claude")
+	writeFile(t, filepath.Join(f.router.Dir, "sleep"), "0.5")
+	a, _, _ := newAdapter(t, config.Cartridge{})
+
+	done := make(chan error, 1)
+	go func() { done <- fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))) }()
+	require.Eventually(t, func() bool { return len(f.router.ArgLists(t)) == 1 },
+		testutil.Patience(5*time.Second), 10*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	_, err := a.Run(ctx, spec(t, cartridge.ToolReadOnly, okEnv(t)))
 	assert.Equal(t, cartridge.KindKilled, cerr(t, err).Kind)
-	// The abandoned call still finishes and is cached for the next firing.
-	require.Eventually(t, func() bool {
-		a.mu.Lock()
-		defer a.mu.Unlock()
-		return len(a.cache) == 1
-	}, testutil.Patience(5*time.Second), 20*time.Millisecond)
-	require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
+	require.NoError(t, <-done, "the other waiter still gets the route")
 	assert.Len(t, f.router.ArgLists(t), 1)
 }
 
@@ -544,17 +580,19 @@ func TestRoute_Singleflight(t *testing.T) {
 
 func TestRun_InnerFailures(t *testing.T) {
 	cases := []struct {
-		name        string
-		stderr      string
-		kind        cartridge.Kind
-		retry       time.Duration
-		msg         string
-		invalidates bool
+		name    string
+		stderr  string
+		kind    cartridge.Kind
+		retry   time.Duration
+		msg     string
+		benches bool
 	}{
 		{"credits become a short rate limit", "Credit balance is too low", cartridge.KindRateLimited, AccountRetryAfter,
 			"account claude-work (claude-opus-5-5) is out of credits; routing again", true},
 		{"rate limit passes through", "API Error: Rate limit reached", cartridge.KindRateLimited, AccountRetryAfter,
 			"account claude-work (claude-opus-5-5) is rate limited; routing again", true},
+		{"a logged-out account becomes a short rate limit", "Invalid API key · Please run /login", cartridge.KindRateLimited, AccountRetryAfter,
+			"account claude-work (claude-opus-5-5) is not logged in; routing again", true},
 		{"crash keeps the route", "segfault", cartridge.KindCrash, 0, "account claude-work (claude-opus-5-5)", false},
 	}
 	for _, tc := range cases {
@@ -575,21 +613,119 @@ func TestRun_InnerFailures(t *testing.T) {
 			require.Equal(t, cartridge.EventError, last.Kind)
 			assert.Equal(t, tc.kind, cartridge.KindOf(last.Err), "the terminal event agrees with Wait")
 
-			// The next firing asks the router again only after a quota
-			// failure, and then without --max-age, so the router probes
-			// afresh instead of answering from a stale snapshot.
+			// After an account failure the next firing asks the router
+			// again, without --max-age so it probes afresh instead of
+			// answering from a stale snapshot, and with the account
+			// disabled so it cannot be named again.
+			say(t, f.router, "claude-opus-5-5 high claude")
 			require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
 			calls := f.router.ArgLists(t)
-			if tc.invalidates {
-				require.Len(t, calls, 2)
-				assert.Equal(t, []string{"route"}, calls[1])
-				require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
-				assert.Len(t, f.router.ArgLists(t), 2, "the fresh answer is cached again")
-			} else {
+			if !tc.benches {
 				assert.Len(t, calls, 1)
+				return
 			}
+			require.Len(t, calls, 2)
+			assert.Equal(t, []string{"route"}, calls[1])
+			assert.Contains(t, strings.Split(recorded(t, f.router, "disable", 2), ","), "claude-work")
+			require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
+			assert.Len(t, f.router.ArgLists(t), 2, "the fresh answer is cached again")
 		})
 	}
+}
+
+func TestRun_InnerNotInstalledDropsTheRoute(t *testing.T) {
+	f := isolate(t, false)
+	say(t, f.router, "claude-opus-5-5 high claude")
+	a, _, _ := newAdapter(t, config.Cartridge{})
+	require.NoError(t, os.Remove(f.claude.Path))
+	_, err := a.Run(context.Background(), spec(t, cartridge.ToolReadOnly, okEnv(t)))
+	e := cerr(t, err)
+	assert.Equal(t, cartridge.KindNotInstalled, e.Kind)
+	assert.Contains(t, e.Msg, "account claude (claude-opus-5-5): claude is not on PATH")
+	assert.Equal(t, Name, e.Cartridge)
+	_ = fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t)))
+	calls := f.router.ArgLists(t)
+	require.Len(t, calls, 2, "a delegated CLI gone missing drops the cached route")
+	assert.NotContains(t, strings.Split(recorded(t, f.router, "disable", 2), ","), "claude", "a missing claude does not bench the account")
+}
+
+func TestRun_BenchedAccountIsNotRoutedUntilItsTime(t *testing.T) {
+	f := isolate(t, false)
+	say(t, f.router, "claude-opus-5-5 high claude-work")
+	a, _, clock := newAdapter(t, config.Cartridge{})
+	err := fire(t, a, spec(t, cartridge.ToolReadOnly, map[string]string{"SC_CLAUDE_STDERR": "API Error: Rate limit reached", "SC_CLAUDE_EXIT": "1"}))
+	require.Equal(t, cartridge.KindRateLimited, cerr(t, err).Kind)
+
+	// The router's probe still sees headroom and names it again: refused.
+	e := cerr(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
+	assert.Equal(t, cartridge.KindRateLimited, e.Kind)
+	assert.Contains(t, e.Msg, `dandelion routed to "claude-work" (claude-opus-5-5 high claude-work), which failed recently and is benched`)
+	assert.Empty(t, firings(t, f.claude)[1:], "the benched account was fired on")
+
+	clock.Advance(BenchFor)
+	require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
+	assert.NotContains(t, strings.Split(recorded(t, f.router, "disable", len(f.router.ArgLists(t))), ","), "claude-work")
+}
+
+func TestRun_EveryAccountBenched(t *testing.T) {
+	f := isolate(t, false)
+	a, _, _ := newAdapter(t, config.Cartridge{})
+	for i, id := range Allowed(cartridge.ToolReadOnly, false) {
+		a.bench(id, time.Duration(30+i)*time.Second)
+	}
+	e := cerr(t, fire(t, a, spec(t, cartridge.ToolReadOnly, nil)))
+	assert.Equal(t, cartridge.KindRateLimited, e.Kind)
+	assert.Equal(t, 30*time.Second, e.RetryAfter, "until the first account is back")
+	assert.Contains(t, e.Msg, "benched")
+	assert.Empty(t, f.router.ArgLists(t), "no router call can help")
+}
+
+func TestRelabel_RateLimitRetryAfter(t *testing.T) {
+	t.Parallel()
+	a, _, _ := newAdapter(t, config.Cartridge{})
+	for in, want := range map[time.Duration]time.Duration{
+		0:                AccountRetryAfter,
+		10 * time.Second: 10 * time.Second,
+		3 * time.Hour:    AccountRetryAfter,
+	} {
+		err := cartridge.NewError(cartridge.KindRateLimited, "x", "slow down", nil)
+		err.RetryAfter = in
+		got := cerr(t, a.relabel(err, fired{Route{Model: "m", Account: "claude"}}))
+		assert.Equal(t, want, got.RetryAfter, in)
+	}
+}
+
+func TestRoute_InvalidationOvertakesAFlight(t *testing.T) {
+	f := isolate(t, false)
+	say(t, f.router, "claude-opus-5-5 high claude")
+	writeFile(t, filepath.Join(f.router.Dir, "sleep"), "0.5")
+	a, _, _ := newAdapter(t, config.Cartridge{})
+	done := make(chan error, 1)
+	go func() { done <- fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))) }()
+	require.Eventually(t, func() bool { return len(f.router.ArgLists(t)) == 1 },
+		testutil.Patience(5*time.Second), 10*time.Millisecond)
+	// Another firing fails on the account while the call is running.
+	a.invalidate(Route{Model: "claude-opus-5-5", Account: "claude"})
+	require.NoError(t, <-done)
+	require.NoError(t, os.Remove(filepath.Join(f.router.Dir, "sleep")))
+	require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
+	calls := f.router.ArgLists(t)
+	require.Len(t, calls, 2, "the overtaken answer was cached")
+	assert.Equal(t, []string{"route"}, calls[1])
+}
+
+func TestRoute_FreshProbeSurvivesAFailedCall(t *testing.T) {
+	f := isolate(t, false)
+	a, _, clock := newAdapter(t, config.Cartridge{})
+	a.invalidate(Route{Model: "m", Account: "claude"})
+	fail(t, f.router, 3, "boom")
+	require.Error(t, fire(t, a, spec(t, cartridge.ToolReadOnly, nil)))
+	say(t, f.router, "claude-opus-5-5 high claude")
+	require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
+	clock.Advance(CacheTTL)
+	require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadOnly, okEnv(t))))
+	maxAge := []string{"route", "--max-age", "120"}
+	assert.Equal(t, [][]string{{"route"}, {"route"}, maxAge}, f.router.ArgLists(t))
 }
 
 func TestToolPolicyEnforcement(t *testing.T) {
