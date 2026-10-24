@@ -42,3 +42,14 @@ func TestRunAutoMergeIsWiredOnlyWhenTheSnapshotAsksForIt(t *testing.T) {
 	assert.Equal(t, 7*time.Minute, on.Spacing)
 	assert.Same(t, pr, on.Branches)
 }
+
+// TestRunDeliveryJudgesExistingPullRequestsFromTheRunsStart: without the
+// run's start, every existing pull request — the run's own included —
+// would fail D-31's ownership check, and each re-delivery to it (a
+// send-back, a resume) would go to a person instead.
+func TestRunDeliveryJudgesExistingPullRequestsFromTheRunsStart(t *testing.T) {
+	started := time.Date(2026, 10, 24, 9, 0, 0, 0, time.UTC)
+	rc := &config.RunConfig{Effective: &config.Effective{}, Run: domain.Run{ID: "20261024-090000-0001", StartedAt: started}}
+	opts := runDeliveryOptions(nil, nil, nil, nil, rc, nil)
+	assert.Equal(t, started, opts.RunStarted)
+}

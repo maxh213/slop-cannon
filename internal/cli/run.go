@@ -1453,23 +1453,7 @@ func runAutoMerge(rc *config.RunConfig, pr *gitx.PRDeliverer, run *orchestrator.
 func runDeliverer(run *orchestrator.Run, states *orchestrator.StateMachine, dgit orchestrator.DeliveryGit,
 	client *beads.Client, m *gitx.Manager, rc *config.RunConfig, filter *agents.SecretFilter,
 	logger *slog.Logger) (*orchestrator.Deliverer, *gitx.PRDeliverer, error) {
-	opts := orchestrator.DeliveryOptions{
-		Host: run, States: states, Git: dgit, Beads: client,
-		CheckCommand: rc.Effective.CheckCommand,
-		// P4-19: a full check under load can outrun gitx's 30-minute
-		// default, and a killed check fails every delivery.
-		CheckTimeout: rc.Effective.Limits.CheckTimeout.Duration(),
-		// P1-14 and P1-18: D-09's threshold and the conflict-round cap
-		// come from the configuration, not from the package constants.
-		ReReviewThreshold: rc.Effective.ReReviewThreshold,
-		MaxConflictRounds: rc.Effective.Limits.MaxConflictRounds,
-		// P9-05: the pull request body is the only sink of agent prose
-		// that leaves the machine.
-		Filter: filter,
-		// D-31: an existing pull request is reused only when it was opened
-		// by this run, which started then (a resume keeps the original).
-		RunStarted: rc.Run.StartedAt,
-	}
+	opts := runDeliveryOptions(run, states, dgit, client, rc, filter)
 	var pr *gitx.PRDeliverer
 	if rc.Run.Config.Safety {
 		var err error
@@ -1489,6 +1473,29 @@ func runDeliverer(run *orchestrator.Run, states *orchestrator.StateMachine, dgit
 	}
 	d, err := orchestrator.NewDeliverer(opts)
 	return d, pr, err
+}
+
+// runDeliveryOptions is the part of [runDeliverer]'s options that comes
+// from the run config, whichever way delivery goes.
+func runDeliveryOptions(run *orchestrator.Run, states *orchestrator.StateMachine, dgit orchestrator.DeliveryGit,
+	client *beads.Client, rc *config.RunConfig, filter *agents.SecretFilter) orchestrator.DeliveryOptions {
+	return orchestrator.DeliveryOptions{
+		Host: run, States: states, Git: dgit, Beads: client,
+		CheckCommand: rc.Effective.CheckCommand,
+		// P4-19: a full check under load can outrun gitx's 30-minute
+		// default, and a killed check fails every delivery.
+		CheckTimeout: rc.Effective.Limits.CheckTimeout.Duration(),
+		// P1-14 and P1-18: D-09's threshold and the conflict-round cap
+		// come from the configuration, not from the package constants.
+		ReReviewThreshold: rc.Effective.ReReviewThreshold,
+		MaxConflictRounds: rc.Effective.Limits.MaxConflictRounds,
+		// P9-05: the pull request body is the only sink of agent prose
+		// that leaves the machine.
+		Filter: filter,
+		// D-31: an existing pull request is reused only when it was opened
+		// by this run, which started then (a resume keeps the original).
+		RunStarted: rc.Run.StartedAt,
+	}
 }
 
 // stopperFunc adapts a function to [orchestrator.AgentStopper]. It is how
