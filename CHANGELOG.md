@@ -17,12 +17,36 @@ next version's entry.
 
 ### Added
 
+- `auto_merge = true` (or `--auto-merge`; safety on only, off by default)
+  lets a run squash-merge the pull requests it opened itself once they are
+  green, instead of waiting for a human: `gh pr merge --squash
+  --match-head-commit`, never `--admin` or `--auto`. Every clause of the
+  ownership check must hold (the bead's branch, the default branch as base,
+  the `slop-cannon` label, a marker naming this run and bead, created after
+  the run started, opened by the `gh` login), and the head must be the commit
+  the testers approved or a branch update the run itself asked GitHub for;
+  any other commit on the branch sends the bead to `needs_human`. A head
+  that does not contain the default branch's tip is updated and re-checked
+  first, a failed check or a conflict goes back to the engineer, and
+  `auto_merge_checks` (required) names the checks that must have succeeded.
+  `auto_merge_spacing` (default 10m) spaces the merges so each deploy can
+  finish.
+- `conventional_pr_titles` titles the run's pull requests
+  `<type>: <title>` from the bead's issue type, for repositories whose CI
+  enforces Conventional Commit titles.
+- The `dandelion` cartridge routes each firing to whichever Claude Code or
+  Cursor Agent account still has quota (`dandelion route`), benching an
+  account that fails until its reset. `[cartridges.dandelion] model` is
+  `high` or `standard`.
 - `signals_command` (with `signals_interval`, default 30m, and
   `limits.signals_timeout`, default 5m) gives the autopilot product owner what
   production is saying: sc runs the command, and its output reaches the
   planning prompt fenced as untrusted evidence. A changed reading can plan
-  while engineers are busy. `sc status` and the TUI header show the last
-  reading and when the next is due.
+  while engineers are busy, up to one plan's worth of beads still to ship.
+  A plan that copies an email address, phone number or IP address from the
+  reading, or 8 or more of its words in a row, into a bead is rejected.
+  `sc status` and the TUI header show the last reading and when the next is
+  due.
 - `sc watch [PATH]` opens the run TUI on a run that is already firing, from
   any terminal: one started with `--headless`, from a script, or in a
   terminal that has since closed. It shows everything the run has done so far
@@ -44,6 +68,10 @@ next version's entry.
 
 ### Changed
 
+- A rate limit only pauses: it no longer uses up a firing's crash retries
+  or counts towards the three failed firings that park a bead, so a bead
+  waits however long a cartridge (or every `dandelion` account) is limited
+  instead of being parked as failed.
 - The default `limits.agent_timeout` is 6 hours instead of 30 minutes, so an
   engineer on a real feature is no longer killed half-way through.
 - A run resumed with `--safety off` settles the pull requests it opened
