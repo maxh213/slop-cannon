@@ -182,9 +182,12 @@ the active cartridge promotes the next configured one, or leaves the cannon
 without an active cartridge (a run refuses to start until one is added).
 Re-adding a configured cartridge updates its model.
 
-Only "claude" (Claude Code) is supported for now; more cartridges are
-planned. Any other name is rejected. Without flags the configured
-cartridges are listed.
+Supported: "claude" (Claude Code), "cursor" (Cursor Agent) and
+"dandelion", the dandelion quota router, which fires Claude Code or Cursor
+Agent on whichever account still has quota. Its --model is "high" (the
+strongest model with quota) or "standard"; the router names the real model,
+so roles.<role>.model is ignored for it. More cartridges are planned; any
+other name is rejected. Without flags the configured cartridges are listed.
 
 ### Usage
 
@@ -196,6 +199,7 @@ sc cartridge [flags]
 
 ```
 sc cartridge --add claude --model fable
+sc cartridge --add dandelion --model high
 sc cartridge --remove claude
 sc cartridge --add animus
 sc cartridge --add kimi --model 3

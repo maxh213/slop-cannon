@@ -173,6 +173,9 @@ func (d *Doc) AddCartridge(name, model string) (activated bool, err error) {
 	if err := ValidateCartridgeName(name); err != nil {
 		return false, err
 	}
+	if err := ValidateCartridgeModel(name, model); err != nil {
+		return false, err
+	}
 	if d.File.Cartridges == nil {
 		d.File.Cartridges = map[string]Cartridge{}
 	}

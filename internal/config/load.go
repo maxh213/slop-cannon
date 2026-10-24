@@ -423,6 +423,9 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 			if err := ValidateCartridgeName(name); err != nil {
 				return &ValidationError{Path: path, Key: KeyCartridges + "." + name, Msg: err.Error()}
 			}
+			if err := ValidateCartridgeModel(name, c.Model); err != nil {
+				return &ValidationError{Path: path, Key: KeyCartridges + "." + name, Msg: err.Error()}
+			}
 			e.Cartridges[name] = cloneCartridge(c)
 			e.Sources[KeyCartridges+"."+name] = src
 			e.Sources[KeyCartridges] = src

@@ -209,6 +209,7 @@ var tsWrappedExempt = map[string]string{
 	"beads: …: …":                                                                            tsWrapStep,
 	"beads: …: …: empty bead id":                                                             tsWrapInvariant,
 	"cartridge …: factory returned nil":                                                      tsWrapInvariant,
+	"cartridge …: the Claude Code adapter reports no tool-policy enforcement":                tsWrapInvariant,
 	"cartridge …: …":                                                                         tsWrapStep,
 	"cartridge: cannot register an empty name":                                               tsWrapInvariant,
 	"cartridge: cannot register … with a nil factory":                                        tsWrapInvariant,

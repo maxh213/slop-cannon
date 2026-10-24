@@ -22,13 +22,15 @@ import (
 	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/cartridge"
-	// The Claude and Cursor adapters are the ones a user may fire (D-29);
-	// importing them here is what puts them in cartridge.Default. The mock
-	// adapter registers itself the same way, so a test binary that imports
+	// The Claude and Cursor adapters, and the dandelion router in front of
+	// them, are the ones a user may fire (D-29, D-30); importing them here
+	// is what puts them in cartridge.Default. The mock adapter registers
+	// itself the same way, so a test binary that imports
 	// internal/cartridge/mock can select it without loosening that for
 	// users (P8-08).
 	_ "slop-cannon/internal/cartridge/claude"
 	_ "slop-cannon/internal/cartridge/cursor"
+	_ "slop-cannon/internal/cartridge/dandelion"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"

@@ -15,8 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/cartridge"
-	_ "slop-cannon/internal/cartridge/claude" // registers "claude" for CARTRIDGE=claude
-	_ "slop-cannon/internal/cartridge/cursor" // registers "cursor" for CARTRIDGE=cursor
+	_ "slop-cannon/internal/cartridge/claude"    // registers "claude" for CARTRIDGE=claude
+	_ "slop-cannon/internal/cartridge/cursor"    // registers "cursor" for CARTRIDGE=cursor
+	_ "slop-cannon/internal/cartridge/dandelion" // registers "dandelion" for CARTRIDGE=dandelion
 	"slop-cannon/internal/cartridge/mock"
 	"slop-cannon/internal/config"
 )
@@ -26,6 +27,8 @@ import (
 var conformanceDefaultModels = map[string]string{
 	"claude": "claude-haiku-4-5-20251001",
 	"cursor": "auto",
+	// dandelion's model is its mode; the router picks the real model.
+	"dandelion": "standard",
 }
 
 // conformanceFastOptions are Options that make a mock run finish in well

@@ -7,9 +7,11 @@ in, `Run` starts one session for a `RunSpec` (prompts, workdir, model, tool
 policy, limits) and streams `SessionEvent`s until a `Done` or `Error`.
 
 **Claude Code** and **Cursor Agent** ship today (D-29, superseding the
-Claude-only scope of D-19). Kimi, Animus and a custom-command adapter are
-planned; the interface, registry and mock cartridge are adapter-agnostic so
-each is one package plus one registry line.
+Claude-only scope of D-19), and so does **dandelion**, a quota router that
+fires either of them on whichever account still has quota (D-30). Kimi,
+Animus and a custom-command adapter are planned; the interface, registry and
+mock cartridge are adapter-agnostic so each is one package plus one registry
+line.
 
 ## Claude Code (`claude`)
 
@@ -359,6 +361,169 @@ An unknown model exits 1 with `Cannot use this model: …` on stderr and is a
 (`testutil.FakeBin`); `SC_CURSOR_LIVE=1 go test -run TestLive
 ./internal/cartridge/cursor/` fires the real CLI once on `auto`.
 
+## Dandelion (`dandelion`)
+
+Package `internal/cartridge/dandelion` (D-30). Registered under `dandelion`;
+configured by `[cartridges.dandelion]` (`model`, `command`, `args`, `env`).
+The binary is `dandelion` unless `command` names another.
+
+dandelion is a quota router: `dandelion route` prints the subscription to
+use right now and `dandelion route --high` the strongest model that still
+has quota, as one line `<model>[ <effort>] <account>` (for example
+`claude-fable-5-1 max claude`). The cartridge asks it before every firing and
+then runs the session through the Claude Code or Cursor Agent adapter on
+that account. One cartridge name therefore stands for several accounts; the
+trade-offs that follow are recorded in D-30.
+
+```toml
+[cartridges.dandelion]
+model = "high"      # "dandelion route --high"; "standard" or empty: "dandelion route"
+```
+
+```sh
+sc cartridge --add dandelion --model high
+```
+
+`model` selects the router's mode and nothing else: any value but `high`,
+`standard` or empty is a config error. **The routed model wins**:
+`RunSpec.Model` is ignored, so `roles.<role>.model` has no effect on a role
+that fires on dandelion (put that role on `claude` instead if it needs a
+pinned model). `args` are appended to the router call; `env` is set on the
+router and on the delegated CLI.
+
+### Invocation
+
+Per firing, unless a cached route applies (below):
+
+```
+DANDELION_DISABLE=<every provider sc cannot use for this firing> \
+  dandelion route [--high] --max-age 120 [configured args…]
+```
+
+then, for the account the line names:
+
+| Account | Delegated as | Environment |
+|---|---|---|
+| `claude` | Claude Code: `claude -p … --model <model> … --effort <effort>` | as sc's own (the default home, like `dandelion run`) |
+| `claude-work` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_WORK_CONFIG_DIR`, else `~/.claude-work` |
+| `claude-deepseek` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_DEEPSEEK_CONFIG_DIR`, else `~/.claude-deepseek` |
+| `claude-ollama` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_OLLAMA_CONFIG_DIR`, else `~/.claude-ollama` |
+| `cursor` | Cursor Agent: `cursor-agent -p … --model <model>` (`read_write` firings only) | as sc's own |
+| `agy`, `kimi`, `grok`, `codex`, `codex-animus`, `junie`, `hermes`, `kilo` | not driven: always in `DANDELION_DISABLE` | – |
+
+The table is `dandelion.Providers`, mirrored from dandelion's
+`src/app/launch.ts` (`TARGETS`, `ACCOUNT_HOMES`) and `src/probes/index.ts`.
+Copies of both live in `testdata/dandelion/` and
+`TestProviders_MatchPinnedDandelionSources` fails when they name an account
+the table does not classify; its `README.md` says how to refresh them. The
+`--effort` pair is passed only when the line has an effort Claude Code
+accepts (`low`, `medium`, `high`, `xhigh`, `max`; anything else is dropped
+with a warning). The variables are looked up in the configured `env` first,
+then sc's environment. Everything the Claude and Cursor sections say about
+their invocation, parsing and errors applies to the delegated session; its
+errors and events carry the name `dandelion`. The delegated CLIs are always
+`claude` and `cursor-agent` from `PATH`: a `command` set under
+`[cartridges.claude]` or `[cartridges.cursor]` does not apply to dandelion's
+firings (the factory sees only `[cartridges.dandelion]`).
+
+The router is given the user's whole environment, minus the markers a
+parent Claude Code session sets: it probes every provider the way the user's
+shell would. `DANDELION_DISABLE` is sc's list joined with whatever the user
+already disabled.
+
+### Tool policy
+
+The adapter implements `agents.ToolPolicyEnforcer`:
+
+| `ToolPolicy` | Who gets it | Accounts it may route to | Enforcement |
+|---|---|---|---|
+| `read_only` | product owner | the Claude accounts only (`cursor` is disabled too) | native, Claude Code's own flags |
+| `read_exec` | testers | the Claude accounts only | native, Claude Code's own flags |
+| `read_write` | engineers | the Claude accounts and `cursor` (when `cursor-agent` is on `PATH`) | nothing to restrict (`none`) |
+
+Because `read_only` and `read_exec` are held natively, no worktree copy is
+made and a planning product owner (which has no worktree) can fire on
+dandelion. Defence in depth: a route that names an account the firing's
+policy does not allow, for example `cursor` for a tester because the router
+ignored `DANDELION_DISABLE`, is treated as no route and nothing is started.
+
+### Routing cost and the cache
+
+A probe round starts every enabled provider's CLI and takes about six
+seconds, so:
+
+- one answer serves every firing with the same mode and allowed account set
+  for **2 minutes** (`dandelion.CacheTTL`), so `read_only` and `read_exec`
+  share one, and `read_write` has its own;
+- concurrent firings with the same key share **one** router call, and a
+  firing whose context ends while it waits gives up without cancelling the
+  call the others are waiting for; when the last waiter gives up (the run is
+  stopping) the call is cancelled, so no probe round outlives the run;
+- `--max-age 120` lets a running dandelion dashboard answer from its own
+  snapshot without probing;
+- a delegated session that ends `rate_limited`, `credits_exhausted` or
+  `auth` **benches** the account: until the reset time the CLI reported, or
+  5 minutes (`dandelion.BenchFor`) when it reported none, the account is left
+  out of the allowed set, so it is in `DANDELION_DISABLE` and a route that
+  still names it is refused. This holds even when dandelion's probe still
+  sees headroom the CLI does not (a weekly or model-specific cap). When every
+  account the firing may use is benched, the firing is a `rate_limited` until
+  the first one is back (at most 5 minutes) and the router is not asked;
+- the same failures, a delegated `not_installed`, and a refused route drop
+  every cached route naming that account, and the next call for every key
+  leaves out `--max-age` so the router probes afresh instead of answering
+  from a snapshot that still shows the failed account. A call already in
+  flight when an account fails is not cached, and the next call stays fresh
+  until a fresh one succeeds.
+
+Failures are never cached.
+
+### Error-kind mapping
+
+| What happened | Kind | Why |
+|---|---|---|
+| router prints `none` (exit 1, or exit 0) | `rate_limited`, `RetryAfter` 5 min | nothing has quota now; the supervisor pauses the cartridge and asks again |
+| router exits 1 without printing `none` | `crash`, with dandelion's first stderr line | Node exits 1 on an uncaught exception too; a broken router must not look like empty quota |
+| router exits 2 (`routes.json` unreadable or invalid) | `not_installed`, with dandelion's stderr reason | a human must fix the file. The closest kind that neither retries (`crash` would) nor retires the cartridge for the run (`credits_exhausted` would) |
+| `dandelion` not on `PATH` | `not_installed` | |
+| a line that is not `<model>[ <effort>] <account>`, or more than one line | `crash`, with the line | |
+| any other exit, a timeout (90 s), a cancelled wait | `crash`, `timeout`, `killed` | |
+| route names an account sc cannot drive, one the policy does not allow, or a benched one | `rate_limited`, `RetryAfter` 5 min | treated as no route |
+| every account the firing may use is benched | `rate_limited`, `RetryAfter` until the first is back (at most 5 min) | the router is not asked |
+| delegated session: `credits_exhausted` | **`rate_limited`**, `RetryAfter` 1 min, account benched | the supervisor retires a cartridge *by name*; one empty account must not retire every other account behind the router |
+| delegated session: `auth` | **`rate_limited`**, `RetryAfter` 1 min, account benched | the supervisor fails an `auth` firing without a retry; one logged-out account must not fail firings another account can serve |
+| delegated session: `rate_limited` | `rate_limited`, `RetryAfter` the CLI's own but at most 1 min, account benched until the CLI's reset | the pause is per name too, so an account's (possibly hours-long) back-off would pause every account; the bench keeps that account out instead. When every account is out the next route says `none` |
+| delegated session: `not_installed` | unchanged, cached route dropped | |
+| delegated session: anything else | unchanged | |
+
+Every delegated failure's message names the account and model, for example
+`cartridge dandelion: rate limited: account claude-work (claude-opus-5-5) is out of credits; routing again: …`.
+
+### Detect and visibility
+
+`Detect` resolves the router on `PATH` and then runs the Claude adapter's
+Detect (`claude --version`, `claude auth status --json`): the product owner
+and the testers can only ever run on Claude Code. It never asks for a route.
+`Status.Version` is Claude Code's, and `Status.Detail` names the mode and
+the accounts, for example `dandelion route --high over claude, claude-work,
+claude-deepseek, claude-ollama (Claude Code) and cursor (Cursor Agent,
+read_write firings only); claude: logged in as …`.
+
+Each firing logs `dandelion routed a firing` to the run log with `agent`,
+`account`, `model`, `effort`, `mode`, `policy` and `cached`; that line is
+where the model a dandelion agent really ran on is recorded. The agent's own
+`Model` in state and the TUI stays the configured mode (`high`), because the
+supervisor stamps it before the adapter routes.
+
+### Tests
+
+`internal/cartridge/dandelion` runs against a fake `dandelion`
+(`testutil.FakeBin`, answering from files so a test can change the route
+between calls and recording `DANDELION_DISABLE` per call) and fake `claude`
+and `cursor-agent` binaries replaying the fixtures in `testdata/claude/` and
+`testdata/cursor/`, on a `PATH` without the real tools. No test runs the real
+router.
+
 ## Conformance suite
 
 Package `internal/cartridge/conformance` (P2-09) runs the same fixed set of
@@ -392,12 +557,12 @@ make cartridge-conformance CARTRIDGE=claude # the installed Claude Code, about 5
 The target runs `TestConformance` in the package with `-v`; the table is
 printed to stdout and the target fails when any check fails. Knobs:
 
-- `CARTRIDGE=<name>`: the registry name to build (`mock`, `claude` or `cursor` today).
+- `CARTRIDGE=<name>`: the registry name to build (`mock`, `claude`, `cursor` or `dandelion` today).
   Any name but `mock` fires the real CLI and is **skipped when `CI` is set**,
   so CI only ever runs the mock.
 - `SC_CONFORMANCE_MODEL=<model>`: the model for real cartridges; the default
   is the cheapest one per cartridge (`claude-haiku-4-5-20251001` for
-  Claude).
+  Claude, `standard` for dandelion, whose model is its mode).
 - `SC_CONFORMANCE_CHECKS=detect,timeout,kill`: run a subset (unselected
   checks are reported as `SKIP`).
 
@@ -519,9 +684,31 @@ beads-readonly  PASS    17.98s  bd update refused through the shim; 6 events, 37
 classifies as a retryable `crash`, and a second attempt sat silent until
 the 3-minute session timeout. Both are the service, not the adapter.)
 
+### Expected output: dandelion
+
+`make cartridge-conformance CARTRIDGE=dandelion` builds the cartridge with
+model `standard` (`SC_CONFORMANCE_MODEL=high` asks for `--high`, which costs
+far more) and fires real sessions on whatever accounts the router names. It
+has **not been run live yet** (P2-17 shipped with the unit tests only). What
+it should show:
+
+- `detect` passes when `dandelion` and a logged-in Claude Code are on
+  `PATH`; its detail is the mode and account list described above.
+- `echo`, `structured`, `refuse`, `timeout`, `kill` and `beads-readonly` are
+  `read_only` or `read_exec`, so they always land on a Claude account and
+  should look like the Claude Code run above. In particular `refuse`
+  passes: unlike plain `cursor`, dandelion never gives a read-only session
+  to Cursor.
+- `write` is `read_write` and may land on `cursor`, which passes it too.
+- Expected failures: none by design. When the router answers `none`, every
+  session check fails with `cartridge dandelion: rate limited: dandelion
+  route found no account with quota left`; that is the quota, not the
+  adapter. The first check waits for a probe round (about six seconds); the
+  rest share the cached route.
+
 ## Adding a new cartridge
 
-**Claude Code and Cursor Agent ship today (D-29).** Kimi (P2-04), Animus (P2-05) and a
+**Claude Code, Cursor Agent and the dandelion router ship today (D-29, D-30).** Kimi (P2-04), Animus (P2-05) and a
 custom-command adapter (P2-06) are planned and stay blocked until the human
 reopens them; do not pick them up on your own. This guide is for the day
 they are reopened, or for any other LLM CLI: the interface, registry, mock,
@@ -951,6 +1138,9 @@ the file under `read_write`, `refuse` must create nothing under `read_only`.
    `model` (passed to the CLI), `command` (alternative binary; use
    `cfg.Binary(Name)`), `args` (appended last to every firing) and `env`
    (set on the child). Do not add adapter-specific config fields; use `env`.
+   When only some `model` values make sense (dandelion's is a mode, D-30),
+   reject the rest in `config.ValidateCartridgeModel`, which the config
+   loader and `sc cartridge --add` both call.
 5. **Selection needs nothing from you.** `cartridge.NewSelector` /
    `BuildSelector` implement D-12 (active cartridge, per-role override,
    Detect-probed with a TTL, Warning + fallback when an override fails) over
