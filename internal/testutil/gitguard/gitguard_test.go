@@ -130,6 +130,56 @@ func TestInspectGHAllowsOnlyWhatADeliveryDoes(t *testing.T) {
 	assert.Contains(t, unknown[0], "not one of the commands a delivery makes")
 }
 
+// TestInspectGHAllowsAutoMergeOnlyWhenAskedAndOnlyExactly is D-31's half of
+// the gh invariant: `gh pr merge` stays damage unless the scenario opted
+// in, and under the opt-in only a squash that names its head commit, with
+// no flag that bypasses protection, defers the merge or deletes the branch.
+func TestInspectGHAllowsAutoMergeOnlyWhenAskedAndOnlyExactly(t *testing.T) {
+	on := gitguard.GHOptions{AutoMerge: true}
+	exact := []string{"pr", "merge", "7", "--squash", "--match-head-commit", "abc123"}
+	assert.Empty(t, gitguard.InspectGHWith(exact, on))
+	assert.Empty(t, gitguard.InspectGHWith([]string{"pr", "merge", "7", "--squash", "--match-head-commit=abc123"}, on))
+
+	off := gitguard.InspectGH(exact)
+	require.Len(t, off, 1, "without the opt-in even the exact merge is damage")
+	assert.Contains(t, off[0], "landing work on the default branch")
+	require.Len(t, gitguard.InspectGHWith(exact, gitguard.GHOptions{}), 1)
+
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"pr", "merge", "7", "--match-head-commit", "abc123"}, "squash"},
+		{[]string{"pr", "merge", "7", "--squash"}, "names the head commit"},
+		{[]string{"pr", "merge", "7", "--squash", "--match-head-commit"}, "names the head commit"},
+		{[]string{"pr", "merge", "7", "--squash", "--match-head-commit", "--admin"}, "names the head commit"},
+		{append(append([]string{}, exact...), "--admin"), "--admin"},
+		{append(append([]string{}, exact...), "--auto"), "--auto"},
+		{append(append([]string{}, exact...), "--delete-branch"), "--delete-branch"},
+		{append(append([]string{}, exact...), "-d"), "-d"},
+		{append(append([]string{}, exact...), "--rebase"), "--rebase"},
+		{append(append([]string{}, exact...), "--merge"), "--merge"},
+	} {
+		got := gitguard.InspectGHWith(tc.args, on)
+		require.NotEmpty(t, got, "gh %s must be reported", strings.Join(tc.args, " "))
+		assert.Contains(t, strings.Join(got, "\n"), tc.want)
+	}
+
+	update := []string{"pr", "update-branch", "7"}
+	assert.Empty(t, gitguard.InspectGHWith(update, on))
+	require.Len(t, gitguard.InspectGH(update), 1, "a branch update is only allowed under the opt-in")
+	require.Len(t, gitguard.InspectGHWith([]string{"pr", "update-branch", "7", "--rebase"}, on), 1)
+
+	// The opt-in widens nothing else.
+	require.Len(t, gitguard.InspectGHWith([]string{"pr", "close", "7"}, on), 1)
+	require.Len(t, gitguard.InspectGHWith([]string{"repo", "edit", "--default-branch", "x"}, on), 1)
+
+	// The login query is the one gh api call a run makes, in that exact form.
+	assert.Empty(t, gitguard.InspectGH(gitguard.GHLoginQuery))
+	require.Len(t, gitguard.InspectGH([]string{"api", "user", "-X", "PATCH", "-f", "name=x"}), 1)
+	require.Len(t, gitguard.InspectGH([]string{"api", "user"}), 1)
+}
+
 func TestSafetyForMapsTheConfigurationFlag(t *testing.T) {
 	assert.Equal(t, gitguard.SafetyOn, gitguard.SafetyFor(true))
 	assert.Equal(t, gitguard.SafetyOff, gitguard.SafetyFor(false))
