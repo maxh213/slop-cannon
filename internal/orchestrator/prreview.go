@@ -608,9 +608,16 @@ type PRReview struct {
 	mu      sync.Mutex
 	tracked map[domain.BeadID]*prReviewEntry
 	seen    map[domain.BeadID]bool
-	stats   PRReviewStats
-	next    int
+	// preRun holds the review beads already reported as left alone
+	// because their pull request predates the run (D-31).
+	preRun map[domain.BeadID]bool
+	stats  PRReviewStats
+	next   int
 }
+
+// preRunSaidLimit bounds [PRReview.preRun]; past it a pre-run review bead
+// is reported on every poll rather than remembered.
+const preRunSaidLimit = 4096
 
 // NewPRReview returns a reviewer configured by opts. It fails only without
 // a watcher: every other part of the job is optional, and a reviewer
@@ -630,6 +637,7 @@ func NewPRReview(opts PRReviewOptions) (*PRReview, error) {
 		log:      opts.Logger,
 		tracked:  map[domain.BeadID]*prReviewEntry{},
 		seen:     map[domain.BeadID]bool{},
+		preRun:   map[domain.BeadID]bool{},
 	}
 	if len(r.lenses) == 0 {
 		r.lenses = domain.Lenses()
@@ -1248,6 +1256,23 @@ func (r *PRReview) settleStale(ctx context.Context, stale []gitx.StaleReview) {
 		bead, _ := is.SafeBead(r.opts.Statuses)
 		if bead.ID == "" || BeadStateSettled(bead.State) {
 			r.forget(bead.ID)
+			continue
+		}
+		if st.Reason == gitx.StalePreRun {
+			// D-31: the pull request is still open and its review is still
+			// owed; it is only not this run's to give. The bead — an earlier
+			// run's, in flight — is not this run's to settle either, so
+			// nothing is written to it whatever the policy, and it is said
+			// once. When the pull request goes it is settled like any other.
+			r.mu.Lock()
+			said := r.preRun[bead.ID]
+			if !said && len(r.preRun) < preRunSaidLimit {
+				r.preRun[bead.ID] = true
+			}
+			r.mu.Unlock()
+			if !said {
+				r.warn(bead.ID, gitx.StaleSentence(st.Reason, prNumberOf(st, bead), st.ForeignRun)+"; leaving its review bead where it is", nil)
+			}
 			continue
 		}
 		r.mu.Lock()
