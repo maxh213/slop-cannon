@@ -63,6 +63,33 @@ func TestRun_NonZeroExit(t *testing.T) {
 	assert.False(t, res.Cancelled)
 }
 
+func TestRun_TailKeepsOnlyTheLastBytesOfEachStream(t *testing.T) {
+	t.Parallel()
+	spec := sh(`i=0; while [ $i -lt 20000 ]; do echo "out $i"; echo "err $i" >&2; i=$((i+1)); done`)
+	spec.StdoutTail, spec.StderrTail = 100, 9
+	res, err := Run(context.Background(), spec)
+	require.NoError(t, err)
+	assert.Len(t, res.Stdout, 100)
+	assert.True(t, strings.HasSuffix(res.Stdout, "out 19998\nout 19999\n"), res.Stdout)
+	assert.Equal(t, "rr 19999\n", res.Stderr, "a tail shorter than a line keeps the line's end")
+}
+
+func TestCaptureHoldsBoundedMemory(t *testing.T) {
+	t.Parallel()
+	c := newCapture(64)
+	chunk := []byte(strings.Repeat("x", 7) + "\n")
+	for i := 0; i < 100000; i++ {
+		_, _ = c.Write(chunk)
+		require.LessOrEqual(t, c.buf.Len(), 2*64, "the buffer is compacted, not grown")
+	}
+	_, _ = c.Write([]byte(strings.Repeat("y", 1000) + "end"))
+	assert.Equal(t, strings.Repeat("y", 61)+"end", c.String(), "a write longer than the limit keeps its own tail")
+
+	all := newCapture(0)
+	_, _ = all.Write([]byte("every byte"))
+	assert.Equal(t, "every byte", all.String(), "zero keeps everything")
+}
+
 func TestRun_Stdin(t *testing.T) {
 	t.Parallel()
 	res, err := Run(context.Background(), Spec{Command: "cat", Stdin: strings.NewReader("hello\nworld")})

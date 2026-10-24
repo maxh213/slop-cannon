@@ -60,6 +60,12 @@ type Spec struct {
 	// would otherwise outlive the agent that started it. The tag sweep reads
 	// /proc and runs on Linux only; elsewhere only the group is killed.
 	ReapDescendants bool
+	// StdoutTail and StderrTail, when positive, make [Run] hold only the
+	// last that many bytes of each stream while the process runs, so a
+	// command that prints far more than its caller keeps costs bounded
+	// memory. Zero captures everything. [Stream] ignores them.
+	StdoutTail int
+	StderrTail int
 }
 
 // Result records what a finished process did.
@@ -122,7 +128,8 @@ func (e *ExitError) Error() string {
 func (e *ExitError) Unwrap() error { return e.Cause }
 
 // Run starts the process described by spec and waits for it to finish,
-// capturing stdout and stderr in full.
+// capturing stdout and stderr in full, or their tails when spec sets
+// StdoutTail or StderrTail.
 //
 // A nil error means the process exited with status 0. Any other outcome
 // after a successful start returns an *ExitError with the populated Result;
@@ -130,8 +137,8 @@ func (e *ExitError) Unwrap() error { return e.Cause }
 // cause. A failure to start (unknown command, bad directory) returns the
 // underlying error and a zero Result.
 func Run(ctx context.Context, spec Spec) (Result, error) {
-	var stdout, stderr bytes.Buffer
-	p, err := start(ctx, spec, &stdout, &stderr)
+	stdout, stderr := newCapture(spec.StdoutTail), newCapture(spec.StderrTail)
+	p, err := start(ctx, spec, stdout, stderr)
 	if err != nil {
 		return Result{}, err
 	}
@@ -145,6 +152,41 @@ func Run(ctx context.Context, spec Spec) (Result, error) {
 		}
 	}
 	return res, err
+}
+
+// capture is where [Run] collects one output stream: all of it, or only
+// the last limit bytes when limit is positive.
+type capture struct {
+	buf   bytes.Buffer
+	limit int
+}
+
+func newCapture(limit int) *capture { return &capture{limit: limit} }
+
+// Write keeps the tail. It compacts only once the buffer holds twice the
+// limit, so a stream written in small pieces is not copied on every write.
+func (c *capture) Write(p []byte) (int, error) {
+	n := len(p)
+	if c.limit > 0 && n > c.limit {
+		c.buf.Reset()
+		p = p[n-c.limit:]
+	}
+	c.buf.Write(p)
+	if c.limit > 0 && c.buf.Len() > 2*c.limit {
+		tail := append([]byte(nil), c.buf.Bytes()[c.buf.Len()-c.limit:]...)
+		c.buf.Reset()
+		c.buf.Write(tail)
+	}
+	return n, nil
+}
+
+// String is what was kept.
+func (c *capture) String() string {
+	b := c.buf.Bytes()
+	if c.limit > 0 && len(b) > c.limit {
+		b = b[len(b)-c.limit:]
+	}
+	return string(b)
 }
 
 // Source identifies which output pipe a [Line] came from.
