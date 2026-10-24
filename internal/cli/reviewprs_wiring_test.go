@@ -199,6 +199,48 @@ func prwEvents(t *testing.T, repo string) []events.Event {
 	return evs
 }
 
+// TestRunNeverReviewsAPullRequestOpenedBeforeTheRun is D-31's review half,
+// through the assembled run with --review-prs on: a pull request that was
+// already open when the run started gets no review bead, no tester and no
+// gh pr review.
+func TestRunNeverReviewsAPullRequestOpenedBeforeTheRun(t *testing.T) {
+	env := runFireSetup(t, true)
+	head := prwContributorBranch(t, env)
+	gh := prwGH(t, head, prwAuthOK)
+	var list []map[string]any
+	require.NoError(t, json.Unmarshal(prwPRList(t, head), &list))
+	list[0]["createdAt"] = time.Now().UTC().Add(-24 * time.Hour).Format(time.RFC3339)
+	old, err := json.Marshal(list)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(gh.Dir, "prlist.json"), old, 0o644))
+	prwSetPollInterval(t, prwInterval)
+
+	stdout, stderr, code := runFireExec(t, env.Repo.Dir, "-m", runFireBrief,
+		"--headless", "--cartridge", "mock", "--verbose")
+	require.Equal(t, 0, code, "stdout:\n%s\nstderr:\n%s", stdout, stderr)
+	require.Contains(t, stdout, "run finished: completed")
+	rec := prwLogRecord(t, env.Repo.Dir, "reviewing external pull requests")
+	require.Equal(t, "gh is installed and a remote exists", rec["reason"], "review is on")
+
+	for _, ev := range prwEvents(t, env.Repo.Dir) {
+		if e, ok := ev.(events.PROpened); ok {
+			require.False(t, e.External, "no external pull request is announced")
+		}
+		if e, ok := ev.(events.BeadCreated); ok {
+			require.NotContains(t, e.Bead.Title, "Review PR #", "no review bead is raised for it")
+		}
+	}
+	var polls int
+	for _, in := range gh.Invocations(t) {
+		require.False(t, prwArg(in.Args, 0) == "pr" && prwArg(in.Args, 1) == "review", "it is never reviewed")
+		require.False(t, prwArg(in.Args, 0) == "pr" && prwArg(in.Args, 1) == "merge", "nor merged")
+		if prwIsPoll(in.Args) {
+			polls++
+		}
+	}
+	require.Positive(t, polls, "the watcher did list it")
+}
+
 // TestRunReviewsAnExternalPullRequestEndToEnd is P8-04's wiring, fired for
 // real: `sc <repo> -m … --headless` with a gh that lists somebody else's
 // open pull request must raise a review bead, fire one tester per lens at a
