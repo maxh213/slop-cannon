@@ -31,6 +31,10 @@ import (
 //     external pull requests [PRWatcher] offers for review: nothing that
 //     existed before the run started is ever merged, reviewed, adopted or
 //     pushed to.
+//   - [PRDeliverer.ReviewedHead] judges the commits, which ownership does
+//     not: a head is merged only when it is the tip delivery recorded as
+//     sc_pr_head, the one the testers approved, or that tip plus GitHub's
+//     clean update merges of the base.
 //   - [GH.ViewPR] reads everything a merge decision needs in one call;
 //     [PRView.Checks] judges the status-check rollup. `gh pr checks` is not
 //     used: it exits non-zero while a check is pending or failed, and [GH]

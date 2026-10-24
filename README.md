@@ -372,8 +372,12 @@ for a default branch that deploys to production, so it errs on waiting:
   existed before the run started is ever merged, reviewed, adopted or pushed
   to — with auto-merge off too: a pull request already on a bead's branch
   that fails the check is handed to you instead of reused.
+- **Only what was reviewed.** The head must be the commit the run delivered
+  and its testers approved, or that commit plus GitHub's clean update merges
+  of the default branch. A commit anybody else pushes to the branch waits
+  for you.
 - **Only when green.** At least one check, every check finished and passed,
-  every name in `auto_merge_checks` among them, and GitHub reporting the
+  every name in `auto_merge_checks` among them (at least one is required), and GitHub reporting the
   pull request `CLEAN`. A required review (`BLOCKED`) waits for you; nothing
   is bypassed.
 - **Only exactly.** `gh pr merge <n> --squash --match-head-commit <sha>`, the
@@ -388,7 +392,7 @@ for a default branch that deploys to production, so it errs on waiting:
   pull request is waiting for.
 
 `conventional_pr_titles = true` titles the pull requests `fix: …`, `feat: …`
-or `chore: …` from the bead's type, for repositories whose CI checks
+or `chore: …` from the bead's type (never an agent's own type or `!`), for repositories whose CI checks
 Conventional Commit titles; a squash merge makes the title the commit
 subject.
 

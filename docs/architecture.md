@@ -137,8 +137,10 @@ machine ([below](#bead-states-d-07)) is what makes each move legal.
 11a gate poller    the human merges the PR; the gate
                    resolves and the bead is closed (D-20)    delivering → closed
                    with auto_merge (D-31) the poller merges
-                   the run's own green, CLEAN PR itself, at
-                   most one per auto_merge_spacing; a failed
+                   the run's own green, CLEAN PR itself at
+                   the head its testers approved (or GitHub's
+                   clean update of it), at most one per
+                   auto_merge_spacing; a failed
                    check or a conflict found there goes back
                    to the engineer                           delivering → changes_requested
 11b safety off     the merge landed; `bd close` with
