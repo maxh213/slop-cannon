@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/agents"
+	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 )
 
@@ -89,6 +91,38 @@ func TestRunSignalsKeepsTheLast32KiBCutAtALineBoundary(t *testing.T) {
 	}
 }
 
+func TestRunSignalsHoldsATailOfAHugeOutput(t *testing.T) {
+	// About 12 MiB: what `cat` of a production log prints.
+	read := RunSignals(context.Background(), SignalsOptions{
+		Command: `yes 'GET /checkout 500 upstream timed out' | head -n 300000; echo last line`,
+		Dir:     t.TempDir(), Timeout: time.Minute,
+	})
+	require.False(t, read.Failed(), read.Err)
+	assert.True(t, read.Truncated)
+	assert.LessOrEqual(t, len(read.Output), agents.MaxSignalsBytes)
+	assert.True(t, strings.HasSuffix(read.Output, "upstream timed out\nlast line\n"))
+}
+
+func TestSignalsSpecHoldsOnlyATailOfEachStream(t *testing.T) {
+	t.Parallel()
+	spec := signalsSpec("cat app.log", "/repo", time.Minute)
+	assert.Equal(t, []string{"-c", "cat app.log"}, spec.Args)
+	assert.True(t, spec.ReapDescendants)
+	assert.Equal(t, 4*agents.MaxSignalsBytes+1, spec.StdoutTail, "a whole log is never held in memory")
+	assert.Equal(t, signalsStderrMax, spec.StderrTail)
+}
+
+func TestRunSignalsRecognisesARepeatedFailureByItsKind(t *testing.T) {
+	run := func(command string) SignalsReading {
+		return RunSignals(context.Background(), SignalsOptions{Command: command, Dir: t.TempDir(), Timeout: time.Minute})
+	}
+	a, b := run("echo 'request r-1: 503' >&2; exit 2"), run("echo 'request r-2: 503' >&2; exit 2")
+	assert.Equal(t, "exit status 2: request r-1: 503", a.Err)
+	assert.NotEqual(t, a.Err, b.Err)
+	assert.Equal(t, a.failureKey(), b.failureKey(), "a request id on the error line is the same failure")
+	assert.NotEqual(t, a.failureKey(), run("exit 3").failureKey(), "a different exit status is not")
+}
+
 func TestSignalsTail(t *testing.T) {
 	t.Parallel()
 	got, cut := signalsTail("abc\ndef\n", 100)
@@ -114,6 +148,7 @@ type signalsFake struct {
 	mu    sync.Mutex
 	out   string
 	err   string
+	class string
 	calls int
 	now   func() time.Time
 }
@@ -122,7 +157,7 @@ func (s *signalsFake) run(context.Context) SignalsReading {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
-	r := SignalsReading{Command: "signals", RanAt: s.now(), Output: s.out, Err: s.err}
+	r := SignalsReading{Command: "signals", RanAt: s.now(), Output: s.out, Err: s.err, class: s.class}
 	if s.err != "" {
 		r.ExitCode = 1
 	}
@@ -133,6 +168,13 @@ func (s *signalsFake) set(out, err string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.out, s.err = out, err
+}
+
+// fail makes the next readings fail with err, recognised as class.
+func (s *signalsFake) fail(err, class string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.out, s.err, s.class = "", err, class
 }
 
 func (s *signalsFake) count() int {
@@ -317,6 +359,53 @@ func TestPlannerWarnsOncePerDistinctSignalsFailureAndPlansAnyway(t *testing.T) {
 	assert.Equal(t, 3, f.runner.count(), "no failure ever stopped a plan")
 }
 
+func TestPlannerWarnsOnceForAFailureWhoseErrorLineKeepsChanging(t *testing.T) {
+	f := signalsSetup(t, "")
+	f.sig.fail("exit status 1: request r-1", "exit status 1")
+	f.fire()
+	f.sig.fail("exit status 1: request r-2", "exit status 1")
+	f.clock.Advance(signalsInterval)
+	f.fire()
+	assert.Equal(t, 2, f.sig.count())
+	assert.Equal(t, 1, strings.Count(f.log(), "the signals command gave no reading"))
+}
+
+func TestPlannerDropsAReadingCutShortByItsContext(t *testing.T) {
+	f := signalsSetup(t, "")
+	f.fire()
+	f.sig.fail("stopped with the run", "stopped with the run")
+	f.clock.Advance(signalsInterval)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	assert.Nil(t, f.p.signalsForPlan(ctx))
+	f.settle()
+	assert.Equal(t, 2, f.sig.count())
+	assert.NotContains(t, f.log(), "the signals command gave no reading", "a run stopping is no news about production")
+	f.p.sigMu.Lock()
+	defer f.p.sigMu.Unlock()
+	require.NotNil(t, f.p.sig.last)
+	assert.Equal(t, "ERROR E-1 boom\n", f.p.sig.last.Output, "the reading before it stays cached")
+}
+
+func TestPlannerMarksTheRunsStateWhenABackgroundReadingLands(t *testing.T) {
+	f := signalsSetup(t, "")
+	run, err := New(planningRunConfig(t, ""), Options{Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Now: f.clock.Now})
+	require.NoError(t, err)
+	run.UseVitals(func() RunVitals { return RunVitals{} })
+	run.mu.Lock()
+	run.stateDirty = false
+	run.mu.Unlock()
+	f.p.Attach(run)
+
+	f.p.sigMu.Lock()
+	f.p.startSignalsLocked(context.Background())
+	f.p.sigMu.Unlock()
+	f.settle()
+	run.mu.Lock()
+	defer run.mu.Unlock()
+	assert.True(t, run.stateDirty, "the reading reaches state.json, so sc status shows it")
+}
+
 // signalsFirstPlan fires the run's first plan (which takes the first
 // reading) and puts an engineer to work on it.
 func signalsFirstPlan(t *testing.T) *signalsFixture {
@@ -352,6 +441,47 @@ func TestPlannerOffersNothingForAnUnchangedReading(t *testing.T) {
 	assert.Empty(t, f.demands())
 	assert.Equal(t, 2, f.sig.count(), "the reading was taken")
 	assert.Empty(t, f.demands(), "but it is what the last plan saw")
+}
+
+func TestPlannerOffersNothingWhenTheReadingChangesToEmpty(t *testing.T) {
+	f := signalsFirstPlan(t)
+	f.sig.set("", "")
+	f.clock.Advance(signalsInterval)
+	f.demands()
+	assert.Equal(t, 2, f.sig.count())
+	assert.Empty(t, f.demands(), "production went quiet: nothing for a plan of its own to do")
+}
+
+func TestPlannerTakesTheFirstReadingOfAResumedRunAsTheBaseline(t *testing.T) {
+	f := signalsSetup(t, "")
+	// What adoptResumedPlan leaves: a plan counted as made, none of whose
+	// firings this process ran, so no plan has been given a reading.
+	f.p.mu.Lock()
+	f.p.attempts, f.p.plans, f.p.resumedPlan = 1, 1, true
+	f.p.mu.Unlock()
+	f.beads.set(planningBead("sc-alpha", domain.BeadStateInProgress))
+	f.busy()
+
+	f.demands()
+	assert.Equal(t, 1, f.sig.count())
+	assert.Empty(t, f.demands(), "the same output as before the restart is no change")
+
+	f.sig.set("ERROR E-2\n", "")
+	f.clock.Advance(signalsInterval)
+	f.demands()
+	assert.Equal(t, []Demand{planDemand()}, f.demands(), "a change after the baseline still plans")
+}
+
+func TestPlannerHoldsSignalsDuringTheIdleHoldAfterAnEmptyPlan(t *testing.T) {
+	f := signalsFirstPlan(t)
+	f.p.mu.Lock()
+	f.p.nextAt = f.clock.Now().Add(2 * signalsInterval)
+	f.p.mu.Unlock()
+	f.sig.set("ERROR E-2\n", "")
+	f.clock.Advance(signalsInterval)
+	f.demands()
+	assert.Empty(t, f.demands(), "idle_replan_interval's hold holds a signals plan too")
+	assert.Equal(t, 1, f.sig.count(), "and no reading is taken during it")
 }
 
 func TestPlannerOffersNothingForAFailedReading(t *testing.T) {
@@ -409,6 +539,50 @@ func TestPlannerWaitsWhileThePreviousSignalsPlanIsUntouched(t *testing.T) {
 	f.clock.Advance(signalsInterval)
 	f.demands()
 	assert.Equal(t, []Demand{planDemand()}, f.demands(), "one of them has been picked up")
+}
+
+func TestPlannerWaitsWhenItCannotListThePreviousSignalsPlansBeads(t *testing.T) {
+	f := signalsFirstPlan(t)
+	f.sig.set("ERROR E-2\n", "")
+	f.clock.Advance(signalsInterval)
+	f.demands()
+	require.Equal(t, []Demand{planDemand()}, f.demands())
+	f.runner.setPlan(planningPlan("fix-e2"))
+	f.fire()
+	f.busy()
+
+	f.beads.mu.Lock()
+	f.beads.err = errors.New("bd is not answering")
+	f.beads.mu.Unlock()
+	f.sig.set("ERROR E-3\n", "")
+	f.clock.Advance(signalsInterval)
+	f.demands()
+	assert.Empty(t, f.demands(), "when it cannot tell, it waits rather than plans")
+}
+
+func TestPlannerRecordsNoBeadsForAFailedSignalsPlan(t *testing.T) {
+	f := signalsSetup(t, "")
+	f.p.sig.firing = true
+	f.p.signalsPlanned(map[string]domain.BeadID{"fix": "sc-fix"}, errors.New("apply failed"))
+	assert.False(t, f.p.sig.firing)
+	assert.Empty(t, f.p.sig.planBeads)
+	assert.False(t, f.p.sig.untouched)
+
+	f.p.sig.firing = true
+	f.p.signalsPlanned(map[string]domain.BeadID{"fix": "sc-fix"}, nil)
+	assert.Equal(t, []domain.BeadID{"sc-fix"}, f.p.sig.planBeads)
+	assert.True(t, f.p.sig.untouched)
+}
+
+func TestPlannerSignalsStatusOnceTheReadingIsOverdue(t *testing.T) {
+	f := signalsSetup(t, "")
+	f.fire()
+	f.clock.Advance(signalsInterval + time.Minute)
+	st := f.p.Status().Signals
+	require.NotNil(t, st)
+	assert.True(t, st.NextAt.IsZero(), "a due time gone by is shown as the next plan")
+	v := RunVitals{At: f.clock.Now(), Planning: f.p.Status()}
+	assert.Contains(t, v.SignalsLine(), "· due on the next plan")
 }
 
 func TestPlannerKeepsTheP828HoldForASignalsPlan(t *testing.T) {
@@ -484,4 +658,27 @@ func TestPlannerRunsTheConfiguredSignalsCommand(t *testing.T) {
 	req, _ := runner.last()
 	require.NotNil(t, req.Signals)
 	assert.Equal(t, fmt.Sprintf("ran in %s\ntoken ghp_[REDACTED]\n", rc.Run.RepoPath), req.Signals.Output)
+	assert.NotContains(t, req.Signals.Command, "ghp_ABCDEFGHIJKLMNOPQRST", "the command the prompt echoes is filtered too")
+	assert.Equal(t, config.DefaultSignalsInterval, p.sigInterval)
+}
+
+// signals_interval and limits.signals_timeout come from the configuration
+// when no option overrides them.
+func TestPlannerTakesTheConfiguredSignalsIntervalAndTimeout(t *testing.T) {
+	rc := planningRunConfig(t, "")
+	rc.Effective.SignalsCommand = "echo started; sleep 30"
+	rc.Effective.SignalsInterval = config.NewDuration(7 * time.Minute)
+	rc.Effective.Limits.SignalsTimeout = config.NewDuration(200 * time.Millisecond)
+	runner := &planningRunner{plan: planningPlan("alpha")}
+	p, err := NewPlanner(PlannerOptions{
+		Config: rc, Runner: runner, Applier: &planningApplier{}, NoShim: true,
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	assert.Equal(t, 7*time.Minute, p.sigInterval)
+	_, err = p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.NoError(t, err)
+	req, _ := runner.last()
+	require.NotNil(t, req.Signals)
+	assert.Equal(t, "timed out after 200ms", req.Signals.Failure)
 }

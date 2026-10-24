@@ -53,10 +53,24 @@ type SignalsReading struct {
 	// Err is one line saying why the reading is unusable — a non-zero
 	// exit, a timeout, a command that did not start; empty on success.
 	Err string `json:"error,omitempty"`
+	// class is Err without the standard error line — "exit status 3",
+	// "timed out after 5m0s" — which is what a repeated failure is
+	// recognised by: a CLI that puts a request id or a timestamp on its
+	// last error line still fails the same way.
+	class string
 }
 
 // Failed reports whether the reading is unusable as evidence.
 func (r SignalsReading) Failed() bool { return r.Err != "" }
+
+// failureKey is what tells one failure from another, for warning once per
+// distinct failure.
+func (r SignalsReading) failureKey() string {
+	if r.class != "" {
+		return r.class
+	}
+	return r.Err
+}
 
 // hash identifies a successful reading's output, so the planner can tell a
 // changed reading from the one the last plan already saw. A failed reading
@@ -98,6 +112,10 @@ const signalsDefaultTimeout = 5 * time.Minute
 // signalsErrLineMax bounds the one line a failure is reported as.
 const signalsErrLineMax = 300
 
+// signalsStderrMax bounds how much standard error a reading holds while the
+// command runs: only its last line is ever used.
+const signalsStderrMax = 4 << 10
+
 // RunSignals runs the signals command and returns its reading. It never
 // returns an error: a command that fails, exits non-zero or times out is a
 // reading whose Err says so, because production being unreachable must
@@ -118,19 +136,7 @@ func RunSignals(ctx context.Context, o SignalsOptions) SignalsReading {
 	}
 	command := o.Filter.Text(textsafe.ScrubLine(o.Command))
 	read := SignalsReading{Command: command, RanAt: now()}
-	var inherit []string
-	for _, kv := range os.Environ() {
-		name, _, _ := strings.Cut(kv, "=")
-		inherit = append(inherit, name)
-	}
-	res, err := proc.Run(ctx, proc.Spec{
-		Command:         "sh",
-		Args:            []string{"-c", o.Command},
-		Dir:             o.Dir,
-		InheritEnv:      inherit,
-		Timeout:         timeout,
-		ReapDescendants: true,
-	})
+	res, err := proc.Run(ctx, signalsSpec(o.Command, o.Dir, timeout))
 	read.ExitCode, read.Duration = res.ExitCode, res.Duration
 	read.Output, read.Truncated = signalsClean(res.Stdout, o.Filter)
 	if err == nil {
@@ -153,11 +159,36 @@ func RunSignals(ctx context.Context, o SignalsOptions) SignalsReading {
 	default:
 		why = "could not start: " + err.Error()
 	}
+	read.class = signalsLine(o.Filter.Text(textsafe.ScrubLine(why)))
 	if last := signalsLastLine(res.Stderr); last != "" {
 		why += ": " + last
 	}
 	read.Err = signalsLine(o.Filter.Text(textsafe.ScrubLine(why)))
 	return read
+}
+
+// signalsSpec is how the signals command runs: "sh -c" in dir with the
+// whole of the user's environment, its leftovers reaped, and only a tail of
+// each stream held while it runs.
+func signalsSpec(command, dir string, timeout time.Duration) proc.Spec {
+	var inherit []string
+	for _, kv := range os.Environ() {
+		name, _, _ := strings.Cut(kv, "=")
+		inherit = append(inherit, name)
+	}
+	return proc.Spec{
+		Command:         "sh",
+		Args:            []string{"-c", command},
+		Dir:             dir,
+		InheritEnv:      inherit,
+		Timeout:         timeout,
+		ReapDescendants: true,
+		// The command can print far more than is kept — `cat` of a whole
+		// log — so only a tail is held while it runs. One byte over the
+		// window is how [signalsClean] still sees that it was cut.
+		StdoutTail: 4*agents.MaxSignalsBytes + 1,
+		StderrTail: signalsStderrMax,
+	}
 }
 
 // signalsClean turns raw standard output into prompt-safe evidence: cut to
@@ -245,8 +276,14 @@ type signalsState struct {
 	// warned is the failure last warned about, so a command that keeps
 	// failing the same way warns once.
 	warned string
-	// seen is the hash of the successful reading the last plan was given.
-	seen string
+	// seen is the hash of the successful reading the last plan was given,
+	// and given is true once any plan of this process has been given a
+	// reading. Until then the first reading is the baseline, not a change:
+	// a resumed run that adopted its plan from state.json has given no
+	// plan a reading, and production printing what it printed before the
+	// restart is no reason to plan.
+	seen  string
+	given bool
 	// wanted latches a signals-driven plan demand until a plan fires.
 	wanted bool
 	// firing is true while the firing that consumed the latch runs, and
@@ -254,8 +291,8 @@ type signalsState struct {
 	firing  bool
 	firedAt time.Time
 	// planBeads are the beads the last signals-driven plan created, and
-	// untouched is true when, at the last background reading, every one of
-	// them was still open: nothing has picked any of them up yet.
+	// untouched is true when, at the last reading, every one of them was
+	// still open: nothing has picked any of them up yet.
 	planBeads []domain.BeadID
 	untouched bool
 }
@@ -284,8 +321,9 @@ func (p *Planner) signalsDueLocked(now time.Time) bool {
 // command that may take minutes. The demand is offered only when all of
 // these hold:
 //
-//   - the latest reading succeeded and its output differs from the reading
-//     the last plan was given;
+//   - the latest reading succeeded, printed something, and its output
+//     differs from the reading the last plan was given (the first reading
+//     a process takes with no plan given one is the baseline);
 //   - no signals-driven plan has fired within `signals_interval`;
 //   - the previous signals-driven plan's beads are not all still open (all
 //     open means nobody has picked any up yet, and another plan would only
@@ -303,9 +341,15 @@ func (p *Planner) signalsWantLocked(ctx context.Context, now time.Time) bool {
 	case s.running:
 		return false
 	case p.signalsDueLocked(now):
-		p.startSignalsLocked(ctx, true)
+		p.startSignalsLocked(ctx)
 		return false
 	case s.last.Failed() || s.last.hash() == s.seen:
+		return false
+	case !s.given:
+		s.seen, s.given = s.last.hash(), true
+		return false
+	case !s.last.plan().Evidence():
+		// Production went quiet: nothing for a plan of its own to act on.
 		return false
 	case !s.firedAt.IsZero() && now.Sub(s.firedAt) < p.sigInterval:
 		return false
@@ -316,20 +360,18 @@ func (p *Planner) signalsWantLocked(ctx context.Context, now time.Time) bool {
 	return true
 }
 
-// startSignalsLocked starts a reading on its own goroutine. check also
-// looks up whether the previous signals-driven plan's beads are untouched,
-// for the next demand decision. The caller holds sigMu.
-func (p *Planner) startSignalsLocked(ctx context.Context, check bool) {
+// startSignalsLocked starts a reading on its own goroutine. Each reading
+// also looks up whether the previous signals-driven plan's beads are
+// untouched, for the next demand decision, so a reading a quiet-time plan
+// took refreshes it too. The caller holds sigMu.
+func (p *Planner) startSignalsLocked(ctx context.Context) {
 	s := &p.sig
 	s.running, s.done = true, make(chan struct{})
 	prev := append([]domain.BeadID(nil), s.planBeads...)
 	go func() {
 		read := p.signalsRun(ctx)
-		untouched := false
-		if check {
-			untouched = p.signalsUntouched(ctx, prev)
-		}
-		p.finishSignals(read, check, untouched)
+		untouched := p.signalsUntouched(ctx, prev)
+		p.finishSignals(read, untouched, ctx.Err() != nil)
 	}()
 }
 
@@ -360,18 +402,25 @@ func (p *Planner) signalsUntouched(ctx context.Context, ids []domain.BeadID) boo
 // error, and then wakes whoever is waiting for it, so a plan that waited
 // for the reading is never fired ahead of its warning. It is called with no
 // lock held, and warns only after releasing sigMu.
-func (p *Planner) finishSignals(read SignalsReading, checked, untouched bool) {
+//
+// A reading cut short because its context ended — the run stopping, the
+// firing that wanted it abandoned — says nothing about production: it is
+// dropped, with no warning, and the reading before it stays cached.
+func (p *Planner) finishSignals(read SignalsReading, untouched, cancelled bool) {
 	p.sigMu.Lock()
 	s := &p.sig
-	s.last, s.running = &read, false
-	if checked {
-		s.untouched = untouched
-	}
+	s.running = false
 	done := s.done
 	s.done = nil
-	warn := read.Failed() && read.Err != s.warned
+	if cancelled {
+		p.sigMu.Unlock()
+		close(done)
+		return
+	}
+	s.last, s.untouched = &read, untouched
+	warn := read.Failed() && read.failureKey() != s.warned
 	if read.Failed() {
-		s.warned = read.Err
+		s.warned = read.failureKey()
 	} else {
 		s.warned = ""
 	}
@@ -384,9 +433,7 @@ func (p *Planner) finishSignals(read SignalsReading, checked, untouched bool) {
 	if r := p.host(); r != nil {
 		r.VitalsChanged()
 	}
-	if done != nil {
-		close(done)
-	}
+	close(done)
 }
 
 // signalsForPlan returns the reading a planning firing is given: the cached
@@ -401,7 +448,7 @@ func (p *Planner) signalsForPlan(ctx context.Context) *agents.PlanSignals {
 	}
 	p.sigMu.Lock()
 	if !p.sig.running && p.signalsDueLocked(p.opts.Now()) {
-		p.startSignalsLocked(ctx, false)
+		p.startSignalsLocked(ctx)
 	}
 	done := p.sig.done
 	p.sigMu.Unlock()
@@ -422,6 +469,7 @@ func (p *Planner) signalsForPlan(ctx context.Context) *agents.PlanSignals {
 	if !s.last.Failed() {
 		s.seen = s.last.hash()
 	}
+	s.given = true
 	if s.wanted {
 		s.wanted, s.firing, s.firedAt = false, true, p.opts.Now()
 	}
@@ -458,7 +506,12 @@ func (p *Planner) signalsStatusLocked() *SignalsStatus {
 	st := &SignalsStatus{Running: p.sig.running}
 	if r := p.sig.last; r != nil {
 		st.LastAt, st.ExitCode, st.Bytes, st.LastError = r.RanAt, r.ExitCode, len(r.Output), r.Err
-		st.NextAt = r.RanAt.Add(p.sigInterval)
+		// Once it is due and nothing has taken it (a demand is latched,
+		// a hold is on, or the run is quiet and the reading waits for the
+		// next plan) it is due on the next plan, not at a time gone by.
+		if next := r.RanAt.Add(p.sigInterval); next.After(p.opts.Now()) {
+			st.NextAt = next
+		}
 	}
 	return st
 }

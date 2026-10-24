@@ -1303,10 +1303,13 @@ func (v RunVitals) SignalsLine() string {
 		return "signals: not run yet, due on the next plan"
 	}
 	parts := []string{"last " + v.when(s.LastAt), fmt.Sprintf("exit %d", s.ExitCode), fmt.Sprintf("%d bytes", s.Bytes)}
-	if s.Running {
+	switch {
+	case s.Running:
 		parts = append(parts, "running now")
-	} else if !s.NextAt.IsZero() {
+	case !s.NextAt.IsZero():
 		parts = append(parts, "next "+v.when(s.NextAt))
+	default:
+		parts = append(parts, "due on the next plan")
 	}
 	if s.LastError != "" {
 		parts = append(parts, "last error: "+s.LastError)
