@@ -1249,6 +1249,9 @@ func (v RunVitals) Lines() []string {
 	if l := v.AutoMergeLine(); l != "" {
 		out = append(out, l)
 	}
+	if l := v.SignalsLine(); l != "" {
+		out = append(out, l)
+	}
 	if l := v.ForeignLine(); l != "" {
 		out = append(out, l)
 	}
@@ -1368,6 +1371,35 @@ func (v RunVitals) AutoMergeLine() string {
 	return "auto-merge: " + strings.Join(parts, " · ")
 }
 
+// SignalsLine reports the production signals command (P6-71): when it last
+// ran, how it exited, how much it kept and when it is next due; "" when the
+// run takes no signals.
+func (v RunVitals) SignalsLine() string {
+	s := v.Planning.Signals
+	if s == nil {
+		return ""
+	}
+	if s.LastAt.IsZero() {
+		if s.Running {
+			return "signals: running now"
+		}
+		return "signals: not run yet, due on the next plan"
+	}
+	parts := []string{"last " + v.when(s.LastAt), fmt.Sprintf("exit %d", s.ExitCode), fmt.Sprintf("%d bytes", s.Bytes)}
+	switch {
+	case s.Running:
+		parts = append(parts, "running now")
+	case !s.NextAt.IsZero():
+		parts = append(parts, "next "+v.when(s.NextAt))
+	default:
+		parts = append(parts, "due on the next plan")
+	}
+	if s.LastError != "" {
+		parts = append(parts, "last error: "+s.LastError)
+	}
+	return "signals: " + strings.Join(parts, " · ")
+}
+
 // ForeignLine reports the beads the run is leaving alone (P6-28), or "" if
 // there are none.
 func (v RunVitals) ForeignLine() string {
@@ -1392,6 +1424,13 @@ func (v RunVitals) Header() string {
 		parts = append(parts, "planning done")
 	case !p.NextAt.IsZero():
 		parts = append(parts, "plan "+v.when(p.NextAt))
+	}
+	if s := v.Planning.Signals; s != nil && !s.LastAt.IsZero() {
+		sig := fmt.Sprintf("signals exit %d, %d bytes", s.ExitCode, s.Bytes)
+		if !s.NextAt.IsZero() {
+			sig += ", next " + v.when(s.NextAt)
+		}
+		parts = append(parts, sig)
 	}
 	if v.Gates.GHDown {
 		parts = append(parts, "gh down "+v.since(v.Gates.GHDownSince))

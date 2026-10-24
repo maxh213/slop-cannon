@@ -44,6 +44,8 @@ const (
 	KeyExclude            = "exclude"
 	KeyCheckCommand       = "check_command"
 	KeyIdleReplanInterval = "idle_replan_interval"
+	KeySignalsCommand     = "signals_command"
+	KeySignalsInterval    = "signals_interval"
 	KeyGatePollInterval   = "gate_poll_interval"
 	KeyPRPollInterval     = "pr_poll_interval"
 	KeyGraphPollInterval  = "graph_poll_interval"
@@ -62,6 +64,7 @@ const (
 	KeyAgentTimeout       = "limits.agent_timeout"
 	KeyMaxAgentTimeout    = "limits.max_agent_timeout"
 	KeyCheckTimeout       = "limits.check_timeout"
+	KeySignalsTimeout     = "limits.signals_timeout"
 	KeyMaxTokens          = "limits.max_tokens"
 	KeyMaxCostUSD         = "limits.max_cost_usd"
 	KeyMaxPlanRejections  = "limits.max_plan_rejections"
@@ -195,11 +198,11 @@ func load(globalPath, repoRoot string) (*Effective, error) {
 // scalarKeys are the keys whose source is tracked one by one.
 var scalarKeys = []string{
 	KeyActiveCartridge, KeyAmmo, KeySafety, KeyVibes, KeyRules, KeyExclude, KeyCheckCommand, KeyIdleReplanInterval,
-	KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyMaxDiffBytes, KeyReReviewThreshold,
+	KeySignalsCommand, KeySignalsInterval, KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyMaxDiffBytes, KeyReReviewThreshold,
 	KeyMaxBeadsPerPlan, KeyNice, KeyResearch,
 	KeyAutoMerge, KeyAutoMergeChecks, KeyAutoMergeSpacing, KeyConventionalTitles,
-	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyMaxConflictRounds, KeyAgentTimeout, KeyMaxAgentTimeout, KeyCheckTimeout, KeyMaxTokens, KeyMaxCostUSD,
-	KeyMaxPlanRejections, KeyMaxPlanFailures,
+	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyMaxConflictRounds, KeyAgentTimeout, KeyMaxAgentTimeout, KeyCheckTimeout, KeySignalsTimeout, KeyMaxTokens,
+	KeyMaxCostUSD, KeyMaxPlanRejections, KeyMaxPlanFailures,
 }
 
 // ReadFile parses one config file. exists is false (with a nil File and no
@@ -461,6 +464,14 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 		e.IdleReplanInterval = *f.IdleReplanInterval
 		e.Sources[KeyIdleReplanInterval] = src
 	}
+	if f.SignalsCommand != nil {
+		e.SignalsCommand = *f.SignalsCommand
+		e.Sources[KeySignalsCommand] = src
+	}
+	if f.SignalsInterval != nil {
+		e.SignalsInterval = *f.SignalsInterval
+		e.Sources[KeySignalsInterval] = src
+	}
 	if f.GatePollInterval != nil {
 		e.GatePollInterval = *f.GatePollInterval
 		e.Sources[KeyGatePollInterval] = src
@@ -534,6 +545,10 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 	if v := f.Limits.CheckTimeout; v != nil {
 		e.Limits.CheckTimeout = *v
 		e.Sources[KeyCheckTimeout] = src
+	}
+	if v := f.Limits.SignalsTimeout; v != nil {
+		e.Limits.SignalsTimeout = *v
+		e.Sources[KeySignalsTimeout] = src
 	}
 	if v := f.Limits.MaxTokens; v != nil {
 		e.Limits.MaxTokens = *v
@@ -658,6 +673,9 @@ func (e *Effective) validate() error {
 	if e.IdleReplanInterval.Duration() <= 0 {
 		return &ValidationError{Path: e.pathOf(KeyIdleReplanInterval), Key: KeyIdleReplanInterval, Msg: "must be a positive duration"}
 	}
+	if e.SignalsInterval.Duration() <= 0 {
+		return &ValidationError{Path: e.pathOf(KeySignalsInterval), Key: KeySignalsInterval, Msg: "must be a positive duration"}
+	}
 	if e.GatePollInterval.Duration() <= 0 {
 		return &ValidationError{Path: e.pathOf(KeyGatePollInterval), Key: KeyGatePollInterval, Msg: "must be a positive duration"}
 	}
@@ -710,6 +728,9 @@ func (e *Effective) validate() error {
 	}
 	if e.Limits.CheckTimeout.Duration() <= 0 {
 		return &ValidationError{Path: e.pathOf(KeyCheckTimeout), Key: KeyCheckTimeout, Msg: "must be a positive duration"}
+	}
+	if e.Limits.SignalsTimeout.Duration() <= 0 {
+		return &ValidationError{Path: e.pathOf(KeySignalsTimeout), Key: KeySignalsTimeout, Msg: "must be a positive duration"}
 	}
 	if e.Limits.MaxTokens < 0 {
 		return &ValidationError{Path: e.pathOf(KeyMaxTokens), Key: KeyMaxTokens, Msg: "must not be negative (0 means unlimited)"}
@@ -844,6 +865,8 @@ func (e *Effective) Entries() []Entry {
 	add(KeyExclude, formatList(e.Exclude), e.Sources[KeyExclude])
 	add(KeyCheckCommand, e.CheckCommand, e.Sources[KeyCheckCommand])
 	add(KeyIdleReplanInterval, e.IdleReplanInterval.String(), e.Sources[KeyIdleReplanInterval])
+	add(KeySignalsCommand, e.SignalsCommand, e.Sources[KeySignalsCommand])
+	add(KeySignalsInterval, e.SignalsInterval.String(), e.Sources[KeySignalsInterval])
 	add(KeyGatePollInterval, e.GatePollInterval.String(), e.Sources[KeyGatePollInterval])
 	add(KeyPRPollInterval, e.PRPollInterval.String(), e.Sources[KeyPRPollInterval])
 	add(KeyGraphPollInterval, e.GraphPollInterval.String(), e.Sources[KeyGraphPollInterval])
@@ -862,6 +885,7 @@ func (e *Effective) Entries() []Entry {
 	add(KeyAgentTimeout, e.Limits.AgentTimeout.String(), e.Sources[KeyAgentTimeout])
 	add(KeyMaxAgentTimeout, e.Limits.MaxAgentTimeout.String(), e.Sources[KeyMaxAgentTimeout])
 	add(KeyCheckTimeout, e.Limits.CheckTimeout.String(), e.Sources[KeyCheckTimeout])
+	add(KeySignalsTimeout, e.Limits.SignalsTimeout.String(), e.Sources[KeySignalsTimeout])
 	add(KeyMaxTokens, strconv.FormatInt(e.Limits.MaxTokens, 10), e.Sources[KeyMaxTokens])
 	add(KeyMaxCostUSD, strconv.FormatFloat(e.Limits.MaxCostUSD, 'f', -1, 64), e.Sources[KeyMaxCostUSD])
 	add(KeyMaxPlanRejections, strconv.Itoa(e.Limits.MaxPlanRejections), e.Sources[KeyMaxPlanRejections])

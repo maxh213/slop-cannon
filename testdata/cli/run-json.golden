@@ -41,6 +41,8 @@
       "rules": [],
       "check_command": "",
       "idle_replan_interval": "10m",
+      "signals_command": "",
+      "signals_interval": "30m",
       "gate_poll_interval": "1m",
       "pr_poll_interval": "1m",
       "graph_poll_interval": "2s",
@@ -55,6 +57,7 @@
         "agent_timeout": "6h",
         "max_agent_timeout": "24h",
         "check_timeout": "30m",
+        "signals_timeout": "5m",
         "max_plan_rejections": 2,
         "max_plan_failures": 5
       },
@@ -90,6 +93,7 @@
       "limits.max_pushback_rounds": "default",
       "limits.max_review_rounds": "default",
       "limits.max_tokens": "default",
+      "limits.signals_timeout": "default",
       "max_beads_per_plan": "default",
       "max_diff_bytes": "default",
       "nice": "default",
@@ -98,6 +102,8 @@
       "research": "default",
       "rules": "default",
       "safety": "default",
+      "signals_command": "default",
+      "signals_interval": "default",
       "vibes": "default"
     },
     "global_path": "<tmp>/home/.config/slop-cannon/config.toml",

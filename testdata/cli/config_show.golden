@@ -8,6 +8,8 @@ rules                       []          default
 exclude                     []          default
 check_command               make check  repo
 idle_replan_interval        10m         default
+signals_command                         default
+signals_interval            30m         default
 gate_poll_interval          1m          default
 pr_poll_interval            1m          default
 graph_poll_interval         2s          default
@@ -26,6 +28,7 @@ limits.max_conflict_rounds  3           default
 limits.agent_timeout        6h          default
 limits.max_agent_timeout    24h         default
 limits.check_timeout        30m         default
+limits.signals_timeout      5m          default
 limits.max_tokens           0           default
 limits.max_cost_usd         0           default
 limits.max_plan_rejections  2           default

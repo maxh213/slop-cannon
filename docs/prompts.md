@@ -132,7 +132,13 @@ a time, in this order, and stops as soon as the prompt fits:
 3. **the README head** — 1 KiB, then omitted;
 4. **the open-bead list** — 20 beads, then omitted.
 
-Rules, vibes and the output contract are never dropped. A tester's diff is
+Rules, vibes and the output contract are never dropped, and neither is a
+task instructions section: an autopilot plan's `## Production signals`
+section (P6-71, D-32) is therefore capped before the prompt is built, at the
+last 32 KiB of what `signals_command` printed, cut at a line boundary,
+scrubbed of terminal controls and secret-masked, and fenced with a fence
+longer than any backtick run inside it, so nothing in the evidence can pass
+for the cannon's own text. A tester's diff is
 bounded before the prompt is built (whole patch → 60 000 → 20 000 → 6 000
 characters → a summary of the files touched).
 

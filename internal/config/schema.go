@@ -138,6 +138,11 @@ const (
 	// the bead's own title unless the repository asks for Conventional
 	// Commit titles (D-31).
 	DefaultConventionalPRTitles = false
+	// DefaultSignalsInterval is how often an autopilot run re-runs the
+	// configured signals command (P6-71, D-32).
+	DefaultSignalsInterval = 30 * time.Minute
+	// DefaultSignalsTimeout bounds one run of the signals command.
+	DefaultSignalsTimeout = 5 * time.Minute
 	// MaxPromptFileSize is the largest vibes or rules file accepted (64 KiB).
 	MaxPromptFileSize = 64 * 1024
 )
@@ -270,6 +275,7 @@ type LimitsFile struct {
 	AgentTimeout      *Duration `toml:"agent_timeout,omitempty"`
 	MaxAgentTimeout   *Duration `toml:"max_agent_timeout,omitempty"`
 	CheckTimeout      *Duration `toml:"check_timeout,omitempty"`
+	SignalsTimeout    *Duration `toml:"signals_timeout,omitempty"`
 	MaxTokens         *int64    `toml:"max_tokens,omitempty"`
 	MaxCostUSD        *float64  `toml:"max_cost_usd,omitempty"`
 	MaxPlanRejections *int      `toml:"max_plan_rejections,omitempty"`
@@ -305,6 +311,12 @@ type File struct {
 	CheckCommand *string `toml:"check_command,omitempty"`
 	// IdleReplanInterval is the autopilot re-plan delay when idle (D-18).
 	IdleReplanInterval *Duration `toml:"idle_replan_interval,omitempty"`
+	// SignalsCommand is the read-only command whose output an autopilot
+	// product owner is given as production evidence; empty means off
+	// (P6-71, D-32).
+	SignalsCommand *string `toml:"signals_command,omitempty"`
+	// SignalsInterval is how often the signals command is re-run.
+	SignalsInterval *Duration `toml:"signals_interval,omitempty"`
 	// GatePollInterval is how often the gh:pr gates are checked (P6-10).
 	GatePollInterval *Duration `toml:"gate_poll_interval,omitempty"`
 	// PRPollInterval is how often GitHub is asked for external pull
@@ -373,6 +385,8 @@ type Limits struct {
 	// CheckTimeout bounds the repository's check command when a delivery
 	// runs it before merging (P4-19).
 	CheckTimeout Duration `json:"check_timeout"`
+	// SignalsTimeout bounds one run of the signals command (P6-71).
+	SignalsTimeout Duration `json:"signals_timeout"`
 	// MaxTokens is an opt-in token budget; 0 means unlimited (D-18).
 	MaxTokens int64 `json:"max_tokens,omitempty"`
 	// MaxCostUSD is an opt-in cost budget; 0 means unlimited (D-18).
@@ -413,6 +427,12 @@ type Config struct {
 	CheckCommand string `json:"check_command"`
 	// IdleReplanInterval is the autopilot re-plan delay when idle.
 	IdleReplanInterval Duration `json:"idle_replan_interval"`
+	// SignalsCommand is run with "sh -c" in the repository root before an
+	// autopilot plan, and its output is given to the product owner as
+	// untrusted evidence; empty means off (P6-71, D-32).
+	SignalsCommand string `json:"signals_command"`
+	// SignalsInterval is the least time between two runs of SignalsCommand.
+	SignalsInterval Duration `json:"signals_interval"`
 	// GatePollInterval is how often a delivered bead's gh:pr gate is
 	// checked for the merge that closes it (P6-10).
 	GatePollInterval Duration `json:"gate_poll_interval"`
@@ -482,6 +502,7 @@ func Defaults() Config {
 		Rules:              []string{},
 		Exclude:            []string{},
 		IdleReplanInterval: NewDuration(DefaultIdleReplanInterval),
+		SignalsInterval:    NewDuration(DefaultSignalsInterval),
 		GatePollInterval:   NewDuration(DefaultGatePollInterval),
 		PRPollInterval:     NewDuration(DefaultPRPollInterval),
 		GraphPollInterval:  NewDuration(DefaultGraphPollInterval),
@@ -496,6 +517,7 @@ func Defaults() Config {
 			AgentTimeout:      NewDuration(DefaultAgentTimeout),
 			MaxAgentTimeout:   NewDuration(DefaultMaxAgentTimeout),
 			CheckTimeout:      NewDuration(DefaultCheckTimeout),
+			SignalsTimeout:    NewDuration(DefaultSignalsTimeout),
 			MaxPlanRejections: DefaultMaxPlanRejections,
 			MaxPlanFailures:   DefaultMaxPlanFailures,
 		},

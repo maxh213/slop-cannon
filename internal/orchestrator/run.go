@@ -1482,6 +1482,19 @@ func (r *Run) UseVitals(f func() RunVitals) {
 	r.vitals = f
 }
 
+// VitalsChanged tells the run that something its vitals report moved with
+// no event to say so — a production signals reading landing in the
+// background (P6-71) — so the next coalesced state.json write carries it
+// and `sc status` does not show a stale reading. It must not be called with
+// a lock the vitals function takes.
+func (r *Run) VitalsChanged() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.vitals != nil {
+		r.markStateDirtyLocked()
+	}
+}
+
 // UseBudget names the function that snapshots the run's spend for every
 // state.json the run writes (P9-01), which is how a resumed run picks its
 // budget up where the last invocation left it rather than counting from

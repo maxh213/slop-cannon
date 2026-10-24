@@ -40,8 +40,9 @@ var pgGoldens = map[string]map[string]string{
 		"test-evaluate_pushback.golden.md": "agents.TestTesterPromptGoldens",
 	},
 	"testdata/plan": {
-		"po-plan-autopilot.golden.md": "agents.TestPOPlanPromptGolden",
-		"po-plan-brief.golden.md":     "agents.TestPOPlanPromptGolden",
+		"po-plan-autopilot.golden.md":         "agents.TestPOPlanPromptGolden",
+		"po-plan-autopilot-signals.golden.md": "agents.TestPOPlanPromptSignalsGolden",
+		"po-plan-brief.golden.md":             "agents.TestPOPlanPromptGolden",
 	},
 	"testdata/arbitration": {
 		"po-arbitrate.golden.md": "agents.TestArbitrationPromptGolden",
