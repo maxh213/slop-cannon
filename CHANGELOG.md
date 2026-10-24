@@ -17,6 +17,12 @@ next version's entry.
 
 ### Added
 
+- `signals_command` (with `signals_interval`, default 30m, and
+  `limits.signals_timeout`, default 5m) gives the autopilot product owner what
+  production is saying: sc runs the command, and its output reaches the
+  planning prompt fenced as untrusted evidence. A changed reading can plan
+  while engineers are busy. `sc status` and the TUI header show the last
+  reading and when the next is due.
 - `sc watch [PATH]` opens the run TUI on a run that is already firing, from
   any terminal: one started with `--headless`, from a script, or in a
   terminal that has since closed. It shows everything the run has done so far
