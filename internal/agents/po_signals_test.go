@@ -120,3 +120,91 @@ func TestPOPlanPromptSaysATruncatedReadingIsTheTail(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, p.Text, "Below are the last 32 KiB of what it printed, cut at a line boundary.")
 }
+
+// A plan made with production evidence is checked deterministically for
+// the evidence's personal data, not only asked in the prompt to leave it
+// out: a bead's text becomes a pull request's title and body and, with
+// auto_merge on, the default branch's history, with nobody reading it on
+// the way. The rejection goes back to the product owner like any broken
+// planning rule, and never repeats what was copied.
+func TestValidatePlanRejectsPersonalDataCopiedFromTheSignals(t *testing.T) {
+	t.Parallel()
+	reading := &agents.PlanSignals{
+		Command: "./recent-errors.sh",
+		RanAt:   time.Date(2026, 10, 24, 10, 0, 0, 0, time.UTC),
+		Output: "2026-10-24T10:00Z CHK-77 checkout 500 for alice.smith@example.com from 203.0.113.9 (+44 20 7946 0958)\n" +
+			"conv c-9183: \"my card was charged twice and nobody answers the support line at all\"\n",
+	}
+	req := poRequest(t.TempDir())
+	req.Signals = reading
+	bead := func(edit func(*domain.PlanBead)) domain.Plan {
+		p := domain.Plan{Beads: []domain.PlanBead{{
+			Key: "fix-charge", Title: "Stop charging a card twice on a checkout retry",
+			Description: "CHK-77 at 2026-10-24T10:00Z and conversation c-9183 report a double charge.",
+			Acceptance:  "A retried checkout charges the card once; a test covers the retry.",
+			Priority:    domain.PriorityDefault, Size: domain.SizeS,
+		}}}
+		if edit != nil {
+			edit(&p.Beads[0])
+		}
+		return p
+	}
+
+	require.NoError(t, agents.ValidatePlan(req, bead(nil)), "citing by reference and paraphrasing passes")
+
+	for _, tc := range []struct {
+		name, want string
+		edit       func(*domain.PlanBead)
+	}{
+		{"an email in the title", "bead \"fix-charge\"'s title copies an email address",
+			func(b *domain.PlanBead) { b.Title = "Fix double charge reported by Alice.Smith@example.com" }},
+		{"an IP address in the description", "description copies an IP address",
+			func(b *domain.PlanBead) { b.Description = "Requests from 203.0.113.9 fail." }},
+		{"a phone number in the acceptance criteria", "acceptance criteria copies a phone number",
+			func(b *domain.PlanBead) { b.Acceptance = "Call +44 20 7946 0958 back once it is fixed." }},
+		{"a message copied word for word", "copies 8 or more words in a row",
+			func(b *domain.PlanBead) {
+				b.Acceptance = `The customer no longer says "My card was charged twice and nobody answers the support line".`
+			}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := agents.ValidatePlan(req, bead(tc.edit))
+			require.ErrorIs(t, err, agents.ErrPlanRejected)
+			assert.Contains(t, err.Error(), tc.want)
+			for _, secret := range []string{"alice.smith", "203.0.113.9", "7946", "nobody answers"} {
+				assert.NotContains(t, err.Error(), secret, "the rejection never quotes what was copied")
+			}
+		})
+	}
+
+	t.Run("an address the reading does not hold is the repository's business", func(t *testing.T) {
+		t.Parallel()
+		p := bead(func(b *domain.PlanBead) { b.Description = "The footer still says help@old-domain.example." })
+		require.NoError(t, agents.ValidatePlan(req, p))
+	})
+	t.Run("seven words in a row is not a copy", func(t *testing.T) {
+		t.Parallel()
+		p := bead(func(b *domain.PlanBead) {
+			b.Acceptance = "No more reports that my card was charged twice and support is fine."
+		})
+		require.NoError(t, agents.ValidatePlan(req, p))
+	})
+	t.Run("without evidence nothing is checked", func(t *testing.T) {
+		t.Parallel()
+		p := bead(func(b *domain.PlanBead) { b.Title = "Fix double charge reported by alice.smith@example.com" })
+		quiet := req
+		quiet.Signals = &agents.PlanSignals{Command: reading.Command, RanAt: reading.RanAt, Failure: "exit status 1"}
+		require.NoError(t, agents.ValidatePlan(quiet, p))
+		quiet.Signals = nil
+		require.NoError(t, agents.ValidatePlan(quiet, p))
+	})
+	t.Run("the product owner is told why, so it can redo the plan", func(t *testing.T) {
+		t.Parallel()
+		p := bead(func(b *domain.PlanBead) { b.Title = "Fix double charge reported by alice.smith@example.com" })
+		_, _, err := agents.ParsePlanOutput(req, poOutput(t, p))
+		var pe interface{ Feedback() string }
+		require.ErrorAs(t, err, &pe)
+		assert.Contains(t, pe.Feedback(), "copies an email address from the production signals")
+	})
+}

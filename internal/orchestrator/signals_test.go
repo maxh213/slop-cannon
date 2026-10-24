@@ -647,6 +647,21 @@ func TestSignalsOutstandingCountsWorkStillToShip(t *testing.T) {
 	assert.False(t, signalsOutstanding(epic), "the run epic is not work")
 }
 
+// Personal data in the signals that the product owner copies into a bead
+// never reaches bd, and so never a pull request's title or body: the plan
+// is rejected before anything is applied.
+func TestPlannerNeverAppliesAPlanThatCopiesPersonalDataFromTheSignals(t *testing.T) {
+	f := signalsSetup(t, "")
+	f.sig.set("2026-10-24T10:00Z checkout 500 for alice.smith@example.com: \"my card was charged twice\"\n", "")
+	plan := planningPlan("fix")
+	plan.Beads[0].Title = "Fix double charge reported by alice.smith@example.com"
+	f.runner.setPlan(plan)
+	_, err := f.p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
+	require.ErrorIs(t, err, agents.ErrPlanRejected)
+	assert.Contains(t, err.Error(), "copies an email address from the production signals")
+	assert.Zero(t, f.p.opts.Applier.(*planningApplier).count(), "nothing reached bd")
+}
+
 func TestPlannerRecordsNoBeadsForAFailedSignalsPlan(t *testing.T) {
 	f := signalsSetup(t, "")
 	f.p.sig.firing = true

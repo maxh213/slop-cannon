@@ -504,9 +504,11 @@ func isPlanSentinel(err error) bool {
 // acceptance criteria, priorities, types, sizes, dangling and duplicate
 // dependencies, cycles), then the planning rules of P5-02: at most
 // PlanRequest.BeadLimit beads, no two beads with the same title, no bead
-// duplicating the title of an open bead, and, in brief mode, at least one
-// bead. An empty plan is valid in autopilot: it means "nothing worth adding
-// right now" (D-18).
+// duplicating the title of an open bead, in brief mode at least one bead,
+// and, for a plan made with production signals, no bead (or brief) that
+// repeats the reading's personal data or copies a run of its words
+// ([signalsLeaks]). An empty plan is valid in autopilot: it means "nothing
+// worth adding right now" (D-18).
 //
 // Errors wrap ErrPlanRejected, and the structural ones also wrap
 // domain.ErrInvalidPlan.
@@ -536,6 +538,7 @@ func ValidatePlan(req PlanRequest, p domain.Plan) error {
 	for _, d := range DuplicateOpenBeads(p, req.OpenBeads) {
 		errs = append(errs, fmt.Errorf("bead %q duplicates open bead %s (%q)", d.Key, d.Bead, d.Title))
 	}
+	errs = append(errs, signalsLeaks(req.Signals, p)...)
 	if len(errs) == 0 {
 		return nil
 	}
