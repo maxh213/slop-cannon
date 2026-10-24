@@ -362,14 +362,21 @@ func TestConventionalPRTitle(t *testing.T) {
 		{domain.Bead{ID: "fx-1", Title: "Spike caching", Type: domain.BeadTypeSpike}, "feat: spike caching"},
 		{domain.Bead{ID: "fx-1", Title: "Untyped"}, "feat: untyped"},
 		{domain.Bead{ID: "fx-1", Title: "Énorme refonte", Type: domain.BeadTypeFeature}, "feat: énorme refonte"},
-		{domain.Bead{ID: "fx-1", Title: "fix(rooms): keep the scroll position", Type: domain.BeadTypeFeature}, "fix(rooms): keep the scroll position"},
-		{domain.Bead{ID: "fx-1", Title: "feat!: drop the v1 API", Type: domain.BeadTypeBug}, "feat!: drop the v1 API"},
+		// An agent-written prefix keeps its scope, never its type or "!":
+		// the bead's type decides, and no bump is picked for release-please.
+		{domain.Bead{ID: "fx-1", Title: "fix(rooms): keep the scroll position", Type: domain.BeadTypeFeature}, "feat(rooms): keep the scroll position"},
+		{domain.Bead{ID: "fx-1", Title: "feat!: drop the v1 API", Type: domain.BeadTypeBug}, "fix: drop the v1 API"},
+		{domain.Bead{ID: "fx-1", Title: "chore(deps)!: Bump everything", Type: domain.BeadTypeBug}, "fix(deps): bump everything"},
+		{domain.Bead{ID: "fx-1", Title: "API keys rotate", Type: domain.BeadTypeFeature}, "feat: API keys rotate"},
+		{domain.Bead{ID: "fx-1", Title: "README tidy", Type: domain.BeadTypeChore}, "chore: README tidy"},
+		{domain.Bead{ID: "fx-1", Title: "A clearer error", Type: domain.BeadTypeBug}, "fix: a clearer error"},
+		{domain.Bead{ID: "fx-1", Title: "X", Type: domain.BeadTypeBug}, "fix: x"},
 		{domain.Bead{ID: "fx-1", Title: "Note: not a type", Type: domain.BeadTypeBug}, "fix: note: not a type"},
 		{domain.Bead{ID: "fx-1", Title: " ", Type: domain.BeadTypeBug}, "fix: bead fx-1"},
 	}
 	for _, tc := range cases {
 		assert.Equal(t, tc.want, ConventionalPRTitle(tc.bead), tc.bead.Title)
-		assert.Regexp(t, `^[a-z]+(\([^)]*\))?!?: \S`, ConventionalPRTitle(tc.bead), "the shape amannn/action-semantic-pull-request accepts")
+		assert.Regexp(t, `^[a-z]+(\([^)]*\))?: \S`, ConventionalPRTitle(tc.bead), "the shape amannn/action-semantic-pull-request accepts, never with a \"!\"")
 	}
 	long := ConventionalPRTitle(domain.Bead{ID: "fx-1", Title: strings.Repeat("x", 500), Type: domain.BeadTypeBug})
 	assert.LessOrEqual(t, len(long), maxPRTitleLen)

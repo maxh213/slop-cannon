@@ -554,8 +554,9 @@ func (d *PRDeliverer) ReviewedHead(ctx context.Context, reviewed, head, base str
 // defaults).
 var conventionalTypes = []string{"feat", "fix", "docs", "style", "refactor", "perf", "test", "build", "ci", "chore", "revert"}
 
-// conventionalRe matches a title that is already "<type>[(scope)][!]: …".
-var conventionalRe = regexp.MustCompile(`^([a-z]+)(\([^)]*\))?!?: \S`)
+// conventionalRe matches a title that is already "<type>[(scope)][!]: …",
+// capturing the type, the scope and the subject.
+var conventionalRe = regexp.MustCompile(`^([a-z]+)(\([^)]*\))?!?: (\S.*)$`)
 
 // ConventionalType maps a bead's issue type onto a Conventional Commit type
 // (D-31): bug → fix, feature → feat, chore and task → chore, anything else
@@ -571,20 +572,34 @@ func ConventionalType(t domain.BeadType) string {
 }
 
 // ConventionalPRTitle is [PRTitle] in Conventional Commit form:
-// "<type>: <title starting lowercase>", the type from [ConventionalType]. A
-// title that is already conventional is kept as it is. The result is capped
-// like PRTitle's.
+// "<type>: <subject>", the type always from [ConventionalType]. Bead titles
+// come from the planning agents, so a title that already looks
+// conventional keeps only its scope and subject: its type is replaced and a
+// breaking-change "!" is dropped, because the squash merge makes this the
+// commit subject release-please reads, and an agent must not be able to
+// pick the version bump. The subject's first letter is lowercased unless
+// it starts an acronym ("API keys" stays). The result is capped like
+// PRTitle's.
 func ConventionalPRTitle(bead domain.Bead) string {
 	title := strings.Join(strings.Fields(bead.Title), " ")
 	if title == "" {
 		title = "bead " + string(bead.ID)
 	}
+	scope := ""
 	if m := conventionalRe.FindStringSubmatch(title); m != nil && isConventionalType(m[1]) {
-		return capTitle(title)
+		scope, title = m[2], m[3]
 	}
-	r, size := utf8.DecodeRuneInString(title)
-	title = string(unicode.ToLower(r)) + title[size:]
-	return capTitle(ConventionalType(bead.Type) + ": " + title)
+	return capTitle(ConventionalType(bead.Type) + scope + ": " + lowerFirst(title))
+}
+
+// lowerFirst lowercases the first letter of s unless the next one is
+// uppercase too, which makes it an acronym.
+func lowerFirst(s string) string {
+	r, size := utf8.DecodeRuneInString(s)
+	if next, _ := utf8.DecodeRuneInString(s[size:]); unicode.IsUpper(next) {
+		return s
+	}
+	return string(unicode.ToLower(r)) + s[size:]
 }
 
 func isConventionalType(t string) bool {
