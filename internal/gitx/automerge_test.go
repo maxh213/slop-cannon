@@ -317,6 +317,26 @@ func TestPRDelivererNeverAdoptsAPullRequestThatIsNotTheRunsOwn(t *testing.T) {
 		assert.Equal(t, []domain.BeadState{domain.BeadStateNeedsHuman}, f.tracker.statuses)
 	})
 
+	t.Run("a foreign pull request with the same head name does not hide the run's own", func(t *testing.T) {
+		// A fork's pull request matches `gh pr list --head <branch>` too,
+		// and a newer one would be preferred if ownership were not judged
+		// across every candidate.
+		f := dpSetup(t, true)
+		dpSet(t, f.gh, "prs.json", dpPRs(
+			dpPR(t, 9, "OPEN", f.wt.Branch, func(pr map[string]any) { pr["author"] = map[string]string{"login": "mallory"} }),
+			dpPR(t, 5, "OPEN", f.wt.Branch, nil),
+		))
+		req := dpRequest()
+		req.Bead.PRNumber = 5
+		res, err := f.d.Deliver(ctx, req)
+		require.NoError(t, err)
+		assert.Equal(t, PRExisting, res.Status)
+		require.NotNil(t, res.PR)
+		assert.Equal(t, 5, res.PR.Number)
+		assert.True(t, res.Pushed)
+		assert.Equal(t, domain.BeadStateDelivering, res.State)
+	})
+
 	t.Run("the run's own pull request with no number recorded yet is reused", func(t *testing.T) {
 		// The delivery that opened it died before sc_pr_number was written;
 		// every other clause ties it to this run.

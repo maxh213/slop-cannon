@@ -315,32 +315,49 @@ func (d *PRDeliverer) Deliver(ctx context.Context, req PRRequest) (*PRResult, er
 	// the branch is history, and pushing a local tip that has fallen behind
 	// the remote one (a resume after the human updated the pull request)
 	// only fails as non-fast-forward.
-	pr, state, err := d.gh.FindPR(ctx, branch)
+	candidates, err := d.gh.FindPRs(ctx, branch)
 	reason, ghDown := ghUnavailable(err)
 	if err != nil && !ghDown {
 		return nil, err
 	}
-	if pr != nil {
+	var pr *PullRequest
+	var state string
+	if len(candidates) > 0 {
 		// D-31: a pull request is adopted only when it is this run's own.
 		// Anything else on the branch — a human's, another run's, one from
-		// before the run started — is not pushed to, not reused and not
-		// merged: a person decides what happens to it.
-		owned, why, err := d.owned(ctx, req, *pr, branch, base)
-		if r, down := ghUnavailable(err); down {
-			// The branch has a pull request nobody has shown is this
-			// run's: gh failing now is no licence to push onto it.
-			res.Status = PRForeign
-			res.PR, res.PRState = pr, state
-			res.Reason = fmt.Sprintf("could not confirm pull request #%d on %s is this run's own: %s", pr.Number, branch, r)
-			res.Instructions = fmt.Sprintf("slop-cannon will not push to, reuse or merge it unconfirmed; fix gh and retry the bead, or close the pull request (or move it off %s) if it is not this run's", branch)
-			return d.handOff(ctx, res, log)
-		} else if err != nil {
-			return nil, err
+		// before the run started, a fork's that reuses the name — is not
+		// pushed to, not reused and not merged: a person decides what
+		// happens to it. The run's own pull request is looked for among
+		// all of them, so a foreign one with the same head name does not
+		// hide it.
+		var why string
+		for _, c := range candidates {
+			owned, w, err := d.owned(ctx, req, c.PR, branch, base)
+			if r, down := ghUnavailable(err); down {
+				// The branch has a pull request nobody has shown is this
+				// run's: gh failing now is no licence to push onto it.
+				res.Status = PRForeign
+				res.PR, res.PRState = &c.PR, c.State
+				res.Reason = fmt.Sprintf("could not confirm pull request #%d on %s is this run's own: %s", c.PR.Number, branch, r)
+				res.Instructions = fmt.Sprintf("slop-cannon will not push to, reuse or merge it unconfirmed; fix gh and retry the bead, or close the pull request (or move it off %s) if it is not this run's", branch)
+				return d.handOff(ctx, res, log)
+			} else if err != nil {
+				return nil, err
+			}
+			if owned {
+				found := c.PR
+				pr, state = &found, c.State
+				break
+			}
+			if why == "" {
+				why = w
+			}
 		}
-		if !owned {
+		if pr == nil {
+			first := candidates[0]
 			res.Status = PRForeign
-			res.PR, res.PRState = pr, state
-			res.Reason = fmt.Sprintf("pull request #%d on %s is not this run's own: %s", pr.Number, branch, why)
+			res.PR, res.PRState = &first.PR, first.State
+			res.Reason = fmt.Sprintf("pull request #%d on %s is not this run's own: %s", first.PR.Number, branch, why)
 			res.Instructions = fmt.Sprintf("slop-cannon will not push to, reuse or merge it; close it (or move it off %s) and retry the bead, or merge the work yourself", branch)
 			return d.handOff(ctx, res, log)
 		}
@@ -640,30 +657,50 @@ const ghFindPRFields = "number,url,state,title,headRefName,baseRefName,labels,bo
 // request carries what [OwnedByRun] needs, and the caller must judge it:
 // FindPR itself does not know whose it is.
 func (g *GH) FindPR(ctx context.Context, branch string) (pr *PullRequest, state string, err error) {
+	candidates, err := g.FindPRs(ctx, branch)
+	if err != nil || len(candidates) == 0 {
+		return nil, "", err
+	}
+	return &candidates[0].PR, candidates[0].State, nil
+}
+
+// PRCandidate is one pull request [GH.FindPRs] found for a branch, with
+// its state ("OPEN" or "MERGED").
+type PRCandidate struct {
+	PR    PullRequest
+	State string
+}
+
+// FindPRs returns every open or merged pull request whose head is branch,
+// in [GH.FindPR]'s order of preference: open before merged, newest first
+// within each. Several can share a head name — a fork's pull request
+// matches the same name — so a caller that judges ownership looks at all
+// of them.
+func (g *GH) FindPRs(ctx context.Context, branch string) ([]PRCandidate, error) {
 	if branch == "" {
-		return nil, "", errors.New("gitx: FindPR: empty branch")
+		return nil, errors.New("gitx: FindPR: empty branch")
 	}
 	out, err := g.run(ctx, "", "pr", "list", "--head", branch, "--state", "all", "--limit", "50", "--json", ghFindPRFields)
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	var refs []ghPRRef
 	if strings.TrimSpace(out) != "" {
 		if err := json.Unmarshal([]byte(out), &refs); err != nil {
-			return nil, "", fmt.Errorf("gitx: gh pr list: unexpected output %q: %w", out, err)
+			return nil, fmt.Errorf("gitx: gh pr list: unexpected output %q: %w", out, err)
 		}
 	}
 	// Newest first, so among several of one state the latest wins.
 	sort.SliceStable(refs, func(i, j int) bool { return refs[i].Number > refs[j].Number })
+	var found []PRCandidate
 	for _, want := range []string{"OPEN", "MERGED"} {
 		for _, ref := range refs {
 			if strings.EqualFold(ref.State, want) {
-				found := ref.pullRequest()
-				return &found, want, nil
+				found = append(found, PRCandidate{PR: ref.pullRequest(), State: want})
 			}
 		}
 	}
-	return nil, "", nil
+	return found, nil
 }
 
 // PRSpec describes a pull request to open with [GH.CreatePR].
