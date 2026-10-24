@@ -659,7 +659,9 @@ func TestPlannerNeverAppliesAPlanThatCopiesPersonalDataFromTheSignals(t *testing
 	_, err := f.p.Fire(context.Background(), Firing{Demand: planDemand(), Agent: domain.Agent{ID: "po-plan-1"}})
 	require.ErrorIs(t, err, agents.ErrPlanRejected)
 	assert.Contains(t, err.Error(), "copies an email address from the production signals")
-	assert.Zero(t, f.p.opts.Applier.(*planningApplier).count(), "nothing reached bd")
+	app, ok := f.p.opts.Applier.(*planningApplier)
+	require.True(t, ok)
+	assert.Zero(t, app.count(), "nothing reached bd")
 }
 
 func TestPlannerRecordsNoBeadsForAFailedSignalsPlan(t *testing.T) {
