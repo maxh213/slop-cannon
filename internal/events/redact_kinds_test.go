@@ -70,14 +70,15 @@ var redactKeeps = map[string]string{
 	// names of the cartridge, model and documents sc was pointed at. None
 	// of it came out of a subprocess, and `sc status` and the TUI header
 	// read the paths back.
-	"run_started.Info.RepoPath":         "the repository sc was fired at",
-	"run_started.Info.StateDir":         "the run's own state directory (D-23)",
-	"run_started.Info.Config.Cartridge": "the cartridge name from the configuration",
-	"run_started.Info.Config.Model":     "the model name from the configuration",
-	"run_started.Info.Config.Rules[]":   "a rules document path the user configured",
-	"run_started.Info.Config.Vibes[]":   "a vibes document path the user configured",
-	"agent_spawned.Agent.Cartridge":     "the cartridge name from the configuration",
-	"agent_spawned.Agent.Model":         "the model name from the configuration",
+	"run_started.Info.RepoPath":                 "the repository sc was fired at",
+	"run_started.Info.StateDir":                 "the run's own state directory (D-23)",
+	"run_started.Info.Config.Cartridge":         "the cartridge name from the configuration",
+	"run_started.Info.Config.Model":             "the model name from the configuration",
+	"run_started.Info.Config.Rules[]":           "a rules document path the user configured",
+	"run_started.Info.Config.Vibes[]":           "a vibes document path the user configured",
+	"run_started.Info.Config.AutoMergeChecks[]": "a check name the user configured in auto_merge_checks (D-31)",
+	"agent_spawned.Agent.Cartridge":             "the cartridge name from the configuration",
+	"agent_spawned.Agent.Model":                 "the model name from the configuration",
 
 	// Correlation keys. They are written by a model, but everything downstream
 	// matches on them — a plan's Deps against its Keys, a response and a
