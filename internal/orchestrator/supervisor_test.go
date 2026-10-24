@@ -524,25 +524,49 @@ func TestSupervisorPausesARateLimitedCartridge(t *testing.T) {
 
 func TestSupervisorDoublesTheRateLimitBackoff(t *testing.T) {
 	sc := mock.NewScenario("very-rate-limited")
-	sc.Otherwise("limited").FailWith(mock.Failure{Kind: mock.FailRateLimited})
+	sc.Rule("limited", mock.Match{}).Times(4).FailWith(mock.Failure{Kind: mock.FailRateLimited})
+	sc.Otherwise("approve").Say("fine").Structured(json.RawMessage(`{"outcome":"approve"}`))
 	f := supSetup(t, map[string]*mock.Scenario{supAlpha: sc})
 	sup := f.supervisor(t, func(o *SupervisorOptions) {
 		o.RateLimitBackoff = time.Minute
 		o.MaxRateLimitBackoff = 90 * time.Second
-		o.CrashRetries = 3
+		o.CrashRetries = 1
 	})
 
 	_, _, err := FireAgent[domain.Verdict](context.Background(), sup, supTesterFiring("tester-qa-bd-6-r1", "bd-6", f.worktree(t, "bd-6")))
-	require.ErrorIs(t, err, cartridge.ErrRateLimited)
-	// Each failure pauses the whole cartridge, the last one included: the
-	// firing is out of attempts but the cartridge is still rate limited for
-	// everyone else. That last pause is served in the background, so only
-	// the ladder up to the retries is asserted in order.
-	waits := f.Sleeper.Waits()
-	require.GreaterOrEqual(t, len(waits), 3)
-	assert.Equal(t, []time.Duration{time.Minute, 90 * time.Second, 90 * time.Second}, waits[:3],
+	require.NoError(t, err, "four rate limits in a row are four pauses, not four of the two attempts")
+	assert.Equal(t, []time.Duration{time.Minute, 90 * time.Second, 90 * time.Second, 90 * time.Second}, f.Sleeper.Waits(),
 		"the pause doubles and is then capped")
-	assert.Equal(t, 90*time.Second, sup.Backoff(supAlpha))
+	assert.Zero(t, sup.Backoff(supAlpha), "a session that worked clears the back-off")
+	fails := f.supFailures()
+	require.Len(t, fails, 4)
+	for _, fl := range fails {
+		assert.Equal(t, events.FailureRateLimited, fl.Failure)
+		assert.True(t, fl.WillRetry, "a rate limit is always waited out")
+	}
+}
+
+// A rate limit that lasts (a quota window with every account empty, which
+// dandelion reports as a rate limit) is waited out until the run stops: the
+// firing never gives up on its own and never reports the work as failed.
+func TestSupervisorWaitsOutARateLimitUntilTheRunStops(t *testing.T) {
+	sc := mock.NewScenario("no-quota")
+	sc.Otherwise("limited").FailWith(mock.Failure{Kind: mock.FailRateLimited})
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: sc})
+	sup := f.supervisor(t, func(o *SupervisorOptions) { o.CrashRetries = -1 })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for len(f.Sleeper.Waits()) < 6 {
+			time.Sleep(time.Millisecond)
+		}
+		cancel()
+	}()
+
+	_, _, err := FireAgent[domain.Verdict](ctx, sup, supTesterFiring("tester-qa-bd-6-r2", "bd-6", f.worktree(t, "bd-6")))
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.Canceled, "only the run stopping ended it")
+	assert.GreaterOrEqual(t, len(f.Sleeper.Waits()), 6, "six pauses and more, on a supervisor with no crash retries at all")
 }
 
 func TestSupervisorHonoursARetryAfterHint(t *testing.T) {

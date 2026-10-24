@@ -38,7 +38,9 @@ import (
 //     exponential back-off between them;
 //   - a per-cartridge pause on cartridge.ErrRateLimited, starting at
 //     [DefaultRateLimitBackoff] and doubling to [MaxRateLimitBackoff],
-//     which every firing on that cartridge waits out;
+//     which every firing on that cartridge waits out; a rate limit never
+//     spends a crash retry, so a firing waits as long as the limit lasts
+//     (D-18: a rate limit only pauses);
 //   - cartridge.ErrCreditsExhausted retires that cartridge for the whole
 //     run (D-18), re-routes the firing to any cartridge still alive
 //     (ignoring the D-12 per-role override, which is a preference, not a
@@ -885,6 +887,13 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 			return tr, fmt.Errorf("%w: %w", ErrNoLiveCartridge, err)
 
 		case kind == cartridge.KindRateLimited:
+			// A rate limit only pauses (D-18): it says nothing about
+			// whether this work can succeed, so it never spends one of the
+			// crash retries. The firing waits out the pause for as long as
+			// the limit lasts — a subscription quota window can be hours,
+			// and dandelion reports "no account has quota" this way — and
+			// only a stop or the caller giving up ends it.
+			maxAttempts++
 			pause := s.pauseCartridge(name, supRetryAfter(err))
 			willRetry := attempt < maxAttempts
 			h.Warn(SourceSupervisor,

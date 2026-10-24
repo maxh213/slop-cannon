@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/beads"
+	"slop-cannon/internal/cartridge"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
@@ -1346,6 +1347,42 @@ func TestSchedulerBudgetCountsFailuresInARowNotInARun(t *testing.T) {
 	require.Len(t, parker.Requests(), 1)
 	assert.Equal(t, domain.BeadStateInReview, parker.Requests()[0].From,
 		"a demand that claims nothing is parked from where the source said the bead was")
+}
+
+// A rate limit only pauses (D-18): a quota router with every account empty
+// reports one firing after another as rate limited, and none of them spends
+// the demand's budget, so the bead waits for quota instead of being parked
+// as failed.
+func TestSchedulerDoesNotSpendTheBudgetOnARateLimit(t *testing.T) {
+	var fires atomic.Int64
+	var done atomic.Bool
+	parker := &schedParker{}
+	implement := schedImplement("sc-1", 1)
+	f := schedSetup(t, 10, SchedulerOptions{
+		// Offered until a firing of it works, as a real source would.
+		Work: WorkSourceFunc(func(context.Context) ([]Demand, error) {
+			if done.Load() {
+				return nil, nil
+			}
+			return []Demand{implement}, nil
+		}),
+		Claims: newSchedClaims(nil),
+		Fire: FirerFunc(func(context.Context, Firing) (FireResult, error) {
+			if fires.Add(1) <= 2*DefaultDemandFailureLimit {
+				e := cartridge.NewError(cartridge.KindRateLimited, "dandelion", "dandelion route found no account with quota left", nil)
+				return FireResult{Failure: events.FailureRateLimited}, e
+			}
+			done.Store(true)
+			return FireResult{Produced: domain.MessageImplReport}, nil
+		}),
+		Park: parker,
+		Stop: schedFinishWhenIdle(),
+	})
+	_, err := f.Wait()
+	require.NoError(t, err)
+	assert.Equal(t, int64(2*DefaultDemandFailureLimit+1), fires.Load(), "fired until quota came back")
+	assert.Empty(t, parker.Requests(), "a rate limit is not a failed demand")
+	assert.Zero(t, f.Sched.Status().Parked)
 }
 
 // TestSchedulerParkNamesTheBookkeepingNotTheCartridge covers the round-3

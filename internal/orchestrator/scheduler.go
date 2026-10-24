@@ -13,7 +13,9 @@ import (
 	"sync"
 	"time"
 
+	"slop-cannon/internal/agents"
 	"slop-cannon/internal/beads"
+	"slop-cannon/internal/cartridge"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
@@ -1298,11 +1300,14 @@ func (s *Scheduler) fire(ctx context.Context, r *Run, l *liveAgent, startedAt ti
 	switch {
 	case err == nil:
 		s.clearFailures(l.demand)
-	case ctx.Err() == nil:
+	case ctx.Err() == nil && !rateLimited(res, err):
 		// A firing that failed on its own spends the demand's budget. One
 		// that ended because the run is stopping says nothing about
 		// whether the work can ever succeed, whichever error it reports,
-		// so it spends nothing (P6-31).
+		// so it spends nothing (P6-31), and neither does a rate limit,
+		// which only pauses (D-18): with every account of a quota router
+		// empty for hours, every bead in flight would otherwise be parked
+		// as failed.
 		s.spendBudget(ctx, r, l, agent.ID, err)
 	}
 
@@ -1415,6 +1420,13 @@ func (s *Scheduler) clearFailures(d Demand) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.failures, d.Key())
+}
+
+// rateLimited reports whether a firing failed only because its cartridge
+// is rate limited.
+func rateLimited(res FireResult, err error) bool {
+	return res.Failure == events.FailureRateLimited || agents.FailureOf(err) == events.FailureRateLimited ||
+		cartridge.KindOf(err) == cartridge.KindRateLimited
 }
 
 // spendBudget charges one failed firing to its demand and parks the demand
