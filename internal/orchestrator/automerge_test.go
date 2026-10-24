@@ -44,6 +44,7 @@ type amFakeGH struct {
 	viewErr  error
 	loginErr error
 	mergeErr error
+	updErr   error
 	nReads   int
 	Merges   []string // "<n>@<head>"
 	Updates  []int
@@ -95,7 +96,7 @@ func (g *amFakeGH) UpdateBranch(_ context.Context, n int) error {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	g.Updates = append(g.Updates, n)
-	return nil
+	return g.updErr
 }
 
 func (g *amFakeGH) reads() int {
@@ -468,6 +469,31 @@ func TestAutoMergeUpdatesABranchThatIsBehindOncePerHead(t *testing.T) {
 	h.poll()
 	assert.Equal(t, []string{"7@3333333333333333333333333333333333333333"}, h.GH.Merges)
 	assert.Len(t, h.GH.Updates, 1)
+}
+
+// A failed `gh pr update-branch` does not count as the one update for the
+// head: the next poll asks again.
+func TestAutoMergeRetriesAnUpdateGitHubRefused(t *testing.T) {
+	t.Parallel()
+	h := newAMHarness(t, nil)
+	v := amOwnedView(amHead)
+	v.MergeStateStatus = "BEHIND"
+	h.GH.set(v)
+	h.GH.updErr = errors.New("HTTP 502: Bad Gateway")
+	h.pending()
+
+	h.poll()
+	assert.Equal(t, []int{amPR}, h.GH.Updates)
+	assert.Contains(t, h.status().Reason, "gh could not update pull request #7")
+
+	h.GH.mu.Lock()
+	h.GH.updErr = nil
+	h.GH.mu.Unlock()
+	h.poll()
+	h.poll()
+	assert.Equal(t, []int{amPR, amPR}, h.GH.Updates, "asked again after the failure, then once only")
+	assert.Equal(t, AutoMergeUpdating, h.status().State)
+	assert.Equal(t, 1, h.P.Stats().AutoMergeUpdates)
 }
 
 func TestAutoMergeSendsAConflictBackToTheEngineer(t *testing.T) {

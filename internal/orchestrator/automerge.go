@@ -43,8 +43,8 @@ import (
 //	failed    a check failed → back to the engineer through the same edge,
 //	          one qa item per failed check with its URL (once per head
 //	          commit and check)
-//	behind    BEHIND → `gh pr update-branch <n>` (once per head commit),
-//	          then wait for the checks again
+//	behind    BEHIND → `gh pr update-branch <n>` (once per head commit
+//	          GitHub accepted it for), then wait for the checks again
 //	checks    no checks at all, one still running, or a required name
 //	          (auto_merge_checks) missing → wait
 //	clean     anything but CLEAN (BLOCKED by a required review, UNSTABLE,
@@ -388,9 +388,11 @@ func (p *GatePoller) amReviewed(ctx context.Context, issue beads.Issue, view *gi
 }
 
 // amUpdate asks GitHub to merge the default branch into a pull request that
-// has fallen behind it, once per head commit.
+// has fallen behind it, once per head commit. Only an update GitHub
+// accepted counts: a refused one is asked for again on the next poll.
 func (p *GatePoller) amUpdate(ctx context.Context, id domain.BeadID, number int, head string) {
-	if !p.auto.once("update:" + head) {
+	key := "update:" + head
+	if p.auto.done[key] {
 		p.amStatus(id, number, AutoMergeUpdating, fmt.Sprintf("pull request #%d is behind %s; waiting for the update GitHub was asked for", number, p.branch), false)
 		return
 	}
@@ -398,6 +400,7 @@ func (p *GatePoller) amUpdate(ctx context.Context, id domain.BeadID, number int,
 		p.amFailure(id, number, "update", fmt.Sprintf("gh could not update pull request #%d with %s", number, p.branch), err)
 		return
 	}
+	p.auto.once(key)
 	p.mu.Lock()
 	p.stats.AutoMergeUpdates++
 	p.mu.Unlock()
