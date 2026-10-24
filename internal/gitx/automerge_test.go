@@ -77,6 +77,7 @@ func TestOwnedByRun(t *testing.T) {
 		{name: "no run start", owner: func(o *Ownership) { o.RunStarted = time.Time{} }, want: "before this run started"},
 		{name: "another author", pr: func(p *PullRequest) { p.Author = "mallory" }, want: "author"},
 		{name: "no login", owner: func(o *Ownership) { o.Login = "" }, want: "author"},
+		{name: "no login and no author", pr: func(p *PullRequest) { p.Author = "" }, owner: func(o *Ownership) { o.Login = "" }, want: "author"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
