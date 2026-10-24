@@ -257,7 +257,8 @@ owner. Nothing merges until every lens is satisfied.
         ┌──────────────────────────────────────────────────────────────┐
         │  DELIVERY                                                    │
         │   safety on   push sc/<bead>-<slug>, open a PR, wait on a    │
-        │               gh:pr gate — you merge, the bead closes        │
+        │               gh:pr gate — you merge (or, with auto_merge,   │
+        │               the run merges its own green PR), it closes    │
         │   safety off  rebase, run the check command, fast-forward    │
         │  conflict → back to the engineer  ·  check failed → a qa     │
         │  feedback item  ·  no remote / no gh → needs_human           │
@@ -267,7 +268,8 @@ owner. Nothing merges until every lens is satisfied.
 
 Meanwhile the run also reviews pull requests it did **not** open (D-11): it
 adopts them, fires testers at them, posts one consolidated `gh pr review`,
-and never merges them. `--review-prs=false` turns that off.
+and never merges them. A pull request that was already open when the run
+started is left alone. `--review-prs=false` turns that off.
 
 The workflow state of a bead **is** its `bd` status (`open`, `in_progress`,
 `in_review`, `changes_requested`, `approved`, `delivering`, `escalated`,
@@ -352,9 +354,47 @@ branch**.
 | | safety on (default) | safety off |
 |---|---|---|
 | Where work lands | a branch `sc/<bead-id>-<slug>`, pushed | rebased onto the default branch and fast-forwarded |
-| Who merges | you, in GitHub | `sc`, after the check command passes |
-| Bead closes when | you merge the pull request and the gate poller sees it | the merge lands |
+| Who merges | you, in GitHub — or the run, for its own green pull requests, with `auto_merge` | `sc`, after the check command passes |
+| Bead closes when | the pull request merges and the gate poller sees it | the merge lands |
 | Needs `gh` | yes | no (a remote is optional) |
+
+**Auto-merge** (`auto_merge = true` or `--auto-merge`, safety on only, off by
+default) lets the run merge the pull requests it opened itself once they are
+green, for a repository where you would rather review the cannon's output
+after it lands than click merge on every pull request (D-31). It is built
+for a default branch that deploys to production, so it errs on waiting:
+
+- **Only its own.** A pull request is merged only when every clause holds:
+  its head is exactly the bead's `sc/` branch, its base is the default
+  branch, it has the `slop-cannon` label and a body marker naming this run
+  and this bead, it is the number the bead recorded, it was created after
+  the run first started, and its author is your `gh` login. Nothing that
+  existed before the run started is ever merged, reviewed, adopted or pushed
+  to — with auto-merge off too: a pull request already on a bead's branch
+  that fails the check is handed to you instead of reused.
+- **Only what was reviewed.** The head must be the commit the run delivered
+  and its testers approved, or that commit plus GitHub's clean update merges
+  of the default branch. A commit anybody else pushes to the branch waits
+  for you.
+- **Only when green.** At least one check, every check finished and passed,
+  every name in `auto_merge_checks` among them (at least one is required), and GitHub reporting the
+  pull request `CLEAN`. A required review (`BLOCKED`) waits for you; nothing
+  is bypassed.
+- **Only exactly.** `gh pr merge <n> --squash --match-head-commit <sha>`, the
+  head the same poll judged — never `--admin`, `--auto` or
+  `--delete-branch` — and at most one merge per `auto_merge_spacing`
+  (default 10 minutes, kept across a resume), so each deploy finishes before
+  the next merge starts another.
+- **Never by force.** A pull request behind the default branch is updated
+  by GitHub (`gh pr update-branch`); a failed check or a conflict goes back
+  to the bead's engineer as a change request, and the fix is pushed to the
+  same pull request as a plain fast-forward. `sc status` shows what each
+  pull request is waiting for.
+
+`conventional_pr_titles = true` titles the pull requests `fix: …`, `feat: …`
+or `chore: …` from the bead's type (never an agent's own type or `!`), for repositories whose CI checks
+Conventional Commit titles; a squash merge makes the title the commit
+subject.
 
 `sc safety off` writes the setting; `--safety off` overrides it for one run;
 `S` in the TUI flips it mid-run after asking. On top of that switch:
@@ -436,7 +476,10 @@ itself.
 
 **Will it push to my main branch?** Not with safety on, which is the default:
 work goes to an `sc/…` branch and a pull request, and a human merges it. You
-have to say `sc safety off` for anything else.
+have to say `sc safety off` for anything else. With `auto_merge` on, GitHub
+squash-merges the run's own green pull requests at the run's request — still
+no push from `sc` to the default branch, and never a pull request the run did
+not open.
 
 **What does it write inside my repository?** The beads database in `.beads/`
 (created on the first run), an optional `.slop-cannon/config.toml` if you set

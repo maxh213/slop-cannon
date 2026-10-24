@@ -635,7 +635,10 @@ func (v PRsModel) summary(st *State, rows []PRRow, w int) string {
 	safety := st != nil && st.Run.Config.Safety
 	indicator := "safety " + v.theme.Accent().Render(onOff(safety))
 	explain := "merged straight to the default branch"
-	if safety {
+	switch {
+	case safety && st.Run.Config.AutoMerge:
+		explain = "the run merges its own green PRs (D-31)"
+	case safety:
 		explain = "a human merges every PR (D-20)"
 	}
 	counts := prsCounts(rows)

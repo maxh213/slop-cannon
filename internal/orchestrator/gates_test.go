@@ -248,6 +248,20 @@ func (f *gateFakeBD) AddBead(id domain.BeadID, state domain.BeadState, pr int, l
 	}
 }
 
+// SetMeta sets one metadata key of a bead.
+func (f *gateFakeBD) SetMeta(id domain.BeadID, key string, value any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	is := f.issues[id]
+	meta := beads.Metadata{}
+	for k, v := range is.Metadata {
+		meta[k] = v
+	}
+	meta[key] = value
+	is.Metadata = meta
+	f.issues[id] = is
+}
+
 // gate returns a gate as bd holds it now, open or closed.
 func (f *gateFakeBD) gate(id domain.BeadID) beads.Gate {
 	f.mu.Lock()

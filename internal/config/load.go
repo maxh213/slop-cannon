@@ -52,6 +52,10 @@ const (
 	KeyMaxBeadsPerPlan    = "max_beads_per_plan"
 	KeyNice               = "nice"
 	KeyResearch           = "research"
+	KeyAutoMerge          = "auto_merge"
+	KeyAutoMergeChecks    = "auto_merge_checks"
+	KeyAutoMergeSpacing   = "auto_merge_spacing"
+	KeyConventionalTitles = "conventional_pr_titles"
 	KeyMaxReviewRounds    = "limits.max_review_rounds"
 	KeyMaxPushbackRounds  = "limits.max_pushback_rounds"
 	KeyMaxConflictRounds  = "limits.max_conflict_rounds"
@@ -193,6 +197,7 @@ var scalarKeys = []string{
 	KeyActiveCartridge, KeyAmmo, KeySafety, KeyVibes, KeyRules, KeyExclude, KeyCheckCommand, KeyIdleReplanInterval,
 	KeyGatePollInterval, KeyPRPollInterval, KeyGraphPollInterval, KeyMaxDiffBytes, KeyReReviewThreshold,
 	KeyMaxBeadsPerPlan, KeyNice, KeyResearch,
+	KeyAutoMerge, KeyAutoMergeChecks, KeyAutoMergeSpacing, KeyConventionalTitles,
 	KeyMaxReviewRounds, KeyMaxPushbackRounds, KeyMaxConflictRounds, KeyAgentTimeout, KeyMaxAgentTimeout, KeyCheckTimeout, KeyMaxTokens, KeyMaxCostUSD,
 	KeyMaxPlanRejections, KeyMaxPlanFailures,
 }
@@ -488,6 +493,24 @@ func (e *Effective) mergeLayer(f *File, path string, src Source) error {
 		e.Research = *f.Research
 		e.Sources[KeyResearch] = src
 	}
+	if f.AutoMerge != nil {
+		e.AutoMerge = *f.AutoMerge
+		e.Sources[KeyAutoMerge] = src
+	}
+	if f.AutoMergeChecks != nil {
+		// Unioned global-then-repo like exclude: a repository can require
+		// one more check, never fewer than the global file asks for.
+		e.AutoMergeChecks = MergeExcludes(e.AutoMergeChecks, f.AutoMergeChecks)
+		e.Sources[KeyAutoMergeChecks] = mergedSource(e.Sources[KeyAutoMergeChecks], src)
+	}
+	if f.AutoMergeSpacing != nil {
+		e.AutoMergeSpacing = *f.AutoMergeSpacing
+		e.Sources[KeyAutoMergeSpacing] = src
+	}
+	if f.ConventionalPRTitles != nil {
+		e.ConventionalPRTitles = *f.ConventionalPRTitles
+		e.Sources[KeyConventionalTitles] = src
+	}
 	if v := f.Limits.MaxReviewRounds; v != nil {
 		e.Limits.MaxReviewRounds = *v
 		e.Sources[KeyMaxReviewRounds] = src
@@ -700,8 +723,28 @@ func (e *Effective) validate() error {
 	if e.Limits.MaxPlanFailures < 1 {
 		return &ValidationError{Path: e.pathOf(KeyMaxPlanFailures), Key: KeyMaxPlanFailures, Msg: "must be at least 1"}
 	}
+	if e.AutoMergeSpacing.Duration() <= 0 {
+		return &ValidationError{Path: e.pathOf(KeyAutoMergeSpacing), Key: KeyAutoMergeSpacing, Msg: "must be a positive duration"}
+	}
+	if e.AutoMerge && !e.Safety {
+		return &ValidationError{Path: e.pathOf(KeyAutoMerge), Key: KeyAutoMerge, Msg: ErrAutoMergeNeedsSafety.Error()}
+	}
+	if e.AutoMerge && len(e.AutoMergeChecks) == 0 {
+		return &ValidationError{Path: e.pathOf(KeyAutoMerge), Key: KeyAutoMerge, Msg: ErrAutoMergeNeedsChecks.Error()}
+	}
 	return nil
 }
+
+// ErrAutoMergeNeedsChecks refuses auto_merge without a name in
+// auto_merge_checks (D-31): the rollup only lists the checks GitHub has
+// created so far, so with nothing required a fast check that finishes
+// before CI has registered the tests would read as all green.
+var ErrAutoMergeNeedsChecks = errors.New("needs at least one auto_merge_checks name: without one, a pull request whose quick checks finish before its tests have even started reads as green")
+
+// ErrAutoMergeNeedsSafety refuses auto_merge with safety off (D-31): the
+// run only ever merges a pull request it opened itself, and safety off
+// opens none — it merges into the default branch directly.
+var ErrAutoMergeNeedsSafety = errors.New("needs safety = true: auto-merge merges the run's own pull requests, and safety off opens none")
 
 // Overrides are the CLI flags that sit above both files (D-03). Nil means
 // "not given".
@@ -709,6 +752,8 @@ type Overrides struct {
 	Ammo      *int
 	Safety    *bool
 	Cartridge *string
+	// AutoMerge is --auto-merge (D-31).
+	AutoMerge *bool
 }
 
 // Apply layers flag values over the merged config and marks them
@@ -735,6 +780,18 @@ func (e *Effective) Apply(o Overrides) error {
 		}
 		e.ActiveCartridge = name
 		e.Sources[KeyActiveCartridge] = SourceFlag
+	}
+	if o.AutoMerge != nil {
+		e.AutoMerge = *o.AutoMerge
+		e.Sources[KeyAutoMerge] = SourceFlag
+	}
+	if e.AutoMerge && !e.Safety {
+		// Either half may come from a flag, so the pair is judged after
+		// both are applied (D-31).
+		return fmt.Errorf("auto_merge is on but safety is off: %w", ErrAutoMergeNeedsSafety)
+	}
+	if e.AutoMerge && len(e.AutoMergeChecks) == 0 {
+		return fmt.Errorf("auto_merge is on: %w", ErrAutoMergeNeedsChecks)
 	}
 	return nil
 }
@@ -795,6 +852,10 @@ func (e *Effective) Entries() []Entry {
 	add(KeyMaxBeadsPerPlan, strconv.Itoa(e.MaxBeadsPerPlan), e.Sources[KeyMaxBeadsPerPlan])
 	add(KeyNice, strconv.Itoa(e.Nice), e.Sources[KeyNice])
 	add(KeyResearch, strconv.FormatBool(e.Research), e.Sources[KeyResearch])
+	add(KeyAutoMerge, strconv.FormatBool(e.AutoMerge), e.Sources[KeyAutoMerge])
+	add(KeyAutoMergeChecks, formatList(e.AutoMergeChecks), e.Sources[KeyAutoMergeChecks])
+	add(KeyAutoMergeSpacing, e.AutoMergeSpacing.String(), e.Sources[KeyAutoMergeSpacing])
+	add(KeyConventionalTitles, strconv.FormatBool(e.ConventionalPRTitles), e.Sources[KeyConventionalTitles])
 	add(KeyMaxReviewRounds, strconv.Itoa(e.Limits.MaxReviewRounds), e.Sources[KeyMaxReviewRounds])
 	add(KeyMaxPushbackRounds, strconv.Itoa(e.Limits.MaxPushbackRounds), e.Sources[KeyMaxPushbackRounds])
 	add(KeyMaxConflictRounds, strconv.Itoa(e.Limits.MaxConflictRounds), e.Sources[KeyMaxConflictRounds])

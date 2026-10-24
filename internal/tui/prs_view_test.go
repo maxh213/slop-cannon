@@ -531,6 +531,15 @@ func TestPRsViewLayout(t *testing.T) {
 		}
 	})
 
+	t.Run("says who merges", func(t *testing.T) {
+		require.Contains(t, prsView(120, 20, PRsOptions{}).View(st), "a human merges every PR (D-20)")
+		am := prsState(true, prsFixtureEvents())
+		am.Run.Config.AutoMerge = true
+		out := prsView(120, 20, PRsOptions{}).View(am)
+		require.Contains(t, out, "the run merges its own green PRs (D-31)")
+		require.NotContains(t, out, "a human merges every PR")
+	})
+
 	t.Run("a tiny pane still renders", func(t *testing.T) {
 		out := prsView(40, 6, PRsOptions{}).View(st)
 		require.Len(t, strings.Split(out, "\n"), 2)

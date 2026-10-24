@@ -104,7 +104,32 @@ type State struct {
 	// It is absent for a run assembled without a budget and for a state
 	// file written by an older sc.
 	Budget *BudgetState `json:"budget,omitempty"`
+	// AutoMerge is the run's auto-merge ledger (D-31): when it last merged
+	// one of its own pull requests. It is written before the merge is
+	// asked for, so a resumed run waits out auto_merge_spacing from the
+	// last merge any invocation of it made. Absent for a run that never
+	// auto-merged.
+	AutoMerge *AutoMergeState `json:"auto_merge,omitempty"`
 }
+
+// AutoMergeState is what [State.AutoMerge] records.
+type AutoMergeState struct {
+	// LastAt is when the run last asked GitHub to merge a pull request.
+	LastAt time.Time `json:"last_at"`
+	// LastBead and LastPR are the bead and pull request it merged.
+	LastBead domain.BeadID `json:"last_bead,omitempty"`
+	LastPR   int           `json:"last_pr,omitempty"`
+	// Merges counts the merges asked for over the life of the run.
+	Merges int `json:"merges,omitempty"`
+	// SentBack are the heads already sent back to their engineer, as
+	// "conflict:<sha>" and "check:<sha>:<name>", the newest
+	// [autoMergeSentBackLimit] of them: a head that comes back the same
+	// after a resume goes to a person, not round again.
+	SentBack []string `json:"sent_back,omitempty"`
+}
+
+// autoMergeSentBackLimit bounds [AutoMergeState.SentBack].
+const autoMergeSentBackLimit = 256
 
 // Spent is the run's budget state, or the zero value for a state file that
 // carries none.
@@ -122,6 +147,11 @@ func (s State) clone() State {
 		out.Agents = append([]domain.Agent(nil), s.Agents...)
 	}
 	out.Run.Config = cloneSnapshot(s.Run.Config)
+	if s.AutoMerge != nil {
+		am := *s.AutoMerge
+		am.SentBack = append([]string(nil), s.AutoMerge.SentBack...)
+		out.AutoMerge = &am
+	}
 	return out
 }
 
@@ -133,6 +163,9 @@ func cloneSnapshot(c domain.ConfigSnapshot) domain.ConfigSnapshot {
 	}
 	if len(c.Rules) > 0 {
 		out.Rules = append([]string(nil), c.Rules...)
+	}
+	if len(c.AutoMergeChecks) > 0 {
+		out.AutoMergeChecks = append([]string(nil), c.AutoMergeChecks...)
 	}
 	return out
 }
@@ -323,6 +356,29 @@ func RestoreRunConfig(rc *config.RunConfig) (RestoreResult, error) {
 			current.Cartridge, frozen.Cartridge))
 		frozen.Cartridge = current.Cartridge
 		frozen.Model = current.Model
+	}
+	// D-31: what the run may merge is frozen like safety, and --auto-merge
+	// overrides it like --safety. Turning it on now takes the checks and the
+	// spacing the configuration has now: a run that never merged recorded
+	// neither.
+	if src, ok := drifted(config.KeyAutoMerge, frozen.AutoMerge != current.AutoMerge); ok {
+		res.Notes = append(res.Notes, fmt.Sprintf("the %s config now says auto_merge %t, but run %s keeps its recorded auto_merge %t; pass --auto-merge=%t to change it",
+			src, current.AutoMerge, rc.Run.ID, frozen.AutoMerge, current.AutoMerge))
+	}
+	if flagged(config.KeyAutoMerge) && frozen.AutoMerge != current.AutoMerge {
+		res.Overridden = append(res.Overridden, config.KeyAutoMerge)
+		res.Notes = append(res.Notes, fmt.Sprintf("--auto-merge=%t overrides the run's recorded auto_merge %t", current.AutoMerge, frozen.AutoMerge))
+		frozen.AutoMerge = current.AutoMerge
+		frozen.AutoMergeChecks = append([]string(nil), current.AutoMergeChecks...)
+		frozen.AutoMergeSpacing = current.AutoMergeSpacing
+	}
+	if frozen.AutoMerge && !frozen.Safety {
+		return res, fmt.Errorf("orchestrator: run %s merges its own pull requests (auto_merge), which %w; pass --auto-merge=false with --safety off",
+			rc.Run.ID, config.ErrAutoMergeNeedsSafety)
+	}
+	if frozen.AutoMerge && len(frozen.AutoMergeChecks) == 0 {
+		return res, fmt.Errorf("orchestrator: run %s merges its own pull requests (auto_merge), which %w; set auto_merge_checks and pass --auto-merge, or pass --auto-merge=false",
+			rc.Run.ID, config.ErrAutoMergeNeedsChecks)
 	}
 
 	alloc, err := config.Allocate(frozen.Ammo)

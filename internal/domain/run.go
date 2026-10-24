@@ -73,6 +73,15 @@ type ConfigSnapshot struct {
 	ReviewPRs bool `json:"review_prs"`
 	// Headless means events are rendered as log lines instead of the TUI (D-15).
 	Headless bool `json:"headless"`
+	// AutoMerge lets the run squash-merge the pull requests it opened once
+	// they are green (D-31); meaningful only with Safety.
+	AutoMerge bool `json:"auto_merge,omitempty"`
+	// AutoMergeChecks are the check names an auto-merge requires (D-31).
+	AutoMergeChecks []string `json:"auto_merge_checks,omitempty"`
+	// AutoMergeSpacing is the least time between two auto-merges (D-31).
+	AutoMergeSpacing time.Duration `json:"auto_merge_spacing,omitempty"`
+	// ConventionalPRTitles titles pull requests "<type>: <title>" (D-31).
+	ConventionalPRTitles bool `json:"conventional_pr_titles,omitempty"`
 }
 
 // Run is one orchestrator run against a target repository.

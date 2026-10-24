@@ -10,5 +10,6 @@ vibes      [<tmp>/repo/vibes.md] (from repo)
 rules      [] (from default)
 nice       10: the run and every process it starts run at a lower priority (from default)
 review-prs true
+auto-merge off: a human merges every pull request (from default)
 headless   false
 animation  on

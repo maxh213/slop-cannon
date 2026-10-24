@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"slop-cannon/internal/beads"
@@ -20,8 +21,12 @@ import (
 // Safety-on delivery (D-10, D-20): the bead's branch is pushed to the
 // default remote and a pull request is opened with gh. The default branch
 // is never touched. The bead stays in `delivering`, records the PR in its
-// metadata, and gets a gh:pr gate that blocks it until a human merges;
-// dependents therefore wait for the merge, which is the point of safety.
+// metadata, and gets a gh:pr gate that blocks it until the pull request
+// merges — by a human, or by the run's gate poller when it auto-merges its
+// own (D-31); dependents therefore wait for the merge, which is the point
+// of safety. An existing pull request for the branch is reused only when
+// [OwnedByRun] says it is the run's own; anything else on the branch is
+// neither pushed to nor reused, and the bead goes to a person.
 // When gh cannot be used (not installed, not authenticated, or the remote
 // is not on GitHub) the branch is still pushed, the human gets the compare
 // URL, and the bead moves to `needs_human` because no gate can be checked.
@@ -67,6 +72,11 @@ const (
 	// PRNoRemote means the repository has no remote; the branch was left
 	// in place and the bead moved to needs_human.
 	PRNoRemote PRStatus = "no-remote"
+	// PRForeign means a pull request already exists for the bead's branch
+	// and it is not this run's own ([OwnedByRun], D-31): it was not
+	// adopted, nothing was pushed to its branch, and the bead moved to
+	// needs_human.
+	PRForeign PRStatus = "foreign"
 )
 
 // PRTracker is the slice of the beads client the delivery needs to record
@@ -105,6 +115,11 @@ type PRRequest struct {
 	// Base overrides the branch the pull request targets; empty means the
 	// repository's default branch.
 	Base string
+	// RunStarted is when the run first started. An existing pull request
+	// for the branch is reused only when it is the run's own
+	// ([OwnedByRun]), and one created before this cannot be (D-31); zero
+	// means no existing pull request is ever reused.
+	RunStarted time.Time
 }
 
 // PRResult is what [PRDeliverer.Deliver] did.
@@ -154,7 +169,7 @@ func (r *PRResult) Summary() string {
 		return fmt.Sprintf("%s: reusing PR #%d %s (gate %s)", r.Bead, r.PR.Number, r.PR.URL, r.Gate)
 	case PRPushOnly:
 		return fmt.Sprintf("%s: pushed %s to %s but %s; %s", r.Bead, r.Branch, r.Remote, r.Reason, r.Instructions)
-	case PRNoRemote:
+	case PRNoRemote, PRForeign:
 		return fmt.Sprintf("%s: %s; %s", r.Bead, r.Reason, r.Instructions)
 	}
 	return fmt.Sprintf("%s: %s", r.Bead, r.Status)
@@ -164,10 +179,11 @@ func (r *PRResult) Summary() string {
 // worktree manager. It is safe for concurrent use; the orchestrator
 // usually delivers one bead at a time anyway.
 type PRDeliverer struct {
-	m       *Manager
-	tracker PRTracker
-	gh      *GH
-	logger  *slog.Logger
+	m            *Manager
+	tracker      PRTracker
+	gh           *GH
+	logger       *slog.Logger
+	conventional bool
 }
 
 // PROption customises [NewPRDeliverer].
@@ -191,6 +207,24 @@ func WithPRGH(gh *GH) PROption {
 			d.gh = gh
 		}
 	}
+}
+
+// WithConventionalTitles titles every pull request with
+// [ConventionalPRTitle] instead of [PRTitle] (conventional_pr_titles, D-31).
+func WithConventionalTitles(on bool) PROption {
+	return func(d *PRDeliverer) { d.conventional = on }
+}
+
+// GH returns the gh runner the deliverer opens pull requests with; the gate
+// poller merges through the same one, so the login is read once.
+func (d *PRDeliverer) GH() *GH { return d.gh }
+
+// Title is the pull request title the deliverer gives bead.
+func (d *PRDeliverer) Title(bead domain.Bead) string {
+	if d.conventional {
+		return ConventionalPRTitle(bead)
+	}
+	return PRTitle(bead)
 }
 
 // NewPRDeliverer returns a deliverer for the manager's repository that
@@ -281,10 +315,52 @@ func (d *PRDeliverer) Deliver(ctx context.Context, req PRRequest) (*PRResult, er
 	// the branch is history, and pushing a local tip that has fallen behind
 	// the remote one (a resume after the human updated the pull request)
 	// only fails as non-fast-forward.
-	pr, state, err := d.gh.FindPR(ctx, branch)
+	candidates, err := d.gh.FindPRs(ctx, branch)
 	reason, ghDown := ghUnavailable(err)
 	if err != nil && !ghDown {
 		return nil, err
+	}
+	var pr *PullRequest
+	var state string
+	if len(candidates) > 0 {
+		// D-31: a pull request is adopted only when it is this run's own.
+		// Anything else on the branch — a human's, another run's, one from
+		// before the run started, a fork's that reuses the name — is not
+		// pushed to, not reused and not merged: a person decides what
+		// happens to it. The run's own pull request is looked for among
+		// all of them, so a foreign one with the same head name does not
+		// hide it.
+		var why string
+		for _, c := range candidates {
+			owned, w, err := d.owned(ctx, req, c.PR, branch, base)
+			if r, down := ghUnavailable(err); down {
+				// The branch has a pull request nobody has shown is this
+				// run's: gh failing now is no licence to push onto it.
+				res.Status = PRForeign
+				res.PR, res.PRState = &c.PR, c.State
+				res.Reason = fmt.Sprintf("could not confirm pull request #%d on %s is this run's own: %s", c.PR.Number, branch, r)
+				res.Instructions = fmt.Sprintf("slop-cannon will not push to, reuse or merge it unconfirmed; fix gh and retry the bead, or close the pull request (or move it off %s) if it is not this run's", branch)
+				return d.handOff(ctx, res, log)
+			} else if err != nil {
+				return nil, err
+			}
+			if owned {
+				found := c.PR
+				pr, state = &found, c.State
+				break
+			}
+			if why == "" {
+				why = w
+			}
+		}
+		if pr == nil {
+			first := candidates[0]
+			res.Status = PRForeign
+			res.PR, res.PRState = &first.PR, first.State
+			res.Reason = fmt.Sprintf("pull request #%d on %s is not this run's own: %s", first.PR.Number, branch, why)
+			res.Instructions = fmt.Sprintf("slop-cannon will not push to, reuse or merge it; close it (or move it off %s) and retry the bead, or merge the work yourself", branch)
+			return d.handOff(ctx, res, log)
+		}
 	}
 	if pr != nil && state == "MERGED" {
 		log.InfoContext(ctx, "pull request already merged; not pushing the bead branch", "number", pr.Number)
@@ -306,7 +382,7 @@ func (d *PRDeliverer) Deliver(ctx context.Context, req PRRequest) (*PRResult, er
 		res.Status = PRExisting
 		log.InfoContext(ctx, "reusing existing pull request", "number", pr.Number, "url", pr.URL, "state", state)
 	} else {
-		title := PRTitle(bead)
+		title := d.Title(bead)
 		body := PRBody(req, branch, base)
 		created, warn, err := d.gh.CreatePR(ctx, PRSpec{Head: branch, Base: base, Title: title, Body: body, Labels: []string{CannonPRLabel}})
 		if err != nil {
@@ -321,7 +397,12 @@ func (d *PRDeliverer) Deliver(ctx context.Context, req PRRequest) (*PRResult, er
 	}
 	res.PR, res.PRState = pr, state
 
-	if _, err := d.tracker.SetMetadata(ctx, bead.ID, beads.PRMetadata(pr.URL, pr.Number)); err != nil {
+	// sc_pr_head is the tip the testers approved: auto-merge merges that
+	// commit, or GitHub's clean update merges on top of it, and nothing
+	// else pushed to the branch (D-31).
+	meta := beads.PRMetadata(pr.URL, pr.Number)
+	meta[beads.MetaPRHead] = head
+	if _, err := d.tracker.SetMetadata(ctx, bead.ID, meta); err != nil {
 		return nil, fmt.Errorf("gitx: recording PR on %s: %w", bead.ID, err)
 	}
 	gate, warn, err := d.ensureGate(ctx, bead, pr)
@@ -382,12 +463,33 @@ func (d *PRDeliverer) ensureGate(ctx context.Context, bead domain.Bead, pr *Pull
 	default:
 		return "", "", fmt.Errorf("gitx: looking up the gate of %s: %w", bead.ID, err)
 	}
-	reason := fmt.Sprintf("PR #%d: %s", pr.Number, PRTitle(bead))
+	reason := fmt.Sprintf("PR #%d: %s", pr.Number, d.Title(bead))
 	gate, err := d.tracker.CreatePRGate(ctx, bead.ID, pr.Number, reason)
 	if err != nil {
 		return "", "", fmt.Errorf("gitx: creating the gh:pr gate for %s: %w", bead.ID, err)
 	}
 	return gate.ID, warn, nil
+}
+
+// owned judges an existing pull request for the branch with [OwnedByRun].
+// A bead that has not recorded its pull request yet — the delivery that
+// opened it died before sc_pr_number was written — has its number clause
+// judged against the candidate itself; every other clause still applies,
+// and the body marker and the creation time are what tie it to this run.
+func (d *PRDeliverer) owned(ctx context.Context, req PRRequest, pr PullRequest, branch, base string) (bool, string, error) {
+	login, err := d.gh.Login(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	number := req.Bead.PRNumber
+	if number <= 0 {
+		number = pr.Number
+	}
+	ok, why := OwnedByRun(pr, Ownership{
+		Bead: req.Bead.ID, Run: req.Run, Branch: branch, Base: base,
+		PRNumber: number, RunStarted: req.RunStarted, Login: login,
+	})
+	return ok, why, nil
 }
 
 // manualPRInstructions tells the human how to open the pull request by
@@ -409,6 +511,11 @@ func PRTitle(bead domain.Bead) string {
 	if title == "" {
 		return "Bead " + string(bead.ID)
 	}
+	return capTitle(title)
+}
+
+// capTitle caps a title at [maxPRTitleLen] bytes on a rune boundary.
+func capTitle(title string) string {
 	if len(title) > maxPRTitleLen {
 		const ellipsis = "…"
 		cut := maxPRTitleLen - len(ellipsis)
@@ -537,43 +644,68 @@ func (r *Repo) RemoteURL(ctx context.Context, remote string) (string, error) {
 	return r.Git(ctx, "remote", "get-url", "--", remote)
 }
 
-// ghPRRef is the raw gh JSON shape of `gh pr list --json number,url,state,title`.
+// ghPRRef is the raw gh JSON shape of `gh pr list --json <ghFindPRFields>`.
 type ghPRRef struct {
-	Number int    `json:"number"`
-	URL    string `json:"url"`
-	State  string `json:"state"`
-	Title  string `json:"title"`
+	ghPR
+	State string `json:"state"`
 }
+
+// ghFindPRFields are what [GH.FindPR] asks for: enough to judge the pull
+// request with [OwnedByRun] before it is reused (D-31).
+const ghFindPRFields = "number,url,state,title,headRefName,baseRefName,labels,body,author,createdAt"
 
 // FindPR looks up the pull request whose head is branch with
 // "gh pr list --head <branch> --state all". An open one wins; otherwise a
 // merged one is returned so the gate resolves immediately; a closed,
 // unmerged one is ignored so a retry opens a fresh pull request. state is
-// gh's "OPEN" or "MERGED"; the result is nil when there is none.
+// gh's "OPEN" or "MERGED"; the result is nil when there is none. The pull
+// request carries what [OwnedByRun] needs, and the caller must judge it:
+// FindPR itself does not know whose it is.
 func (g *GH) FindPR(ctx context.Context, branch string) (pr *PullRequest, state string, err error) {
-	if branch == "" {
-		return nil, "", errors.New("gitx: FindPR: empty branch")
-	}
-	out, err := g.run(ctx, "", "pr", "list", "--head", branch, "--state", "all", "--limit", "50", "--json", "number,url,state,title")
-	if err != nil {
+	candidates, err := g.FindPRs(ctx, branch)
+	if err != nil || len(candidates) == 0 {
 		return nil, "", err
+	}
+	return &candidates[0].PR, candidates[0].State, nil
+}
+
+// PRCandidate is one pull request [GH.FindPRs] found for a branch, with
+// its state ("OPEN" or "MERGED").
+type PRCandidate struct {
+	PR    PullRequest
+	State string
+}
+
+// FindPRs returns every open or merged pull request whose head is branch,
+// in [GH.FindPR]'s order of preference: open before merged, newest first
+// within each. Several can share a head name — a fork's pull request
+// matches the same name — so a caller that judges ownership looks at all
+// of them.
+func (g *GH) FindPRs(ctx context.Context, branch string) ([]PRCandidate, error) {
+	if branch == "" {
+		return nil, errors.New("gitx: FindPR: empty branch")
+	}
+	out, err := g.run(ctx, "", "pr", "list", "--head", branch, "--state", "all", "--limit", "50", "--json", ghFindPRFields)
+	if err != nil {
+		return nil, err
 	}
 	var refs []ghPRRef
 	if strings.TrimSpace(out) != "" {
 		if err := json.Unmarshal([]byte(out), &refs); err != nil {
-			return nil, "", fmt.Errorf("gitx: gh pr list: unexpected output %q: %w", out, err)
+			return nil, fmt.Errorf("gitx: gh pr list: unexpected output %q: %w", out, err)
 		}
 	}
 	// Newest first, so among several of one state the latest wins.
 	sort.SliceStable(refs, func(i, j int) bool { return refs[i].Number > refs[j].Number })
+	var found []PRCandidate
 	for _, want := range []string{"OPEN", "MERGED"} {
 		for _, ref := range refs {
 			if strings.EqualFold(ref.State, want) {
-				return &PullRequest{Number: ref.Number, URL: ref.URL, Title: ref.Title, HeadRef: branch}, want, nil
+				found = append(found, PRCandidate{PR: ref.pullRequest(), State: want})
 			}
 		}
 	}
-	return nil, "", nil
+	return found, nil
 }
 
 // PRSpec describes a pull request to open with [GH.CreatePR].

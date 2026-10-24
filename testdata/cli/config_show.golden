@@ -16,6 +16,10 @@ re_review_threshold         0.4         default
 max_beads_per_plan          8           default
 nice                        10          default
 research                    true        default
+auto_merge                  false       default
+auto_merge_checks           []          default
+auto_merge_spacing          10m         default
+conventional_pr_titles      false       default
 limits.max_review_rounds    3           repo
 limits.max_pushback_rounds  2           default
 limits.max_conflict_rounds  3           default

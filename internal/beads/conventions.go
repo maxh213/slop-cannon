@@ -188,6 +188,12 @@ func (i Issue) PRNumber() int {
 	return n
 }
 
+// PRHead returns the sc_pr_head commit, or "" when none is recorded.
+func (i Issue) PRHead() string {
+	s, _ := i.Metadata.String(MetaPRHead)
+	return s
+}
+
 // MergeSHA returns the sc_merge_sha metadata, or "".
 func (i Issue) MergeSHA() string {
 	s, _ := i.Metadata.String(MetaMergeSHA)

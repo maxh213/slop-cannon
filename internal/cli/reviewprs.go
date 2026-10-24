@@ -142,6 +142,9 @@ func newPRReviewer(ctx context.Context, s prReviewSetup) (*orchestrator.PRReview
 
 	watcher := gitx.NewPRWatcher(gh, s.Beads,
 		gitx.WithRun(s.RC.Run.ID),
+		// D-31: a pull request that was open before the run first started
+		// (a resume keeps the original start) is never reviewed.
+		gitx.WithRunStarted(s.RC.Run.StartedAt),
 		gitx.WithPollInterval(s.Interval),
 		gitx.WithWatcherLogger(logger))
 	var checkout orchestrator.PRCheckout

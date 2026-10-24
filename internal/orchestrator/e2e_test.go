@@ -158,8 +158,12 @@ func e2eShellQuote(s string) string {
 // The gh shim
 // ---------------------------------------------------------------------------
 
-// e2ePRHost is the GitHub repository the gh shim pretends to serve.
-const e2ePRHost = "https://github.com/acme/widgets"
+// e2ePRHost is the GitHub repository the gh shim pretends to serve, and
+// e2eLogin the login it is authenticated as.
+const (
+	e2ePRHost = "https://github.com/acme/widgets"
+	e2eLogin  = "sc-bot"
+)
 
 // e2eFakeGH installs a `gh` shim that opens numbered pull requests and
 // remembers them (P8-26). It is the one gh stand-in the package has: the
@@ -183,6 +187,13 @@ const e2ePRHost = "https://github.com/acme/widgets"
 //     as it is in life, so a resume finds the D-20 state that hangs — a
 //     pull request open with no gate watching it — and the merge lands
 //     between two polls, which is what the gate poller exists to notice.
+//     With the control file "automerge" present (D-31) nothing merges by
+//     being looked at: a pull request is OPEN, green and CLEAN until
+//     `gh pr merge` merges it, which is the run merging its own;
+//   - every pull request it lists carries what D-31's ownership check
+//     reads — the label, the body's marker line, the base, the author
+//     `gh api user` names and the time it was opened — so a resumed run
+//     can reuse the pull request it opened itself.
 //
 // Every invocation is recorded, so a test can assert the pull requests the
 // run created and the order it asked about them in.
@@ -190,23 +201,45 @@ func e2eFakeGH(t *testing.T) *testutil.Shim {
 	t.Helper()
 	return testutil.FakeBin(t, "gh", `
 _head=''
+_base=''
 _prev=''
 for _a in "$@"; do
   if [ "$_prev" = "--head" ]; then _head=$_a; fi
+  if [ "$_prev" = "--base" ]; then _base=$_a; fi
   _prev=$_a
 done
 _key=$(printf '%s' "$_head" | tr '/' '_')
 # _state prints the state of pull request $1: OPEN until it has been looked
-# at once, MERGED afterwards.
+# at once, MERGED afterwards (or, with auto-merge, until gh pr merge).
 _state() {
   if [ -f "$SC_FAKEBIN_DIR/merged.$1" ]; then echo MERGED; else echo OPEN; fi
 }
 # _pr prints one pull request as JSON: $1 number, $2 head branch, $3 state.
 _pr() {
-  printf '{"number":%s,"url":"`+e2ePRHost+`/pull/%s","state":"%s","title":"Pull request %s","headRefName":"%s"}' "$1" "$1" "$3" "$1" "$2"
+  _m=$(cat "$SC_FAKEBIN_DIR/marker.$1" 2>/dev/null || echo '')
+  _b=$(cat "$SC_FAKEBIN_DIR/base.$1" 2>/dev/null || echo main)
+  _c=$(cat "$SC_FAKEBIN_DIR/created.$1" 2>/dev/null || echo 2000-01-01T00:00:00Z)
+  printf '{"number":%s,"url":"`+e2ePRHost+`/pull/%s","state":"%s","title":"Pull request %s","headRefName":"%s","baseRefName":"%s","labels":[{"name":"slop-cannon"}],"body":"%s","author":{"login":"`+e2eLogin+`"},"createdAt":"%s"}' "$1" "$1" "$3" "$1" "$2" "$_b" "$_m" "$_c"
+}
+# _view prints everything auto-merge reads about pull request $1: green,
+# CLEAN, and at the head its branch has on the remote.
+_view() {
+  _h=$(cat "$SC_FAKEBIN_DIR/num.$1" 2>/dev/null || echo '')
+  _m=$(cat "$SC_FAKEBIN_DIR/marker.$1" 2>/dev/null || echo '')
+  _b=$(cat "$SC_FAKEBIN_DIR/base.$1" 2>/dev/null || echo main)
+  _c=$(cat "$SC_FAKEBIN_DIR/created.$1" 2>/dev/null || echo 2000-01-01T00:00:00Z)
+  _o=$(git ls-remote origin "refs/heads/$_h" 2>/dev/null | cut -f1)
+  printf '{"number":%s,"state":"%s","isDraft":false,"headRefName":"%s","headRefOid":"%s","baseRefName":"%s","mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","statusCheckRollup":[{"__typename":"CheckRun","name":"test","status":"COMPLETED","conclusion":"SUCCESS","detailsUrl":"https://ci.example/test"}],"labels":[{"name":"slop-cannon"}],"body":"%s","createdAt":"%s","author":{"login":"`+e2eLogin+`"}}' "$1" "$(_state "$1")" "$_h" "${_o:-e2e-head-$1}" "$_b" "$_m" "$_c"
 }
 case "$1 $2" in
   "label create")
+    ;;
+  "api user")
+    echo `+e2eLogin+`
+    ;;
+  "pr merge")
+    echo merged > "$SC_FAKEBIN_DIR/merged.$3"
+    echo "Squashed and merged pull request acme/widgets#$3"
     ;;
   "pr list")
     if [ -n "$_head" ] && [ -f "$SC_FAKEBIN_DIR/head.$_key" ]; then
@@ -234,16 +267,26 @@ case "$1 $2" in
     echo "$n" > "$SC_FAKEBIN_DIR/prcount"
     echo "$n" > "$SC_FAKEBIN_DIR/head.$_key"
     echo "$_head" > "$SC_FAKEBIN_DIR/num.$n"
+    echo "$_base" > "$SC_FAKEBIN_DIR/base.$n"
+    head -n 1 "$SC_FAKEBIN_DIR/body.$SC_FAKEBIN_SEQ" > "$SC_FAKEBIN_DIR/marker.$n"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$SC_FAKEBIN_DIR/created.$n"
     rmdir "$SC_FAKEBIN_DIR/.prlock"
     echo "Creating pull request in acme/widgets"
     echo "`+e2ePRHost+`/pull/$n"
     ;;
   "pr view")
     _n=$3
-    _h=$(cat "$SC_FAKEBIN_DIR/num.$_n" 2>/dev/null || echo '')
-    _s=$(_state "$_n")
-    echo merged > "$SC_FAKEBIN_DIR/merged.$_n"
-    _pr "$_n" "$_h" "$_s"; printf '\n'
+    if [ -f "$SC_FAKEBIN_DIR/automerge" ]; then
+      case "$*" in
+        *statusCheckRollup*) _view "$_n"; printf '\n' ;;
+        *) _h=$(cat "$SC_FAKEBIN_DIR/num.$_n" 2>/dev/null || echo ''); _pr "$_n" "$_h" "$(_state "$_n")"; printf '\n' ;;
+      esac
+    else
+      _h=$(cat "$SC_FAKEBIN_DIR/num.$_n" 2>/dev/null || echo '')
+      _s=$(_state "$_n")
+      echo merged > "$SC_FAKEBIN_DIR/merged.$_n"
+      _pr "$_n" "$_h" "$_s"; printf '\n'
+    fi
     ;;
   *)
     echo "gh shim: unexpected command: $*" >&2
@@ -418,7 +461,9 @@ type e2eRig struct {
 	Sched     *Scheduler
 	Deliverer *Deliverer
 	Poller    *GatePoller
-	Run       *Run
+	// prPath is the pull request path of a safety-on rig.
+	prPath *gitx.PRDeliverer
+	Run    *Run
 	// Cond is the production run-level glue (P8-14). The rig drives it
 	// rather than a conductor of its own: `sc run` and this test must fire
 	// the same code, or the e2e proves the rig instead of the product.
@@ -454,6 +499,10 @@ type e2eEnv struct {
 	// the runs this machine hosted; e2eBuild fills them in.
 	SafetyOn bool
 	built    bool
+	// AutoMerge runs every rig built on this machine with auto_merge on
+	// (D-31): the gh shim merges only through `gh pr merge`, and the argv
+	// invariant allows exactly the merge auto-merge makes.
+	AutoMerge bool
 }
 
 // e2eFakeGit installs a `git` shim that records every invocation and then
@@ -503,7 +552,7 @@ func (e *e2eEnv) assertGitInvariant(t *testing.T) {
 			"safety %s: git was asked to do something a run may never do:\n%s",
 			env.Safety, strings.Join(bad, "\n"))
 	}
-	if bad := gitguard.ScanGH(t, e.GH); len(bad) > 0 {
+	if bad := gitguard.ScanGHWith(t, e.GH, gitguard.GHOptions{AutoMerge: e.AutoMerge}); len(bad) > 0 {
 		assert.Failf(t, "gh broke the safety invariant",
 			"safety %s: gh was asked to do something a run may never do (D-11):\n%s",
 			env.Safety, strings.Join(bad, "\n"))
@@ -596,6 +645,13 @@ func e2eBuild(t *testing.T, env *e2eEnv, safety, resume bool) *e2eRig {
 	}
 	cfg.ActiveCartridge = mock.Name
 	cfg.Cartridges = map[string]config.Cartridge{mock.Name: {}}
+	if env.AutoMerge {
+		cfg.AutoMerge = true
+		// Two green pull requests must both merge within the test, so the
+		// spacing is short; that it is honoured is a unit test's business.
+		cfg.AutoMergeSpacing = config.NewDuration(time.Millisecond)
+		cfg.AutoMergeChecks = []string{"test"}
+	}
 	eff := &config.Effective{Config: cfg, Sources: map[string]config.Source{}}
 	settings := config.RunSettings{
 		ID: e2eRunID, Brief: e2eBrief, StartedAt: e2eEpoch, Headless: true,
@@ -758,6 +814,15 @@ func e2eBuild(t *testing.T, env *e2eEnv, safety, resume bool) *e2eRig {
 
 	rig.setDeliveryPaths()
 
+	var autoMerge *AutoMergeOptions
+	if snap := rc.Run.Config; snap.Safety && snap.AutoMerge {
+		// The production parts, as cli.runAutoMerge assembles them; the
+		// conductor is built below, so the outcome applier is late-bound.
+		autoMerge = &AutoMergeOptions{
+			GH: rig.prPath.GH(), Branches: rig.prPath, Ledger: run, Outcomes: e2eOutcomes{rig: rig},
+			Checks: snap.AutoMergeChecks, Spacing: snap.AutoMergeSpacing, RunStarted: rc.Run.StartedAt,
+		}
+	}
 	poller, err := NewGatePoller(GatePollerOptions{
 		Gates: client, Beads: client, States: rig.Machine, Host: run,
 		Scope: rc.Run.ID, Statuses: rig.Statuses, Branch: repo.DefaultBranch,
@@ -766,6 +831,7 @@ func e2eBuild(t *testing.T, env *e2eEnv, safety, resume bool) *e2eRig {
 		// behind the run's back waits. Keeping it well above the
 		// conductor's leaves the serialised bd client free for the work.
 		Interval: 100 * time.Millisecond, Logger: logger,
+		AutoMerge: autoMerge,
 	})
 	require.NoError(t, err)
 	rig.Poller = poller
@@ -787,6 +853,14 @@ func e2eBuild(t *testing.T, env *e2eEnv, safety, resume bool) *e2eRig {
 	rig.Cond = cond
 
 	return rig
+}
+
+// e2eOutcomes hands a bead auto-merge sends back to the rig's conductor,
+// which is built after the poller.
+type e2eOutcomes struct{ rig *e2eRig }
+
+func (o e2eOutcomes) ApplyOutcome(ctx context.Context, id domain.BeadID, out *DeliveryOutcome) error {
+	return o.rig.Cond.ApplyOutcome(ctx, id, out)
 }
 
 // e2eDelivery is the glue's delivery seam with the rig's own bookkeeping
@@ -836,12 +910,16 @@ func (r *e2eRig) setDeliveryPaths() {
 	opts := DeliveryOptions{
 		Host: r.Run, States: r.Machine, Git: r.Git, Beads: r.Beads,
 		CheckCommand: r.RC.Effective.CheckCommand, CheckTimeout: time.Minute,
+		// D-31: what `sc run` passes, so a resume reuses the pull request
+		// the run opened before it was killed.
+		RunStarted: r.RC.Run.StartedAt,
 	}
 	if r.Safety {
 		pr, err := gitx.NewPRDeliverer(r.Manager, r.Beads,
 			gitx.WithPRLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 		require.NoError(r.T, err)
 		opts.PR = pr
+		r.prPath = pr
 	} else {
 		opts.Merge = r.Manager
 	}
@@ -1151,6 +1229,9 @@ func TestE2EBriefRunWithSafetyOn(t *testing.T) {
 	gh := e2eGHCommands(t, rig.GH)
 	assert.Equal(t, 2, e2eCountCommand(gh, "pr create"), "one pull request per bead (gh calls: %v)", gh)
 	assert.GreaterOrEqual(t, e2eCountCommand(gh, "pr view"), 2, "the gate poller asked gh about both pull requests")
+	assert.Zero(t, e2eCountCommand(gh, "pr merge"), "auto_merge off: the run never merges anything (D-10, D-31)")
+	assert.Zero(t, e2eCountCommand(gh, "pr update-branch"))
+	assert.False(t, rig.Poller.Stats().AutoMergeOn)
 	heads := e2ePRCreateHeads(t, rig)
 	require.Len(t, heads, 2)
 	for head, base := range heads {
@@ -1186,6 +1267,80 @@ func TestE2EBriefRunWithSafetyOn(t *testing.T) {
 	assert.Zero(t, gitguard.Count(git, "merge"), "safety on merges nothing (D-10)")
 
 	e2eAssertEvents(t, rig, true)
+	e2eAssertStateFile(t, rig, out)
+}
+
+// TestE2EBriefRunWithSafetyOnAndAutoMerge runs the safety-on scenario with
+// auto_merge on (D-31) against a GitHub on which nothing merges unless the
+// run asks: both pull requests are green and CLEAN, the run merges each of
+// its own with exactly the squash that names the head it read, and the gate
+// poller then closes both beads as it does for a human merge.
+func TestE2EBriefRunWithSafetyOnAndAutoMerge(t *testing.T) {
+	ctx := context.Background()
+	env := e2eNewEnv(t)
+	env.AutoMerge = true
+	require.NoError(t, os.WriteFile(filepath.Join(env.GH.Dir, "automerge"), nil, 0o644))
+	rig := e2eBuild(t, env, true, false)
+	mainBefore := rig.Repo.Head(t)
+
+	rig.start(ctx)
+	out, err := rig.wait(e2eTimeout)
+	require.NoError(t, err, "problems: %v", rig.Problems())
+	assert.Empty(t, rig.Problems(), "the conductor hit no problem")
+	assert.Equal(t, events.FinishCompleted, out.Reason)
+	e2eAssertBothBeadsShipped(ctx, t, rig)
+
+	// The run's git still never touches the default branch: the merge is
+	// GitHub's, made through gh.
+	assert.Equal(t, mainBefore, rig.Repo.Head(t))
+	assert.Equal(t, mainBefore, e2eRemoteHead(t, rig))
+
+	// Exactly one merge per pull request the run opened, each the exact
+	// squash at the head the same poll read, and nothing else.
+	created := map[string]bool{}
+	for _, inv := range rig.GH.Invocations(t) {
+		if len(inv.Args) >= 2 && inv.Args[0] == "pr" && inv.Args[1] == "create" {
+			created[e2eFlagValue(inv.Args, "--head")] = true
+		}
+	}
+	require.Len(t, created, 2)
+	var merged []string
+	for _, inv := range rig.GH.Invocations(t) {
+		if len(inv.Args) < 2 || inv.Args[0] != "pr" || inv.Args[1] != "merge" {
+			continue
+		}
+		require.Len(t, inv.Args, 6, "gh %s", strings.Join(inv.Args, " "))
+		n := inv.Args[2]
+		head, err := os.ReadFile(filepath.Join(rig.GH.Dir, "num."+n))
+		require.NoError(t, err, "pull request #%s was opened by this run", n)
+		branch := strings.TrimSpace(string(head))
+		assert.True(t, created[branch], "#%s is one of the run's own", n)
+		tip := strings.Fields(rig.Repo.Git(t, "ls-remote", rig.Repo.RemoteDir, "refs/heads/"+branch))
+		require.NotEmpty(t, tip)
+		assert.Equal(t, []string{"pr", "merge", n, "--squash", "--match-head-commit", tip[0]}, inv.Args, "the tip the run delivered and reviewed")
+		merged = append(merged, n)
+	}
+	assert.Len(t, merged, 2, "both of the run's pull requests were merged, once each")
+	gh := e2eGHCommands(t, rig.GH)
+	assert.Zero(t, e2eCountCommand(gh, "pr update-branch"), "nothing was behind")
+	assert.Equal(t, 1, e2eCountCommand(gh, "api user"), "the login is read once")
+	stats := rig.Poller.Stats()
+	assert.True(t, stats.AutoMergeOn)
+	assert.Equal(t, 2, stats.AutoMerged)
+	assert.Equal(t, 2, stats.Closed, "the poller closed both beads once bd saw the merges")
+	am := rig.Run.State().AutoMerge
+	require.NotNil(t, am, "the merges are in state.json")
+	assert.Equal(t, 2, am.Merges)
+
+	// The invariant is meaningful: the same argv judged without the
+	// auto-merge opt-in reports both merges as damage.
+	bad := gitguard.ScanGH(t, rig.GH)
+	require.Len(t, bad, 2, "%v", bad)
+	for _, b := range bad {
+		assert.Contains(t, b, "gh pr merge")
+	}
+	git := rig.judgedGit(t)
+	assert.Zero(t, gitguard.Count(git, "merge"), "the run's git merges nothing")
 	e2eAssertStateFile(t, rig, out)
 }
 

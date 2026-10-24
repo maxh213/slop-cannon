@@ -38,14 +38,22 @@
       "tester": "claude"
     },
     "role_models": {},
-    "research": true
+    "research": true,
+    "auto_merge": false,
+    "auto_merge_checks": [],
+    "auto_merge_spacing": "10m",
+    "conventional_pr_titles": false
   },
   "sources": {
     "active_cartridge": "global",
     "ammo": "repo",
+    "auto_merge": "default",
+    "auto_merge_checks": "default",
+    "auto_merge_spacing": "default",
     "cartridges": "global",
     "cartridges.claude": "global",
     "check_command": "repo",
+    "conventional_pr_titles": "default",
     "exclude": "default",
     "gate_poll_interval": "default",
     "graph_poll_interval": "default",
@@ -168,6 +176,26 @@
     {
       "key": "research",
       "value": "true",
+      "source": "default"
+    },
+    {
+      "key": "auto_merge",
+      "value": "false",
+      "source": "default"
+    },
+    {
+      "key": "auto_merge_checks",
+      "value": "[]",
+      "source": "default"
+    },
+    {
+      "key": "auto_merge_spacing",
+      "value": "10m",
+      "source": "default"
+    },
+    {
+      "key": "conventional_pr_titles",
+      "value": "false",
       "source": "default"
     },
     {

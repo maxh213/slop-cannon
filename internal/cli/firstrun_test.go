@@ -987,6 +987,7 @@ var tsExempt = map[string]string{
 	"beads.ErrUnsupportedPayload":         "encoding guard for a message type sc did not define",
 	"beads.ErrShimLayout":                 "the read-only bd shim was asked for a directory that is not a run worktree: sc's own layout",
 	"beads.ErrNoGate":                     "control flow: 'this bead has no open gate', which the gate poller expects",
+	"gitx.ErrNoHeadCommit":                "a merge guard: the gate poller always passes the head it read; only a programming error trips it",
 	"mock.ErrNoMatch":                     "the mock cartridge is a test double; it is never fired at a user's repository",
 	"orchestrator.ErrNoDeliveryHost":      "assembly invariant: the deliverer is always built with a host",
 	"orchestrator.ErrNoGateStore":         "assembly invariant: the gate poller is always built with a store",

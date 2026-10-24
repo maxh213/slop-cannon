@@ -127,6 +127,17 @@ const (
 	// DefaultCheckTimeout bounds the check command a delivery runs before it
 	// merges; it matches gitx.DefaultCheckTimeout.
 	DefaultCheckTimeout = 30 * time.Minute
+	// DefaultAutoMerge is false: with safety on a human merges every pull
+	// request unless the run is told otherwise (D-10, D-31).
+	DefaultAutoMerge = false
+	// DefaultAutoMergeSpacing is the least time between two auto-merges by
+	// one run (D-31). A repository that deploys every push to its default
+	// branch gets one deploy finished before the next merge starts another.
+	DefaultAutoMergeSpacing = 10 * time.Minute
+	// DefaultConventionalPRTitles is false: a pull request is titled with
+	// the bead's own title unless the repository asks for Conventional
+	// Commit titles (D-31).
+	DefaultConventionalPRTitles = false
 	// MaxPromptFileSize is the largest vibes or rules file accepted (64 KiB).
 	MaxPromptFileSize = 64 * 1024
 )
@@ -314,6 +325,16 @@ type File struct {
 	Nice *int `toml:"nice,omitempty"`
 	// Research lets the planning product owner search and read the web.
 	Research *bool `toml:"research,omitempty"`
+	// AutoMerge lets the run merge its own pull requests once they are
+	// green (D-31); it needs Safety.
+	AutoMerge *bool `toml:"auto_merge,omitempty"`
+	// AutoMergeChecks names the checks that must be present and successful
+	// before an auto-merge (D-31).
+	AutoMergeChecks []string `toml:"auto_merge_checks,omitempty"`
+	// AutoMergeSpacing is the least time between two auto-merges (D-31).
+	AutoMergeSpacing *Duration `toml:"auto_merge_spacing,omitempty"`
+	// ConventionalPRTitles titles pull requests "<type>: <title>" (D-31).
+	ConventionalPRTitles *bool `toml:"conventional_pr_titles,omitempty"`
 	// Limits holds the feedback-loop and budget limits (D-08, D-18).
 	Limits LimitsFile `toml:"limits,omitempty"`
 	// Cartridges are the configured subscriptions, keyed by name (global only).
@@ -431,6 +452,24 @@ type Config struct {
 	// Research lets the planning product owner search and read the web, so
 	// an autopilot plan can be grounded in comparable products.
 	Research bool `json:"research"`
+	// AutoMerge lets a safety-on run squash-merge the pull requests it
+	// opened itself, once every check on them is green, GitHub says they
+	// are mergeable and AutoMergeSpacing has passed since its last merge
+	// (D-31). It is refused without Safety.
+	AutoMerge bool `json:"auto_merge"`
+	// AutoMergeChecks are the check or status names that must be present
+	// on the pull request and successful before it is auto-merged, on top
+	// of "every check that is there passed". Unioned global-then-repo.
+	AutoMergeChecks []string `json:"auto_merge_checks"`
+	// AutoMergeSpacing is the least time between two auto-merges by one
+	// run, so each deploy the default branch triggers finishes before the
+	// next merge starts another.
+	AutoMergeSpacing Duration `json:"auto_merge_spacing"`
+	// ConventionalPRTitles titles the run's pull requests
+	// "<type>: <title starting lowercase>", the type taken from the bead's
+	// issue type, for repositories whose CI enforces Conventional Commit
+	// titles (a squash merge makes the title the commit subject).
+	ConventionalPRTitles bool `json:"conventional_pr_titles"`
 }
 
 // Defaults returns the built-in configuration (D-04 and friends).
@@ -460,9 +499,13 @@ func Defaults() Config {
 			MaxPlanRejections: DefaultMaxPlanRejections,
 			MaxPlanFailures:   DefaultMaxPlanFailures,
 		},
-		Roles:      map[domain.Role]string{},
-		RoleModels: map[domain.Role]string{},
-		Research:   DefaultResearch,
+		Roles:                map[domain.Role]string{},
+		RoleModels:           map[domain.Role]string{},
+		Research:             DefaultResearch,
+		AutoMerge:            DefaultAutoMerge,
+		AutoMergeChecks:      []string{},
+		AutoMergeSpacing:     NewDuration(DefaultAutoMergeSpacing),
+		ConventionalPRTitles: DefaultConventionalPRTitles,
 	}
 }
 
@@ -502,6 +545,15 @@ func (c Config) Snapshot() domain.ConfigSnapshot {
 	}
 	if len(c.Rules) > 0 {
 		snap.Rules = append([]string(nil), c.Rules...)
+	}
+	// D-31: what a run may merge is frozen with it, so a resume keeps it.
+	// The checks and the spacing mean nothing without auto-merge, so a run
+	// that does not merge records neither.
+	snap.ConventionalPRTitles = c.ConventionalPRTitles
+	if c.AutoMerge {
+		snap.AutoMerge = true
+		snap.AutoMergeChecks = append([]string(nil), c.AutoMergeChecks...)
+		snap.AutoMergeSpacing = c.AutoMergeSpacing.Duration()
 	}
 	return snap
 }

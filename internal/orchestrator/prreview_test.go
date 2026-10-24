@@ -837,6 +837,55 @@ func TestPRReviewStaleReasonIsTheTrueOne(t *testing.T) {
 	}
 }
 
+// TestPRReviewLeavesAPreRunReviewBeadAlone is D-31's other half of "never
+// review what existed before the run": an earlier run's review bead for a
+// pull request that is still open is not this run's to settle either.
+// Closing it would write "nothing left to review" over a review that is
+// still owed; it is left where it is, said once, whatever the stale
+// policy, and settled like any other once its pull request has gone.
+func TestPRReviewLeavesAPreRunReviewBeadAlone(t *testing.T) {
+	t.Parallel()
+	pr := prvPR()
+	preRun := func() *gitx.PollResult {
+		return &gitx.PollResult{Stale: []gitx.StaleReview{{
+			Issue: prvForeignIssue(pr, domain.BeadStateOpen), Reason: gitx.StalePreRun, PR: pr, ForeignRun: true,
+		}}}
+	}
+	for _, policy := range []StaleReviewPolicy{StaleReviewClose, StaleReviewNeedsHuman} {
+		t.Run(string(policy), func(t *testing.T) {
+			t.Parallel()
+			rig := prvNew(t, []*gitx.PollResult{preRun(), preRun(), preRun()}, func(o *PRReviewOptions) { o.Stale = policy })
+			ctx := context.Background()
+			for range 3 {
+				if err := rig.review.Sync(ctx); err != nil {
+					t.Fatalf("Sync: %v", err)
+				}
+			}
+			if reason, closed := rig.store.closeReason("sc-ext7"); closed {
+				t.Errorf("a pre-run review bead was closed: %q", reason)
+			}
+			rig.store.mu.Lock()
+			st, moved := rig.store.statuses["sc-ext7"]
+			rig.store.mu.Unlock()
+			if moved {
+				t.Errorf("a pre-run review bead was moved to %s", st)
+			}
+			var said int
+			for _, w := range prvOfKind[events.Warning](rig.sink) {
+				if strings.Contains(w.Message, "opened before this run started") {
+					said++
+					if !strings.Contains(w.Message, "leaving its review bead where it is") {
+						t.Errorf("warning = %q", w.Message)
+					}
+				}
+			}
+			if said != 1 {
+				t.Errorf("said %d times, want once", said)
+			}
+		})
+	}
+}
+
 // TestPRReviewStaleReviewBeadCanBeHandedToAHuman is P8-11's other choice.
 func TestPRReviewStaleReviewBeadCanBeHandedToAHuman(t *testing.T) {
 	t.Parallel()

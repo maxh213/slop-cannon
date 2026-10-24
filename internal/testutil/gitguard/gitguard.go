@@ -41,12 +41,18 @@
 // so anything a delivery has never needed is reported and a reviewer
 // decides. "gh pr merge" above all, which lands work on the default branch
 // with no git call for the git checker to see, and which D-11 forbids
-// outright for a pull request sc did not open.
+// outright for a pull request sc did not open. It is damage by default; a
+// scenario that runs with auto_merge on (D-31) opts in with
+// [GHOptions.AutoMerge], and even then only the exact merge auto-merge
+// makes passes — a squash that names the head commit, never --admin,
+// --auto or --delete-branch. Whose pull request was merged is not in the
+// argv, so such a scenario must also assert that itself.
 package gitguard
 
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -428,6 +434,22 @@ var GHAllowed = map[string]bool{
 	"auth status": true, "repo view": true,
 }
 
+// GHLoginQuery is the one `gh api` call a run makes: reading the
+// authenticated login, which D-31's ownership check compares a pull
+// request's author with. Any other `gh api` call is reported.
+var GHLoginQuery = []string{"api", "user", "--jq", ".login"}
+
+// GHOptions widens what [InspectGHWith] allows. The zero value judges
+// exactly as [InspectGH] does.
+type GHOptions struct {
+	// AutoMerge allows the D-31 merge and branch update of a run started
+	// with auto_merge on: `gh pr merge <n> --squash --match-head-commit
+	// <sha>` with none of --admin, --auto, --delete-branch/-d, --merge or
+	// --rebase, and `gh pr update-branch <n>` without --rebase. Everything
+	// else about `pr merge` stays damage.
+	AutoMerge bool
+}
+
 // GHDamage names the gh commands worth reporting in their own words,
 // because they are the ones that would break the invariant rather than
 // merely being unrecognised.
@@ -458,17 +480,49 @@ func GHKey(args []string) string {
 }
 
 // InspectGH judges one recorded gh invocation.
-func InspectGH(args []string) []string {
+func InspectGH(args []string) []string { return InspectGHWith(args, GHOptions{}) }
+
+// InspectGHWith judges one recorded gh invocation under opts.
+func InspectGHWith(args []string, opts GHOptions) []string {
 	key := GHKey(args)
 	line := "gh " + strings.Join(args, " ")
 	switch {
 	case key == "" || GHAllowed[key]:
+		return nil
+	case key == "api user" && slices.Equal(args, GHLoginQuery):
+		return nil
+	case opts.AutoMerge && key == "pr merge":
+		return autoMergeViolations(args, line)
+	case opts.AutoMerge && key == "pr update-branch":
+		if hasFlag(args, "--rebase") {
+			return []string{"gh pr update-branch --rebase rewrites the pull request's branch: " + line}
+		}
 		return nil
 	case GHDamage[key] != "":
 		return []string{fmt.Sprintf("gh %s %s: %s", key, GHDamage[key], line)}
 	default:
 		return []string{fmt.Sprintf("gh %s is not one of the commands a delivery makes: %s", key, line)}
 	}
+}
+
+// autoMergeViolations judges a `gh pr merge` under [GHOptions.AutoMerge]:
+// it must be a squash, it must name the head commit it was judged on, and
+// it must not bypass protection, defer the merge to GitHub or delete the
+// branch.
+func autoMergeViolations(args []string, line string) []string {
+	var out []string
+	if !hasFlag(args, "--squash") {
+		out = append(out, "an auto-merge is a squash merge, and this one is not: "+line)
+	}
+	if v, ok := flagValue(args, "--match-head-commit"); !ok || v == "" || strings.HasPrefix(v, "-") {
+		out = append(out, "an auto-merge names the head commit it was judged on, and this one does not: "+line)
+	}
+	for _, f := range []string{"--admin", "--auto", "--delete-branch", "-d", "--merge", "-m", "--rebase", "-r"} {
+		if hasFlag(args, f) {
+			out = append(out, fmt.Sprintf("an auto-merge never passes %s: %s", f, line))
+		}
+	}
+	return out
 }
 
 // Parse reads the shim's log and splits every invocation into a [Call].
@@ -507,9 +561,15 @@ func Scan(calls []Call, env Env) []string {
 // ScanGH judges every gh invocation recorded so far.
 func ScanGH(t testing.TB, gh *testutil.Shim) []string {
 	t.Helper()
+	return ScanGHWith(t, gh, GHOptions{})
+}
+
+// ScanGHWith judges every gh invocation recorded so far under opts.
+func ScanGHWith(t testing.TB, gh *testutil.Shim, opts GHOptions) []string {
+	t.Helper()
 	var bad []string
 	for _, inv := range gh.Invocations(t) {
-		bad = append(bad, InspectGH(inv.Args)...)
+		bad = append(bad, InspectGHWith(inv.Args, opts)...)
 	}
 	return bad
 }

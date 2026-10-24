@@ -60,14 +60,22 @@
       },
       "roles": {},
       "role_models": {},
-      "research": true
+      "research": true,
+      "auto_merge": false,
+      "auto_merge_checks": [],
+      "auto_merge_spacing": "10m",
+      "conventional_pr_titles": false
     },
     "sources": {
       "active_cartridge": "global",
       "ammo": "default",
+      "auto_merge": "default",
+      "auto_merge_checks": "default",
+      "auto_merge_spacing": "default",
       "cartridges": "global",
       "cartridges.claude": "global",
       "check_command": "default",
+      "conventional_pr_titles": "default",
       "exclude": "default",
       "gate_poll_interval": "default",
       "graph_poll_interval": "default",

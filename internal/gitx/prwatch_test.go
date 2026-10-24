@@ -536,6 +536,37 @@ func TestPRWatcher_Poll(t *testing.T) {
 		assert.Len(t, store.created, 2)
 	})
 
+	// D-31: a pull request that was already open when the run started is
+	// never reviewed, even with --review-prs on: no review bead, no tester,
+	// no gh pr review. A review bead an earlier run left for it is stale
+	// with a reason that says so, not "no longer open".
+	t.Run("never reviews a pull request created before the run started", func(t *testing.T) {
+		pwGH(t, pwShimConfig{listFile: pwTestdata(t, "pr-list.json")})
+		store := &pwStore{}
+		store.pwSeed("fx-earlier", "in_review", map[string]any{beads.MetaPRNumber: 12, beads.MetaRun: "r0"})
+		started := time.Date(2026, 9, 2, 7, 45, 0, 0, time.UTC) // after #12, before #15
+		w := NewPRWatcher(NewGH(repo), store, WithRun("r1"), WithRunStarted(started))
+
+		res, err := w.Poll(ctx)
+		require.NoError(t, err)
+		require.Len(t, res.PreRun, 1)
+		assert.Equal(t, 12, res.PreRun[0].Number)
+		require.Len(t, res.External, 1)
+		assert.Equal(t, 15, res.External[0].Number)
+		require.Len(t, res.New, 1, "only the pull request opened during the run gets a review bead")
+		assert.Equal(t, 15, res.New[0].PR.Number)
+		assert.Empty(t, res.Existing, "the earlier run's bead for #12 is not adopted")
+		require.Len(t, store.created, 1)
+		require.Len(t, res.Stale, 1)
+		assert.Equal(t, StalePreRun, res.Stale[0].Reason)
+		assert.True(t, res.Stale[0].ForeignRun)
+		assert.Equal(t, "pull request #12 was opened before this run started, so this run does not review it (its review bead was raised by an earlier run)", res.Stale[0].Explain())
+
+		// A pull request gh reports no creation time for counts as older.
+		assert.True(t, CreatedBefore(PullRequest{}, started))
+		assert.False(t, CreatedBefore(PullRequest{CreatedAt: started}, started), "one created at the start itself is the run's to review")
+	})
+
 	t.Run("matches existing beads by number, url, and after restart", func(t *testing.T) {
 		pwGH(t, pwShimConfig{listFile: pwTestdata(t, "pr-list.json")})
 		store := &pwStore{}

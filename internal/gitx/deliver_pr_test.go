@@ -2,6 +2,7 @@ package gitx
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
@@ -23,6 +25,40 @@ import (
 
 // dpPRURL is the pull request URL the gh shim prints for a created PR.
 const dpPRURL = "https://github.com/acme/widgets/pull/7"
+
+// dpLogin is the login `gh api user` answers with, and dpStarted the start
+// of the run dpRequest delivers for (D-31).
+const dpLogin = "sc-bot"
+
+var dpStarted = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
+
+// dpPR renders one `gh pr list` entry for the fixture bead's branch that
+// passes every clause of [OwnedByRun] for dpRequest; edit tweaks the raw
+// fields first, so a test can break exactly one clause.
+func dpPR(t *testing.T, n int, state, branch string, edit func(map[string]any)) string {
+	t.Helper()
+	pr := map[string]any{
+		"number":      n,
+		"url":         fmt.Sprintf("https://github.com/acme/widgets/pull/%d", n),
+		"state":       state,
+		"title":       "Fix the mean() bug!",
+		"headRefName": branch,
+		"baseRefName": "main",
+		"labels":      []map[string]string{{"name": CannonPRLabel}},
+		"body":        fmt.Sprintf("<!-- slop-cannon bead=%s run=run-1 branch=%s -->\n## Bead\n", wtBead.ID, branch),
+		"author":      map[string]string{"login": dpLogin},
+		"createdAt":   dpStarted.Add(time.Hour).Format(time.RFC3339),
+	}
+	if edit != nil {
+		edit(pr)
+	}
+	out, err := json.Marshal(pr)
+	require.NoError(t, err)
+	return string(out)
+}
+
+// dpPRs renders a `gh pr list` answer.
+func dpPRs(entries ...string) string { return "[" + strings.Join(entries, ",") + "]" }
 
 // dpTracker is an in-memory PRTracker recording what Deliver asked of the
 // beads client.
@@ -142,6 +178,15 @@ case "$1 $2" in
   "label create") if [ "$mode" = nolabel ]; then echo "HTTP 403: Resource not accessible by integration" >&2; exit 1; fi ;;
   "pr create") echo "Creating pull request for $4 into $6 in acme/widgets"; echo '`+dpPRURL+`' ;;
   "pr close") echo "Closed pull request acme/widgets#$3" ;;
+  "api user")
+    if [ -s "$SC_FAKEBIN_DIR/login-fails" ]; then cat "$SC_FAKEBIN_DIR/login-fails" >&2; exit 1; fi
+    if [ -f "$SC_FAKEBIN_DIR/login-fails" ]; then echo "HTTP 502: Bad Gateway" >&2; exit 1; fi
+    cat "$SC_FAKEBIN_DIR/login" 2>/dev/null || echo `+dpLogin+` ;;
+  "pr view") cat "$SC_FAKEBIN_DIR/view.json" ;;
+  "pr merge")
+    if [ -f "$SC_FAKEBIN_DIR/merge-fails" ]; then cat "$SC_FAKEBIN_DIR/merge-fails" >&2; exit 1; fi
+    echo "Squashed and merged pull request acme/widgets#$3" ;;
+  "pr update-branch") echo "Updated pull request acme/widgets#$3" ;;
   *) echo "gh shim: unexpected command: $*" >&2; exit 1 ;;
 esac
 `, testutil.WithStdinCapture())
@@ -208,8 +253,9 @@ func dpSetup(t *testing.T, remote bool) *dpFixture {
 // dpRequest is the delivery request for wtBead with a report and verdicts.
 func dpRequest() PRRequest {
 	return PRRequest{
-		Bead: domain.Bead{ID: wtBead.ID, Title: wtBead.Title, Type: domain.BeadTypeBug, Priority: 1, Acceptance: "Mean returns the average of all values."},
-		Run:  "run-1",
+		Bead:       domain.Bead{ID: wtBead.ID, Title: wtBead.Title, Type: domain.BeadTypeBug, Priority: 1, Acceptance: "Mean returns the average of all values."},
+		Run:        "run-1",
+		RunStarted: dpStarted,
 		Report: &domain.ImplReport{
 			Summary:      "Start the loop at index 0.",
 			FilesChanged: []string{"stats/mean.go", "stats/mean_test.go"},
@@ -425,7 +471,7 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		// gh was driven as specified.
 		assert.Equal(t, []string{"pr list", "label create", "pr create"}, dpCalls(t, f.gh))
 		calls := f.gh.Invocations(t)
-		assert.Equal(t, []string{"pr", "list", "--head", f.wt.Branch, "--state", "all", "--limit", "50", "--json", "number,url,state,title"}, calls[0].Args)
+		assert.Equal(t, []string{"pr", "list", "--head", f.wt.Branch, "--state", "all", "--limit", "50", "--json", "number,url,state,title,headRefName,baseRefName,labels,body,author,createdAt"}, calls[0].Args)
 		assert.Equal(t, []string{"label", "create", CannonPRLabel, "--color", prLabelColor, "--description", prLabelDescription, "--force"}, calls[1].Args)
 		assert.Equal(t, []string{"pr", "create", "--head", f.wt.Branch, "--base", "main", "--title", "Fix the mean() bug!", "--body-file", "-", "--label", CannonPRLabel}, calls[2].Args)
 		assert.Equal(t, PRBody(dpRequest(), f.wt.Branch, "main"), calls[2].Stdin)
@@ -434,7 +480,7 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		}
 
 		// Bead bookkeeping: metadata, gate, and no status change.
-		assert.Equal(t, map[string]any{beads.MetaPRURL: dpPRURL, beads.MetaPRNumber: 7}, f.tracker.meta[wtBead.ID])
+		assert.Equal(t, map[string]any{beads.MetaPRURL: dpPRURL, beads.MetaPRNumber: 7, beads.MetaPRHead: f.head}, f.tracker.meta[wtBead.ID], "sc_pr_head is the tip the testers approved")
 		assert.Equal(t, []int{7}, f.tracker.created)
 		assert.Equal(t, wtBead.ID, f.tracker.gates[0].Blocks)
 		assert.Contains(t, f.tracker.gates[0].Description, "Reason: PR #7: Fix the mean() bug!")
@@ -443,10 +489,7 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 
 	t.Run("is idempotent: a retry reuses the open pull request and its gate", func(t *testing.T) {
 		f := dpSetup(t, true)
-		dpSet(t, f.gh, "prs.json", `[
-  {"number":3,"url":"https://github.com/acme/widgets/pull/3","state":"MERGED","title":"old"},
-  {"number":5,"url":"https://github.com/acme/widgets/pull/5","state":"OPEN","title":"Fix the mean() bug!"}
-]`)
+		dpSet(t, f.gh, "prs.json", dpPRs(dpPR(t, 3, "MERGED", f.wt.Branch, nil), dpPR(t, 5, "OPEN", f.wt.Branch, nil)))
 		seed := f.tracker.dpSeedGate(wtBead.ID, 5)
 
 		res, err := f.d.Deliver(ctx, dpRequest())
@@ -458,8 +501,8 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		assert.Equal(t, seed.ID, res.Gate, "the existing gate is reused")
 		assert.Equal(t, domain.BeadStateDelivering, res.State)
 		assert.Empty(t, res.Warnings)
-		assert.Equal(t, []string{"pr list"}, dpCalls(t, f.gh), "nothing is created")
-		assert.Equal(t, map[string]any{beads.MetaPRURL: "https://github.com/acme/widgets/pull/5", beads.MetaPRNumber: 5}, f.tracker.meta[wtBead.ID])
+		assert.Equal(t, []string{"pr list", "api user"}, dpCalls(t, f.gh), "nothing is created; the login is read to judge the pull request")
+		assert.Equal(t, map[string]any{beads.MetaPRURL: "https://github.com/acme/widgets/pull/5", beads.MetaPRNumber: 5, beads.MetaPRHead: f.head}, f.tracker.meta[wtBead.ID])
 		assert.Empty(t, f.tracker.created)
 		assert.Contains(t, res.Summary(), "reusing PR #5")
 
@@ -469,15 +512,12 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, PRExisting, res2.Status)
 		assert.Equal(t, seed.ID, res2.Gate)
-		assert.Equal(t, []string{"pr list"}, dpCalls(t, f.gh))
+		assert.Equal(t, []string{"pr list"}, dpCalls(t, f.gh), "the login is cached")
 	})
 
 	t.Run("a merged pull request is reused over a closed one; closed alone means a new one", func(t *testing.T) {
 		f := dpSetup(t, true)
-		dpSet(t, f.gh, "prs.json", `[
-  {"number":4,"url":"https://github.com/acme/widgets/pull/4","state":"CLOSED","title":"abandoned"},
-  {"number":2,"url":"https://github.com/acme/widgets/pull/2","state":"MERGED","title":"landed"}
-]`)
+		dpSet(t, f.gh, "prs.json", dpPRs(dpPR(t, 4, "CLOSED", f.wt.Branch, nil), dpPR(t, 2, "MERGED", f.wt.Branch, nil)))
 		res, err := f.d.Deliver(ctx, dpRequest())
 		require.NoError(t, err)
 		assert.Equal(t, PRExisting, res.Status)
@@ -500,7 +540,7 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 	// pushed; the gate is still made, so the poller closes the bead.
 	t.Run("does not push the branch of a pull request that has already merged", func(t *testing.T) {
 		f := dpSetup(t, true)
-		dpSet(t, f.gh, "prs.json", `[{"number":2,"url":"https://github.com/acme/widgets/pull/2","state":"MERGED","title":"landed"}]`)
+		dpSet(t, f.gh, "prs.json", dpPRs(dpPR(t, 2, "MERGED", f.wt.Branch, nil)))
 		remoteBefore := dpRemoteHeads(t, f)
 
 		res, err := f.d.Deliver(ctx, dpRequest())
@@ -511,7 +551,7 @@ func TestPRDeliverer_Deliver(t *testing.T) {
 		assert.Equal(t, remoteBefore, dpRemoteHeads(t, f), "the remote is untouched")
 		assert.NotContains(t, dpRemoteHeads(t, f), f.wt.Branch)
 		assert.Equal(t, []int{2}, f.tracker.created)
-		assert.Equal(t, []string{"pr list"}, dpCalls(t, f.gh))
+		assert.Equal(t, []string{"pr list", "api user"}, dpCalls(t, f.gh))
 	})
 
 	// P6-14/P6-22, the retry half: a gh:pr gate left behind by a pull
@@ -734,7 +774,11 @@ func TestPRDeliverer_WithBeadsClient(t *testing.T) {
 	bead := domain.Bead{ID: "fx-0uu", Title: "Gated bead"}
 	_, err := f.m.Create(ctx, bead)
 	require.NoError(t, err)
-	dpSet(t, f.gh, "prs.json", `[{"number":1,"url":"https://github.com/acme/widgets/pull/1","state":"OPEN","title":"Gated bead"}]`)
+	wt, _, err := f.m.BranchFor(ctx, bead)
+	require.NoError(t, err)
+	dpSet(t, f.gh, "prs.json", dpPRs(dpPR(t, 1, "OPEN", wt, func(pr map[string]any) {
+		pr["body"] = "<!-- slop-cannon bead=fx-0uu run=run-1 branch=" + wt + " -->\n"
+	})))
 
 	samples := testutil.StageBDSamples(t, nil)
 	bd := testutil.FakeBD(t, samples)
@@ -742,7 +786,7 @@ func TestPRDeliverer_WithBeadsClient(t *testing.T) {
 	d, err := NewPRDeliverer(f.m, client, WithPRLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	require.NoError(t, err)
 
-	res, err := d.Deliver(ctx, PRRequest{Bead: bead, Run: "run-1"})
+	res, err := d.Deliver(ctx, PRRequest{Bead: bead, Run: "run-1", RunStarted: dpStarted})
 	require.NoError(t, err)
 	assert.Equal(t, PRExisting, res.Status)
 	assert.Equal(t, 1, res.PR.Number)
