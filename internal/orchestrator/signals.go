@@ -295,6 +295,10 @@ type signalsState struct {
 	// still open: nothing has picked any of them up yet.
 	planBeads []domain.BeadID
 	untouched bool
+	// outstanding is how many of the run's beads were still to be shipped
+	// at the last reading (see [signalsOutstanding]); -1 when the listing
+	// failed.
+	outstanding int
 }
 
 // signalsOn reports whether this run takes signals: autopilot with a
@@ -327,7 +331,15 @@ func (p *Planner) signalsDueLocked(now time.Time) bool {
 //   - no signals-driven plan has fired within `signals_interval`;
 //   - the previous signals-driven plan's beads are not all still open (all
 //     open means nobody has picked any up yet, and another plan would only
-//     pile more on top of them).
+//     pile more on top of them);
+//   - fewer of the run's beads are still to be shipped (open, being worked
+//     on, in review, approved, delivering or escalated) than one plan may
+//     create (`max_beads_per_plan`). A reading with timestamps in it
+//     changes every interval, and with engineers busy a plan every
+//     `signals_interval` would otherwise queue beads far faster than the
+//     run (and auto-merge's spacing) can ship them; once the backlog is
+//     worked down, the next changed reading plans again. A listing that
+//     failed counts as a full backlog.
 //
 // Once offered it stays offered until a plan fires, because the scheduler
 // may not have a slot for it on this tick.
@@ -355,6 +367,8 @@ func (p *Planner) signalsWantLocked(ctx context.Context, now time.Time) bool {
 		return false
 	case s.untouched:
 		return false
+	case s.outstanding < 0 || s.outstanding >= p.maxBeads:
+		return false
 	}
 	s.wanted = true
 	return true
@@ -370,32 +384,55 @@ func (p *Planner) startSignalsLocked(ctx context.Context) {
 	prev := append([]domain.BeadID(nil), s.planBeads...)
 	go func() {
 		read := p.signalsRun(ctx)
-		untouched := p.signalsUntouched(ctx, prev)
-		p.finishSignals(read, untouched, ctx.Err() != nil)
+		untouched, outstanding := p.signalsBacklog(ctx, prev)
+		p.finishSignals(read, untouched, outstanding, ctx.Err() != nil)
 	}()
 }
 
-// signalsUntouched reports whether every bead of the previous
-// signals-driven plan is still open. A listing that fails counts as
-// untouched: when the planner cannot tell, it waits rather than plans.
-func (p *Planner) signalsUntouched(ctx context.Context, ids []domain.BeadID) bool {
-	if len(ids) == 0 || p.opts.Beads == nil {
-		return false
+// signalsBacklog reports whether every bead of the previous
+// signals-driven plan (ids) is still open, and how many of the run's beads
+// are still to be shipped. A listing that fails counts as untouched and as
+// a full backlog (-1): when the planner cannot tell, it waits rather than
+// plans.
+func (p *Planner) signalsBacklog(ctx context.Context, ids []domain.BeadID) (untouched bool, outstanding int) {
+	if p.opts.Beads == nil {
+		return false, 0
 	}
 	list, err := p.opts.Beads(ctx)
 	if err != nil {
-		return true
+		return len(ids) > 0, -1
 	}
 	state := make(map[domain.BeadID]domain.BeadState, len(list))
 	for _, b := range list {
 		state[b.ID] = b.State
+		if signalsOutstanding(b) {
+			outstanding++
+		}
+	}
+	if len(ids) == 0 {
+		return false, outstanding
 	}
 	for _, id := range ids {
 		if st, ok := state[id]; !ok || st != domain.BeadStateOpen {
-			return false
+			return false, outstanding
 		}
 	}
-	return true
+	return true, outstanding
+}
+
+// signalsOutstanding reports whether b is work the run has yet to ship:
+// planned work that is not closed and not parked for a person.
+func signalsOutstanding(b domain.Bead) bool {
+	if planInfrastructure(b) {
+		return false
+	}
+	switch b.State {
+	case domain.BeadStateOpen, domain.BeadStateInProgress, domain.BeadStateInReview,
+		domain.BeadStateChangesRequested, domain.BeadStateApproved, domain.BeadStateDelivering,
+		domain.BeadStateEscalated:
+		return true
+	}
+	return false
 }
 
 // finishSignals stores a reading, warns about a failure once per distinct
@@ -406,7 +443,7 @@ func (p *Planner) signalsUntouched(ctx context.Context, ids []domain.BeadID) boo
 // A reading cut short because its context ended — the run stopping, the
 // firing that wanted it abandoned — says nothing about production: it is
 // dropped, with no warning, and the reading before it stays cached.
-func (p *Planner) finishSignals(read SignalsReading, untouched, cancelled bool) {
+func (p *Planner) finishSignals(read SignalsReading, untouched bool, outstanding int, cancelled bool) {
 	p.sigMu.Lock()
 	s := &p.sig
 	s.running = false
@@ -417,7 +454,7 @@ func (p *Planner) finishSignals(read SignalsReading, untouched, cancelled bool) 
 		close(done)
 		return
 	}
-	s.last, s.untouched = &read, untouched
+	s.last, s.untouched, s.outstanding = &read, untouched, outstanding
 	warn := read.Failed() && read.failureKey() != s.warned
 	if read.Failed() {
 		s.warned = read.failureKey()
@@ -474,6 +511,14 @@ func (p *Planner) signalsForPlan(ctx context.Context) *agents.PlanSignals {
 		s.wanted, s.firing, s.firedAt = false, true, p.opts.Now()
 	}
 	return s.last.plan()
+}
+
+// signalsDriven reports whether the firing now in progress consumed a
+// signals demand, which [Planner.signalsForPlan] marks.
+func (p *Planner) signalsDriven() bool {
+	p.sigMu.Lock()
+	defer p.sigMu.Unlock()
+	return p.sig.firing
 }
 
 // signalsPlanned records the beads a signals-driven firing created, so the

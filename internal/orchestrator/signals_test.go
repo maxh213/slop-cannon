@@ -560,6 +560,93 @@ func TestPlannerWaitsWhenItCannotListThePreviousSignalsPlansBeads(t *testing.T) 
 	assert.Empty(t, f.demands(), "when it cannot tell, it waits rather than plans")
 }
 
+// A signals-driven plan is made while engineers are busy, so it is not told
+// the run is idle and asked for follow-up work: it is told to add fixes for
+// the new evidence only. An idle replan still gets the idle note.
+func TestPlannerTellsASignalsPlanThatEngineersAreBusy(t *testing.T) {
+	f := signalsFirstPlan(t)
+	f.beads.set(planningBead("sc-alpha", domain.BeadStateInProgress), planningBead("sc-beta", domain.BeadStateOpen))
+	f.sig.set("ERROR E-2 checkout fails\n", "")
+	f.clock.Advance(signalsInterval)
+	f.demands()
+	require.Equal(t, []Demand{planDemand()}, f.demands())
+	notes := strings.Join(f.fire().Notes, "\n")
+	assert.NotContains(t, notes, "no engineer is running", "an engineer is running")
+	assert.NotContains(t, notes, "propose the follow-up work")
+	assert.Contains(t, notes, "Engineers are still working through the beads listed below")
+	assert.Contains(t, notes, "Propose fixes for the new evidence alone")
+
+	// The next plan the run asks for because it went quiet is an idle one.
+	f.setStatus(SchedulerStatus{Quiet: true, Idle: true, Fired: 10})
+	f.clock.Advance(2 * signalsInterval)
+	notes = strings.Join(f.fire().Notes, "\n")
+	assert.Contains(t, notes, "no engineer is running")
+	assert.NotContains(t, notes, "Engineers are still working")
+}
+
+// With engineers busy and a reading that changes every interval (any
+// timestamped output does), a plan every signals_interval would queue
+// beads far faster than the run ships them. Once the run has as many beads
+// still to ship as one plan may create, a changed reading waits; once the
+// backlog is worked down it plans again.
+func TestPlannerHoldsSignalsPlansWhileTheBacklogIsFull(t *testing.T) {
+	f := signalsFirstPlan(t)
+	all := []domain.Bead{planningBead("sc-alpha", domain.BeadStateInProgress)}
+	plans := 0
+	for round := range 10 {
+		f.sig.set(fmt.Sprintf("2026-10-24T%02d:00Z ERROR E-%d\n", round, round), "")
+		f.clock.Advance(signalsInterval)
+		f.demands()
+		if len(f.demands()) == 0 {
+			continue
+		}
+		keys := make([]string, f.p.MaxBeads())
+		for i := range keys {
+			keys[i] = fmt.Sprintf("r%d-b%d", round, i)
+		}
+		f.runner.setPlan(planningPlan(keys...))
+		f.fire()
+		plans++
+		// One bead of the new plan is picked up; the rest stay open.
+		for i, k := range keys {
+			st := domain.BeadStateOpen
+			if i == 0 {
+				st = domain.BeadStateInProgress
+			}
+			all = append(all, planningBead(domain.BeadID("sc-"+k), st))
+		}
+		f.beads.set(all...)
+		f.busy()
+	}
+	assert.Equal(t, 1, plans, "the first plan filled the backlog")
+
+	// The run works it down: everything but two beads ships.
+	for i := range all {
+		if i > 1 {
+			all[i].State = domain.BeadStateClosed
+		}
+	}
+	all[1].State = domain.BeadStateNeedsHuman // parked for a person: not backlog
+	f.beads.set(all...)
+	f.sig.set("2026-10-24T11:00Z ERROR E-11\n", "")
+	f.clock.Advance(signalsInterval)
+	f.demands()
+	assert.Equal(t, []Demand{planDemand()}, f.demands(), "the backlog is below one plan again")
+}
+
+func TestSignalsOutstandingCountsWorkStillToShip(t *testing.T) {
+	for _, st := range []domain.BeadState{domain.BeadStateOpen, domain.BeadStateInProgress, domain.BeadStateInReview,
+		domain.BeadStateChangesRequested, domain.BeadStateApproved, domain.BeadStateDelivering, domain.BeadStateEscalated} {
+		assert.True(t, signalsOutstanding(planningBead("sc-x", st)), st)
+	}
+	for _, st := range []domain.BeadState{domain.BeadStateClosed, domain.BeadStateNeedsHuman, domain.BeadStateFailed, domain.BeadStateBlocked} {
+		assert.False(t, signalsOutstanding(planningBead("sc-x", st)), st)
+	}
+	epic := planningBead("sc-epic", domain.BeadStateOpen)
+	epic.Type = domain.BeadTypeEpic
+	assert.False(t, signalsOutstanding(epic), "the run epic is not work")
+}
+
 func TestPlannerRecordsNoBeadsForAFailedSignalsPlan(t *testing.T) {
 	f := signalsSetup(t, "")
 	f.p.sig.firing = true

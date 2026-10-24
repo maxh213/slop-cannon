@@ -1374,6 +1374,9 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 	// agents.ValidatePlan refuses outright.
 	listed := make([]domain.Bead, 0, len(open)+len(done))
 	listed = append(append(listed, open...), done...)
+	// The reading comes before the notes: taking it is what tells a
+	// signals-driven firing from an idle replan, and the notes differ.
+	signals := p.signalsForPlan(ctx)
 	req := agents.PlanRequest{
 		Run:       p.cfg.Run.ID,
 		AgentID:   f.Agent.ID,
@@ -1384,9 +1387,9 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 		Vibes:     vibes,
 		OpenBeads: listed,
 		MaxBeads:  p.maxBeads,
-		Notes:     p.notes(open, done),
+		Notes:     p.notes(open, done, p.signalsDriven()),
 		Model:     p.cfg.Cartridge.Model,
-		Signals:   p.signalsForPlan(ctx),
+		Signals:   signals,
 	}
 	if eff := p.cfg.Effective; eff != nil {
 		req.Research = eff.Research
@@ -1419,7 +1422,11 @@ func (p *Planner) request(ctx context.Context, f Firing) (agents.PlanRequest, er
 // [Planner.splitDemotions] implements — a plan has no field for an existing
 // bead, so the product owner restates it. An instruction the orchestrator
 // would drop on the floor is worse than no instruction at all.
-func (p *Planner) notes(open, done []domain.Bead) []string {
+//
+// A signals-driven firing (P6-71) is made while engineers are busy, so it
+// is not told the run has nothing left to do: it is told to add only fixes
+// for the new evidence.
+func (p *Planner) notes(open, done []domain.Bead, signalsDriven bool) []string {
 	if p.cfg.Run.Mode == domain.RunModeBrief {
 		return nil
 	}
@@ -1437,7 +1444,14 @@ func (p *Planner) notes(open, done []domain.Bead) []string {
 			"The open beads' current priorities, on the tracker's scale (0 most urgent, 4 least): "+
 				planPriorities(open)+".")
 	}
-	if !first {
+	switch {
+	case signalsDriven:
+		notes = append(notes,
+			"Engineers are still working through the beads listed below: this plan was asked for only "+
+				"because the production signals changed. Propose fixes for the new evidence alone, and "+
+				"nothing that duplicates an open or in-progress bead; an empty plan is the right answer "+
+				"when the open beads already cover what the signals show.")
+	case !first:
 		notes = append(notes,
 			"The ready queue is empty and no engineer is running, so this run has nothing left to do: "+
 				"propose the follow-up work that is most worth doing next.")

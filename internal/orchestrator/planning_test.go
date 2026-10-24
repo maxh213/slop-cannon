@@ -2302,7 +2302,7 @@ func TestPlannerBriefModeShowsNoFinishedWork(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []domain.BeadID{"sc-open"}, planningIDs(open))
 	assert.Empty(t, done)
-	assert.Empty(t, p.notes(open, done), "brief mode has no notes at all")
+	assert.Empty(t, p.notes(open, done, false), "brief mode has no notes at all")
 }
 
 // planningIDs is the bead ids of a listing, for a readable assertion.
