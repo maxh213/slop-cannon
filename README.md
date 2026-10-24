@@ -377,9 +377,10 @@ for a default branch that deploys to production, so it errs on waiting:
   to — with auto-merge off too: a pull request already on a bead's branch
   that fails the check is handed to you instead of reused.
 - **Only what was reviewed.** The head must be the commit the run delivered
-  and its testers approved, or that commit plus GitHub's clean update merges
-  of the default branch. A commit anybody else pushes to the branch waits
-  for you.
+  and its testers approved, or that commit plus the merges of the default
+  branch GitHub made because the run asked it to (`gh pr update-branch`). A
+  commit anybody else pushes to the branch, or an update the run did not ask
+  for, hands the bead to you.
 - **Only when green.** At least one check, every check finished and passed,
   every name in `auto_merge_checks` among them (at least one is required), and GitHub reporting the
   pull request `CLEAN`. A required review (`BLOCKED`) waits for you; nothing

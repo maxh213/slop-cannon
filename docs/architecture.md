@@ -138,8 +138,8 @@ machine ([below](#bead-states-d-07)) is what makes each move legal.
                    resolves and the bead is closed (D-20)    delivering → closed
                    with auto_merge (D-31) the poller merges
                    the run's own green, CLEAN PR itself at
-                   the head its testers approved (or GitHub's
-                   clean update of it), at most one per
+                   the head its testers approved (or the
+                   update it asked GitHub for), at most one per
                    auto_merge_spacing; a failed
                    check or a conflict found there goes back
                    to the engineer                           delivering → changes_requested

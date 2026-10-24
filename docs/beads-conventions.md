@@ -143,7 +143,7 @@ numbers and strings.
 | `sc_lease` | string | RFC 3339 UTC time the claim was last renewed (P3-05) |
 | `sc_pr_url` | string | pull request opened for the bead (safety on) |
 | `sc_pr_number` | number | pull request number |
-| `sc_pr_head` | string | the bead branch's tip delivered to the pull request, the commit the testers approved; auto-merge merges only it or GitHub's clean update merges on top of it (D-31) |
+| `sc_pr_head` | string | the bead branch's tip delivered to the pull request, the commit the testers approved; auto-merge merges only it or the clean merges of the default branch GitHub made on top of it because the run asked for them, which `state.json` records (D-31) |
 | `sc_merge_sha` | string | commit that landed on the default branch |
 
 Read with `bd show <id> --json` (`.metadata`) or filter with

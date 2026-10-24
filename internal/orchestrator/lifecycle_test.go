@@ -1198,6 +1198,42 @@ func TestLifecycleAutoMergeLedgerSurvivesAResume(t *testing.T) {
 	require.NoError(t, r2.Close())
 }
 
+// The update requests behind the approved-tip guard (D-31) are written to
+// state.json at once, read back by a resumed run, deduplicated and bounded.
+func TestLifecycleAutoMergeUpdateRequestsSurviveAResume(t *testing.T) {
+	f := lifecycleSetup(t)
+	rc := f.runConfig(t, config.RunSettings{Brief: "b"})
+	r, err := New(rc, f.options())
+	require.NoError(t, err)
+	require.NoError(t, r.Start(context.Background()))
+	require.Empty(t, r.AutoMergeUpdates())
+	key := AutoMergeUpdateKey("fx-1", "1111111111111111111111111111111111111111")
+	require.NoError(t, r.RecordAutoMergeUpdate(key))
+	require.NoError(t, r.RecordAutoMergeUpdate(key))
+
+	st, err := LoadState(rc.Run.StateDir)
+	require.NoError(t, err)
+	require.NotNil(t, st.AutoMerge)
+	require.Equal(t, []string{key}, st.AutoMerge.Updated, "durable at once, and recorded once")
+
+	require.NoError(t, r.Stop("crash"))
+	_, err = r.Wait()
+	require.NoError(t, err)
+
+	resumed := f.runConfig(t, config.RunSettings{Resume: true})
+	resumed.Resume = true
+	r2, err := New(resumed, f.options())
+	require.NoError(t, err)
+	require.Equal(t, []string{key}, r2.AutoMergeUpdates(), "the resumed run still knows what it asked for")
+	for i := range autoMergeSentBackLimit {
+		require.NoError(t, r2.RecordAutoMergeUpdate(AutoMergeUpdateKey("fx-1", fmt.Sprint(i))))
+	}
+	keys := r2.AutoMergeUpdates()
+	require.Len(t, keys, autoMergeSentBackLimit)
+	require.Equal(t, AutoMergeUpdateKey("fx-1", "0"), keys[0], "the oldest request went first")
+	require.NoError(t, r2.Close())
+}
+
 func TestLifecycleRestoreWithoutAStateFile(t *testing.T) {
 	f := lifecycleSetup(t)
 	dir := config.RunDir(f.Repo, "20260903-110000-0001")

@@ -1467,6 +1467,45 @@ func (r *Run) RecordAutoMergeSentBack(keys []string) error {
 	return nil
 }
 
+// AutoMergeUpdates returns the update requests state.json records (D-31).
+func (r *Run) AutoMergeUpdates() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.st.AutoMerge == nil {
+		return nil
+	}
+	return append([]string(nil), r.st.AutoMerge.Updated...)
+}
+
+// RecordAutoMergeUpdate adds key to the update requests in state.json,
+// synchronously, before the update is asked for, keeping the newest
+// [autoMergeSentBackLimit]. A key already recorded is not added again. An
+// error means the record is not durable, and the caller must not ask.
+func (r *Run) RecordAutoMergeUpdate(key string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	am := AutoMergeState{}
+	if r.st.AutoMerge != nil {
+		am = *r.st.AutoMerge
+	}
+	for _, k := range am.Updated {
+		if k == key {
+			return nil
+		}
+	}
+	am.Updated = append(append([]string(nil), am.Updated...), key)
+	if n := len(am.Updated) - autoMergeSentBackLimit; n > 0 {
+		am.Updated = am.Updated[n:]
+	}
+	prev := r.st.AutoMerge
+	r.st.AutoMerge = &am
+	if err := r.persistLocked(); err != nil {
+		r.st.AutoMerge = prev
+		return err
+	}
+	return nil
+}
+
 // UseVitals names the function that snapshots the run's vitals — what the
 // planner is doing and what the gate poller has seen — for every state.json
 // the run writes (P6-29). It may be set at any time, including after the

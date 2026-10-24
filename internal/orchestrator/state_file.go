@@ -105,7 +105,8 @@ type State struct {
 	// file written by an older sc.
 	Budget *BudgetState `json:"budget,omitempty"`
 	// AutoMerge is the run's auto-merge ledger (D-31): when it last merged
-	// one of its own pull requests. It is written before the merge is
+	// one of its own pull requests, the heads it sent back and the heads it
+	// asked GitHub to update. It is written before the merge is
 	// asked for, so a resumed run waits out auto_merge_spacing from the
 	// last merge any invocation of it made. Absent for a run that never
 	// auto-merged.
@@ -126,9 +127,17 @@ type AutoMergeState struct {
 	// [autoMergeSentBackLimit] of them: a head that comes back the same
 	// after a resume goes to a person, not round again.
 	SentBack []string `json:"sent_back,omitempty"`
+	// Updated are the pull request heads the run asked GitHub to update
+	// (`gh pr update-branch`), as [AutoMergeUpdateKey]s, the newest
+	// [autoMergeSentBackLimit] of them. Each is written before the update
+	// is asked for: only a merge GitHub made on top of one of these passes
+	// the approved-tip guard, so a resumed run still merges the update it
+	// asked for and still refuses one it never asked for.
+	Updated []string `json:"updated,omitempty"`
 }
 
-// autoMergeSentBackLimit bounds [AutoMergeState.SentBack].
+// autoMergeSentBackLimit bounds [AutoMergeState.SentBack] and
+// [AutoMergeState.Updated].
 const autoMergeSentBackLimit = 256
 
 // Spent is the run's budget state, or the zero value for a state file that
@@ -150,6 +159,7 @@ func (s State) clone() State {
 	if s.AutoMerge != nil {
 		am := *s.AutoMerge
 		am.SentBack = append([]string(nil), s.AutoMerge.SentBack...)
+		am.Updated = append([]string(nil), s.AutoMerge.Updated...)
 		out.AutoMerge = &am
 	}
 	return out

@@ -32,11 +32,15 @@ import (
 //	          never merged, updated or sent back — it waits for a human,
 //	          exactly as with auto_merge off
 //	open      not OPEN, or a draft → wait
-//	reviewed  the head is the tip delivered to the pull request
-//	          (sc_pr_head) or that tip plus GitHub's clean update merges
-//	          of the default branch ([gitx.PRDeliverer.ReviewedHead]);
-//	          a commit anybody else pushed → waits for a human, like a
-//	          pull request that is not the run's own
+//	approved  the head is the tip delivered to the pull request after
+//	          the testers approved it (sc_pr_head), or that tip plus the
+//	          clean merges of the default branch GitHub made because this
+//	          run asked it to (`gh pr update-branch`, recorded in
+//	          state.json before it is asked; [gitx.PRDeliverer.ReviewedHead]);
+//	          the bead's own branch tip, which a re-delivery has pushed
+//	          but not recorded yet → wait; any other commit (one somebody
+//	          pushed, an update nobody asked the run for) → needs_human
+//	          with what to do, never merged, updated or sent back
 //	conflict  DIRTY / CONFLICTING → back to the engineer through the
 //	          check-failed edge, one item: merge the default branch in and
 //	          resolve (once per head commit)
@@ -91,13 +95,17 @@ type AutoMergeBranches interface {
 	// TrackingRef names a branch as the remote's tracking ref.
 	TrackingRef(ctx context.Context, branch string) (string, error)
 	// ReviewedHead reports whether head is reviewed, or reviewed plus
-	// clean update merges of base, and why not.
-	ReviewedHead(ctx context.Context, reviewed, head, base string) (bool, string, error)
+	// clean merges of base GitHub made for the updates the run asked for
+	// (updatedFrom), and why not.
+	ReviewedHead(ctx context.Context, reviewed, head, base string, updatedFrom []string) (bool, string, error)
+	// BranchTip is the commit the bead's local branch is at.
+	BranchTip(ctx context.Context, bead domain.Bead) (string, error)
 }
 
-// AutoMergeLedger is where the time of the run's last merge and the heads
-// already sent back live, so the spacing and the once-per-head send-back
-// hold across a resume. *Run satisfies it.
+// AutoMergeLedger is where the time of the run's last merge, the heads
+// already sent back and the heads the run asked GitHub to update live, so
+// the spacing, the once-per-head send-back and the approved-tip guard hold
+// across a resume. *Run satisfies it.
 type AutoMergeLedger interface {
 	// LastAutoMerge is when the run last merged; zero for never.
 	LastAutoMerge() time.Time
@@ -107,6 +115,31 @@ type AutoMergeLedger interface {
 	AutoMergeSentBack() []string
 	// RecordAutoMergeSentBack durably records heads sent back.
 	RecordAutoMergeSentBack(keys []string) error
+	// AutoMergeUpdates are the update requests recorded so far, as
+	// [AutoMergeUpdateKey]s.
+	AutoMergeUpdates() []string
+	// RecordAutoMergeUpdate durably records that the run is about to ask
+	// GitHub to update a pull request whose head is the key's commit.
+	RecordAutoMergeUpdate(key string) error
+}
+
+// AutoMergeUpdateKey names one `gh pr update-branch` the run asked for:
+// bead's pull request, at head. Only a merge GitHub makes on top of a head
+// recorded this way can pass the approved-tip guard.
+func AutoMergeUpdateKey(bead domain.BeadID, head string) string {
+	return string(bead) + "@" + head
+}
+
+// updatedFrom returns the heads of bead the run asked GitHub to update.
+func (am *autoMerger) updatedFrom(bead domain.BeadID) []string {
+	prefix := string(bead) + "@"
+	var out []string
+	for _, k := range am.opts.Ledger.AutoMergeUpdates() {
+		if h, ok := strings.CutPrefix(k, prefix); ok && h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // DeliveryOutcomeApplier hands a delivery outcome to whoever owns the
@@ -326,7 +359,7 @@ func (p *GatePoller) autoMergeBead(ctx context.Context, g beads.Gate, issue bead
 	case head == "":
 		p.amStatus(id, number, AutoMergeWaiting, fmt.Sprintf("GitHub reported no head commit for pull request #%d", number), false)
 		return
-	case !p.amReviewed(ctx, issue, view):
+	case !p.amReviewed(ctx, issue, bead, view):
 		return
 	case view.MergeStateStatus == "DIRTY" || view.Mergeable == "CONFLICTING":
 		p.amConflict(ctx, issue, bead, branch, view)
@@ -386,14 +419,19 @@ func (p *GatePoller) autoMergeBead(ctx context.Context, g beads.Gate, issue bead
 		slog.String("bead", string(id)), slog.Int("pr", number), slog.String("head", head))
 }
 
-// amReviewed reports whether the pull request's head holds only what the
-// run reviewed: the tip delivered to it (sc_pr_head), or that tip plus
-// GitHub's clean update merges of the default branch. Anything else — a
-// commit somebody pushed to the branch after delivery — is never merged,
-// updated or sent back; like a pull request that is not the run's own, it
-// waits for a human. A head shown to be reviewed is remembered, so the
-// fetch behind the check is not repeated every poll.
-func (p *GatePoller) amReviewed(ctx context.Context, issue beads.Issue, view *gitx.PRView) bool {
+// amReviewed is the approved-tip guard (D-31). Ownership is judged per
+// pull request, so the head is judged too: it must be the tip delivered to
+// the pull request after the testers approved it (sc_pr_head), or that tip
+// plus the clean merges of the default branch GitHub made because this run
+// asked it to. The bead's own branch tip is sc's re-delivery, pushed a
+// moment before it is recorded as sc_pr_head, and waits. Anything else — a
+// commit somebody pushed to the branch after delivery, an update the run
+// never asked for — is never merged, updated or sent back: the bead goes
+// to needs_human with what to do. Sending it back to an engineer instead
+// would put commits nobody approved into an agent's worktree and have the
+// next review approve them along with the fix. A head shown to be approved
+// is remembered, so the fetch behind the check is not repeated every poll.
+func (p *GatePoller) amReviewed(ctx context.Context, issue beads.Issue, bead domain.Bead, view *gitx.PRView) bool {
 	id, number, head := issue.ID, view.Number, view.HeadSHA
 	reviewed := issue.PRHead()
 	key := "reviewed:" + reviewed + ":" + head
@@ -404,26 +442,40 @@ func (p *GatePoller) amReviewed(ctx context.Context, issue beads.Issue, view *gi
 	case reviewed == head, p.auto.done[key]:
 		return true
 	}
-	ok, why, err := p.auto.opts.Branches.ReviewedHead(ctx, reviewed, head, p.branch)
+	ok, why, err := p.auto.opts.Branches.ReviewedHead(ctx, reviewed, head, p.branch, p.auto.updatedFrom(id))
 	if err != nil {
 		p.amFailure(id, number, "reviewed", fmt.Sprintf("could not show that pull request #%d's head %s is the work the run reviewed", number, shortHead(head)), err)
 		return false
 	}
-	if !ok {
-		p.amStatus(id, number, AutoMergeNotOwned, fmt.Sprintf("pull request #%d holds commits the run did not review (%s); it is left for a human to merge", number, why), true)
+	if ok {
+		p.auto.once(key)
+		return true
+	}
+	if tip, err := p.auto.opts.Branches.BranchTip(ctx, bead); err == nil && tip == head {
+		p.amStatus(id, number, AutoMergeWaiting, fmt.Sprintf("pull request #%d is at %s, the bead's branch, which its delivery has not recorded yet", number, shortHead(head)), false)
 		return false
 	}
-	p.auto.once(key)
-	return true
+	p.amHandOff(ctx, issue, number, fmt.Sprintf("pull request #%d holds commits the run did not approve (%s): its head %s is not %s, the commit its testers approved, "+
+		"or a branch update the run asked GitHub for. Review the commits yourself (`git log %s..%s`) and merge the pull request by hand, "+
+		"or push the branch back to %s and retry the bead",
+		number, why, shortHead(head), shortHead(reviewed), shortHead(reviewed), shortHead(head), shortHead(reviewed)))
+	return false
 }
 
 // amUpdate asks GitHub to merge the default branch into a pull request that
-// has fallen behind it, once per head commit. Only an update GitHub
-// accepted counts: a refused one is asked for again on the next poll.
+// has fallen behind it, once per head commit. The request is written into
+// state.json first (no record, no request): GitHub's merge commit can pass
+// the approved-tip guard only because the run asked for it, on this or an
+// earlier invocation. Only an update GitHub accepted counts as done: a
+// refused one is asked for again on the next poll.
 func (p *GatePoller) amUpdate(ctx context.Context, id domain.BeadID, number int, head string) {
 	key := "update:" + head
 	if p.auto.done[key] {
 		p.amStatus(id, number, AutoMergeUpdating, fmt.Sprintf("pull request #%d is behind %s; waiting for the update GitHub was asked for", number, p.branch), false)
+		return
+	}
+	if err := p.auto.opts.Ledger.RecordAutoMergeUpdate(AutoMergeUpdateKey(id, head)); err != nil {
+		p.amFailure(id, number, "record-update", fmt.Sprintf("could not record in state.json that pull request #%d is to be updated, so it was not asked for", number), err)
 		return
 	}
 	if err := p.auto.opts.GH.UpdateBranch(ctx, number); err != nil {

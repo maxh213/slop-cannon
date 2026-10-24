@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -33,8 +32,9 @@ import (
 //     pushed to.
 //   - [PRDeliverer.ReviewedHead] judges the commits, which ownership does
 //     not: a head is merged only when it is the tip delivery recorded as
-//     sc_pr_head, the one the testers approved, or that tip plus GitHub's
-//     clean update merges of the base.
+//     sc_pr_head, the one the testers approved, or that tip plus the clean
+//     merges of the base GitHub made because slop-cannon itself asked for
+//     them (`gh pr update-branch`, recorded in state.json first).
 //   - [GH.ViewPR] reads everything a merge decision needs in one call;
 //     [PRView.Checks] judges the status-check rollup. `gh pr checks` is not
 //     used: it exits non-zero while a check is pending or failed, and [GH]
@@ -478,21 +478,29 @@ func (d *PRDeliverer) SyncBranch(ctx context.Context, bead domain.Bead, head str
 	return err
 }
 
-// maxUpdateMerges bounds how many commits [PRDeliverer.ReviewedHead]
-// walks between the reviewed commit and a pull request's head: GitHub's
-// update merges come one per `gh pr update-branch`, and auto-merge asks
-// for at most one per head.
+// maxUpdateMerges bounds how many update merges [PRDeliverer.ReviewedHead]
+// walks back from a pull request's head to the approved commit: GitHub
+// makes one per `gh pr update-branch`, and auto-merge asks for at most one
+// per head.
 const maxUpdateMerges = 20
 
 // ReviewedHead reports whether head, a pull request's head commit, holds
-// only work the run reviewed (D-31): it is reviewed itself — the bead
-// branch's tip at delivery, sc_pr_head — or it descends from reviewed and
-// every commit since that is not on base is a clean, automatic merge of its
-// two parents, which is what `gh pr update-branch` makes. A commit someone
-// else pushed onto the branch, or a merge whose tree is not the automatic
-// result of its parents, makes it false, and why says which. The default
-// remote's tracking refs are fetched first, so head and base are current.
-func (d *PRDeliverer) ReviewedHead(ctx context.Context, reviewed, head, base string) (bool, string, error) {
+// only work the run approved (D-31): it is the approved commit itself —
+// the bead branch's tip that delivery pushed after the testers approved
+// it, sc_pr_head — or it is a chain of the merges GitHub made because
+// slop-cannon asked it to (`gh pr update-branch`). updatedFrom are the
+// heads slop-cannon asked GitHub to update, as the run's state.json
+// records them. Walking back from head, every commit before the approved
+// one must be a merge with exactly two parents, one of them a head in
+// updatedFrom and the other a commit on base, whose tree is exactly the
+// automatic merge of the two; the walk then continues from the updatedFrom
+// parent and must reach reviewed. Anything else — a commit somebody pushed
+// onto the branch, a merge nobody asked slop-cannon for (the "Update
+// branch" button included), a merge of some other branch, a merge that
+// resolves conflicts or changes more than merging its parents — makes it
+// false, and why says which commit and why. The default remote's tracking
+// refs are fetched first, so head and base are current.
+func (d *PRDeliverer) ReviewedHead(ctx context.Context, reviewed, head, base string, updatedFrom []string) (bool, string, error) {
 	switch {
 	case strings.TrimSpace(reviewed) == "":
 		return false, "no reviewed commit is recorded for the bead", nil
@@ -500,6 +508,14 @@ func (d *PRDeliverer) ReviewedHead(ctx context.Context, reviewed, head, base str
 		return false, "GitHub reported no head commit", nil
 	case head == reviewed:
 		return true, "", nil
+	}
+	asked := make(map[string]bool, len(updatedFrom))
+	for _, h := range updatedFrom {
+		asked[h] = true
+	}
+	if len(asked) == 0 {
+		return false, fmt.Sprintf("its head %s is not the approved commit %s, and slop-cannon has asked GitHub for no branch update",
+			shortSHA(head), shortSHA(reviewed)), nil
 	}
 	repo := d.m.Repo()
 	if err := repo.Fetch(ctx); err != nil {
@@ -513,44 +529,71 @@ func (d *PRDeliverer) ReviewedHead(ctx context.Context, reviewed, head, base str
 	if _, err := repo.RevParse(ctx, head); err != nil {
 		return false, "", fmt.Errorf("gitx: the pull request's head %s is not on the remote: %w", shortSHA(head), err)
 	}
-	if ok, err := repo.isAncestor(ctx, reviewed, head); err != nil {
-		return false, "", err
-	} else if !ok {
-		return false, fmt.Sprintf("its head %s does not contain the reviewed commit %s", shortSHA(head), shortSHA(reviewed)), nil
-	}
-	out, err := repo.Git(ctx, "rev-list", "--parents", "--max-count", strconv.Itoa(maxUpdateMerges+1), head, "^"+reviewed, "^"+ref)
-	if err != nil {
-		return false, "", err
-	}
-	out = strings.TrimSpace(out)
-	if out == "" {
-		// Every commit since the reviewed one is already on base.
-		return true, "", nil
-	}
-	commits := strings.Split(out, "\n")
-	if len(commits) > maxUpdateMerges {
-		return false, fmt.Sprintf("more than %d commits since the reviewed commit %s", maxUpdateMerges, shortSHA(reviewed)), nil
-	}
-	for _, line := range commits {
-		f := strings.Fields(line)
-		if len(f) != 3 {
-			return false, fmt.Sprintf("commit %s since the reviewed commit %s is not a merge of %s", shortSHA(f[0]), shortSHA(reviewed), base), nil
-		}
-		tree, err := repo.Git(ctx, "rev-parse", "--verify", "--end-of-options", f[0]+"^{tree}")
+	cur := head
+	for range maxUpdateMerges {
+		out, err := repo.Git(ctx, "rev-list", "--parents", "--max-count=1", cur)
 		if err != nil {
 			return false, "", err
 		}
-		merged, err := repo.Git(ctx, "merge-tree", "--write-tree", "--no-messages", f[1], f[2])
+		parents := strings.Fields(out)
+		if len(parents) > 0 {
+			parents = parents[1:] // the first field is cur itself
+		}
+		if len(parents) != 2 {
+			return false, fmt.Sprintf("commit %s is neither the approved commit %s nor a merge GitHub made when slop-cannon asked it to update the branch",
+				shortSHA(cur), shortSHA(reviewed)), nil
+		}
+		prev := ""
+		for _, pair := range [][2]string{{parents[0], parents[1]}, {parents[1], parents[0]}} {
+			if !asked[pair[0]] {
+				continue
+			}
+			onBase, err := repo.isAncestor(ctx, pair[1], ref)
+			if err != nil {
+				return false, "", err
+			}
+			if onBase {
+				prev = pair[0]
+				break
+			}
+		}
+		if prev == "" {
+			return false, fmt.Sprintf("merge commit %s is not an update slop-cannon asked for: its parents are not a head it asked GitHub to update and a commit on %s",
+				shortSHA(cur), base), nil
+		}
+		tree, err := repo.Git(ctx, "rev-parse", "--verify", "--end-of-options", cur+"^{tree}")
+		if err != nil {
+			return false, "", err
+		}
+		merged, err := repo.Git(ctx, "merge-tree", "--write-tree", "--no-messages", parents[0], parents[1])
 		if isExit(err, 1) {
-			return false, fmt.Sprintf("merge commit %s resolves conflicts the run did not review", shortSHA(f[0])), nil
+			return false, fmt.Sprintf("merge commit %s resolves conflicts the run did not review", shortSHA(cur)), nil
 		} else if err != nil {
 			return false, "", err
 		}
-		if tree0, _, _ := strings.Cut(strings.TrimSpace(merged), "\n"); tree0 != tree {
-			return false, fmt.Sprintf("merge commit %s changes more than merging its parents", shortSHA(f[0])), nil
+		if tree0, _, _ := strings.Cut(strings.TrimSpace(merged), "\n"); tree0 != strings.TrimSpace(tree) {
+			return false, fmt.Sprintf("merge commit %s changes more than merging its parents", shortSHA(cur)), nil
 		}
+		if prev == reviewed {
+			return true, "", nil
+		}
+		cur = prev
 	}
-	return true, "", nil
+	return false, fmt.Sprintf("more than %d update merges since the approved commit %s", maxUpdateMerges, shortSHA(reviewed)), nil
+}
+
+// BranchTip is the commit the bead's local branch is at. In delivering it
+// is the commit the testers approved, which a re-delivery may have pushed
+// to the pull request a moment before it records it as sc_pr_head.
+func (d *PRDeliverer) BranchTip(ctx context.Context, bead domain.Bead) (string, error) {
+	branch, exists, err := d.m.BranchFor(ctx, bead)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
+		return "", fmt.Errorf("%w: %s", ErrBranchMissing, branch)
+	}
+	return d.m.Repo().RevParse(ctx, "refs/heads/"+branch)
 }
 
 // Conventional Commit types a pull request title may carry, the ones the

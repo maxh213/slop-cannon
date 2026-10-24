@@ -113,9 +113,13 @@ type amFakeBranches struct {
 	syncErr error
 	Syncs   []string // "<bead>@<head>"
 
-	updates   map[string]bool
+	// merges maps a merge commit to the head GitHub merged the base into
+	// to make it: what `gh pr update-branch` makes, whoever asked for it.
+	merges    map[string]string
 	reviewErr error
 	Reviews   []string // "<reviewed>..<head> on <base>"
+	// tip is the bead's local branch tip; "" is a commit nobody pushed.
+	tip string
 }
 
 func (b *amFakeBranches) BranchFor(_ context.Context, bead domain.Bead) (string, bool, error) {
@@ -141,29 +145,50 @@ func (b *amFakeBranches) TrackingRef(_ context.Context, branch string) (string, 
 	return "origin/" + branch, nil
 }
 
-// ReviewedHead accepts only the heads the test marked as clean updates of
-// the reviewed tip; the poller itself handles a head equal to it.
-func (b *amFakeBranches) ReviewedHead(_ context.Context, reviewed, head, base string) (bool, string, error) {
+// ReviewedHead applies the gitx rule to the fake history: walking back from
+// head, every commit before reviewed must be an update merge (markUpdate)
+// of a head the run asked GitHub to update (updatedFrom).
+func (b *amFakeBranches) ReviewedHead(_ context.Context, reviewed, head, base string, updatedFrom []string) (bool, string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.Reviews = append(b.Reviews, fmt.Sprintf("%s..%s on %s", reviewed, head, base))
 	if b.reviewErr != nil {
 		return false, "", b.reviewErr
 	}
-	if b.updates[head] {
-		return true, "", nil
+	asked := map[string]bool{}
+	for _, h := range updatedFrom {
+		asked[h] = true
 	}
-	return false, "commit " + head[:7] + " is not a merge of " + base, nil
+	for cur := head; cur != reviewed; {
+		from, ok := b.merges[cur]
+		switch {
+		case !ok:
+			return false, "commit " + cur[:7] + " is neither the approved commit nor a merge GitHub made when slop-cannon asked it to update the branch", nil
+		case !asked[from]:
+			return false, "merge commit " + cur[:7] + " is not an update slop-cannon asked for", nil
+		}
+		cur = from
+	}
+	return true, "", nil
 }
 
-// markUpdate makes head a clean update merge of the reviewed tip.
-func (b *amFakeBranches) markUpdate(head string) {
+func (b *amFakeBranches) BranchTip(context.Context, domain.Bead) (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.updates == nil {
-		b.updates = map[string]bool{}
+	if b.tip == "" {
+		return amHead, nil
 	}
-	b.updates[head] = true
+	return b.tip, nil
+}
+
+// markUpdate makes head GitHub's merge of the base into from.
+func (b *amFakeBranches) markUpdate(head, from string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.merges == nil {
+		b.merges = map[string]string{}
+	}
+	b.merges[head] = from
 }
 
 // amFakeLedger is the run's state.json half.
@@ -173,6 +198,23 @@ type amFakeLedger struct {
 	err      error
 	Records  []string
 	sentBack []string
+	updated  []string
+}
+
+func (l *amFakeLedger) AutoMergeUpdates() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.updated...)
+}
+
+func (l *amFakeLedger) RecordAutoMergeUpdate(key string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.err != nil {
+		return l.err
+	}
+	l.updated = append(l.updated, key)
+	return nil
 }
 
 func (l *amFakeLedger) LastAutoMerge() time.Time {
@@ -476,7 +518,8 @@ func TestAutoMergeUpdatesABranchThatIsBehindOncePerHead(t *testing.T) {
 	assert.Equal(t, AutoMergeUpdating, h.status().State)
 
 	// GitHub merged the base in: a new head, checks running again.
-	h.Branches.markUpdate("3333333333333333333333333333333333333333")
+	assert.Equal(t, []string{AutoMergeUpdateKey(amBead, amHead)}, h.Ledger.AutoMergeUpdates(), "recorded before it was asked for")
+	h.Branches.markUpdate("3333333333333333333333333333333333333333", amHead)
 	next := amOwnedView("3333333333333333333333333333333333333333", amCheck("test", ""))
 	h.GH.set(next)
 	h.poll()
@@ -737,6 +780,8 @@ func (forgetfulLedger) LastAutoMerge() time.Time                            { re
 func (forgetfulLedger) RecordAutoMerge(time.Time, domain.BeadID, int) error { return nil }
 func (forgetfulLedger) AutoMergeSentBack() []string                         { return nil }
 func (forgetfulLedger) RecordAutoMergeSentBack([]string) error              { return nil }
+func (forgetfulLedger) AutoMergeUpdates() []string                          { return nil }
+func (forgetfulLedger) RecordAutoMergeUpdate(string) error                  { return nil }
 
 // The spacing is measured from the ledger, which is the run's state.json:
 // a resumed run's poller waits out the rest of it.
@@ -845,9 +890,10 @@ func TestAutoMergeOffNeverMerges(t *testing.T) {
 }
 
 // TestAutoMergeNeverMergesCommitsTheRunDidNotReview: ownership is judged
-// per pull request, so the head is judged too — a commit pushed onto the
-// run's own branch after delivery is never merged, updated or sent back,
-// whatever GitHub says about it.
+// per pull request, so the head is judged too (the approved-tip guard) — a
+// commit pushed onto the run's own branch after delivery is never merged,
+// updated or sent back, whatever GitHub says about it: the bead goes to a
+// person with what to do.
 func TestAutoMergeNeverMergesCommitsTheRunDidNotReview(t *testing.T) {
 	t.Parallel()
 	const pushed = "5555555555555555555555555555555555555555"
@@ -874,12 +920,61 @@ func TestAutoMergeNeverMergesCommitsTheRunDidNotReview(t *testing.T) {
 			assert.Empty(t, h.Branches.Syncs)
 			assert.Empty(t, h.Outcomes.all())
 			assert.Equal(t, []string{amHead + ".." + pushed + " on " + gateBranch}, h.Branches.Reviews)
-			assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State(amBead), "it waits for a human")
+			assert.Equal(t, string(domain.BeadStateNeedsHuman), h.BD.State(amBead), "a person decides")
 			st := h.status()
-			assert.Equal(t, AutoMergeNotOwned, st.State)
-			assert.Contains(t, st.Reason, "holds commits the run did not review")
+			assert.Equal(t, AutoMergeHandedOff, st.State)
+			assert.Contains(t, st.Reason, "holds commits the run did not approve")
+			assert.Contains(t, st.Reason, "git log 1111111..5555555")
+
+			h.pending()
+			h.poll()
+			assert.Empty(t, h.GH.Merges, "a bead in needs_human is never merged")
 		})
 	}
+
+	t.Run("an update merge the run never asked for", func(t *testing.T) {
+		t.Parallel()
+		h := newAMHarness(t, nil)
+		h.Branches.markUpdate(pushed, amHead) // somebody pressed "Update branch"
+		h.GH.set(amOwnedView(pushed))
+		h.pending()
+		h.poll()
+		assert.Empty(t, h.GH.Merges)
+		assert.Equal(t, string(domain.BeadStateNeedsHuman), h.BD.State(amBead))
+		assert.Contains(t, h.status().Reason, "is not an update slop-cannon asked for")
+	})
+
+	t.Run("a commit pushed on top of the update the run asked for", func(t *testing.T) {
+		t.Parallel()
+		const update = "3333333333333333333333333333333333333333"
+		h := newAMHarness(t, nil)
+		require.NoError(t, h.Ledger.RecordAutoMergeUpdate(AutoMergeUpdateKey(amBead, amHead)))
+		h.Branches.markUpdate(update, amHead)
+		h.GH.set(amOwnedView(pushed))
+		h.pending()
+		h.poll()
+		assert.Empty(t, h.GH.Merges)
+		assert.Equal(t, string(domain.BeadStateNeedsHuman), h.BD.State(amBead))
+		assert.Contains(t, h.status().Reason, "is neither the approved commit")
+	})
+
+	t.Run("the bead's own tip, pushed by a re-delivery that has not recorded it yet, waits", func(t *testing.T) {
+		t.Parallel()
+		h := newAMHarness(t, nil)
+		h.Branches.tip = pushed
+		h.GH.set(amOwnedView(pushed))
+		h.pending()
+		h.poll()
+		assert.Empty(t, h.GH.Merges)
+		assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State(amBead), "not handed off")
+		assert.Equal(t, AutoMergeWaiting, h.status().State)
+		assert.Contains(t, h.status().Reason, "which its delivery has not recorded yet")
+
+		h.BD.SetMeta(amBead, beads.MetaPRHead, pushed) // the delivery records it
+		h.pending()
+		h.poll()
+		assert.Equal(t, []string{"7@" + pushed}, h.GH.Merges)
+	})
 
 	t.Run("nothing recorded", func(t *testing.T) {
 		t.Parallel()
@@ -903,12 +998,14 @@ func TestAutoMergeNeverMergesCommitsTheRunDidNotReview(t *testing.T) {
 		assert.Empty(t, h.GH.Merges)
 		assert.Equal(t, AutoMergeWaiting, h.status().State)
 		assert.Contains(t, h.status().Reason, "fetch failed")
+		assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State(amBead), "an unanswered question is not a hand-off")
 	})
 
-	t.Run("a clean update merge is merged, and judged once", func(t *testing.T) {
+	t.Run("the update merge the run asked for is merged, and judged once", func(t *testing.T) {
 		t.Parallel()
-		h := newAMHarness(t, func(o *AutoMergeOptions) { o.Ledger = forgetfulLedger{} })
-		h.Branches.markUpdate(pushed)
+		h := newAMHarness(t, nil)
+		require.NoError(t, h.Ledger.RecordAutoMergeUpdate(AutoMergeUpdateKey(amBead, amHead)))
+		h.Branches.markUpdate(pushed, amHead)
 		v := amOwnedView(pushed, amCheck("test", ""))
 		h.GH.set(v)
 		h.pending()
@@ -921,6 +1018,63 @@ func TestAutoMergeNeverMergesCommitsTheRunDidNotReview(t *testing.T) {
 		assert.Equal(t, []string{"7@" + pushed}, h.GH.Merges)
 		assert.Len(t, h.Branches.Reviews, 1, "a head shown to be reviewed is remembered")
 	})
+
+	t.Run("another bead's update request does not cover this one", func(t *testing.T) {
+		t.Parallel()
+		h := newAMHarness(t, nil)
+		require.NoError(t, h.Ledger.RecordAutoMergeUpdate(AutoMergeUpdateKey("fx-other", amHead)))
+		h.Branches.markUpdate(pushed, amHead)
+		h.GH.set(amOwnedView(pushed))
+		h.pending()
+		h.poll()
+		assert.Empty(t, h.GH.Merges)
+		assert.Equal(t, string(domain.BeadStateNeedsHuman), h.BD.State(amBead))
+	})
+}
+
+// The approved-tip guard holds across a resume: the update a run asked for
+// before it stopped is still the run's own work to the resumed poller, and
+// one it never asked for still is not.
+func TestAutoMergeApprovedTipGuardSurvivesAResume(t *testing.T) {
+	t.Parallel()
+	const update = "3333333333333333333333333333333333333333"
+	first := newAMHarness(t, nil)
+	v := amOwnedView(amHead)
+	v.MergeStateStatus = "BEHIND"
+	first.GH.set(v)
+	first.pending()
+	first.poll()
+	require.Equal(t, []int{amPR}, first.GH.Updates)
+
+	resumed := newAMHarness(t, func(o *AutoMergeOptions) { o.Ledger = first.Ledger })
+	resumed.Branches.markUpdate(update, amHead)
+	resumed.GH.set(amOwnedView(update))
+	resumed.pending()
+	resumed.poll()
+	assert.Equal(t, []string{"7@" + update}, resumed.GH.Merges)
+
+	fresh := newAMHarness(t, nil) // the same update, but no record of asking for it
+	fresh.Branches.markUpdate(update, amHead)
+	fresh.GH.set(amOwnedView(update))
+	fresh.pending()
+	fresh.poll()
+	assert.Empty(t, fresh.GH.Merges)
+	assert.Equal(t, string(domain.BeadStateNeedsHuman), fresh.BD.State(amBead))
+}
+
+// An update request that state.json could not record is not asked for:
+// GitHub's merge for it could never pass the guard.
+func TestAutoMergeDoesNotUpdateWhatItCouldNotRecord(t *testing.T) {
+	t.Parallel()
+	h := newAMHarness(t, nil)
+	h.Ledger.err = errors.New("disk full")
+	v := amOwnedView(amHead)
+	v.MergeStateStatus = "BEHIND"
+	h.GH.set(v)
+	h.pending()
+	h.poll()
+	assert.Empty(t, h.GH.Updates)
+	assert.Contains(t, h.status().Reason, "could not record in state.json that pull request #7 is to be updated")
 }
 
 // The once-per-head send-back holds across a resume: a new poller (a new
