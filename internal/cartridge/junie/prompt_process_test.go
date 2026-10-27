@@ -29,7 +29,13 @@ case "$task" in
     prompt_path=${task#Read the file at this exact path: }
     prompt_path=${prompt_path%. Its complete contents are the task instructions; follow them as the task.}
     if [ -n "$SC_JUNIE_PROMPT_COPY" ]; then cp "$prompt_path" "$SC_JUNIE_PROMPT_COPY"; fi
-    if [ -n "$SC_JUNIE_PROMPT_MODE" ]; then stat -c '%a' "$prompt_path" > "$SC_JUNIE_PROMPT_MODE"; fi
+    if [ -n "$SC_JUNIE_PROMPT_MODE" ]; then
+      if stat -c '%a' "$prompt_path" >/dev/null 2>&1; then
+        stat -c '%a' "$prompt_path" > "$SC_JUNIE_PROMPT_MODE"
+      else
+        stat -f '%Lp' "$prompt_path" > "$SC_JUNIE_PROMPT_MODE"
+      fi
+    fi
     if [ -n "$SC_JUNIE_PROMPT_PATH" ]; then printf '%s' "$prompt_path" > "$SC_JUNIE_PROMPT_PATH"; fi
     ;;
 esac

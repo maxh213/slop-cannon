@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -802,7 +803,9 @@ func TestPlannerRunsTheConfiguredSignalsCommand(t *testing.T) {
 	require.NoError(t, err)
 	req, _ := runner.last()
 	require.NotNil(t, req.Signals)
-	assert.Equal(t, fmt.Sprintf("ran in %s\ntoken ghp_[REDACTED]\n", rc.Run.RepoPath), req.Signals.Output)
+	repo, err := filepath.EvalSymlinks(rc.Run.RepoPath)
+	require.NoError(t, err)
+	assert.Equal(t, fmt.Sprintf("ran in %s\ntoken ghp_[REDACTED]\n", repo), req.Signals.Output)
 	assert.NotContains(t, req.Signals.Command, "ghp_ABCDEFGHIJKLMNOPQRST", "the command the prompt echoes is filtered too")
 	assert.Equal(t, config.DefaultSignalsInterval, p.sigInterval)
 }

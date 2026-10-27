@@ -143,5 +143,6 @@ func (a *Adapter) pump(h *proc.Handle, pipe *cartridge.Pipe, cleanup func()) {
 	if output := p.Output(); output != "" {
 		pipe.Emit(cartridge.TextDelta(output))
 	}
+	cleanup()
 	pipe.Finish(result, Classify(a.name, p, procErr, res.ExitCode))
 }
