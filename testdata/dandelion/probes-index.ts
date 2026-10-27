@@ -2,7 +2,7 @@ import type { Fetcher, FileReader, ProviderUsage } from '../domain/index.ts';
 import { agyProbe } from './agy.ts';
 import { probeClaudeDeepseek } from './claude-deepseek.ts';
 import { probeClaudeOllama } from './claude-ollama.ts';
-import { claudeProbe, claudeWorkProbe } from './claude.ts';
+import { claudeAnimusProbe, claudeProbe, claudeWorkProbe } from './claude.ts';
 import { probeCli, type CliProbe } from './cli.ts';
 import { probeCodex, probeCodexAnimus, type CodexIo } from './codex.ts';
 import { probeCursor, type CursorIo } from './cursor.ts';
@@ -44,6 +44,7 @@ function rawProbes(io: ProbeIo, env: Record<string, string | undefined>): Provid
   return [
     cliProbe(io, claudeProbe),
     cliProbe(io, claudeWorkProbe(env, io.reader.homeDir())),
+    cliProbe(io, claudeAnimusProbe(env, io.reader.homeDir())),
     { id: 'claude-deepseek', probe: (now) => probeClaudeDeepseek(io, env, now) },
     { id: 'claude-ollama', probe: (now) => probeClaudeOllama(io, env, now) },
     cliProbe(io, agyProbe),

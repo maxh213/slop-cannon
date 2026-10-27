@@ -17,6 +17,9 @@ next version's entry.
 
 ### Added
 
+- The `dandelion` cartridge knows the `claude-animus` account: Claude Code with
+  `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_ANIMUS_CONFIG_DIR`, else
+  `~/.claude-animus`, launched and policed exactly like `claude-work`.
 - `po_planners` (default 1; Animus intends 2) coordinates independent PO
   producers with unique IDs behind one completion barrier. A fresh snapshot,
   at most one read-only semantic judge with no retry loop, and deterministic

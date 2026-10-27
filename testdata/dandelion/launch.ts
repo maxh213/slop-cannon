@@ -9,6 +9,7 @@ type Target = { command: string; modelFlag: string; effortFlag?: string; effortC
 const TARGETS: Record<string, Target> = {
   claude: { command: 'claude', modelFlag: '--model', effortFlag: '--effort' },
   'claude-work': { command: 'claude', modelFlag: '--model', effortFlag: '--effort' },
+  'claude-animus': { command: 'claude', modelFlag: '--model', effortFlag: '--effort' },
   'claude-deepseek': { command: 'claude', modelFlag: '--model', effortFlag: '--effort' },
   'claude-ollama': { command: 'claude', modelFlag: '--model', effortFlag: '--effort' },
   agy: { command: 'agy', modelFlag: '--model' },
@@ -26,6 +27,7 @@ type AccountHome = { variable: string; name: string; fallback: string };
 
 const ACCOUNT_HOMES: Record<string, AccountHome> = {
   'claude-work': { variable: 'CLAUDE_CONFIG_DIR', name: 'DANDELION_CLAUDE_WORK_CONFIG_DIR', fallback: '.claude-work' },
+  'claude-animus': { variable: 'CLAUDE_CONFIG_DIR', name: 'DANDELION_CLAUDE_ANIMUS_CONFIG_DIR', fallback: '.claude-animus' },
   'claude-deepseek': { variable: 'CLAUDE_CONFIG_DIR', name: 'DANDELION_CLAUDE_DEEPSEEK_CONFIG_DIR', fallback: '.claude-deepseek' },
   'claude-ollama': { variable: 'CLAUDE_CONFIG_DIR', name: 'DANDELION_CLAUDE_OLLAMA_CONFIG_DIR', fallback: '.claude-ollama' },
   'codex-animus': { variable: 'CODEX_HOME', name: 'DANDELION_CODEX_ANIMUS_HOME', fallback: '.codex-animus' }

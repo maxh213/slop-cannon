@@ -484,7 +484,7 @@ func TestRun_KiloBudgetWithoutAlternativeIsNoRoute(t *testing.T) {
 	env["SC_KILO_NEXT_ROUTE"] = filepath.Join(f.router.Dir, "line")
 	env["SC_KILO_NEXT_ROUTE_LINE"] = NoRoute
 	a, _, _ := newAdapter(t, config.Cartridge{Env: map[string]string{
-		disableEnv: "claude,claude-work,claude-deepseek,claude-ollama,agy,kimi,grok,codex,codex-animus,cursor,junie,hermes",
+		disableEnv: "claude,claude-work,claude-animus,claude-deepseek,claude-ollama,agy,kimi,grok,codex,codex-animus,cursor,junie,hermes",
 	}})
 	err := fire(t, a, spec(t, cartridge.ToolReadWrite, env))
 	e := cerr(t, err)
@@ -512,6 +512,7 @@ func TestRun_ClaudeConfigDirPerAccount(t *testing.T) {
 	t.Setenv("HOME", home)
 	cases := []struct{ account, want string }{
 		{"claude-work", "/custom/work"},
+		{"claude-animus", filepath.Join(home, ".claude-animus")},
 		{"claude-deepseek", filepath.Join(home, ".claude-deepseek")},
 		{"claude-ollama", filepath.Join(home, ".claude-ollama")},
 	}
@@ -983,7 +984,7 @@ func TestDetect(t *testing.T) {
 	assert.Equal(t, f.router.Path, st.Path)
 	assert.Equal(t, "2.1.309", st.Version)
 	assert.Equal(t, cartridge.AuthOK, st.Auth)
-	assert.Contains(t, st.Detail, "dandelion route --high over claude, claude-work, claude-deepseek, claude-ollama (Claude Code)")
+	assert.Contains(t, st.Detail, "dandelion route --high over claude, claude-work, claude-animus, claude-deepseek, claude-ollama (Claude Code)")
 	assert.Contains(t, st.Detail, "cursor-agent is not on PATH")
 	assert.Contains(t, st.Detail, "claude: logged in as user@example.com")
 	assert.Empty(t, f.router.ArgLists(t), "Detect must not run a probe round")

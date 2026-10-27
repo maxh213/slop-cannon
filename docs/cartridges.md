@@ -467,6 +467,7 @@ then, for the account the line names:
 |---|---|---|
 | `claude` | Claude Code: `claude -p … --model <model> … --effort <effort>` | as sc's own (the default home, like `dandelion run`) |
 | `claude-work` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_WORK_CONFIG_DIR`, else `~/.claude-work` |
+| `claude-animus` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_ANIMUS_CONFIG_DIR`, else `~/.claude-animus` |
 | `claude-deepseek` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_DEEPSEEK_CONFIG_DIR`, else `~/.claude-deepseek` |
 | `claude-ollama` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_OLLAMA_CONFIG_DIR`, else `~/.claude-ollama` |
 | `agy` | Agy, `read_write` only | large prompts use a workdir-private mode-0600 file, removed afterwards |

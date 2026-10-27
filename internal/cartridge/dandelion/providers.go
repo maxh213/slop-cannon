@@ -58,6 +58,7 @@ type Provider struct {
 var Providers = []Provider{
 	{ID: "claude", Driver: DriverClaude},
 	{ID: "claude-work", Driver: DriverClaude, ConfigDirEnv: "DANDELION_CLAUDE_WORK_CONFIG_DIR", ConfigDirFallback: ".claude-work"},
+	{ID: "claude-animus", Driver: DriverClaude, ConfigDirEnv: "DANDELION_CLAUDE_ANIMUS_CONFIG_DIR", ConfigDirFallback: ".claude-animus"},
 	{ID: "claude-deepseek", Driver: DriverClaude, ConfigDirEnv: "DANDELION_CLAUDE_DEEPSEEK_CONFIG_DIR", ConfigDirFallback: ".claude-deepseek"},
 	{ID: "claude-ollama", Driver: DriverClaude, ConfigDirEnv: "DANDELION_CLAUDE_OLLAMA_CONFIG_DIR", ConfigDirFallback: ".claude-ollama"},
 	{ID: "agy", Driver: DriverAgy},

@@ -18,10 +18,11 @@ import (
 // another file. A probe not listed here fails the test: look its id up and
 // add it, then classify the id in Providers.
 var cliProbeIDs = map[string]string{
-	"claudeProbe":     "claude",
-	"claudeWorkProbe": "claude-work",
-	"agyProbe":        "agy",
-	"kiloProbe":       "kilo",
+	"claudeProbe":       "claude",
+	"claudeWorkProbe":   "claude-work",
+	"claudeAnimusProbe": "claude-animus",
+	"agyProbe":          "agy",
+	"kiloProbe":         "kilo",
 }
 
 var (
@@ -146,12 +147,12 @@ func TestProviders_MatchPinnedDandelionSources(t *testing.T) {
 }
 
 func TestProviders_Policy(t *testing.T) {
-	claudes := []string{"claude", "claude-work", "claude-deepseek", "claude-ollama"}
+	claudes := []string{"claude", "claude-work", "claude-animus", "claude-deepseek", "claude-ollama"}
 	available := func(Driver) bool { return true }
 	assert.Equal(t, claudes, allowedProviders(Providers, builtinDrivers, cartridge.ToolReadOnly, available))
-	assert.Equal(t, []string{"claude", "claude-work", "claude-deepseek", "claude-ollama", "kimi", "grok", "codex", "codex-animus", "hermes", "kilo"},
+	assert.Equal(t, []string{"claude", "claude-work", "claude-animus", "claude-deepseek", "claude-ollama", "kimi", "grok", "codex", "codex-animus", "hermes", "kilo"},
 		allowedProviders(Providers, builtinDrivers, cartridge.ToolReadExec, available))
-	assert.Equal(t, []string{"claude", "claude-work", "claude-deepseek", "claude-ollama", "agy", "kimi", "grok", "codex", "codex-animus", "cursor", "junie", "hermes", "kilo"},
+	assert.Equal(t, []string{"claude", "claude-work", "claude-animus", "claude-deepseek", "claude-ollama", "agy", "kimi", "grok", "codex", "codex-animus", "cursor", "junie", "hermes", "kilo"},
 		allowedProviders(Providers, builtinDrivers, cartridge.ToolReadWrite, available))
 	for policy, want := range map[cartridge.ToolPolicy]string{
 		cartridge.ToolReadOnly:  "agy,kimi,grok,codex,codex-animus,cursor,junie,hermes,kilo",
