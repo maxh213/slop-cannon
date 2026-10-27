@@ -4054,10 +4054,13 @@ func (c *Conductor) attempted(job deliveryJob) {
 
 // release lets a bead be delivered again: a check failure or a conflict,
 // both of which come back through the feedback loop, or a request the
-// deliverer refused outright.
+// deliverer refused outright. The shipped mark goes too: the send-back and
+// re-approval can both happen between listings, with no non-approved pass to
+// clear it.
 func (c *Conductor) release(id domain.BeadID) {
 	c.mu.Lock()
 	delete(c.inflight, id)
+	delete(c.shipped, id)
 	c.mu.Unlock()
 }
 

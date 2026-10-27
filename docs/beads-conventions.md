@@ -242,6 +242,50 @@ a graph plan), so `bd ready --parent <epic>`, `bd epic status` and `bd
 swarm status <epic>` show one run. On resume the epic is found with
 `bd list -l sc:run:<id> --metadata-field sc_kind=epic --all`.
 
+### Parallel planning, canonical edges and recovery (D-41)
+
+The default `po_planners = 1` path applies the original plan without
+namespacing or a semantic review round. Above 1, independent producers cannot
+write beads or choose the epic. Their unique IDs (`po-plan-1-p1`,
+`po-plan-1-p2`, …) identify their candidate plans; after every producer has
+finished, raw keys and local dependencies are namespaced by planner position
+as `p1:<key>`, `p2:<key>`, …, never by completion order.
+
+Reconciliation reads a fresh run snapshot after that completion barrier.
+Normalized-title matches against existing non-closed beads win first, then
+the earliest candidate wins among producers. A semantic judge may classify
+unresolved candidates as `duplicate`, `conflict`, or `independent`, but cannot
+rewrite bead prose, IDs, dependencies, or quota. A duplicate's canonical
+target must be another known candidate or a fresh open existing bead.
+Unresolved candidates and dependents of conflicts fail closed as conflicts,
+so no dependency is silently dropped. Multi-producer planning never performs
+Q-04 deprioritisation and never rewrites an existing canonical bead.
+
+The accepted graph uses the ordinary top-level `edges[]` encoding with two
+target forms:
+
+- a local dependency uses `to_key` after its target has been remapped to the
+  canonical candidate key;
+- a dependency on an existing canonical bead uses `to_id`, from the new
+  candidate's `from_key`, with type `blocks`.
+
+Before the dry run or create call, `sc` reads every external `to_id` target
+again; a missing target fails with `beads: apply plan: fresh canonical
+targets`. After creation it verifies both local and external dependencies.
+Existing canonical beads supply read-only identity and dependency targets;
+their prose, priority, state, and acceptance criteria are not updated.
+
+One reconciled graph is applied under the current run epic, or creates that
+epic in the same graph when needed. If acceptance finalisation fails after
+creation, `PlanResult` can still carry the epic, returned IDs, and
+`Unfinished` beads together with the error; those are recovery evidence, not
+silent success. The retained `planningCommit` first uses positive returned-ID
+evidence and otherwise takes a fresh run-scoped listing. If the old graph is
+proven present, the retry adopts it without a second graph apply and
+publishes review/plan events once. If it is not proven present, the
+unfinished round regenerates. Epic adoption and resume therefore do not
+duplicate planning or graph creation.
+
 ### Structured messages
 
 Agents exchange structured messages as bead comments (`bd comment <id>

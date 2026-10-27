@@ -905,3 +905,102 @@ func TestShimVerifyChecksBDsOwnReadOnlyOncePerBinary(t *testing.T) {
 		assert.Contains(t, err.Error(), "does not enforce --readonly itself")
 	}
 }
+
+func TestShimVerifySerializesBDReadOnlyProbe(t *testing.T) {
+	const callers = 16
+	fake := testutil.FakeBin(t, "bd", `
+case " $* " in
+  *" update "*)
+    if ! mkdir "$SC_FAKEBIN_DIR/probe-lock" 2>/dev/null; then
+      echo "Error: overlapping bd verification" >&2
+      exit 1
+    fi
+    : > "$SC_FAKEBIN_DIR/probe-started"
+    while [ ! -f "$SC_FAKEBIN_DIR/probe-release" ]; do sleep 0.01; done
+    rmdir "$SC_FAKEBIN_DIR/probe-lock"
+    echo "Error: operation 'update' is not allowed in read-only mode" >&2
+    exit 1
+    ;;
+esac
+mkdir "$SC_FAKEBIN_DIR/preprobe.$SC_FAKEBIN_SEQ"
+case " $* " in
+  *" version "*) printf '{"schema_version":1,"data":{"version":"1.2.2"}}\n'; exit 0 ;;
+esac
+printf 'ok\n'
+`)
+	s, err := WriteShim(t.TempDir(), ShimOptions{Real: fake.Path})
+	require.NoError(t, err)
+	dir := t.TempDir()
+	start := make(chan struct{})
+	errs := make(chan error, callers)
+	for range callers {
+		go func() {
+			<-start
+			errs <- s.Verify(context.Background(), dir)
+		}()
+	}
+	close(start)
+
+	ready := assert.Eventually(t, func() bool {
+		preprobes, err := filepath.Glob(filepath.Join(fake.Dir, "preprobe.*"))
+		if err != nil || len(preprobes) != callers*3 {
+			return false
+		}
+		_, err = os.Stat(filepath.Join(fake.Dir, "probe-started"))
+		return err == nil
+	}, testutil.Patience(10*time.Second), time.Millisecond,
+		"every caller finishes its shim probes while bd's first direct probe is held")
+	require.NoError(t, os.WriteFile(filepath.Join(fake.Dir, "probe-release"), nil, 0o644))
+	verifyErrs := make([]error, 0, callers)
+	for range callers {
+		verifyErrs = append(verifyErrs, <-errs)
+	}
+	require.True(t, ready)
+	for _, err := range verifyErrs {
+		require.NoError(t, err)
+	}
+	assert.Equal(t, 1, shimBDUpdateProbes(t, fake), "only the first caller runs bd's direct probe")
+	assert.Len(t, fake.Invocations(t), callers*3+1, "every caller still runs all of the shim's own probes")
+}
+
+func TestShimVerifyRetriesBDReadOnlyProbeAfterFailure(t *testing.T) {
+	fake := testutil.FakeBin(t, "bd", `
+case " $* " in
+  *" update "*)
+    if [ ! -f "$SC_FAKEBIN_DIR/failed" ]; then
+      : > "$SC_FAKEBIN_DIR/failed"
+      echo "Error: no beads database found" >&2
+      exit 1
+    fi
+    echo "Error: operation 'update' is not allowed in read-only mode" >&2
+    exit 1
+    ;;
+  *" version "*) printf '{"schema_version":1,"data":{"version":"1.2.2"}}\n'; exit 0 ;;
+esac
+printf 'ok\n'
+`)
+	s, err := WriteShim(t.TempDir(), ShimOptions{Real: fake.Path})
+	require.NoError(t, err)
+	dir := t.TempDir()
+
+	err = s.Verify(context.Background(), dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no beads database found")
+	assert.Equal(t, 1, shimBDUpdateProbes(t, fake))
+
+	require.NoError(t, s.Verify(context.Background(), dir), "a failed probe is not cached as a success")
+	assert.Equal(t, 2, shimBDUpdateProbes(t, fake), "the next caller really verifies again")
+	require.NoError(t, s.Verify(context.Background(), dir))
+	assert.Equal(t, 2, shimBDUpdateProbes(t, fake), "only the successful retry is cached")
+}
+
+func shimBDUpdateProbes(t *testing.T, fake *testutil.Shim) int {
+	t.Helper()
+	n := 0
+	for _, call := range fake.Invocations(t) {
+		if slices.Contains(call.Args, "update") {
+			n++
+		}
+	}
+	return n
+}

@@ -1077,6 +1077,18 @@ func TestFeedbackCheckFailedOpensAQARound(t *testing.T) {
 	for _, l := range domain.Lenses() {
 		fbSay(sc, "tester-"+l.String()+"-sc-fb1-r1", fbApprove("fine"))
 	}
+	failed := fbItemAt("check-r1-1", "the check command failed: go test ./...", "retry.go",
+		domain.SeverityBlocker, domain.ItemOpen)
+	failed.Category = DefaultCheckItemCategory
+	resolved := failed
+	resolved.Status = domain.ItemResolved
+	fbSay(sc, "eng-sc-fb1-r2", fbResponses(domain.Response{
+		ItemID: failed.ID, Action: domain.ActionFixed, Rationale: "fixed the failure",
+	}))
+	fbSay(sc, "tester-qa-sc-fb1-r2", fbSettled("the check now passes", resolved))
+	fbSay(sc, "tester-ux-sc-fb1-r2", fbApprove("still reads fine"))
+	fbSay(sc, "tester-test-sc-fb1-r2", fbApprove("still covered"))
+
 	rig := fbSetup(t, sc, nil)
 	rig.pump(t, 8)
 	require.Equal(t, domain.BeadStateApproved, rig.Thread().State)
@@ -1084,9 +1096,6 @@ func TestFeedbackCheckFailedOpensAQARound(t *testing.T) {
 
 	// The delivery handoff has already moved the bead back and published
 	// its RoundStarted (P6-06); the loop takes the items.
-	failed := fbItemAt("check-r1-1", "the check command failed: go test ./...", "retry.go",
-		domain.SeverityBlocker, domain.ItemOpen)
-	failed.Category = DefaultCheckItemCategory
 	require.NoError(t, rig.Loop.CheckFailed(context.Background(),
 		domain.Bead{ID: fbBead, Title: "make the retry loop terminate"}, 1, []domain.FeedbackItem{failed}))
 
@@ -1103,6 +1112,50 @@ func TestFeedbackCheckFailedOpensAQARound(t *testing.T) {
 	require.Len(t, ds, 1)
 	assert.Equal(t, events.TaskAddressFeedback, ds[0].FiringTask())
 	assert.Equal(t, ClaimRework, ds[0].Claim)
+
+	rig.setDiff("head2", 400, 0.9)
+	require.Equal(t, 1, rig.step(t), "the engineer answers the failed check")
+	th = rig.Thread()
+	assert.Equal(t, FeedbackReviewing, th.Phase)
+	require.Equal(t, domain.Lenses(), th.Reviewers, "the large fix requires every reviewer again")
+
+	fire := func(d Demand) {
+		agent := d.Agent
+		if agent == "" {
+			agent = mintAgentID(d, 1)
+		}
+		_, err := rig.Sup.Fire(context.Background(), Firing{
+			Agent: domain.Agent{
+				ID: agent, Role: d.Role(), Lens: d.Lens, Bead: d.Bead,
+				State: domain.AgentStateRunning, StartedAt: fbEpoch,
+			},
+			Demand: d, Run: rig.Run,
+		})
+		require.NoError(t, err)
+	}
+	for i, lens := range domain.Lenses() {
+		ds, err = rig.Loop.Demands(context.Background())
+		require.NoError(t, err)
+		require.Len(t, ds, len(domain.Lenses())-i)
+		var next *Demand
+		for j := range ds {
+			if ds[j].Lens == lens {
+				next = &ds[j]
+				break
+			}
+		}
+		require.NotNil(t, next, "the %s reviewer is still required", lens)
+		fire(*next)
+		th = rig.Thread()
+		if i+1 < len(domain.Lenses()) {
+			assert.Equal(t, FeedbackReviewing, th.Phase)
+			assert.NotEqual(t, domain.BeadStateApproved, th.State, "outstanding reviewers prevent approval")
+			assert.Len(t, th.Reviewers, len(domain.Lenses())-i-1)
+		}
+	}
+	assert.Equal(t, FeedbackSettled, th.Phase)
+	assert.Equal(t, domain.BeadStateApproved, th.State, "the final required verdict permits approval")
+	assert.Zero(t, rig.Loop.Outstanding())
 }
 
 func TestFeedbackPlansTheDeliveryConflictRound(t *testing.T) {

@@ -587,12 +587,15 @@ func DuplicateOpenBeads(p domain.Plan, open []domain.Bead) []PlanDuplicate {
 	return out
 }
 
-// normaliseTitle folds a title for duplicate detection: lower case, runs of
-// whitespace collapsed to one space, trailing punctuation dropped.
-func normaliseTitle(s string) string {
+// NormalisePlanTitle folds a title for deterministic duplicate detection:
+// lower case, runs of whitespace collapsed to one space, trailing punctuation
+// dropped. Planning reconciliation and single-producer validation share it.
+func NormalisePlanTitle(s string) string {
 	s = strings.ToLower(strings.Join(strings.Fields(s), " "))
 	return strings.TrimRight(s, ".!?;:,")
 }
+
+func normaliseTitle(s string) string { return NormalisePlanTitle(s) }
 
 // PlanApplier is the part of the beads client that turns a plan into beads
 // (P3-10). *beads.Client satisfies it; a test can substitute a fake.

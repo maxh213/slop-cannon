@@ -332,6 +332,8 @@ func headlessGlyph(ev events.Event) string {
 		return "◇"
 	case events.PlanProduced:
 		return "✎"
+	case events.PlanReviewed:
+		return "≈"
 	case events.BeadCreated:
 		return "+"
 	case events.BeadUpdated:
@@ -392,6 +394,8 @@ func HeadlessLine(ev events.Event) string {
 		return headlessRunFinished(e)
 	case events.PlanProduced:
 		return headlessPlan(e)
+	case events.PlanReviewed:
+		return strings.TrimSpace(fmt.Sprintf("plan review %s: %s %s %s", e.Planner, e.Candidate, e.Decision, e.Canonical))
 	case events.BeadCreated:
 		return fmt.Sprintf("bead %s created %q (%s, p%d, %s)",
 			e.Bead.ID, e.Bead.Title, headlessBeadType(e.Bead.Type), int(e.Bead.Priority), orDash(string(e.Bead.State)))

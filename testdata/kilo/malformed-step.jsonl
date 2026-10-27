@@ -1,0 +1,2 @@
+{"type":"text","sessionID":"session-malformed","part":{"id":"text-1","type":"text","text":"Incomplete."}}
+{"type":"step_finish","sessionID":"session-malformed","part":{"id":"step-1","type":"step-finish","reason":"stop","cost":0.01,"tokens":{"input":10,"output":5,"reasoning":0,"cache":{"read":2}}}}

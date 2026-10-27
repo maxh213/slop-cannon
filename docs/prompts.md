@@ -71,6 +71,55 @@ can therefore never become prompt structure: a bead whose description
 contains `## Output contract` is read as text inside a fence, not as a new
 section, and a forged contract cannot suppress the real one.
 
+### Parallel planning and the semantic judge (D-41)
+
+`po_planners = 1` keeps the legacy planning prompt and pipeline: one
+`po-plan-1` producer, no candidate namespacing, semantic judge or contributor
+list, and the usual `max_beads_per_plan` cap. Only this default-one path may
+offer Q-04 deprioritisation of an existing open bead. Multi-producer prompts
+never offer deprioritisation, and reconciliation never rewrites an existing
+bead.
+
+With `po_planners = N` above 1, each producer independently receives the
+ordinary planning prompt and returns its own plan. IDs such as
+`po-plan-1-p1` and `po-plan-1-p2` keep the producers distinct even when their
+raw plan keys collide. Planner position, not completion order, determines the
+later `p1:…`, `p2:…` candidate namespaces. One production-signals reading is
+shared by every contributor in a round; the next round takes at most one new
+reading, never one per contributor.
+
+Nothing reviews or writes the graph until every producer has finished. The
+coordinator then takes a fresh bead snapshot and gives the same candidates
+and snapshot to the semantic judge and deterministic reconciler. The judge is
+read-only PO work (`plan_review`), not another plan producer. It runs at most
+once, and is skipped when normalized-title matching has already resolved
+every candidate. There is no judge retry loop, including for malformed
+output.
+
+The judge sees `candidates`, `existing`, and the unresolved keys in
+`judge_only`. Its output contract contains only a `decisions` array:
+
+```json
+{
+  "decisions": [
+    {"candidate": "p1:build", "decision": "independent"},
+    {"candidate": "p2:setup", "decision": "duplicate", "canonical": "p1:build"},
+    {"candidate": "p2:unclear", "decision": "conflict"}
+  ]
+}
+```
+
+`decision` is `duplicate`, `conflict`, or `independent`. The wire field
+`canonical` is optional, but a duplicate must name another known candidate or
+a fresh open existing bead; it is forbidden for the other decisions. The
+judge classifies only: it may not return prose, new IDs, rewritten bead
+content, dependencies, a graph, or quota changes. When uncertain it must
+choose `conflict`. A successful reconciliation with an unresolved candidate
+also marks it as a conflict, and dependents of conflicts become conflicts
+rather than losing an edge silently. A failed or invalid judge attempt uses
+the deterministic no-retry reconciliation fallback instead of another model
+call.
+
 ## Rules and vibes
 
 Both are plain files of your own, listed in the config (`rules` and `vibes`,

@@ -1,0 +1,3 @@
+{"type":"thread.started","thread_id":"thread-auth"}
+{"type":"turn.started"}
+{"type":"error","message":"401 Unauthorized: invalid API key"}

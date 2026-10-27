@@ -1339,10 +1339,9 @@ func TestLifecycleRestoreReinstatesTheRecordedCartridge(t *testing.T) {
 }
 
 // A run frozen on Claude keeps Claude as its active cartridge on resume, but
-// the per-role cartridges added to the configuration since (D-27) are not
-// part of the snapshot, so they take effect: engineers and testers move to
-// Cursor while the product owner stays where the run started.
-func TestLifecycleRestoreKeepsNewRoleCartridges(t *testing.T) {
+// per-role cartridges and models added to the configuration since (D-27) are
+// not part of the snapshot, so they take effect through rc.Effective.
+func TestLifecycleRestoreKeepsNewRoleCartridgesAndModels(t *testing.T) {
 	f := lifecycleSetup(t)
 	r, err := New(f.runConfig(t, config.RunSettings{}), f.options())
 	require.NoError(t, err)
@@ -1355,6 +1354,8 @@ func TestLifecycleRestoreKeepsNewRoleCartridges(t *testing.T) {
 	f.Eff.Cartridges["cursor"] = config.Cartridge{Model: "auto"}
 	f.Eff.Roles[domain.RoleEngineer] = "cursor"
 	f.Eff.Roles[domain.RoleTester] = "cursor"
+	f.Eff.RoleModels[domain.RolePO] = "standard"
+	f.Eff.RoleModels[domain.RoleEngineer] = "high"
 	resumed := f.runConfig(t, config.RunSettings{Resume: true})
 
 	_, err = RestoreRunConfig(resumed)
@@ -1364,6 +1365,8 @@ func TestLifecycleRestoreKeepsNewRoleCartridges(t *testing.T) {
 	require.Equal(t, "cursor", resumed.Effective.Roles[domain.RoleEngineer])
 	require.Equal(t, "cursor", resumed.Effective.Roles[domain.RoleTester])
 	require.Equal(t, "auto", resumed.Effective.Cartridges["cursor"].Model)
+	require.Equal(t, "standard", resumed.Effective.RoleModels[domain.RolePO])
+	require.Equal(t, "high", resumed.Effective.RoleModels[domain.RoleEngineer])
 }
 
 // ------------------------------------------------------------- state on disk

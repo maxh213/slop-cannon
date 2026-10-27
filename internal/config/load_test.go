@@ -55,6 +55,7 @@ graph_poll_interval = "3s"
 max_diff_bytes = 4096
 re_review_threshold = 0.5
 max_beads_per_plan = 6
+po_planners = 2
 nice = 12
 research = false
 auto_merge = false
@@ -104,6 +105,7 @@ graph_poll_interval = "5s"
 max_diff_bytes = 8192
 re_review_threshold = 0.25
 max_beads_per_plan = 4
+po_planners = 3
 nice = 5
 auto_merge = true
 auto_merge_checks = ["build", "test"]
@@ -203,6 +205,7 @@ func TestLoadGlobalOnly(t *testing.T) {
 	assert.Equal(t, 4096, eff.MaxDiffBytes)
 	assert.InEpsilon(t, 0.5, eff.ReReviewThreshold, 1e-9)
 	assert.Equal(t, 6, eff.MaxBeadsPerPlan)
+	assert.Equal(t, 2, eff.POPlanners)
 	assert.Equal(t, Limits{MaxReviewRounds: 4, MaxPushbackRounds: 1, MaxConflictRounds: 2, AgentTimeout: NewDuration(20 * time.Minute),
 		MaxAgentTimeout: NewDuration(12 * time.Hour), CheckTimeout: NewDuration(40 * time.Minute), SignalsTimeout: NewDuration(2 * time.Minute), MaxTokens: 1000, MaxCostUSD: 2.5, MaxPlanRejections: 3, MaxPlanFailures: 7}, eff.Limits)
 	assert.Equal(t, map[domain.Role]string{domain.RoleTester: "claude"}, eff.Roles)
@@ -235,6 +238,8 @@ func TestLoadRepoOverridesGlobalForEveryKey(t *testing.T) {
 	assert.Equal(t, 5*time.Second, eff.GraphPollInterval.Duration(), "the repo's graph poll interval wins")
 	assert.Equal(t, 8192, eff.MaxDiffBytes, "the repo's diff cap wins")
 	assert.InEpsilon(t, 0.25, eff.ReReviewThreshold, 1e-9, "the repo's re-review threshold wins")
+	assert.Equal(t, 3, eff.POPlanners)
+	assert.Equal(t, SourceRepo, eff.Sources[KeyPOPlanners])
 	assert.Equal(t, Limits{MaxReviewRounds: 6, MaxPushbackRounds: 3, MaxConflictRounds: 4, AgentTimeout: NewDuration(45 * time.Minute),
 		MaxAgentTimeout: NewDuration(18 * time.Hour), CheckTimeout: NewDuration(90 * time.Minute), SignalsTimeout: NewDuration(3 * time.Minute), MaxTokens: 2000, MaxCostUSD: 9, MaxPlanRejections: 4, MaxPlanFailures: 9}, eff.Limits)
 	// Lists union across layers, global first, deduplicated by absolute path.
@@ -355,8 +360,8 @@ func TestLoadApplyFlags(t *testing.T) {
 
 	low := 2
 	assert.ErrorIs(t, eff.Apply(Overrides{Ammo: &low}), ErrAmmoTooLow)
-	kimi := "kimi"
-	assert.EqualError(t, eff.Apply(Overrides{Cartridge: &kimi}), `cartridge "kimi" is not supported yet (only "claude", "cursor", "dandelion" for now)`)
+	animus := "codex-animus"
+	assert.EqualError(t, eff.Apply(Overrides{Cartridge: &animus}), `cartridge "codex-animus" is not supported yet (only "claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo" for now)`)
 
 	fresh, err := load(filepath.Join(t.TempDir(), "none.toml"), "")
 	require.NoError(t, err)
@@ -524,12 +529,12 @@ func TestLoadValidation(t *testing.T) {
 	}{
 		{"ammo too low global", "ammo = 2\n", "", KeyAmmo, ErrAmmoTooLow.Error()},
 		{"ammo too low repo", "ammo = 10\n", "ammo = 1\n", KeyAmmo, ErrAmmoTooLow.Error()},
-		{"unknown cartridge name", "[cartridges.kimi]\nmodel = \"3\"\n", "", "cartridges.kimi", `cartridge "kimi" is not supported yet (only "claude", "cursor", "dandelion" for now)`},
+		{"unknown cartridge name", "[cartridges.codex-animus]\n", "", "cartridges.codex-animus", `cartridge "codex-animus" is not supported yet (only "claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo" for now)`},
 		{"bad dandelion mode", "[cartridges.dandelion]\nmodel = \"opus\"\n", "", "cartridges.dandelion", `cartridge "dandelion" takes model "high" or "standard", not "opus"`},
 		{"active not configured", "active_cartridge = \"claude\"\n", "", KeyActiveCartridge, `cartridge "claude" is not configured; add it with: sc cartridge --add claude`},
-		{"active unknown", "active_cartridge = \"animus\"\n", "", KeyActiveCartridge, `cartridge "animus" is not supported yet (only "claude", "cursor", "dandelion" for now)`},
+		{"active unknown", "active_cartridge = \"animus\"\n", "", KeyActiveCartridge, `cartridge "animus" is not supported yet (only "claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo" for now)`},
 		{"bad role", "[roles.janitor]\ncartridge = \"claude\"\n", "", "roles.janitor", `role "janitor"`},
-		{"bad role cartridge", "", "[roles.tester]\ncartridge = \"kimi\"\n", "roles.tester.cartridge", `cartridge "kimi" is not supported yet (only "claude", "cursor", "dandelion" for now)`},
+		{"bad role cartridge", "", "[roles.tester]\ncartridge = \"codex-animus\"\n", "roles.tester.cartridge", `cartridge "codex-animus" is not supported yet (only "claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo" for now)`},
 		{"zero interval", "idle_replan_interval = \"0s\"\n", "", KeyIdleReplanInterval, "must be a positive duration"},
 		{"zero gate poll interval", "gate_poll_interval = \"0s\"\n", "", KeyGatePollInterval, "must be a positive duration"},
 		{"zero pr poll interval", "pr_poll_interval = \"0s\"\n", "", KeyPRPollInterval, "must be a positive duration"},
@@ -542,6 +547,8 @@ func TestLoadValidation(t *testing.T) {
 		{"negative conflict rounds", "", "[limits]\nmax_conflict_rounds = -2\n", KeyMaxConflictRounds, "must be at least 1"},
 		{"zero beads per plan", "max_beads_per_plan = 0\n", "", KeyMaxBeadsPerPlan, "must be at least 1"},
 		{"negative beads per plan", "", "max_beads_per_plan = -3\n", KeyMaxBeadsPerPlan, "must be at least 1"},
+		{"zero PO planners", "po_planners = 0\n", "", KeyPOPlanners, "must be at least 1"},
+		{"negative PO planners", "", "po_planners = -2\n", KeyPOPlanners, "must be at least 1"},
 		{"negative nice", "nice = -1\n", "", KeyNice, "must be between 0"},
 		{"nice above 19", "", "nice = 20\n", KeyNice, "must be between 0"},
 		{"zero rounds", "", "[limits]\nmax_review_rounds = 0\n", KeyMaxReviewRounds, "must be at least 1"},
@@ -714,6 +721,7 @@ func TestEntries(t *testing.T) {
 	assert.Equal(t, Entry{Key: KeyReReviewThreshold, Value: "0.5", Source: SourceGlobal}, byKey[KeyReReviewThreshold])
 	assert.Equal(t, Entry{Key: KeyMaxConflictRounds, Value: "2", Source: SourceGlobal}, byKey[KeyMaxConflictRounds])
 	assert.Equal(t, Entry{Key: KeyMaxBeadsPerPlan, Value: "6", Source: SourceGlobal}, byKey[KeyMaxBeadsPerPlan])
+	assert.Equal(t, Entry{Key: KeyPOPlanners, Value: "2", Source: SourceGlobal}, byKey[KeyPOPlanners])
 	assert.Equal(t, "20m", byKey[KeyAgentTimeout].Value)
 	assert.Equal(t, "2.5", byKey[KeyMaxCostUSD].Value)
 	assert.Equal(t, "1000", byKey[KeyMaxTokens].Value)

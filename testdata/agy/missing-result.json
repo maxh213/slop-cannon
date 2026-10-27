@@ -1,0 +1,1 @@
+{"conversation_id":"missing-result","status":"SUCCESS","response":"","duration_seconds":1.2,"num_turns":1,"denied_actions":[{"action":"command","display_name":"RunCommand"}],"usage":{"input_tokens":1,"output_tokens":0,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":1}}

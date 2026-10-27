@@ -1,0 +1,1 @@
+{"sessionId":"session-261024-120000-abcd","taskName":"Reply OK","result":"OK","changes":[],"llmUsage":[{"model":"claude-sonnet-5","calls":2,"cost":0.125,"inputTokens":1000,"cacheInputTokens":200,"cacheCreateTokens":30,"outputTokens":40},{"model":"helper-model","calls":1,"cost":0.025,"inputTokens":100,"cacheInputTokens":20,"cacheCreateTokens":3,"outputTokens":4}]}

@@ -1,0 +1,1 @@
+{"sessionId":"session-auth-failure","errors":["Response 401 | Failed Authentication: invalid API key"],"taskName":"Failed task","result":null,"changes":[],"llmUsage":[{"model":"claude-sonnet-5","calls":1,"cost":0.01,"inputTokens":25,"cacheInputTokens":0,"cacheCreateTokens":0,"outputTokens":0}]}

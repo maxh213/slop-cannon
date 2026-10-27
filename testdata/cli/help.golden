@@ -34,6 +34,7 @@ Available Commands:
   cartridge   Add, remove, list, or switch the LLM CLI subscriptions
   completion  Print a shell completion script (bash, zsh, or fish)
   config      Show, locate, or edit the configuration files
+  dash        Serve a read-only browser dashboard for a run
   doctor      Check that git, bd, dolt, gh, the cartridge CLIs and the repository are ready
   help        Help about any command
   logs        Tail the log of a run, an agent, or a bead

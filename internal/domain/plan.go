@@ -76,6 +76,120 @@ type Plan struct {
 	Beads []PlanBead `json:"beads"`
 }
 
+// PlanCandidate is one planner's contribution to a combined plan. Planner
+// orders otherwise independent producers; Plan.Keys remain local until the
+// candidate is namespaced by the planning reconciler.
+type PlanCandidate struct {
+	Planner AgentID `json:"planner"`
+	Plan    Plan    `json:"plan"`
+}
+
+// PlanReviewDecision is the complete vocabulary a plan judge may use. It
+// classifies work; it does not edit a candidate or the dependency graph.
+type PlanReviewDecision string
+
+const (
+	// PlanReviewIndependent accepts a candidate as distinct work.
+	PlanReviewIndependent PlanReviewDecision = "independent"
+	// PlanReviewDuplicate resolves a candidate to an existing canonical bead.
+	PlanReviewDuplicate PlanReviewDecision = "duplicate"
+	// PlanReviewConflict rejects a candidate whose work cannot be reconciled safely.
+	PlanReviewConflict PlanReviewDecision = "conflict"
+)
+
+// Valid reports whether d is a judge decision.
+func (d PlanReviewDecision) Valid() bool {
+	return d == PlanReviewIndependent || d == PlanReviewDuplicate || d == PlanReviewConflict
+}
+
+// PlanReviewProvenance says whether a decision came from deterministic
+// matching, the judge, or the no-retry fallback used when judging fails.
+type PlanReviewProvenance string
+
+const (
+	// PlanProvenanceExisting marks an exact match to a fresh existing bead.
+	PlanProvenanceExisting PlanReviewProvenance = "existing"
+	// PlanProvenanceDeterministic marks an exact match between candidates.
+	PlanProvenanceDeterministic PlanReviewProvenance = "deterministic"
+	// PlanProvenanceJudge marks a semantic PO judge classification.
+	PlanProvenanceJudge PlanReviewProvenance = "judge"
+	// PlanProvenanceFallback marks a deterministic no-retry fallback decision.
+	PlanProvenanceFallback PlanReviewProvenance = "fallback"
+)
+
+// Valid reports whether p is a known decision source.
+func (p PlanReviewProvenance) Valid() bool {
+	return p == PlanProvenanceExisting || p == PlanProvenanceDeterministic ||
+		p == PlanProvenanceJudge || p == PlanProvenanceFallback
+}
+
+// MaxPlanReviewReferenceLength bounds candidate keys and canonical references
+// in review decisions and their events.
+const MaxPlanReviewReferenceLength = 256
+
+// PlanReview is one bounded, prose-free candidate classification. Candidate
+// and Canonical are namespaced plan keys; Canonical may instead be an
+// existing bead ID for a duplicate. It is empty for independent and conflict
+// decisions.
+type PlanReview struct {
+	Planner    AgentID              `json:"planner"`
+	Candidate  string               `json:"candidate"`
+	Decision   PlanReviewDecision   `json:"decision"`
+	Canonical  string               `json:"canonical,omitempty"`
+	Provenance PlanReviewProvenance `json:"provenance"`
+}
+
+// PlanExternalDependency is an edge from a new plan bead to an existing
+// canonical bead. Keeping these edges outside PlanBead.Deps prevents an
+// agent-produced local key from being mistaken for a tracker ID.
+type PlanExternalDependency struct {
+	FromKey string `json:"from_key"`
+	ToID    BeadID `json:"to_id"`
+}
+
+// CombinedPlan is a reconciled set of new beads plus edges to existing
+// canonical beads. Existing beads are references only: no field here can
+// change their state, priority, title, or acceptance criteria.
+type CombinedPlan struct {
+	Plan         Plan                     `json:"plan"`
+	ExternalDeps []PlanExternalDependency `json:"external_deps,omitempty"`
+}
+
+// DependencyCount includes both local and existing-bead edges.
+func (p CombinedPlan) DependencyCount() int {
+	return p.Plan.DependencyCount() + len(p.ExternalDeps)
+}
+
+// Validate checks the new plan and every external edge. Local cycles are
+// checked by Plan.Validate; existing beads cannot introduce a new cycle
+// because none of their edges are rewritten.
+func (p CombinedPlan) Validate() error {
+	if err := p.Plan.Validate(); err != nil {
+		return err
+	}
+	keys := make(map[string]bool, len(p.Plan.Beads))
+	for _, b := range p.Plan.Beads {
+		keys[b.Key] = true
+	}
+	seen := make(map[PlanExternalDependency]bool, len(p.ExternalDeps))
+	var errs []error
+	for _, edge := range p.ExternalDeps {
+		switch {
+		case !keys[edge.FromKey]:
+			errs = append(errs, fmt.Errorf("external dependency source %q is not a key in the plan", edge.FromKey))
+		case strings.TrimSpace(string(edge.ToID)) == "" || strings.ContainsFunc(string(edge.ToID), unicode.IsSpace):
+			errs = append(errs, fmt.Errorf("bead %q: malformed external dependency %q", edge.FromKey, edge.ToID))
+		case seen[edge]:
+			errs = append(errs, fmt.Errorf("bead %q: duplicate external dependency %q", edge.FromKey, edge.ToID))
+		}
+		seen[edge] = true
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%w: %w", ErrInvalidPlan, errors.Join(errs...))
+	}
+	return nil
+}
+
 // Validate checks the structural rules a plan must satisfy before it is
 // turned into beads: keys present, free of whitespace and unique; titles
 // present; acceptance criteria non-empty; priorities in range; types

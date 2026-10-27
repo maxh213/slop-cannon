@@ -76,14 +76,14 @@ func checkDandelionSources(t *testing.T, launchPath, probesPath string) {
 		if !assert.True(t, ok, "launch.ts account %q is not in dandelion.Providers; classify it", id) {
 			continue
 		}
-		switch command {
-		case "claude":
-			assert.Equal(t, DriverClaude, p.Driver, "%s launches claude", id)
-		case "cursor-agent":
-			assert.Equal(t, DriverCursor, p.Driver, "%s launches cursor-agent", id)
-		default:
-			assert.Equal(t, DriverNone, p.Driver, "%s launches %s, which sc has no adapter for", id, command)
+		want := Driver(command)
+		switch id {
+		case "cursor":
+			want = DriverCursor
+		case "codex-animus":
+			want = DriverCodex
 		}
+		assert.Equal(t, want, p.Driver, "%s launches %s", id, command)
 	}
 
 	// A Claude account's config dir is exactly the one launch.ts sets, and
@@ -104,6 +104,7 @@ func checkDandelionSources(t *testing.T, launchPath, probesPath string) {
 		}
 		assert.Equal(t, [3]string{"CLAUDE_CONFIG_DIR", p.ConfigDirEnv, p.ConfigDirFallback}, h, p.ID)
 	}
+	assert.Equal(t, [3]string{"CODEX_HOME", "DANDELION_CODEX_ANIMUS_HOME", ".codex-animus"}, homes["codex-animus"])
 
 	// Every probe id is classified, so DANDELION_DISABLE can switch off
 	// every provider sc cannot drive.
@@ -145,20 +146,35 @@ func TestProviders_MatchPinnedDandelionSources(t *testing.T) {
 }
 
 func TestProviders_Policy(t *testing.T) {
-	t.Parallel()
 	claudes := []string{"claude", "claude-work", "claude-deepseek", "claude-ollama"}
+	available := func(Driver) bool { return true }
+	assert.Equal(t, claudes, allowedProviders(Providers, builtinDrivers, cartridge.ToolReadOnly, available))
+	assert.Equal(t, []string{"claude", "claude-work", "claude-deepseek", "claude-ollama", "kimi", "grok", "codex", "codex-animus", "hermes", "kilo"},
+		allowedProviders(Providers, builtinDrivers, cartridge.ToolReadExec, available))
+	assert.Equal(t, []string{"claude", "claude-work", "claude-deepseek", "claude-ollama", "agy", "kimi", "grok", "codex", "codex-animus", "cursor", "junie", "hermes", "kilo"},
+		allowedProviders(Providers, builtinDrivers, cartridge.ToolReadWrite, available))
+	for policy, want := range map[cartridge.ToolPolicy]string{
+		cartridge.ToolReadOnly:  "agy,kimi,grok,codex,codex-animus,cursor,junie,hermes,kilo",
+		cartridge.ToolReadExec:  "agy,cursor,junie",
+		cartridge.ToolReadWrite: "",
+	} {
+		allowed := allowedProviders(Providers, builtinDrivers, policy, available)
+		assert.Equal(t, want, Disabled(allowed, ""), policy)
+	}
+	for _, p := range Providers {
+		for _, policy := range cartridge.ToolPolicies() {
+			want := p.Driver == DriverClaude ||
+				(policy == cartridge.ToolReadExec && (p.Driver == DriverCodex || p.Driver == DriverKimi || p.Driver == DriverGrok || p.Driver == DriverHermes || p.Driver == DriverKilo)) ||
+				(policy == cartridge.ToolReadWrite && p.Driver != DriverNone)
+			assert.Equal(t, want, p.allows(policy), "%s %s", p.ID, policy)
+		}
+	}
+
+	// Public Allowed retains its Cursor test seam while every other driver
+	// uses its real binary check rather than host-dependent implicit availability.
+	t.Setenv("PATH", t.TempDir())
 	assert.Equal(t, claudes, Allowed(cartridge.ToolReadOnly, true))
 	assert.Equal(t, claudes, Allowed(cartridge.ToolReadExec, true))
 	assert.Equal(t, append(append([]string{}, claudes...), "cursor"), Allowed(cartridge.ToolReadWrite, true))
 	assert.Equal(t, claudes, Allowed(cartridge.ToolReadWrite, false))
-	for _, p := range Providers {
-		for _, policy := range cartridge.ToolPolicies() {
-			if p.Driver == DriverNone {
-				assert.False(t, p.allows(policy), "%s %s", p.ID, policy)
-			}
-			if p.Driver == DriverCursor && policy != cartridge.ToolReadWrite {
-				assert.False(t, p.allows(policy), "cursor has no tool controls, so never %s", policy)
-			}
-		}
-	}
 }

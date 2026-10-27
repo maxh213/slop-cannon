@@ -60,9 +60,23 @@ if [ -n "$SC_CURSOR_FIXTURE" ]; then cat "$SC_CURSOR_FIXTURE"; fi
 exit 0
 `
 
+const kiloShimScript = `
+d="$SC_FAKEBIN_DIR"
+if [ "$1" = "--version" ]; then echo "7.5.6"; exit 0; fi
+if [ "$1" = "profile" ]; then
+  printf '%s' "${SC_KILO_MIN_BALANCE_USD-unset}" > "$d/profile-floor.$SC_FAKEBIN_SEQ"
+  if [ -n "$SC_KILO_NEXT_ROUTE" ]; then printf '%s\n' "$SC_KILO_NEXT_ROUTE_LINE" > "$SC_KILO_NEXT_ROUTE"; fi
+  if [ -n "$SC_KILO_PROFILE_FIXTURE" ]; then cat "$SC_KILO_PROFILE_FIXTURE"; fi
+  exit "${SC_KILO_PROFILE_EXIT:-0}"
+fi
+printf '%s' "${SC_KILO_MIN_BALANCE_USD-unset}" > "$d/run-floor.$SC_FAKEBIN_SEQ"
+if [ -n "$SC_KILO_FIXTURE" ]; then cat "$SC_KILO_FIXTURE"; fi
+exit "${SC_KILO_EXIT:-0}"
+`
+
 // fakes are the shims one test runs against.
 type fakes struct {
-	router, claude, cursor *testutil.Shim
+	router, claude, cursor, kilo *testutil.Shim
 }
 
 // isolate gives the test a PATH with only the system tools the shims need,
@@ -80,6 +94,13 @@ func isolate(t *testing.T, withCursor bool) fakes {
 	if withCursor {
 		f.cursor = testutil.FakeBin(t, "cursor-agent", cursorShimScript, testutil.WithStdinCapture())
 	}
+	return f
+}
+
+func isolateKilo(t *testing.T) fakes {
+	t.Helper()
+	f := isolate(t, false)
+	f.kilo = testutil.FakeBin(t, "kilo", kiloShimScript, testutil.WithStdinCapture())
 	return f
 }
 
@@ -183,6 +204,13 @@ func okEnv(t *testing.T) map[string]string {
 	return map[string]string{"SC_CLAUDE_FIXTURE": fixture(t, "claude", "text-reply.jsonl")}
 }
 
+func okKiloEnv(t *testing.T) map[string]string {
+	return map[string]string{
+		"SC_KILO_PROFILE_FIXTURE": fixture(t, "kilo", "profile.json"),
+		"SC_KILO_FIXTURE":         fixture(t, "kilo", "success.jsonl"),
+	}
+}
+
 func collect(t *testing.T, s cartridge.Session) ([]cartridge.SessionEvent, cartridge.Result, error) {
 	t.Helper()
 	var evs []cartridge.SessionEvent
@@ -259,6 +287,108 @@ func TestRun_RouterArgsPerMode(t *testing.T) {
 	}, f.router.ArgLists(t))
 }
 
+func TestRun_PerFiringModeOverrides(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured Mode
+		override   string
+		want       Mode
+		wantArgs   []string
+	}{
+		{"high default to standard", ModeHigh, "standard", ModeStandard, []string{"route", "--max-age", "120"}},
+		{"standard default to high", ModeStandard, "high", ModeHigh, []string{"route", "--high", "--max-age", "120"}},
+		{"standard case and whitespace", ModeHigh, " \tStAnDaRd\n", ModeStandard, []string{"route", "--max-age", "120"}},
+		{"high case and whitespace", ModeStandard, "\t hIgH \n", ModeHigh, []string{"route", "--high", "--max-age", "120"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := isolate(t, false)
+			say(t, f.router, "routed-model claude")
+			a, logs, _ := newAdapter(t, config.Cartridge{Model: string(tc.configured)})
+			run := spec(t, cartridge.ToolReadOnly, okEnv(t))
+			run.Model = tc.override
+			require.NoError(t, fire(t, a, run))
+			assert.Equal(t, tc.configured, a.Mode(), "the configured default is unchanged")
+			assert.Equal(t, tc.wantArgs, f.router.ArgLists(t)[0])
+			assert.Contains(t, logs.String(), "mode="+string(tc.want))
+			calls := firings(t, f.claude)
+			require.Len(t, calls, 1)
+			i := slices.Index(calls[0], "--model")
+			require.GreaterOrEqual(t, i, 0)
+			assert.Equal(t, "routed-model", calls[0][i+1])
+			assert.NotContains(t, calls[0], string(ModeStandard))
+			assert.NotContains(t, calls[0], string(ModeHigh))
+		})
+	}
+}
+
+func TestRun_PerFiringModeLegacyFallback(t *testing.T) {
+	cases := []struct {
+		name       string
+		configured Mode
+		model      string
+		wantArgs   []string
+	}{
+		{"empty keeps high", ModeHigh, "", []string{"route", "--high", "--max-age", "120"}},
+		{"empty keeps standard", ModeStandard, "", []string{"route", "--max-age", "120"}},
+		{"legacy model keeps high", ModeHigh, "sonnet", []string{"route", "--high", "--max-age", "120"}},
+		{"provider model keeps standard", ModeStandard, "claude-opus-5-5", []string{"route", "--max-age", "120"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := isolate(t, false)
+			say(t, f.router, "routed-model claude")
+			a, _, _ := newAdapter(t, config.Cartridge{Model: string(tc.configured)})
+			run := spec(t, cartridge.ToolReadOnly, okEnv(t))
+			run.Model = tc.model
+			require.NoError(t, fire(t, a, run))
+			assert.Equal(t, tc.configured, a.Mode())
+			assert.Equal(t, tc.wantArgs, f.router.ArgLists(t)[0])
+			calls := firings(t, f.claude)
+			require.Len(t, calls, 1)
+			i := slices.Index(calls[0], "--model")
+			require.GreaterOrEqual(t, i, 0)
+			assert.Equal(t, "routed-model", calls[0][i+1], "the routed model wins over every legacy value")
+		})
+	}
+}
+
+func TestRun_PerFiringModesHaveSeparateCacheEntries(t *testing.T) {
+	f := isolate(t, false)
+	say(t, f.router, "routed-model claude")
+	a, logs, _ := newAdapter(t, config.Cartridge{Model: "high"})
+	for _, model := range []string{"standard", "standard", "high", "high"} {
+		run := spec(t, cartridge.ToolReadOnly, okEnv(t))
+		run.Model = model
+		require.NoError(t, fire(t, a, run))
+	}
+	assert.Equal(t, ModeHigh, a.Mode())
+	assert.Equal(t, [][]string{
+		{"route", "--max-age", "120"},
+		{"route", "--high", "--max-age", "120"},
+	}, f.router.ArgLists(t), "only the first firing of each mode calls the router")
+
+	logLines := strings.Split(strings.TrimSpace(logs.String()), "\n")
+	require.Len(t, logLines, 4)
+	for i, want := range []struct {
+		mode   Mode
+		cached bool
+	}{{ModeStandard, false}, {ModeStandard, true}, {ModeHigh, false}, {ModeHigh, true}} {
+		assert.Contains(t, logLines[i], "mode="+string(want.mode))
+		assert.Contains(t, logLines[i], "cached="+strconv.FormatBool(want.cached))
+		assert.Contains(t, logLines[i], "model=routed-model")
+	}
+	calls := firings(t, f.claude)
+	require.Len(t, calls, 4)
+	for _, args := range calls {
+		i := slices.Index(args, "--model")
+		require.GreaterOrEqual(t, i, 0)
+		assert.Equal(t, "routed-model", args[i+1])
+		assert.NotContains(t, args, string(ModeStandard))
+		assert.NotContains(t, args, string(ModeHigh))
+	}
+}
+
 func TestRun_DelegatesToClaudeWithRoutedModelAndEffort(t *testing.T) {
 	f := isolate(t, false)
 	say(t, f.router, "claude-fable-5-1 max claude")
@@ -289,6 +419,91 @@ func TestRun_DelegatesToClaudeWithRoutedModelAndEffort(t *testing.T) {
 	for _, want := range []string{"dandelion routed a firing", "agent=eng-1", "account=claude", "model=claude-fable-5-1", "effort=max", "mode=high", "policy=read_only", "cached=false"} {
 		assert.Contains(t, log, want)
 	}
+}
+
+func TestRun_KiloDelegationRefreshesCachedAuthorization(t *testing.T) {
+	f := isolateKilo(t)
+	say(t, f.router, "deepseek/deepseek-v4.1-flash-1017 max kilo")
+	a, logs, _ := newAdapter(t, config.Cartridge{})
+	for range 2 {
+		require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadWrite, okKiloEnv(t))))
+	}
+	calls := f.kilo.ArgLists(t)
+	require.Len(t, calls, 4)
+	for i, want := range []string{"profile", "run", "profile", "run"} {
+		assert.Equal(t, want, calls[i][0], "every launch checks a fresh profile before the provider process")
+	}
+	assert.Equal(t, []string{"profile", "--json"}, calls[0])
+	assert.Equal(t, "unset", recorded(t, f.kilo, "profile-floor", 1), "the floor is read in Go, not exposed to the profile process")
+	assert.Equal(t, "unset", recorded(t, f.kilo, "run-floor", 2), "the launch guard is not exposed to the provider")
+	runArgs := calls[1]
+	modelIndex := slices.Index(runArgs, "--model")
+	require.GreaterOrEqual(t, modelIndex, 0)
+	assert.Equal(t, "kilo/deepseek/deepseek-v4.1-flash-1017", runArgs[modelIndex+1], "the routed model is CLI-qualified for Kilo without changing the Dandelion route")
+	variantIndex := slices.Index(runArgs, "--variant")
+	require.GreaterOrEqual(t, variantIndex, 0)
+	assert.Equal(t, "max", runArgs[variantIndex+1])
+	assert.Contains(t, logs.String(), "model=deepseek/deepseek-v4.1-flash-1017")
+	assert.NotContains(t, logs.String(), "model=kilo/deepseek/deepseek-v4.1-flash-1017")
+
+	routerCalls := f.router.ArgLists(t)
+	require.Len(t, routerCalls, 2, "a cached Kilo route is refreshed before the second launch")
+	assert.Equal(t, []string{"route"}, routerCalls[1], "the cached Kilo route triggers a fresh probe")
+	assert.NotContains(t, logs.String(), "cached=true", "no launch is authorized by a cached Kilo route")
+}
+
+func TestRun_KiloBudgetReroutesFreshWithoutKilo(t *testing.T) {
+	f := isolateKilo(t)
+	say(t, f.router, "kilo-model max kilo")
+	env := okEnv(t)
+	env["SC_KILO_PROFILE_EXIT"] = "1"
+	env["SC_KILO_NEXT_ROUTE"] = filepath.Join(f.router.Dir, "line")
+	env["SC_KILO_NEXT_ROUTE_LINE"] = "rerouted-model claude"
+	a, _, _ := newAdapter(t, config.Cartridge{})
+	require.NoError(t, fire(t, a, spec(t, cartridge.ToolReadWrite, env)))
+
+	calls := f.kilo.ArgLists(t)
+	require.Len(t, calls, 1, "the failed profile must be the only Kilo invocation")
+	assert.Equal(t, []string{"profile", "--json"}, calls[0], "no provider process starts after ErrBudget")
+	routerCalls := f.router.ArgLists(t)
+	require.Len(t, routerCalls, 2)
+	assert.Equal(t, []string{"route"}, routerCalls[1], "the budget retry probes afresh")
+	assert.Contains(t, strings.Split(recorded(t, f.router, "disable", 2), ","), "kilo")
+	claudeCalls := firings(t, f.claude)
+	require.Len(t, claudeCalls, 1)
+	modelIndex := slices.Index(claudeCalls[0], "--model")
+	require.GreaterOrEqual(t, modelIndex, 0)
+	assert.Equal(t, "rerouted-model", claudeCalls[0][modelIndex+1])
+}
+
+func TestRun_KiloBudgetWithoutAlternativeIsNoRoute(t *testing.T) {
+	f := isolateKilo(t)
+	say(t, f.router, "kilo-model max kilo")
+	env := okKiloEnv(t)
+	env["SC_KILO_PROFILE_EXIT"] = "1"
+	env["SC_KILO_NEXT_ROUTE"] = filepath.Join(f.router.Dir, "line")
+	env["SC_KILO_NEXT_ROUTE_LINE"] = NoRoute
+	a, _, _ := newAdapter(t, config.Cartridge{Env: map[string]string{
+		disableEnv: "claude,claude-work,claude-deepseek,claude-ollama,agy,kimi,grok,codex,codex-animus,cursor,junie,hermes",
+	}})
+	err := fire(t, a, spec(t, cartridge.ToolReadWrite, env))
+	e := cerr(t, err)
+	assert.Equal(t, cartridge.KindRateLimited, e.Kind)
+	assert.Equal(t, NoRouteRetryAfter, e.RetryAfter)
+	assert.Contains(t, e.Msg, "no account with quota left")
+	require.Len(t, f.kilo.ArgLists(t), 1, "only the profile ran")
+	assert.Empty(t, firings(t, f.claude))
+	assert.Len(t, f.router.ArgLists(t), 2, "the fresh retry selects none without Kilo")
+}
+
+func TestRun_KiloMissingBinaryRejectsRoute(t *testing.T) {
+	f := isolate(t, false)
+	say(t, f.router, "kilo-model kilo")
+	a, _, _ := newAdapter(t, config.Cartridge{})
+	e := cerr(t, fire(t, a, spec(t, cartridge.ToolReadWrite, nil)))
+	assert.Equal(t, cartridge.KindRateLimited, e.Kind)
+	assert.Contains(t, e.Msg, "which needs kilo on PATH")
+	assert.Empty(t, firings(t, f.claude))
 }
 
 func TestRun_ClaudeConfigDirPerAccount(t *testing.T) {
@@ -423,7 +638,7 @@ func TestRun_CursorForWriteFirings(t *testing.T) {
 
 func TestRun_UnsupportedAccountsAreNoRoute(t *testing.T) {
 	f := isolate(t, true)
-	for _, line := range []string{"gpt-6-astra xhigh codex", "grok-4.7 xhigh grok", "m brand-new-provider"} {
+	for _, line := range []string{"m brand-new-provider"} {
 		say(t, f.router, line)
 		a, _, _ := newAdapter(t, config.Cartridge{})
 		e := cerr(t, fire(t, a, spec(t, cartridge.ToolReadWrite, nil)))
@@ -494,8 +709,10 @@ func TestRun_CancelledWaitStopsTheRouter(t *testing.T) {
 	a, _, _ := newAdapter(t, config.Cartridge{})
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
-		require.Eventually(t, func() bool { return len(f.router.ArgLists(t)) == 1 },
-			testutil.Patience(5*time.Second), 10*time.Millisecond)
+		require.Eventually(t, func() bool {
+			_, err := os.Stat(filepath.Join(f.router.Dir, "pid.1"))
+			return err == nil
+		}, testutil.Patience(5*time.Second), 10*time.Millisecond)
 		cancel()
 	}()
 	_, err := a.Run(ctx, spec(t, cartridge.ToolReadOnly, okEnv(t)))
@@ -732,16 +949,23 @@ func TestToolPolicyEnforcement(t *testing.T) {
 	t.Parallel()
 	c, err := New(Name, config.Cartridge{Model: "high"})
 	require.NoError(t, err)
-	for _, p := range []cartridge.ToolPolicy{cartridge.ToolReadOnly, cartridge.ToolReadExec} {
-		en, err := agents.EnforcementFor(c, p)
-		require.NoError(t, err)
-		assert.Equal(t, agents.EnforceNative, en.Mode, p)
-		assert.Equal(t, Name, en.Cartridge)
-		assert.Equal(t, claude.ToolFlags(p), en.Controls)
-		assert.Contains(t, en.Detail, "routed to Claude Code accounts only")
-		require.NoError(t, en.Check())
-	}
-	en, err := agents.EnforcementFor(c, cartridge.ToolReadWrite)
+	en, err := agents.EnforcementFor(c, cartridge.ToolReadOnly)
+	require.NoError(t, err)
+	assert.Equal(t, agents.EnforceNative, en.Mode)
+	assert.Equal(t, Name, en.Cartridge)
+	assert.Equal(t, claude.ToolFlags(cartridge.ToolReadOnly), en.Controls)
+	assert.Contains(t, en.Detail, "routed to Claude Code accounts only")
+	require.NoError(t, en.Check())
+
+	en, err = agents.EnforcementFor(c, cartridge.ToolReadExec)
+	require.NoError(t, err)
+	assert.Equal(t, agents.EnforceNative, en.Mode)
+	assert.Equal(t, Name, en.Cartridge)
+	assert.Empty(t, en.Controls, "controls are route-specific across multiple native drivers")
+	assert.Contains(t, en.Detail, "every routed driver enforces read_exec natively")
+	assert.Contains(t, en.Detail, "Claude Code accounts")
+	require.NoError(t, en.Check())
+	en, err = agents.EnforcementFor(c, cartridge.ToolReadWrite)
 	require.NoError(t, err)
 	assert.Equal(t, agents.EnforceNone, en.Mode)
 	enf, ok := c.(agents.ToolPolicyEnforcer)

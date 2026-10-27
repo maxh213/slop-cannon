@@ -2,8 +2,8 @@
 // user's quota router: every firing first runs "dandelion route [--high]",
 // which prints the account and model that still have quota
 // ("claude-fable-5-1 max claude"), and then runs the session through the
-// Claude Code or Cursor Agent adapter for that account. It registers
-// itself with the default registry under "dandelion" from init (D-30).
+// adapter registered for that account's driver. It registers itself with the
+// default registry under "dandelion" from init (D-30).
 //
 // One cartridge name stands for many accounts, which shapes everything
 // else; docs/cartridges.md records the details and D-30 the trade-offs.
@@ -11,15 +11,15 @@
 //   - Mode: [cartridges.dandelion] model is "high" (route --high) or
 //     "standard"/empty (route); the routed model wins over RunSpec.Model,
 //     so roles.<role>.model is ignored for this cartridge.
-//   - Accounts: [Providers] classifies every dandelion provider id. Claude
-//     accounts run through internal/cartridge/claude (claude-work,
-//     claude-deepseek and claude-ollama with the CLAUDE_CONFIG_DIR that
-//     dandelion's launch.ts gives them), cursor through
-//     internal/cartridge/cursor, and every other id is passed to the router
-//     in DANDELION_DISABLE so it is never probed or named.
-//   - Tool policy: read_only and read_exec firings may only be routed to
-//     Claude accounts, whose flags hold them natively; cursor is disabled
-//     for them too, and a route naming a disallowed account is no route.
+//   - Accounts: [Providers] classifies every dandelion provider id and its
+//     driver. Claude and Codex Animus accounts receive their isolated config
+//     homes, and each driver's route mapper passes only supported effort.
+//     Unavailable binaries are passed in DANDELION_DISABLE. Kilo launches
+//     require a fresh route and balance profile on every firing.
+//   - Tool policy: read_only may use Claude only; read_exec may use Claude,
+//     Codex, Kimi, Grok, Hermes and Kilo; read_write may use every driver. agy, Grok
+//     and Junie have no read_only routes. A route naming an account the policy
+//     or current binary availability does not allow is no route.
 //   - Cost: one router call probes every enabled provider (about six
 //     seconds), so an answer is cached per mode and account set for
 //     [CacheTTL], concurrent firings share one call, and --max-age lets a

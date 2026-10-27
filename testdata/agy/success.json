@@ -1,0 +1,1 @@
+{"conversation_id":"agy-session-123","status":"SUCCESS","response":"PONG","duration_seconds":1.234,"num_turns":3,"usage":{"input_tokens":120,"output_tokens":45,"thinking_tokens":12,"cache_read_tokens":80,"total_tokens":165}}

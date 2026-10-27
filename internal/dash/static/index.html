@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>sc · run observer</title>
+  <style>{{.CSS}}</style>
+</head>
+<body data-base-path="{{.BasePath}}">
+  <div class="shell">
+    <header class="masthead">
+      <div class="brand" aria-label="Slop Cannon run observer">
+        <span class="brand-mark" aria-hidden="true">▄█▓═▶</span>
+        <span class="brand-copy"><strong>SLOP//CANNON</strong><small>RUN OBSERVER</small></span>
+      </div>
+      <div class="run-heading">
+        <div class="run-line">
+          <span id="run-dot" class="status-dot" aria-hidden="true"></span>
+          <span id="run-status" class="badge badge-unknown" role="status" aria-live="polite" aria-atomic="true">status: connecting</span>
+          <h1 id="run-id">connecting…</h1>
+          <span id="run-phase" class="badge">—</span>
+          <span id="run-quiet" class="badge badge-quiet" hidden>quiet</span>
+        </div>
+        <div class="run-meta">
+          <span id="run-mode">—</span><span class="sep">/</span>
+          <span id="run-ammo">— ammo</span><span class="sep">/</span>
+          <span id="run-safety">safety —</span><span class="sep">/</span>
+          <span id="run-lock">lock —</span><span class="sep">/</span>
+          <span id="run-elapsed">0s elapsed</span>
+        </div>
+      </div>
+      <div class="observer">
+        <span class="pulse" aria-hidden="true"></span>
+        <span id="observer-state">observer connecting</span>
+        <small>READ-ONLY · 2S REFRESH</small>
+      </div>
+    </header>
+
+    <div id="observer-message" class="banner" role="status" hidden></div>
+
+    <section id="host-panel" class="panel panel-host" aria-labelledby="host-title">
+      <header class="panel-head host-head">
+        <div class="host-heading">
+          <h2 id="host-title">Host resources</h2>
+          <span id="host-name" class="host-name">detecting host</span>
+        </div>
+        <span id="host-state" class="badge host-state host-state-sampling" role="status" aria-live="polite" aria-atomic="true">sampling</span>
+      </header>
+      <div id="host-unsupported" class="host-unsupported" hidden>Host metrics are not supported on this platform.</div>
+      <div id="host-content" class="host-content">
+        <div class="host-resources" aria-label="Host resource usage">
+          <article class="host-resource host-resource-cpu">
+            <div class="host-resource-head"><span>CPU</span><strong id="host-cpu-value">sampling</strong></div>
+            <div id="host-cpu-gauge" class="host-cpu-gauge" role="meter" aria-label="Aggregate CPU usage" aria-valuemin="0" aria-valuemax="100" hidden>
+              <span class="host-meter-track" aria-hidden="true"><span id="host-cpu-fill" class="host-meter-fill"></span></span>
+            </div>
+            <small id="host-cpu-note">awaiting a second matching CPU sample</small>
+          </article>
+          <article class="host-resource">
+            <div class="host-resource-head"><span>MEMORY</span><strong id="host-memory-value">—</strong></div>
+            <small>used / total</small>
+          </article>
+          <article id="host-swap-resource" class="host-resource" hidden>
+            <div class="host-resource-head"><span>SWAP</span><strong id="host-swap-value">—</strong></div>
+            <small>used / total</small>
+          </article>
+          <article class="host-resource">
+            <div class="host-resource-head"><span>DISK /</span><strong id="host-disk-value">—</strong></div>
+            <small>used / total on root</small>
+          </article>
+        </div>
+        <div class="host-core-section">
+          <div class="host-core-head"><span>PER-CORE CPU</span><small id="host-core-note">sampling</small></div>
+          <div id="host-cores" class="host-cores"></div>
+        </div>
+        <footer class="host-footer">
+          <span>observer sampling · 2s cadence</span>
+          <time id="host-collected">sampled —</time>
+        </footer>
+      </div>
+    </section>
+
+    <section class="metrics" aria-label="Run totals">
+      <article class="metric"><span>BEADS</span><strong id="metric-beads">0</strong><small id="metric-beads-note">no beads</small></article>
+      <article class="metric"><span>LIVE AGENTS</span><strong id="metric-agents">0</strong><small id="metric-agents-note">0 seen</small></article>
+      <article class="metric"><span>REVIEW ROUNDS</span><strong id="metric-reviews">0</strong><small id="metric-reviews-note">awaiting work</small></article>
+      <article class="metric"><span>PULL REQUESTS</span><strong id="metric-prs">0</strong><small id="metric-delivery-note">0 merged</small></article>
+      <article class="metric"><span>EVENTS</span><strong id="metric-events">0</strong><small id="metric-events-note">event fold</small></article>
+    </section>
+
+    <section id="dandelion-panel" class="panel panel-dandelion" aria-labelledby="dandelion-title" hidden>
+      <header class="panel-head dandelion-head">
+        <div class="dandelion-heading">
+          <h2 id="dandelion-title">Dandelion quota</h2>
+          <div class="dandelion-probe-meta">
+            <span id="dandelion-probe" class="panel-note">probe idle · no successful probe yet</span>
+            <span id="dandelion-attempt" class="panel-note">last attempt —</span>
+          </div>
+        </div>
+        <button id="dandelion-usage-only" class="usage-toggle" type="button" aria-pressed="true" aria-controls="dandelion-providers" title="Hide providers without usage windows or balances">usage only</button>
+      </header>
+      <div class="dandelion-route-grid" aria-label="Dandelion routing and snapshot metadata">
+        <div class="dandelion-route"><span>route</span><strong id="dandelion-route">—</strong></div>
+        <div class="dandelion-route"><span>route --high</span><strong id="dandelion-route-high">—</strong></div>
+        <div class="dandelion-route"><span>last-good generated</span><strong id="dandelion-generated">—</strong></div>
+      </div>
+      <div id="dandelion-notice" class="dandelion-notice" role="status" aria-live="polite" aria-atomic="true" hidden></div>
+      <div id="dandelion-summary" class="dandelion-summary" hidden></div>
+      <div id="dandelion-providers" class="dandelion-providers"></div>
+    </section>
+
+    <main class="dashboard-grid">
+      <section class="panel panel-beads">
+        <header class="panel-head"><h2>Bead flow</h2><span id="bead-window" class="panel-note">0</span></header>
+        <div id="bead-counts" class="state-strip"></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Bead</th><th>State</th><th>Round</th><th>Delivery</th></tr></thead>
+            <tbody id="beads-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="panel panel-agents">
+        <header class="panel-head"><h2>Agents</h2><span id="agent-window" class="panel-note">0 live</span></header>
+        <div id="agents-list" class="card-list"></div>
+      </section>
+
+      <section class="panel panel-reviews">
+        <header class="panel-head"><h2>Review circuit</h2><span id="review-window" class="panel-note">0 rounds</span></header>
+        <div id="reviews-list" class="card-list"></div>
+      </section>
+
+      <section class="panel panel-delivery">
+        <header class="panel-head"><h2>Delivery</h2><span id="delivery-window" class="panel-note">0 routes</span></header>
+        <div id="delivery-list" class="card-list"></div>
+      </section>
+
+      <section class="panel panel-notices">
+        <header class="panel-head"><h2>Warnings &amp; notices</h2><span id="notice-window" class="panel-note">0</span></header>
+        <div id="notices-list" class="event-list"></div>
+      </section>
+
+      <section class="panel panel-activity">
+        <header class="panel-head"><h2>Lifecycle signal</h2><span id="activity-window" class="panel-note">latest first</span></header>
+        <div id="activity-list" class="event-list activity-list"></div>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>OBSERVE ONLY · NO RUN CONTROLS · NO TRANSCRIPTS</span>
+      <span id="snapshot-time">snapshot pending</span>
+    </footer>
+  </div>
+  <script>{{.JS}}</script>
+</body>
+</html>

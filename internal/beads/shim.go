@@ -609,6 +609,13 @@ func (s Shim) Verify(ctx context.Context, dir string) error {
 			return nil
 		}
 	}
+	bdReadOnlyVerifyMu.Lock()
+	defer bdReadOnlyVerifyMu.Unlock()
+	if keyed {
+		if _, done := bdReadOnlyVerified.Load(key); done {
+			return nil
+		}
+	}
 	if err := s.verifyBDReadOnly(ctx, dir); err != nil {
 		return err
 	}
@@ -627,6 +634,10 @@ func (s Shim) Verify(ctx context.Context, dir string) error {
 // fails as "no beads database found" and the probe failed the agent's
 // firing (seen on PandaJump every time a round's testers started together).
 var bdReadOnlyVerified sync.Map
+
+// bdReadOnlyVerifyMu makes the load-probe-store sequence atomic within this
+// process. It cannot coordinate with other processes using the same binary.
+var bdReadOnlyVerifyMu sync.Mutex
 
 // bdIdentity names a bd binary by path, size and modification time, so an
 // upgrade in place is verified afresh. ok is false when it cannot be read,

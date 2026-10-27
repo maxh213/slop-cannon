@@ -17,6 +17,17 @@ next version's entry.
 
 ### Added
 
+- `po_planners` (default 1; Animus intends 2) coordinates independent PO
+  producers with unique IDs behind one completion barrier. A fresh snapshot,
+  at most one read-only semantic judge with no retry loop, and deterministic
+  reconciliation produce one graph under the run epic. The combined proposed
+  and accepted cap is `N × max_beads_per_plan` (16 at N=2 with the default 8),
+  with no trimming. Weighted demands reserve whole rounds within `ammo`, one
+  signals reading is shared per round, and the signals threshold uses the
+  combined cap. Canonical candidate/external `to_id` remapping preserves
+  existing beads; multi-PO planning does not deprioritise them. Default-one
+  planning keeps its exact legacy demand, producer, quota and no-judge path.
+
 - `auto_merge = true` (or `--auto-merge`; safety on only, off by default)
   lets a run squash-merge the pull requests it opened itself once they are
   green, instead of waiting for a human: `gh pr merge --squash
@@ -34,10 +45,51 @@ next version's entry.
 - `conventional_pr_titles` titles the run's pull requests
   `<type>: <title>` from the bead's issue type, for repositories whose CI
   enforces Conventional Commit titles.
-- The `dandelion` cartridge routes each firing to whichever Claude Code or
-  Cursor Agent account still has quota (`dandelion route`), benching an
-  account that fails until its reset. `[cartridges.dandelion] model` is
-  `high` or `standard`.
+- Direct adapters for Agy, Codex, Kimi, Grok Build, Junie, Hermes Agent and
+  Kilo join Claude Code, Cursor Agent and dandelion. Large prompts use stdin
+  or private prompt files with cleanup on every exit path, restricted policies
+  use only native tool enforcement, and account-specific homes are isolated
+  per firing. `codex-animus` is a routed Codex account with its own
+  `CODEX_HOME`, not a separate direct cartridge. Both Codex and Codex Animus
+  have real `read_exec` and `read_write` drivers; personal Codex being logged
+  out and the Codex Animus app-server probe error are current account
+  availability issues, not missing adapters. `codex-animus` is not in
+  Dandelion's high chain.
+- The `dandelion` cartridge can route all eight additional provider IDs
+  (`agy`, `kimi`, `grok`, `codex`, `codex-animus`, `junie`, `hermes` and
+  `kilo`) through seven direct CLI families, with Codex Animus delegated
+  through Codex. Kilo uses `DriverKilo` for `read_exec` and `read_write` as a
+  standard-route balance fallback only; it has no high route. `read_only`
+  remains Claude only; `read_exec` supports Claude, Codex/Codex Animus, Kimi,
+  Grok, Hermes and Kilo; `read_write` covers every routable installed
+  provider. Agy and Grok `read_only` stay disabled after failed live
+  enforcement canaries.
+- The Kilo 7.5.6 adapter sends the complete combined prompt on stdin, sets
+  `KILO_NO_DAEMON=1`, disables project config and automatic updates, and
+  generates an in-memory agent config with native `read_exec`/`read_write`
+  permissions. At the CLI boundary it normalizes the pinned Dandelion model
+  to `kilo/deepseek/deepseek-v4.1-flash-1017` without changing direct custom
+  IDs, `RunSpec.Model`, or the unqualified route log. Dandelion's
+  `SC_KILO_MIN_BALANCE_USD=10` control is removed from the Kilo child
+  environment. Cached Kilo routes are refreshed, and a fresh `profile --json`
+  check precedes every delegated launch; profile failure or a balance at or
+  below the floor excludes Kilo and reroutes without launching it. The
+  `balance - floor` in-session allowance is best effort, not a hard
+  account-wide cap: a final request can overshoot before cost is reported,
+  concurrent sessions can spend the same balance, and other clients or later
+  billed steps can take the account below $10. Real direct/delegated checks
+  covered structured output, large stdin, native policy behavior,
+  timeout/kill without a daemon, below-allowance cost and fail-closed reroute.
+- Per-role Dandelion route modes: `roles.<role>.model = "standard"` or
+  `"high"` selects the per-firing route mode, with case and whitespace
+  tolerated. Empty, other and legacy values fall back to the configured mode,
+  while the real routed model still replaces `spec.Model` for the delegated
+  CLI. Role models are effective config, not `ConfigSnapshot` fields: current
+  repo role-model changes apply on the next ordinary resume, while the active
+  cartridge and its default model/mode stay frozen. The Animus setup is now
+  applied with repo-sourced `standard` for engineers and testers and `high`
+  for the PO; PO `high` is verified from effective config only because no PO
+  fired during the bounded 180-second wait.
 - `signals_command` (with `signals_interval`, default 30m, and
   `limits.signals_timeout`, default 5m) gives the autopilot product owner what
   production is saying: sc runs the command, and its output reaches the
@@ -52,6 +104,47 @@ next version's entry.
   terminal that has since closed. It shows everything the run has done so far
   and then follows it live. It only reads the run's `events.jsonl`: `q` leaves
   while the run keeps firing, and the run controls are not offered.
+- `sc dash [PATH]` serves a read-only browser dashboard for the latest run or
+  `--run ID`, with `--host`, `--port`, `--base-path` and repeatable
+  `--allowed-host` flags. One cached event-log fold follows live, historical
+  and resumed runs and keeps finished and crashed runs available; observer
+  `/health` is separate from run liveness and quiet state. The bounded,
+  redacted snapshot API has no run controls and serves no prompts, diffs or
+  raw transcripts; notices carry a fixed category instead of raw prose.
+  Loopback is the default, exact Host validation blocks DNS rebinding, and
+  sharing beyond the machine belongs behind an authenticating reverse proxy.
+- `sc dash` reports host CPU, memory, swap and root-disk usage on Linux every
+  two seconds. CPU percentages use matching consecutive samples with bounded
+  per-core data, zero-swap rows are omitted, and failed or unsupported
+  collection preserves last-good data without changing observer health.
+- `sc dash` can label a Dandelion agent with the actual account, model and
+  effective effort selected for its exact `(incarnation/run, agent, supervisor
+  attempt)`, reconstructed read-only from bounded `sc.log` backfill and
+  following. Direct run-started records bind generations and preserve prior
+  history. The latest structured route is selected only within one exact
+  attempt; duplicate attempts within a generation are `unknown`, and old
+  last-seen cards keep their own model. Explicit `pending`, `no_route` and
+  `unknown` states permit no global/latest-route guessing. Attempt-fenced
+  snapshot metadata remains bounded and cached (HTTP never reads logs), while
+  the requested `high`/`standard` model configuration and adapter behavior stay
+  distinct. Route selection does not prove process start or success, and
+  non-Dandelion agent rendering is unchanged.
+- `sc dash --dandelion` opts into a Dandelion quota panel, with
+  `--dandelion-refresh` (Go duration, default 10m, minimum 1m) setting the
+  collection interval and Dandelion's max-age. Sequential probes have a fixed
+  five-minute timeout and bounded output. Dandelion may reuse a fresh cache
+  and otherwise performs real external probes; sc's last-good normalized data
+  is memory-only. Attempt and success freshness are separate, failures retain
+  last-good data with one of four safe collector error codes, HTTP requests
+  never trigger probes, and observer health is unaffected. The redacted,
+  bounded snapshot omits raw responses and raw collector subprocess
+  stderr/errors; unavailable/error provider reasons remain bounded,
+  explicitly allowlisted Dandelion diagnostics. The panel shows both routes,
+  probe state, providers and every quota window, with accessible
+  tone-threshold gauges and a default-on `usage only` toggle persisted in
+  `localStorage` (zero-percent windows count as usage). Missing, malformed
+  and zero timestamps are blanked with their DOM metadata rather than shown
+  as year-one dates.
 - The product owner can give a bead a longer agent timeout in its plan
   (`timeout`, up to `limits.max_agent_timeout`, default 24h) when one
   session on it will genuinely need longer than the default.
@@ -98,6 +191,31 @@ next version's entry.
 
 ### Fixed
 
+- Dandelion route generation selection now freezes each launch's spawn time
+  and current/previous direct event starts, then selects history in
+  `(previous event start, current event start]` before matching the exact
+  agent/attempt. This fixes rotation with five direct starts and only four
+  retained event starts: current replay recovers generation five while an old
+  last-seen card keeps its frozen interval and model four. Arrival skew,
+  invalid intervals, missing/ambiguous/damaged history and overflows are
+  `unknown`, never a previous-generation, global/latest-route, `pending` or
+  `routed` guess. Requested and routed models remain separate.
+
+- Parallel planning commit/resume recovery retains returned IDs,
+  `Unfinished` acceptance evidence and the run epic. A fresh run-scoped
+  listing is used when positive ID evidence is absent: a proven graph is
+  adopted without a second apply and review/plan publication happens once,
+  while an unfinished round whose graph cannot be proven regenerates. Resume
+  therefore cannot duplicate planning, graph creation or epic adoption.
+
+- Dashboard balance projection normalizes literal `$` to `USD` and retains
+  only `amount` and `currency`, with regression coverage for projection and
+  clone isolation. The final live Kilo balance was `31.232105 USD`, rendered
+  as `balance $31.23` exactly once without a synthetic gauge or percentage;
+  Kilo remains visible in `usage only` with zero windows. The dashboard
+  service keeps `ProtectHome=read-only` and adds only narrow `ReadWritePaths`
+  exceptions for `~/.local/share/kilo`, `~/.cache/kilo` and
+  `~/.local/state/kilo`, required by Kilo's runtime startup/auth paths.
 - A run that stamps its lock just as `sc --force` takes the lock over no
   longer writes its own record back over the takeover's. The check that the
   lock is still the file it read compared only device and inode, and ext4
@@ -116,6 +234,20 @@ next version's entry.
   second time at once. The conductor could list it while it passed through
   approved and start another delivery in the same worktree, and both checks
   failed.
+- `Conductor.release` now clears a bead's stale `shipped` marker as well as
+  its in-flight reservation. A conflict or failed check sent back and
+  re-approved between conductor listings is therefore delivered again,
+  instead of remaining approved without a delivery.
+- Dandelion route labels retain valid exact-attempt evidence after resumes.
+  Direct run-started records bind history to `(incarnation/run, agent,
+  supervisor attempt)` instead of resetting it, old last-seen cards keep their
+  own model, and duplicate attempts within one generation remain `unknown`.
+  This fixes valid routes previously suppressed after resumes without changing
+  adapters or requested `domain.Agent.Model`, and without global/latest-route
+  guessing.
+- A firing whose context is cancelled when its attempt also fails now returns
+  `errors.Join` of both errors, preserving the context cancellation and the
+  attempt failure for `errors.Is` instead of discarding the cancellation.
 - A bead whose work is already on the default branch is closed instead of
   handed to a person when its next delivery finds nothing to merge: a commit
   whose subject starts `sc(<bead>): ` now counts as proof that it landed,
@@ -130,7 +262,11 @@ next version's entry.
 - Agents no longer fail to start when several fire at once. The read-only
   bd check opened the tracker for writing on every start, which failed as
   "no beads database found" while other agents were writing; bd's own
-  read-only enforcement is now checked once per bd binary.
+  read-only enforcement is now checked once per bd binary. A process-wide
+  double-checked mutex makes the load/verify/store sequence atomic, with a
+  16-way overlap regression and failure-not-cached retry coverage. The mutex
+  coordinates only one `sc` process; independent processes still rely on bd's
+  own locking.
 - A resumed bead whose scope the product owner narrowed resumes in its
   fresh review round. The replay used to keep it at the capped round that
   escalated it and escalate it again.

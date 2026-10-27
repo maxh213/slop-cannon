@@ -50,6 +50,7 @@ import (
 var redactNoText = map[events.Kind]string{
 	events.KindRoundStarted:  "a round's bead, number, kind, lenses and commit are sc's own bookkeeping and git's",
 	events.KindAgentFinished: "how a session ended: duration, exit code and the message type it produced",
+	events.KindPlanReviewed:  "candidate correlation keys, decision, provenance and round contain no prose",
 }
 
 // redactMarker is planted in every string field the reflection walk fills.
@@ -91,6 +92,8 @@ var redactKeeps = map[string]string{
 	"verdict_received.Verdict.Items[].ID":   "the feedback item id responses and rulings answer",
 	"response_received.Responses[].ItemID":  "the verdict item this response answers",
 	"arbitration_received.Rulings[].ItemID": "the verdict item this ruling settles",
+	"plan_reviewed.Candidate":               "the namespaced candidate key this decision classifies",
+	"plan_reviewed.Canonical":               "the known candidate key or existing bead ID selected by reconciliation",
 
 	// bd's and sc's bookkeeping about a bead, not text about it.
 	"bead_created.Bead.Labels[]":     "bd's labels, sc:run:<id> among them",

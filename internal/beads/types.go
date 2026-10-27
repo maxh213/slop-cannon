@@ -585,11 +585,13 @@ type GraphNode struct {
 	Assignee string `json:"assignee,omitempty"`
 }
 
-// GraphEdge is one dependency of a graph plan: FromKey depends on ToKey,
+// GraphEdge is one dependency of a graph plan: FromKey depends on exactly one
+// of ToKey (a node in this plan) or ToID (an existing canonical bead),
 // matching `bd dep add <issue> <depends-on>`.
 type GraphEdge struct {
-	FromKey string `json:"from_key"`
-	ToKey   string `json:"to_key"`
+	FromKey string        `json:"from_key"`
+	ToKey   string        `json:"to_key,omitempty"`
+	ToID    domain.BeadID `json:"to_id,omitempty"`
 	// Type is the dependency type; empty means DepBlocks.
 	Type string `json:"type,omitempty"`
 }

@@ -14,9 +14,8 @@ type Driver string
 
 // Drivers.
 const (
-	// DriverNone is an account sc has no adapter for (codex, grok, agy, …).
-	// The router is told to skip it (DANDELION_DISABLE) and a route that
-	// names it anyway is treated as no route.
+	// DriverNone is an account sc has no adapter for. The router is told to
+	// skip it (DANDELION_DISABLE) and a route naming it is treated as no route.
 	DriverNone Driver = ""
 	// DriverClaude launches the account through the Claude Code adapter,
 	// which holds every tool policy natively.
@@ -24,6 +23,13 @@ const (
 	// DriverCursor launches the account through the Cursor Agent adapter,
 	// which has no tool controls, so only read_write firings may use it.
 	DriverCursor Driver = "cursor"
+	DriverAgy    Driver = "agy"
+	DriverCodex  Driver = "codex"
+	DriverKimi   Driver = "kimi"
+	DriverGrok   Driver = "grok"
+	DriverJunie  Driver = "junie"
+	DriverHermes Driver = "hermes"
+	DriverKilo   Driver = "kilo"
 )
 
 // Provider is one dandelion provider id and how sc drives it. The table
@@ -47,22 +53,22 @@ type Provider struct {
 // the one place sc classifies them. claude-deepseek and claude-ollama are
 // Claude Code with another config dir (their settings.json points the CLI
 // at OpenRouter and Ollama Cloud), so launch.ts launches them exactly like
-// claude-work and so does sc. kilo reports a balance and is never routed,
-// but it is still probed unless disabled.
+// claude-work and so does sc. Kilo's delegated firings additionally check its
+// balance immediately before launch.
 var Providers = []Provider{
 	{ID: "claude", Driver: DriverClaude},
 	{ID: "claude-work", Driver: DriverClaude, ConfigDirEnv: "DANDELION_CLAUDE_WORK_CONFIG_DIR", ConfigDirFallback: ".claude-work"},
 	{ID: "claude-deepseek", Driver: DriverClaude, ConfigDirEnv: "DANDELION_CLAUDE_DEEPSEEK_CONFIG_DIR", ConfigDirFallback: ".claude-deepseek"},
 	{ID: "claude-ollama", Driver: DriverClaude, ConfigDirEnv: "DANDELION_CLAUDE_OLLAMA_CONFIG_DIR", ConfigDirFallback: ".claude-ollama"},
-	{ID: "agy"},
-	{ID: "kimi"},
-	{ID: "grok"},
-	{ID: "codex"},
-	{ID: "codex-animus"},
+	{ID: "agy", Driver: DriverAgy},
+	{ID: "kimi", Driver: DriverKimi},
+	{ID: "grok", Driver: DriverGrok},
+	{ID: "codex", Driver: DriverCodex},
+	{ID: "codex-animus", Driver: DriverCodex},
 	{ID: "cursor", Driver: DriverCursor},
-	{ID: "junie"},
-	{ID: "hermes"},
-	{ID: "kilo"},
+	{ID: "junie", Driver: DriverJunie},
+	{ID: "hermes", Driver: DriverHermes},
+	{ID: "kilo", Driver: DriverKilo},
 }
 
 // providerByID returns the table entry for id.
@@ -75,19 +81,11 @@ func providerByID(id string) (Provider, bool) {
 	return Provider{}, false
 }
 
-// allows reports whether a firing under policy may be delegated to p:
-// Claude accounts always, Cursor only for read_write (it cannot hold
-// read_only or read_exec, and a planning product owner has no worktree to
-// copy), and nothing else ever.
+// allows reports whether p's registered driver declares native enforcement
+// for policy, or needs no restriction for read_write. Binary availability is
+// checked separately when the allowed route set is built.
 func (p Provider) allows(policy cartridge.ToolPolicy) bool {
-	switch p.Driver {
-	case DriverClaude:
-		return true
-	case DriverCursor:
-		return policy == cartridge.ToolReadWrite
-	default:
-		return false
-	}
+	return driverAllows(builtinDrivers, p.Driver, policy)
 }
 
 // configDir returns the CLAUDE_CONFIG_DIR the account launches with, or ""
@@ -111,14 +109,12 @@ func (p Provider) configDir(lookup func(string) (string, bool), home func() (str
 // in table order. cursorInstalled leaves cursor out when cursor-agent is
 // not on PATH, so the router never names an account sc cannot start.
 func Allowed(policy cartridge.ToolPolicy, cursorInstalled bool) []string {
-	var out []string
-	for _, p := range Providers {
-		if !p.allows(policy) || (p.Driver == DriverCursor && !cursorInstalled) {
-			continue
+	return allowedProviders(Providers, builtinDrivers, policy, func(driver Driver) bool {
+		if driver == DriverCursor {
+			return cursorInstalled
 		}
-		out = append(out, p.ID)
-	}
-	return out
+		return driverAvailable(builtinDrivers, driver)
+	})
 }
 
 // Disabled returns the DANDELION_DISABLE value that leaves the router only
@@ -149,9 +145,9 @@ func Disabled(allowed []string, extra string) string {
 	return strings.Join(out, ",")
 }
 
-// Efforts are the values Claude Code's --effort flag accepts (verified
-// against "claude --help" of 2.1.309). A route line's effort outside this
-// list is dropped rather than passed on.
+// Efforts is the routed effort vocabulary shared by Claude, agy, Codex, Kimi,
+// Grok, Hermes and Kilo. Junie declares a narrower list in its own adapter. Anything
+// outside the selected driver's list is dropped rather than rewritten.
 var Efforts = []string{"low", "medium", "high", "xhigh", "max"}
 
 // NoRoute is what the router prints when nothing is routable.

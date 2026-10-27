@@ -1,0 +1,55 @@
+Serve a read-only browser dashboard for a run that is already firing.
+
+PATH may be the repository root or any directory inside it; without it the
+--repo directory (the current one by default) is used. The most recent run
+is shown unless --run names another. The dashboard follows the recorded event
+log and refreshes durable state and run-lock liveness; it never claims the
+lock, writes run state, reconciles beads, or offers run controls.
+
+The page shows bead flow, live and recent agents, review rounds, pull requests
+and merges, notices, and lifecycle activity. Prompts, diffs, agent output,
+review transcripts, and raw notice prose are not served; notices retain their
+time, kind, source, and a small category. Historical and resumed incarnations
+are followed in one stream. A quiet, finished, or crashed run remains available
+for as long as the dashboard process is running.
+
+Dandelion quota collection is off by default. --dandelion enables immediate,
+sequential dandelion --json probes and adds the quota panel. The probes keep
+only bounded, redacted last-good data in memory; quota failures do not change
+observer health. --dandelion-refresh takes a Go duration, defaults to 10m, and
+must be at least 1m.
+
+By default the server listens only on loopback at 127.0.0.1:8790 and serves at
+/. Use --host and --port to change the listener, or --base-path /sc to serve
+the same three read-only endpoints under a URL prefix. HTTP Host headers are
+accepted only for loopback names and IPs unless --allowed-host names an exact
+hostname. Repeat that flag for each additional host, such as a reverse-proxied
+dash.demo.otwarte.xyz; wildcard hosts are not accepted.
+
+Usage:
+  sc dash [PATH] [flags]
+
+Examples:
+  sc dash
+  sc dash ./repo-path
+  sc dash --run 20260924-214444-42c0
+  sc dash --host 127.0.0.1 --port 8790 --base-path /sc
+  sc dash --allowed-host dash.demo.otwarte.xyz --base-path /sc
+  sc dash --dandelion --dandelion-refresh 15m
+
+Flags:
+      --allowed-host HOSTNAME        allow exact HOSTNAME in the HTTP Host header (repeatable; loopback always allowed)
+      --base-path PATH               serve under URL PATH (for example /sc) (default "/")
+      --dandelion                    collect and show Dandelion quota (disabled by default)
+      --dandelion-refresh DURATION   probe Dandelion every DURATION (minimum 1m) (default 10m0s)
+  -h, --help                         help for dash
+      --host HOST                    listen on HOST or IP (loopback by default) (default "127.0.0.1")
+      --port PORT                    listen on PORT (0 chooses a free port) (default 8790)
+      --run ID                       show run ID instead of the most recent one
+
+Global Flags:
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging

@@ -1,0 +1,5 @@
+{"type":"tool","call_id":"t2","name":"run_terminal_cmd","arguments":{"command":"go test ./...","timeout":30}}
+{"type":"tool_update","call_id":"t2","status":"failed","content":"exit status 1"}
+{"type":"text","text":"Tests failed"}
+{"type":"usage","usage":{"inputTokens":11,"outputTokens":6,"cacheReadTokens":4,"cacheWriteTokens":1,"turns":2}}
+{"type":"end","session_id":"alias-session","stopReason":"end_turn","cost_usd":0}

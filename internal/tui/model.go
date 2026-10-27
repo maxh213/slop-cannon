@@ -283,6 +283,8 @@ func (s *State) Apply(ev events.Event) {
 		s.Resumed = e.Resumed
 		s.Live = true
 		if e.Resumed {
+			s.Finish = nil
+			s.Paused, s.Stopping, s.Reason = false, false, ""
 			s.endOrphanedAgents()
 		}
 		if e.Info.Epic != "" {
@@ -563,6 +565,8 @@ func formatEvent(ev events.Event) string {
 		return strings.TrimSpace(fmt.Sprintf("run finished (%s) %s", e.Reason, e.Summary))
 	case events.PlanProduced:
 		return fmt.Sprintf("plan from %s: %d beads under %s", e.Agent, len(e.Plan.Beads), orDash(string(e.Epic)))
+	case events.PlanReviewed:
+		return strings.TrimSpace(fmt.Sprintf("plan review %s: %s %s %s", e.Planner, e.Candidate, e.Decision, e.Canonical))
 	case events.BeadCreated:
 		return fmt.Sprintf("bead %s created %q [%s]", e.Bead.ID, e.Bead.Title, e.Bead.State)
 	case events.BeadUpdated:

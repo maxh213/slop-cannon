@@ -13,8 +13,8 @@ import (
 
 func TestKindsAreUniqueSnakeCaseAndRegistered(t *testing.T) {
 	kinds := Kinds()
-	if len(kinds) != 22 {
-		t.Fatalf("expected the 22 kinds of P0-06, got %d: %v", len(kinds), kinds)
+	if len(kinds) != 23 {
+		t.Fatalf("expected 23 registered kinds, got %d: %v", len(kinds), kinds)
 	}
 	seen := map[Kind]bool{}
 	for _, k := range kinds {

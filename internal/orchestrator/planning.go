@@ -220,11 +220,15 @@ func PlanAgentRun(fc FiringContext, r *Run, req agents.PlanRequest) (agents.Agen
 		// copy of its own — two writers of one file would only disagree.
 		runDir = r.Dir()
 	}
+	checkReq := req
+	if parallelPlanAgent(req.AgentID) {
+		checkReq = planningCandidateRequest(req)
+	}
 	return agents.AgentRun{
 		Cartridge: fc.Cartridge,
 		Spec:      spec,
 		Message:   domain.MessagePlan,
-		Check:     agents.PlanCheck(req),
+		Check:     agents.PlanCheck(checkReq),
 		Agent:     fc.Agent,
 		Task:      events.TaskPlan,
 		Run:       fc.Run,
@@ -266,6 +270,13 @@ type PlannerOptions struct {
 	Runner PlanRunner
 	// Applier turns a validated plan into beads (P3-10); *beads.Client.
 	Applier agents.PlanApplier
+	// Reviewer performs the single semantic review of a multi-producer round.
+	// Nil uses the reconciler's no-retry fallback.
+	Reviewer PlanReviewRunner
+	// PlannerCount overrides `po_planners`; zero means the configured value,
+	// whose default is one. Values greater than one enable the combined-round
+	// coordinator in planning_review.go.
+	PlannerCount int
 	// Beads lists the run's beads: the open ones the plan must not
 	// duplicate, and the ones brief mode waits to settle.
 	Beads BeadSource
@@ -401,14 +412,18 @@ type Planner struct {
 	cfg  *config.RunConfig
 	log  *slog.Logger
 
-	idle      time.Duration
-	maxBeads  int
-	limit     int
-	failLimit int
-	maxBack   time.Duration
-	settle    time.Duration
+	idle       time.Duration
+	maxBeads   int
+	poPlanners int
+	limit      int
+	failLimit  int
+	maxBack    time.Duration
+	settle     time.Duration
 
 	mu            sync.Mutex
+	parallelDone  chan struct{}
+	outstanding   int
+	commit        *planningCommit
 	run           *Run
 	attempts      int
 	plans         int
@@ -481,15 +496,16 @@ func NewPlanner(opts PlannerOptions) (*Planner, error) {
 		opts.Shim = InstallPlanShim
 	}
 	p := &Planner{
-		opts:      opts,
-		cfg:       opts.Config,
-		log:       opts.Logger,
-		idle:      opts.IdleReplanInterval,
-		maxBeads:  opts.MaxBeads,
-		limit:     opts.RejectionLimit,
-		failLimit: opts.FailureLimit,
-		maxBack:   opts.MaxBackoff,
-		settle:    opts.SettleInterval,
+		opts:       opts,
+		cfg:        opts.Config,
+		log:        opts.Logger,
+		idle:       opts.IdleReplanInterval,
+		maxBeads:   opts.MaxBeads,
+		poPlanners: opts.PlannerCount,
+		limit:      opts.RejectionLimit,
+		failLimit:  opts.FailureLimit,
+		maxBack:    opts.MaxBackoff,
+		settle:     opts.SettleInterval,
 	}
 	if p.idle <= 0 {
 		p.idle = config.DefaultIdleReplanInterval
@@ -503,6 +519,13 @@ func NewPlanner(opts PlannerOptions) (*Planner, error) {
 			p.maxBeads = eff.MaxBeadsPerPlan
 		}
 	}
+	if p.poPlanners <= 0 {
+		p.poPlanners = config.DefaultPOPlanners
+		if eff := p.cfg.Effective; eff != nil && eff.POPlanners > 0 {
+			p.poPlanners = eff.POPlanners
+		}
+	}
+	p.opts.PlannerCount = p.poPlanners
 	if p.limit == 0 {
 		p.limit = DefaultPlanRejectionLimit
 		if eff := p.cfg.Effective; eff != nil && eff.Limits.MaxPlanRejections > 0 {
@@ -575,8 +598,14 @@ func (p *Planner) Attach(r *Run) {
 // Mode is the run mode the planner enforces.
 func (p *Planner) Mode() domain.RunMode { return p.cfg.Run.Mode }
 
-// MaxBeads is the effective `max_beads_per_plan` (P1-16).
+// MaxBeads is the effective per-producer `max_beads_per_plan` (P1-16).
 func (p *Planner) MaxBeads() int { return p.maxBeads }
+
+// POPlanners is the number of independent producers in one planning round.
+func (p *Planner) POPlanners() int { return p.poPlanners }
+
+// CombinedMaxBeads is the one quota shared by the reconciled graph.
+func (p *Planner) CombinedMaxBeads() int { return p.poPlanners * p.maxBeads }
 
 // IdleReplanInterval is the effective `idle_replan_interval` (D-18).
 func (p *Planner) IdleReplanInterval() time.Duration { return p.idle }
@@ -626,20 +655,20 @@ func (p *Planner) Demands(ctx context.Context) ([]Demand, error) {
 	if p.running {
 		// Still outstanding. Re-offering it is what a stateless source
 		// does; the scheduler recognises the key and does not fire twice.
-		return []Demand{planDemand()}, nil
+		return []Demand{p.planDemand()}, nil
 	}
 	now := p.opts.Now()
 	if !p.nextAt.IsZero() && now.Before(p.nextAt) {
 		return nil, nil
 	}
 	if p.attempts == 0 {
-		return []Demand{planDemand()}, nil // plan at the start of every run
+		return []Demand{p.planDemand()}, nil // plan at the start of every run
 	}
 	if p.cfg.Run.Mode == domain.RunModeBrief {
 		if p.plans > 0 {
 			return nil, nil // brief mode plans once
 		}
-		return []Demand{planDemand()}, nil // ... and retries until it has one
+		return []Demand{p.planDemand()}, nil // ... and retries until it has one
 	}
 	st := p.statusLocked()
 	if p.replanHeldLocked(st, now) {
@@ -650,11 +679,11 @@ func (p *Planner) Demands(ctx context.Context) ([]Demand, error) {
 		// dispatch still found work to fire. Only a changed production
 		// signals reading plans anyway (P6-71, D-32).
 		if p.signalsOn() && p.signalsWantLocked(ctx, now) {
-			return []Demand{planDemand()}, nil
+			return []Demand{p.planDemand()}, nil
 		}
 		return nil, nil
 	}
-	return []Demand{planDemand()}, nil
+	return []Demand{p.planDemand()}, nil
 }
 
 // replanHeldLocked reports whether the plan now in force is still waiting
@@ -694,6 +723,16 @@ func (p *Planner) markPlanAppliedLocked(now time.Time) {
 // agent ids po-plan-1, po-plan-2, … itself.
 func planDemand() Demand {
 	return Demand{Kind: DemandPlan, Task: events.TaskPlan, Claim: ClaimNone}
+}
+
+// planDemand keeps the legacy demand identity and zero Slots for one PO. A
+// combined round reserves its producer count while retaining that identity.
+func (p *Planner) planDemand() Demand {
+	d := planDemand()
+	if p.poPlanners > 1 {
+		d.Slots = p.poPlanners
+	}
+	return d
 }
 
 // statusLocked returns the scheduler status, from the hook when there is
@@ -960,6 +999,9 @@ func (p *Planner) Fire(ctx context.Context, f Firing) (FireResult, error) {
 func (p *Planner) fire(ctx context.Context, f Firing) (map[string]domain.BeadID, error) {
 	if p.opts.Runner == nil {
 		return nil, ErrNoPlanRunner
+	}
+	if p.poPlanners > 1 {
+		return p.fireParallel(ctx, f)
 	}
 	req, err := p.request(ctx, f)
 	if err != nil {
@@ -1434,7 +1476,7 @@ func (p *Planner) notes(open, done []domain.Bead, signalsDriven bool) []string {
 	first := p.plans == 0
 	p.mu.Unlock()
 	var notes []string
-	if p.opts.Prioritiser != nil && len(open) > 0 {
+	if p.poPlanners == 1 && p.opts.Prioritiser != nil && len(open) > 0 {
 		notes = append(notes,
 			"You may deprioritise an open bead you proposed in an earlier plan if better work has "+
 				"appeared: repeat it in this plan with its title unchanged and a larger `priority` "+

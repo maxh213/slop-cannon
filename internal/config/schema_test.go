@@ -38,11 +38,12 @@ func TestAllocate(t *testing.T) {
 }
 
 func TestValidateCartridgeName(t *testing.T) {
-	assert.NoError(t, ValidateCartridgeName("claude"))
-	assert.NoError(t, ValidateCartridgeName("cursor"))
-	assert.NoError(t, ValidateCartridgeName("dandelion"))
-	assert.EqualError(t, ValidateCartridgeName("kimi"), `cartridge "kimi" is not supported yet (only "claude", "cursor", "dandelion" for now)`)
-	assert.EqualError(t, ValidateCartridgeName("animus"), `cartridge "animus" is not supported yet (only "claude", "cursor", "dandelion" for now)`)
+	for _, name := range []string{"claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo"} {
+		assert.NoError(t, ValidateCartridgeName(name), name)
+	}
+	for _, name := range []string{"animus", "codex-animus", "kilo-unsupported"} {
+		assert.EqualError(t, ValidateCartridgeName(name), `cartridge "`+name+`" is not supported yet (only "claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo" for now)`)
+	}
 	assert.Error(t, ValidateCartridgeName(""))
 	assert.Error(t, ValidateCartridgeName("Claude"), "names are case-sensitive")
 }
@@ -126,6 +127,8 @@ func TestDefaultsMatchD04(t *testing.T) {
 	assert.InEpsilon(t, 0.4, d.ReReviewThreshold, 1e-9)
 	assert.Equal(t, DefaultMaxBeadsPerPlan, d.MaxBeadsPerPlan)
 	assert.Equal(t, 8, d.MaxBeadsPerPlan)
+	assert.Equal(t, DefaultPOPlanners, d.POPlanners)
+	assert.Equal(t, 1, d.POPlanners)
 	assert.Equal(t, Limits{MaxReviewRounds: 5, MaxPushbackRounds: 2, MaxConflictRounds: 3,
 		AgentTimeout: NewDuration(6 * time.Hour), MaxAgentTimeout: NewDuration(24 * time.Hour),
 		CheckTimeout:      NewDuration(30 * time.Minute),

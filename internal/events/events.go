@@ -1,6 +1,9 @@
 package events
 
 import (
+	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"slop-cannon/internal/domain"
@@ -81,10 +84,55 @@ type PlanProduced struct {
 	// Created maps each plan key to the bd-minted id. Empty for an empty
 	// plan (autopilot "nothing to add", D-18).
 	Created map[string]domain.BeadID `json:"created,omitempty"`
+	// Contributors lists every PO whose candidate contributed to the combined
+	// plan. Empty preserves the single-producer event encoding.
+	Contributors []domain.AgentID `json:"contributors,omitempty"`
 }
 
 // Kind implements [Event].
 func (PlanProduced) Kind() Kind { return KindPlanProduced }
+
+// ErrInvalidPlanReviewed is wrapped by every PlanReviewed.Validate failure.
+var ErrInvalidPlanReviewed = errors.New("events: invalid plan review")
+
+// PlanReviewed records one bounded, prose-free reconciliation decision. It
+// deliberately carries no candidate prose or graph, so the audit log cannot
+// be used to smuggle a second plan into the commit path.
+type PlanReviewed struct {
+	Meta
+	Round      int                         `json:"round"`
+	Planner    domain.AgentID              `json:"planner"`
+	Candidate  string                      `json:"candidate"`
+	Decision   domain.PlanReviewDecision   `json:"decision"`
+	Canonical  string                      `json:"canonical,omitempty"`
+	Provenance domain.PlanReviewProvenance `json:"provenance"`
+}
+
+// Kind implements [Event].
+func (PlanReviewed) Kind() Kind { return KindPlanReviewed }
+
+// Validate checks the bounds and correlation rules publishers must enforce.
+func (e PlanReviewed) Validate() error {
+	if e.Round < 0 {
+		return fmt.Errorf("%w: negative round", ErrInvalidPlanReviewed)
+	}
+	if strings.TrimSpace(string(e.Planner)) == "" || len(e.Planner) > domain.MaxPlanReviewReferenceLength {
+		return fmt.Errorf("%w: empty or oversized planner id", ErrInvalidPlanReviewed)
+	}
+	if strings.TrimSpace(e.Candidate) == "" || len(e.Candidate) > domain.MaxPlanReviewReferenceLength {
+		return fmt.Errorf("%w: empty or oversized candidate key", ErrInvalidPlanReviewed)
+	}
+	if len(e.Canonical) > domain.MaxPlanReviewReferenceLength {
+		return fmt.Errorf("%w: oversized canonical reference", ErrInvalidPlanReviewed)
+	}
+	if !e.Decision.Valid() || !e.Provenance.Valid() {
+		return fmt.Errorf("%w: unknown decision or provenance", ErrInvalidPlanReviewed)
+	}
+	if (e.Decision == domain.PlanReviewDuplicate) != (e.Canonical != "") {
+		return fmt.Errorf("%w: canonical reference is present exactly for duplicates", ErrInvalidPlanReviewed)
+	}
+	return nil
+}
 
 // BeadCreated is published for every bead the run creates, including the
 // epic and external-PR review beads (D-11).

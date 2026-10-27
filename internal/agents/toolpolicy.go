@@ -57,6 +57,7 @@ type taskRule struct {
 // silent read_write.
 var taskPolicies = map[events.Task]taskRule{
 	events.TaskPlan:             {domain.RolePO, cartridge.ToolReadOnly},
+	events.TaskPlanReview:       {domain.RolePO, cartridge.ToolReadOnly},
 	events.TaskArbitrate:        {domain.RolePO, cartridge.ToolReadOnly},
 	events.TaskEscalate:         {domain.RolePO, cartridge.ToolReadOnly},
 	events.TaskImplement:        {domain.RoleEngineer, cartridge.ToolReadWrite},

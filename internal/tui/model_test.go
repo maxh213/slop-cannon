@@ -504,6 +504,24 @@ func TestStateResumeEndsAgentsThePreviousProcessLeftRunning(t *testing.T) {
 	require.Equal(t, 1, used, "agents the resumed process fires are live")
 }
 
+func TestStateResumeClearsTerminalLifecycle(t *testing.T) {
+	t.Parallel()
+	s := tui.NewState(domain.Run{ID: "r"})
+	s.Apply(events.RunStarted{Meta: events.NewMeta("r"), Info: domain.Run{ID: "r"}})
+	s.Apply(events.RunPaused{Meta: events.NewMeta("r"), Reason: "cost_cap"})
+	s.Apply(events.RunStopped{Meta: events.NewMeta("r"), Reason: "SIGINT"})
+	s.Apply(events.RunFinished{Meta: events.NewMeta("r"), Reason: events.FinishStopped})
+	require.NotNil(t, s.Finish)
+
+	s.Apply(events.RunStarted{Meta: events.NewMeta("r"), Info: domain.Run{ID: "r"}, Resumed: true})
+	require.True(t, s.Live)
+	require.True(t, s.Resumed)
+	require.Nil(t, s.Finish, "the previous incarnation's terminal event is not the resumed run's outcome")
+	require.False(t, s.Paused)
+	require.False(t, s.Stopping)
+	require.Empty(t, s.Reason)
+}
+
 func TestFormatEventCoversEveryKind(t *testing.T) {
 	t.Parallel()
 	seen := make(map[events.Kind]string, len(events.Kinds()))

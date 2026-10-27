@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","model":"nous/hermes-4","session_id":"credits-session","timestamp":1}
+{"type":"result","session_id":"credits-session","exit_code":1,"text":"","tokens":{"input":11,"output":0,"total":11,"cache_read":0,"cache_write":0},"duration_ms":30,"error":"Payment required: insufficient credit balance","timestamp":2}

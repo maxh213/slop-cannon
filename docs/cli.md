@@ -17,6 +17,7 @@ Every command, flag, and example of the `sc` binary, in the words of
 - [sc config edit](#sc-config-edit) — Open the config file in $EDITOR
 - [sc config path](#sc-config-path) — Print the global and repo config file paths
 - [sc config show](#sc-config-show) — Print the merged configuration with the source of every value
+- [sc dash](#sc-dash) — Serve a read-only browser dashboard for a run
 - [sc doctor](#sc-doctor) — Check that git, bd, dolt, gh, the cartridge CLIs and the repository are ready
 - [sc logs](#sc-logs) — Tail the log of a run, an agent, or a bead
 - [sc resume](#sc-resume) — Continue the most recent run of a repository
@@ -101,6 +102,7 @@ sc safety off
 - [sc cartridge](#sc-cartridge) — Add, remove, list, or switch the LLM CLI subscriptions
 - [sc completion](#sc-completion) — Print a shell completion script (bash, zsh, or fish)
 - [sc config](#sc-config) — Show, locate, or edit the configuration files
+- [sc dash](#sc-dash) — Serve a read-only browser dashboard for a run
 - [sc doctor](#sc-doctor) — Check that git, bd, dolt, gh, the cartridge CLIs and the repository are ready
 - [sc logs](#sc-logs) — Tail the log of a run, an agent, or a bead
 - [sc resume](#sc-resume) — Continue the most recent run of a repository
@@ -182,12 +184,13 @@ the active cartridge promotes the next configured one, or leaves the cannon
 without an active cartridge (a run refuses to start until one is added).
 Re-adding a configured cartridge updates its model.
 
-Supported: "claude" (Claude Code), "cursor" (Cursor Agent) and
-"dandelion", the dandelion quota router, which fires Claude Code or Cursor
-Agent on whichever account still has quota. Its --model is "high" (the
-strongest model with quota) or "standard"; the router names the real model,
-so roles.<role>.model is ignored for it. More cartridges are planned; any
-other name is rejected. Without flags the configured cartridges are listed.
+Supported: "claude" (Claude Code), "cursor" (Cursor Agent), "agy", "codex",
+"kimi", "grok", "junie", "hermes", "kilo", and "dandelion", the quota router that
+fires whichever supported account still has quota. Dandelion's --model is
+"high" (the strongest model with quota) or "standard"; the router names the
+real model, so roles.<role>.model is ignored for it. codex-animus is a routed
+Codex account, not a direct cartridge. Any other name is rejected. Without
+flags the configured cartridges are listed.
 
 ### Usage
 
@@ -201,8 +204,9 @@ sc cartridge [flags]
 sc cartridge --add claude --model fable
 sc cartridge --add dandelion --model high
 sc cartridge --remove claude
-sc cartridge --add animus
-sc cartridge --add kimi --model 3
+sc cartridge --add codex --model gpt-5.1-codex-mini
+sc cartridge --add kimi --model kimi-k2.5
+sc cartridge --add kilo --model deepseek/deepseek-v4.1-flash-1017
 sc cartridge --use claude
 sc cartridge --list
 ```
@@ -468,6 +472,84 @@ sc config show [flags]
 ### See also
 
 - [sc config](#sc-config) — Show, locate, or edit the configuration files
+
+## sc dash
+
+Serve a read-only browser dashboard for a run
+
+### Synopsis
+
+Serve a read-only browser dashboard for a run that is already firing.
+
+PATH may be the repository root or any directory inside it; without it the
+--repo directory (the current one by default) is used. The most recent run
+is shown unless --run names another. The dashboard follows the recorded event
+log and refreshes durable state and run-lock liveness; it never claims the
+lock, writes run state, reconciles beads, or offers run controls.
+
+The page shows bead flow, live and recent agents, review rounds, pull requests
+and merges, notices, and lifecycle activity. Prompts, diffs, agent output,
+review transcripts, and raw notice prose are not served; notices retain their
+time, kind, source, and a small category. Historical and resumed incarnations
+are followed in one stream. A quiet, finished, or crashed run remains available
+for as long as the dashboard process is running.
+
+Dandelion quota collection is off by default. --dandelion enables immediate,
+sequential dandelion --json probes and adds the quota panel. The probes keep
+only bounded, redacted last-good data in memory; quota failures do not change
+observer health. --dandelion-refresh takes a Go duration, defaults to 10m, and
+must be at least 1m.
+
+By default the server listens only on loopback at 127.0.0.1:8790 and serves at
+/. Use --host and --port to change the listener, or --base-path /sc to serve
+the same three read-only endpoints under a URL prefix. HTTP Host headers are
+accepted only for loopback names and IPs unless --allowed-host names an exact
+hostname. Repeat that flag for each additional host, such as a reverse-proxied
+dash.demo.otwarte.xyz; wildcard hosts are not accepted.
+
+### Usage
+
+```
+sc dash [PATH] [flags]
+```
+
+### Examples
+
+```
+sc dash
+sc dash ./repo-path
+sc dash --run 20260924-214444-42c0
+sc dash --host 127.0.0.1 --port 8790 --base-path /sc
+sc dash --allowed-host dash.demo.otwarte.xyz --base-path /sc
+sc dash --dandelion --dandelion-refresh 15m
+```
+
+### Options
+
+```
+      --allowed-host HOSTNAME        allow exact HOSTNAME in the HTTP Host header (repeatable; loopback always allowed)
+      --base-path PATH               serve under URL PATH (for example /sc) (default "/")
+      --dandelion                    collect and show Dandelion quota (disabled by default)
+      --dandelion-refresh DURATION   probe Dandelion every DURATION (minimum 1m) (default 10m0s)
+  -h, --help                         help for dash
+      --host HOST                    listen on HOST or IP (loopback by default) (default "127.0.0.1")
+      --port PORT                    listen on PORT (0 chooses a free port) (default 8790)
+      --run ID                       show run ID instead of the most recent one
+```
+
+### Options inherited from parent commands
+
+```
+      --global      read and write the global config only, not the repo config
+      --json        print machine-readable JSON instead of text
+      --no-color    disable colour output (also honours NO_COLOR)
+      --repo PATH   target repository PATH (default ".")
+  -v, --verbose     enable debug logging
+```
+
+### See also
+
+- [sc](#sc) — Fire LLM agents at a repository
 
 ## sc doctor
 

@@ -113,6 +113,7 @@ func TestToolPolicyForRoleAndTask(t *testing.T) {
 			policy cartridge.ToolPolicy
 		}{
 			{events.TaskPlan, domain.RolePO, cartridge.ToolReadOnly},
+			{events.TaskPlanReview, domain.RolePO, cartridge.ToolReadOnly},
 			{events.TaskArbitrate, domain.RolePO, cartridge.ToolReadOnly},
 			{events.TaskEscalate, domain.RolePO, cartridge.ToolReadOnly},
 			{events.TaskImplement, domain.RoleEngineer, cartridge.ToolReadWrite},

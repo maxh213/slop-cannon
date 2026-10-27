@@ -18,7 +18,9 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/beads"
+	"slop-cannon/internal/cartridge"
 	"slop-cannon/internal/cartridge/mock"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
@@ -251,15 +253,68 @@ func TestRunSubdirectoryResolvesToRoot(t *testing.T) {
 	require.Contains(t, err.Error(), "accepts at most 1 arg(s)")
 }
 
+func TestRunPlannerConstructsStructuredSemanticReviewer(t *testing.T) {
+	repo := t.TempDir()
+	adapter, err := mock.NewAdapter("mock", mock.NewScenario("judge-construction"))
+	require.NoError(t, err)
+	cfg := config.Defaults()
+	cfg.ActiveCartridge = "mock"
+	cfg.Cartridges = map[string]config.Cartridge{"mock": {Model: "standard"}}
+	eff := &config.Effective{Config: cfg, Sources: map[string]config.Source{}}
+	eff.Limits.AgentTimeout = config.NewDuration(23 * time.Minute)
+	rc, err := config.NewRunConfig(repo, eff, config.RunSettings{ID: "run-judge", Brief: "ship the plan"})
+	require.NoError(t, err)
+	sel, err := cartridge.NewSelector(cfg, map[string]cartridge.Cartridge{"mock": adapter})
+	require.NoError(t, err)
+	scan := prompt.RepoContext{Root: repo, DefaultBranch: "main"}
+	rules := []prompt.Doc{{Name: "rules.md", Content: "hard constraints"}}
+	vibes := []prompt.Doc{{Name: "vibes.md", Content: "style"}}
+	var reported []cartridge.Usage
+	runner, err := newRunPlanReviewer(context.Background(), sel, rc, scan, rules, vibes, func(u cartridge.Usage) {
+		reported = append(reported, u)
+	})
+	require.NoError(t, err)
+	require.Same(t, adapter, runner.Cartridge)
+	req := runner.Request
+	require.Equal(t, rc.Run.ID, req.Run)
+	require.NotEmpty(t, req.Run)
+	require.Equal(t, 1, req.Round)
+	require.Equal(t, scan, req.Repo)
+	require.Equal(t, rc.Run.Brief, req.Brief)
+	require.Equal(t, rules, req.Rules)
+	require.Equal(t, vibes, req.Vibes)
+	require.Equal(t, "high", req.Model, "PO defaults to the high route when roles.po.model is unset")
+	require.Equal(t, 23*time.Minute, req.Timeout)
+	require.Empty(t, req.AgentID, "the agents runner derives the judge id from each round")
+	require.NotNil(t, req.OnUsage)
+	req.OnUsage(cartridge.Usage{})
+	require.Empty(t, reported, "an empty usage is not a billable session")
+	usage := cartridge.Usage{InputTokens: 42, OutputTokens: 8}
+	req.OnUsage(usage)
+	require.Equal(t, []cartridge.Usage{usage}, reported)
+	spend := &runSpend{}
+	spend.Record(usage)
+	tokens, _, _, firings := spend.total()
+	require.Equal(t, int64(50), tokens)
+	require.Equal(t, 1, firings)
+
+	rc.Effective.RoleModels[domain.RolePO] = "claude-opus-5-5"
+	runner, err = newRunPlanReviewer(context.Background(), sel, rc, scan, rules, vibes, nil)
+	require.NoError(t, err)
+	require.Equal(t, "claude-opus-5-5", runner.Request.Model)
+}
+
 func TestRunFlagOverridesAndSources(t *testing.T) {
 	_, repo := runTestEnv(t)
 	runAddCartridge(t, "claude", "fable")
 	configWriteFile(t, config.GlobalPath(), "safety = false\n"+configTestGlobalTOML)
-	configWriteFile(t, config.RepoConfigPath(repo), "ammo = 12\n")
+	configWriteFile(t, config.RepoConfigPath(repo), "ammo = 12\npo_planners = 2\n")
 
 	// Files only: repo ammo beats global ammo; global safety applies.
 	rc := runJSON(t, repo)
 	require.Equal(t, 12, rc.Run.Config.Ammo)
+	require.Equal(t, 2, rc.Effective.POPlanners)
+	require.Equal(t, config.SourceRepo, rc.Effective.Sources[config.KeyPOPlanners])
 	require.False(t, rc.Run.Config.Safety)
 	require.Equal(t, config.SourceRepo, rc.Effective.Sources[config.KeyAmmo])
 	require.Equal(t, config.SourceGlobal, rc.Effective.Sources[config.KeySafety])
@@ -275,6 +330,7 @@ func TestRunFlagOverridesAndSources(t *testing.T) {
 	stdout, _, code := runResolve(t, repo, "--ammo", "6", "--safety", "on")
 	require.Equal(t, 0, code)
 	require.Contains(t, stdout, "ammo       6 → 1 PO, up to 1 engineer, up to 4 testers (from flag)\n")
+	require.Contains(t, stdout, "po-planners2 (from repo)\n")
 	require.Contains(t, stdout, "safety     on (from flag): "+SafetyOnMeaning+"\n")
 
 	// Every spelling ParseSafety accepts works on the flag too.
@@ -331,9 +387,9 @@ func TestRunCartridgeFlag(t *testing.T) {
 	require.Equal(t, 0, code)
 	require.Contains(t, stdout, "cartridge  mock (default model, command mock) (from flag)\n")
 
-	_, stderr, code := runResolve(t, repo, "--cartridge", "kimi")
+	_, stderr, code := runResolve(t, repo, "--cartridge", "codex-animus")
 	require.Equal(t, 1, code)
-	require.Equal(t, "sc: cartridge \"kimi\" is not supported yet (only \"claude\", \"cursor\", \"dandelion\", \"mock\" for now)\n", stderr)
+	require.Equal(t, "sc: cartridge \"codex-animus\" is not supported yet (only \"claude\", \"cursor\", \"dandelion\", \"agy\", \"codex\", \"kimi\", \"grok\", \"junie\", \"hermes\", \"kilo\", \"mock\" for now)\n", stderr)
 
 	_, stderr, code = runResolve(t, repo, "--cartridge", "")
 	require.Equal(t, 1, code)

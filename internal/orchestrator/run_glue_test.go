@@ -1686,6 +1686,64 @@ func TestGlueRetriesADeliveryLeftInDelivering(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestGlueRedeliversAfterCheckFailureAndApprovalBetweenSyncs(t *testing.T) {
+	bd := newGlueBD(
+		glueIssue("sc-epic", domain.BeadTypeEpic, "open", "epic"),
+		glueIssue("sc-1", domain.BeadTypeTask, "approved", "add the retry"),
+	)
+	feedback := newGlueFeedback()
+	delivery := glueDelivering(bd, func(attempt int, req DeliveryRequest) (*DeliveryOutcome, error) {
+		out := &DeliveryOutcome{Bead: req.Bead.ID, Round: req.Round, State: domain.BeadStateDelivering}
+		switch attempt {
+		case 1:
+			out.Kind = DeliveryPending
+			return out, nil
+		case 2:
+			out.Kind, out.Reason = DeliveryRetryable, "the remote refused the push"
+			return out, errors.New("push rejected")
+		default:
+			bd.set(req.Bead.ID, domain.BeadStateClosed)
+			out.Kind, out.State = DeliveryMerged, domain.BeadStateClosed
+			return out, nil
+		}
+	})
+	rig := glueSetup(t, bd, ConductorOptions{
+		Feedback: feedback, Delivery: delivery, States: NewStateMachine(glueStore{bd: bd}), DeliveryAttempts: 2,
+	}, config.RunSettings{})
+	require.NoError(t, rig.Run.Start(context.Background()))
+	require.NoError(t, rig.Run.SetEpic("sc-epic"))
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	require.Len(t, delivery.sent(), 1)
+	require.Equal(t, domain.BeadStateDelivering, bd.state("sc-1"))
+
+	// The gate sends the pending delivery back, and the whole feedback round
+	// finishes before another listing can show the bead outside approved.
+	bd.set("sc-1", domain.BeadStateChangesRequested)
+	require.NoError(t, rig.Cond.ApplyOutcome(context.Background(), "sc-1", &DeliveryOutcome{
+		Bead: "sc-1", Kind: DeliveryCheckFailed, State: domain.BeadStateChangesRequested, Round: 1,
+		Items: []domain.FeedbackItem{{ID: "check-r1-1", Severity: domain.SeverityBlocker, Status: domain.ItemOpen}},
+	}))
+	assert.Equal(t, []domain.BeadID{"sc-1"}, feedback.checks, "the check failure is routed once")
+	bd.set("sc-1", domain.BeadStateApproved)
+
+	require.NoError(t, rig.Cond.Sync(context.Background()))
+	rig.Cond.WaitDeliveries()
+	sent := delivery.sent()
+	require.Len(t, sent, 3, "the re-delivery and its retry both run")
+	assert.Equal(t, domain.BeadStateApproved, sent[1].Bead.State)
+	assert.Equal(t, domain.BeadStateDelivering, sent[2].Bead.State)
+	assert.Equal(t, domain.BeadStateClosed, bd.state("sc-1"))
+	assert.NotEqual(t, domain.BeadStateNeedsHuman, bd.state("sc-1"), "a transient push failure does not need a person")
+	assert.Equal(t, []domain.BeadID{"sc-1"}, feedback.checks, "recovery sends no duplicate feedback")
+	assert.Equal(t, domain.BeadStateClosed, feedback.seen("sc-1"))
+
+	require.NoError(t, rig.Run.Stop("test"))
+	_, err := rig.Run.Wait()
+	require.NoError(t, err)
+}
+
 // The retries are bounded: something that fails every time is not retried
 // for the life of the run. The bead goes to a person — needs_human is
 // terminal, so a brief run can finish — and the run says so in words the

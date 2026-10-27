@@ -858,11 +858,11 @@ func (s *Supervisor) supervise(ctx context.Context, f AgentFiring, exec supExec)
 		failure := agents.FailureOf(err)
 		kind := cartridge.KindOf(err)
 		retryable := supRetryable(err, failure, kind)
-		if ctx.Err() != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
 			// The caller (or the run) gave up: never a retry, and never the
 			// cartridge's fault.
 			s.failed(h, agent, f, tr, dur, events.FailureKilled, err, attempt, false)
-			return tr, err
+			return tr, errors.Join(ctxErr, err)
 		}
 
 		switch {

@@ -655,7 +655,7 @@ func TestSchedulerAllocationTable(t *testing.T) {
 		alloc, err := config.Allocate(tc.ammo)
 		require.NoError(t, err, tc.ammo)
 		caps := CapsFor(alloc)
-		assert.Equal(t, SlotCaps{Ammo: tc.ammo, PO: tc.po, Engineers: tc.engineers, Testers: tc.testers}, caps, tc.ammo)
+		assert.Equal(t, SlotCaps{Ammo: tc.ammo, PO: tc.po, Planning: 1, Engineers: tc.engineers, Testers: tc.testers}, caps, tc.ammo)
 		assert.Equal(t, tc.per, caps.TestersPerBead(), tc.ammo)
 		assert.Equal(t, tc.line, caps.String(), tc.ammo)
 		assert.Equal(t, tc.ammo, caps.PO+caps.Engineers+caps.Testers, "the pools add up to ammo")
@@ -670,8 +670,8 @@ func TestSchedulerAllocationTable(t *testing.T) {
 // firing one agent of each role rather than nothing at all.
 func TestSchedulerCapsFallBackToTheMinimum(t *testing.T) {
 	t.Parallel()
-	assert.Equal(t, SlotCaps{Ammo: 3, PO: 1, Engineers: 1, Testers: 1}, CapsFor(config.Allocation{}))
-	assert.Equal(t, SlotCaps{Ammo: 3, PO: 1, Engineers: 1, Testers: 1}, CapsFor(config.Allocation{Ammo: 2}))
+	assert.Equal(t, SlotCaps{Ammo: 3, PO: 1, Planning: 1, Engineers: 1, Testers: 1}, CapsFor(config.Allocation{}))
+	assert.Equal(t, SlotCaps{Ammo: 3, PO: 1, Planning: 1, Engineers: 1, Testers: 1}, CapsFor(config.Allocation{Ammo: 2}))
 	assert.Equal(t, 1, CapsFor(config.Allocation{}).TestersPerBead())
 }
 
@@ -682,7 +682,7 @@ func TestSchedulerTakesItsAllocationFromTheRun(t *testing.T) {
 	schedEventually(t, "the scheduler to read the run's allocation", func() bool {
 		return f.Sched.Caps().Ammo == 13
 	})
-	assert.Equal(t, SlotCaps{Ammo: 13, PO: 1, Engineers: 3, Testers: 9}, f.Sched.Caps())
+	assert.Equal(t, SlotCaps{Ammo: 13, PO: 1, Planning: 1, Engineers: 3, Testers: 9}, f.Sched.Caps())
 }
 
 // TestSchedulerSaturatesEveryPool fires against unlimited demand of every
@@ -879,6 +879,157 @@ func TestSchedulerFillsThePOSlotWithArbitrationFirst(t *testing.T) {
 	t.Cleanup(gate.Open)
 	schedEventually(t, "the PO to be fired", func() bool { return len(gate.Firings()) == 1 })
 	assert.Equal(t, []domain.AgentID{"po-sc-1-r2"}, gate.AgentIDs())
+}
+
+func TestSchedulerPlanningCapIsIndependentOfArbitration(t *testing.T) {
+	gate := newSchedGate()
+	f := schedSetup(t, 4, SchedulerOptions{
+		Planning: 2,
+		Work: schedStatic(
+			Demand{Kind: DemandPlan, Round: 7, Agent: "po-plan-r7", Slots: 2, Task: events.Task("judge")},
+			Demand{Kind: DemandArbitrate, Bead: "sc-1", Round: 2},
+			Demand{Kind: DemandArbitrate, Bead: "sc-2", Round: 2},
+		),
+		Fire: gate,
+	})
+	t.Cleanup(gate.Open)
+	schedEventually(t, "arbitration and the two-session planning round", func() bool { return len(gate.Firings()) == 2 })
+	assert.ElementsMatch(t, []domain.AgentID{"po-sc-1-r2", "po-plan-r7"}, gate.AgentIDs())
+	st := f.Sched.Status()
+	require.Len(t, st.Agents, 2)
+	assert.Equal(t, domain.AgentID("po-sc-1-r2"), st.Agents[0].ID, "arbitration is dispatched first")
+	assert.Equal(t, 3, st.Live)
+	assert.Equal(t, 3, st.ByRole[domain.RolePO])
+	f.Sched.mu.Lock()
+	planning, arbitration := f.Sched.demandsOn(DemandPlan), f.Sched.demandsOn(DemandArbitrate)
+	f.Sched.mu.Unlock()
+	assert.Equal(t, 2, planning)
+	assert.Equal(t, 1, arbitration)
+	assert.Equal(t, 2, f.Sched.Caps().Planning)
+	assert.Equal(t, 1, f.Sched.Caps().PO)
+}
+
+func TestSchedulerDemandSlotsReservationAccounting(t *testing.T) {
+	t.Parallel()
+	for _, slots := range []int{0, 1} {
+		s := NewScheduler(SchedulerOptions{})
+		d := Demand{Kind: DemandPlan, Slots: slots}
+		require.True(t, s.reserve(d))
+		assert.Equal(t, 1, s.Live())
+		assert.Equal(t, 1, s.demandsOn(DemandPlan))
+		assert.Equal(t, 1, s.byRole[domain.RolePO])
+		s.unreserve(d)
+		assert.Zero(t, s.Live())
+		assert.Zero(t, s.demandsOn(DemandPlan))
+		assert.Zero(t, s.byRole[domain.RolePO])
+	}
+
+	s := NewScheduler(SchedulerOptions{Planning: 4})
+	round := Demand{Kind: DemandPlan, Agent: "po-plan-r1", Slots: 2}
+	next := Demand{Kind: DemandPlan, Agent: "po-plan-r2", Slots: 2}
+	require.True(t, s.reserve(round))
+	assert.Equal(t, 2, s.Live())
+	assert.Equal(t, 2, s.demandsOn(DemandPlan))
+	assert.False(t, s.reserve(next), "one free ammo slot cannot fit a two-session round")
+	s.unreserve(round)
+	assert.Zero(t, s.usedSlots)
+	assert.Zero(t, s.byRole[domain.RolePO])
+	require.True(t, s.reserve(next), "unreserve returns every slot to the pool")
+	s.unreserve(next)
+	assert.Zero(t, s.usedSlots)
+	assert.False(t, s.reserve(Demand{Kind: DemandPlan, Slots: 4}), "a round larger than ammo never reserves partial capacity")
+	assert.Zero(t, s.usedSlots)
+	assert.Zero(t, s.byRole[domain.RolePO])
+}
+
+func TestSchedulerWeightedPlanningRoundWaitsForTheNextWave(t *testing.T) {
+	tokens := make(chan struct{})
+	var mu sync.Mutex
+	var ids []domain.AgentID
+	fire := FirerFunc(func(ctx context.Context, f Firing) (FireResult, error) {
+		mu.Lock()
+		ids = append(ids, f.Agent.ID)
+		mu.Unlock()
+		select {
+		case <-tokens:
+			return FireResult{}, nil
+		case <-ctx.Done():
+			return FireResult{}, ctx.Err()
+		}
+	})
+	demands := []Demand{
+		{Kind: DemandPlan, Round: 3, Order: 1, Agent: "po-plan-r3-p1", Slots: 2},
+		{Kind: DemandPlan, Round: 3, Order: 2, Agent: "po-plan-r3-p2", Slots: 2},
+	}
+	f := schedSetup(t, 3, SchedulerOptions{Planning: 4, Work: schedStatic(demands...), Fire: fire})
+	t.Cleanup(func() { close(tokens) })
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(ids)
+	}
+	schedEventually(t, "the first weighted planning round", func() bool { return count() == 1 })
+	assert.Equal(t, 2, f.Sched.Live())
+	assert.Equal(t, 2, f.Sched.Status().ByRole[domain.RolePO])
+	ticks := f.Sched.Status().Ticks
+	f.Clock.Advance(2 * DefaultTickInterval)
+	schedEventually(t, "another dispatch", func() bool { return f.Sched.Status().Ticks > ticks })
+	assert.Equal(t, 1, count(), "the second round waits for two free slots")
+	tokens <- struct{}{}
+	schedEventually(t, "the second weighted planning round", func() bool { return count() == 2 })
+	assert.LessOrEqual(t, f.Sched.Live(), 3)
+}
+
+func TestSchedulerPlanningAboveAmmoRunsInWaves(t *testing.T) {
+	tokens := make(chan struct{})
+	var mu sync.Mutex
+	var ids []domain.AgentID
+	fire := FirerFunc(func(ctx context.Context, f Firing) (FireResult, error) {
+		mu.Lock()
+		ids = append(ids, f.Agent.ID)
+		mu.Unlock()
+		select {
+		case <-tokens:
+			return FireResult{}, nil
+		case <-ctx.Done():
+			return FireResult{}, ctx.Err()
+		}
+	})
+	var demands []Demand
+	for i := 1; i <= 5; i++ {
+		demands = append(demands, Demand{
+			Kind: DemandPlan, Round: 3, Order: i,
+			Agent: domain.AgentID(fmt.Sprintf("po-plan-r3-p%d", i)),
+		})
+	}
+	f := schedSetup(t, 3, SchedulerOptions{Planning: 5, Work: schedStatic(demands...), Fire: fire})
+	t.Cleanup(func() { close(tokens) })
+	count := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(ids)
+	}
+	schedEventually(t, "the first ammo-sized planning wave", func() bool { return count() == 3 })
+	assert.Equal(t, 3, f.Sched.Live())
+	f.Clock.Advance(2 * DefaultTickInterval)
+	assert.Equal(t, 3, count(), "the fourth planner waits for ammo")
+	tokens <- struct{}{}
+	schedEventually(t, "the fourth planner", func() bool { return count() == 4 })
+	tokens <- struct{}{}
+	schedEventually(t, "the fifth planner", func() bool { return count() == 5 })
+	assert.LessOrEqual(t, f.Sched.Live(), 3)
+}
+
+func TestSchedulerParallelPlanIDsIncludeRoundWithoutChangingLegacyIDs(t *testing.T) {
+	t.Parallel()
+	legacy := NewScheduler(SchedulerOptions{})
+	assert.Equal(t, domain.AgentID("po-plan-1"), legacy.mintAgentID(Demand{Kind: DemandPlan, Round: 4}, 1))
+	parallel := NewScheduler(SchedulerOptions{Planning: 2})
+	assert.Equal(t, domain.AgentID("po-plan-r4-1"), parallel.mintAgentID(Demand{Kind: DemandPlan, Round: 4}, 1))
+	assert.Equal(t, "plan|||0", (Demand{Kind: DemandPlan}).Key())
+	assert.NotEqual(t,
+		(Demand{Kind: DemandPlan, Round: 4, Agent: "po-plan-r4-p1"}).Key(),
+		(Demand{Kind: DemandPlan, Round: 4, Agent: "po-plan-r4-p2"}).Key())
 }
 
 // TestSchedulerSortsDemandsInTheD05Order pins the ordering the dispatcher
@@ -2135,7 +2286,7 @@ func TestSchedulerDefaults(t *testing.T) {
 	assert.Equal(t, beads.DefaultRenewInterval, s.renew)
 	assert.Equal(t, DefaultDrainGrace, s.drain)
 	assert.NotNil(t, s.clock)
-	assert.Equal(t, SlotCaps{Ammo: 3, PO: 1, Engineers: 1, Testers: 1}, s.Caps())
+	assert.Equal(t, SlotCaps{Ammo: 3, PO: 1, Planning: 1, Engineers: 1, Testers: 1}, s.Caps())
 	assert.Zero(t, s.Live())
 
 	// A kick that nobody is waiting for is dropped, never blocked on.

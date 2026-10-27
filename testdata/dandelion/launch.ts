@@ -18,7 +18,8 @@ const TARGETS: Record<string, Target> = {
   'codex-animus': { command: 'codex', modelFlag: '--model', effortConfig: 'model_reasoning_effort' },
   cursor: { command: 'cursor-agent', modelFlag: '--model' },
   junie: { command: 'junie', modelFlag: '--model' },
-  hermes: { command: 'hermes', modelFlag: '--model' }
+  hermes: { command: 'hermes', modelFlag: '--model' },
+  kilo: { command: 'kilo', modelFlag: '--model', effortFlag: '--variant' }
 };
 
 type AccountHome = { variable: string; name: string; fallback: string };

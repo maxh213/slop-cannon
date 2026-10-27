@@ -1,0 +1,12 @@
+{"type":"thread.started","thread_id":"thread-123"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"id":"cmd-1","type":"command_execution","command":"go test ./...","status":"in_progress"}}
+{"type":"item.completed","item":{"id":"cmd-1","type":"command_execution","command":"go test ./...","aggregated_output":"ok ./pkg\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"edit-1","type":"file_change","changes":[{"path":"pkg/a.go","kind":"update"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"edit-1","type":"file_change","changes":[{"path":"pkg/a.go","kind":"update"}],"status":"completed"}}
+{"type":"item.started","item":{"id":"mcp-1","type":"mcp_tool_call","server":"docs","tool":"lookup","arguments":{"query":"codex"},"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"mcp-1","type":"mcp_tool_call","server":"docs","tool":"lookup","result":{"content":[{"type":"text","text":"found"}]},"status":"completed"}}
+{"type":"item.completed","item":{"id":"web-1","type":"web_search","query":"Codex JSON events","status":"completed"}}
+{"type":"item.completed","item":{"id":"reason-1","type":"reasoning","text":"private reasoning"}}
+{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"IMPLEMENTED"}}
+{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":800,"cache_write_input_tokens":100,"output_tokens":42,"reasoning_output_tokens":17}}

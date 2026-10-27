@@ -157,6 +157,7 @@ func TestRedactedDoesNotWriteThroughTheCallersSlices(t *testing.T) {
 	events.Redacted(events.GraphChanged{Meta: redactMeta(), Beads: beads}, strings.ToUpper)
 	events.Redacted(events.VerdictReceived{Meta: redactMeta(), Verdict: domain.Verdict{Items: items}}, strings.ToUpper)
 	events.Redacted(events.ResponseReceived{Meta: redactMeta(), Report: &report}, strings.ToUpper)
+	events.Redacted(events.PlanReviewed{Candidate: "p1:a"}, strings.ToUpper)
 
 	require.Equal(t, "keep me", beads[0].Title)
 	require.Equal(t, "keep me", items[0].Title)

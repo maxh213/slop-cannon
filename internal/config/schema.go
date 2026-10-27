@@ -79,6 +79,8 @@ const (
 	// the surplus is not an option: it would break the dependencies of the
 	// beads that stayed.
 	DefaultMaxBeadsPerPlan = 8
+	// DefaultPOPlanners preserves the single-planner planning pipeline.
+	DefaultPOPlanners = 1
 	// DefaultNice is the scheduling niceness a run gives itself and so every
 	// process it starts: agents, check commands and the browsers their test
 	// suites open. A dozen agents running a test suite at once can saturate
@@ -147,10 +149,10 @@ const (
 	MaxPromptFileSize = 64 * 1024
 )
 
-// KnownCartridges lists every cartridge name sc can drive: Claude Code and
-// Cursor Agent (D-29, superseding the Claude-only scope of D-19), and the
-// dandelion quota router in front of them (D-30); more adapters are planned.
-var KnownCartridges = []string{"claude", "cursor", "dandelion"}
+// KnownCartridges lists every directly configurable cartridge. codex-animus
+// is deliberately absent: it is a dandelion account driven through codex, not
+// a separate cartridge registration.
+var KnownCartridges = []string{"claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo"}
 
 // DandelionModes are the values [cartridges.dandelion] model may take
 // (D-30): "high" asks the router for the strongest model that still has
@@ -359,6 +361,8 @@ type File struct {
 	ReReviewThreshold *float64 `toml:"re_review_threshold,omitempty"`
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02).
 	MaxBeadsPerPlan *int `toml:"max_beads_per_plan,omitempty"`
+	// POPlanners is how many planning product owners may work in one round.
+	POPlanners *int `toml:"po_planners,omitempty"`
 	// Nice is the niceness a run gives itself and its children; 0 leaves it.
 	Nice *int `toml:"nice,omitempty"`
 	// Research lets the planning product owner search and read the web.
@@ -484,6 +488,9 @@ type Config struct {
 	// MaxBeadsPerPlan caps how many beads one PO plan may propose (P5-02);
 	// always at least 1.
 	MaxBeadsPerPlan int `json:"max_beads_per_plan"`
+	// POPlanners is the planning concurrency and the multiplier for the
+	// combined accepted-bead and signals-backlog caps.
+	POPlanners int `json:"po_planners"`
 	// Nice is the niceness (0-19) a run applies to itself, which every
 	// process it starts inherits; 0 leaves the priority alone.
 	Nice int `json:"nice"`
@@ -535,6 +542,7 @@ func Defaults() Config {
 		MaxDiffBytes:       DefaultMaxDiffBytes,
 		ReReviewThreshold:  DefaultReReviewThreshold,
 		MaxBeadsPerPlan:    DefaultMaxBeadsPerPlan,
+		POPlanners:         DefaultPOPlanners,
 		Nice:               DefaultNice,
 		Limits: Limits{
 			MaxReviewRounds:   DefaultMaxReviewRounds,

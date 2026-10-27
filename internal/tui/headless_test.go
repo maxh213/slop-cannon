@@ -114,6 +114,8 @@ func headlessRecording() []events.Event {
 		},
 		events.AgentOutput{Meta: c.meta(), Agent: poID, Stream: events.StreamStdout, Line: "reading the repository"},
 		events.AgentFinished{Meta: c.meta(), Agent: poID, Role: domain.RolePO, Duration: 12 * time.Second, Produced: domain.MessagePlan},
+		events.PlanReviewed{Meta: c.meta(), Planner: poID, Candidate: "p2:retry", Decision: domain.PlanReviewDuplicate,
+			Canonical: "p1:retry", Provenance: domain.PlanProvenanceDeterministic},
 		events.PlanProduced{
 			Meta: c.meta(), Agent: poID, Epic: epic,
 			Plan: domain.Plan{Brief: run.Brief, Beads: []domain.PlanBead{

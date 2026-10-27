@@ -59,14 +59,15 @@ line and the column of the offending value like every other parse error
 | `exclude` | string array | `[]` | both | Extra path globs an agent must never be shown, on top of the always-on `.env`, `.env.*`, `*.env`, `*.pem` and `id_*` patterns (P9-05). A pattern is matched against a path's base name, its whole repository-relative path and every parent directory, so `certs` hides `certs/server.key`. Lists union global-then-repo, and the entries are globs rather than paths, so they are never resolved against the config file's directory. A withheld file is left out of the tree an agent sees and its diff is replaced by a placeholder that names neither the path nor the pattern. This key is the path half of secrets hygiene; the value half masks credentials wherever they are printed — see [Secrets: withheld files and masked values](#secrets-withheld-files-and-masked-values). |
 | `check_command` | string | `""` | both | Command run in the worktree before a safety-off merge. Empty or blank means autodetect in this order: `make test` (a Makefile with a `test` target), `npm test` (a `package.json` with a `test` script), `go test ./...`, `pytest`, `cargo test`, by the files present. Nothing detected means no check runs. |
 | `idle_replan_interval` | duration > 0 | `"10m"` | both | Autopilot only: when the PO has nothing to add, the run idles this long before planning again (D-18). |
-| `signals_command` | string | `""` (off) | both | Autopilot only: a read-only command that prints what production is saying — recent errors from an error tracker, a log query, a chat export (P6-71, D-32). Like `check_command` it is run with `sh -c` in the repository root with your whole environment, so it can use the tokens your shell already has; **sc runs it, never the product owner**, whose shell stays the read-only allow-list. Its standard output (the last 32 KiB, cut at a line boundary, with control characters scrubbed and secrets masked) is given to the planning product owner, fenced as untrusted evidence, every time it plans; it is told to propose fixes for real issues first, to cite evidence by reference (an error id, a timestamp, a room or conversation id) and never to copy names, email addresses or message text into a bead; a plan that does is rejected and sent back to it with the reason before anything reaches bd — sc checks every bead's title, description and acceptance criteria (and the plan's brief) for an email address, a phone number or an IP address that the reading contains, and for 8 or more of the reading's words in a row, without quoting what was copied. That check is mechanical, not a privacy guarantee: a name on its own is not caught. What it prints is kept with the run like every prompt (in the run directory's `prompts/` and the transcripts), so give the run directory the care you give that output; keep tokens in the environment rather than written into the command, which `sc config show` and the run's state show as written. Only a bounded tail of its output is held while it runs. A command that fails, exits non-zero or times out never fails a plan: it is one warning per kind of failure (an exit status, a timeout) and a one-line note in the prompt; a reading cut short by the run stopping is dropped without a warning. A changed reading that prints something also offers a plan of its own while engineers are busy, at most once per `signals_interval`, not while every bead of the previous signals-driven plan is still `open`, not while the run already has `max_beads_per_plan` or more beads still to ship (open, in progress, in review, changes requested, approved, delivering or escalated; a bd listing that fails counts as full), so the backlog never outgrows what the run and `auto_merge_spacing` can ship, and not during the `idle_replan_interval` hold after a plan that added nothing or failed. That plan is told engineers are still busy and to propose fixes for the new evidence alone, never duplicates of open or in-progress beads. The first reading after `sc resume` is the baseline: only a change from it offers a plan. Brief runs never run it. Because a repository's own `.slop-cannon/config.toml` can set it, read that file before you fire at a repository you did not write, as you would for `check_command`. |
+| `signals_command` | string | `""` (off) | both | Autopilot only: a read-only command that prints what production is saying — recent errors from an error tracker, a log query, a chat export (P6-71, D-32). Like `check_command` it is run with `sh -c` in the repository root with your whole environment, so it can use the tokens your shell already has; **sc runs it, never the product owner**, whose shell stays the read-only allow-list. Its standard output (the last 32 KiB, cut at a line boundary, with control characters scrubbed and secrets masked) is given to the planning product owner, fenced as untrusted evidence, every time it plans; it is told to propose fixes for real issues first, to cite evidence by reference (an error id, a timestamp, a room or conversation id) and never to copy names, email addresses or message text into a bead; a plan that does is rejected and sent back to it with the reason before anything reaches bd — sc checks every bead's title, description and acceptance criteria (and the plan's brief) for an email address, a phone number or an IP address that the reading contains, and for 8 or more of the reading's words in a row, without quoting what was copied. That check is mechanical, not a privacy guarantee: a name on its own is not caught. What it prints is kept with the run like every prompt (in the run directory's `prompts/` and the transcripts), so give the run directory the care you give that output; keep tokens in the environment rather than written into the command, which `sc config show` and the run's state show as written. Only a bounded tail of its output is held while it runs. A command that fails, exits non-zero or times out never fails a plan: it is one warning per kind of failure (an exit status, a timeout) and a one-line note in the prompt; a reading cut short by the run stopping is dropped without a warning. A changed reading that prints something also offers a plan of its own while engineers are busy, at most once per `signals_interval`, not while every bead of the previous signals-driven plan is still `open`, not while the run already has `po_planners × max_beads_per_plan` or more beads still to ship (open, in progress, in review, changes requested, approved, delivering or escalated; a bd listing that fails counts as full), so the backlog never outgrows what the run and `auto_merge_spacing` can ship, and not during the `idle_replan_interval` hold after a plan that added nothing or failed. That plan is told engineers are still busy and to propose fixes for the new evidence alone, never duplicates of open or in-progress beads. The first reading after `sc resume` is the baseline: only a change from it offers a plan. Brief runs never run it. Because a repository's own `.slop-cannon/config.toml` can set it, read that file before you fire at a repository you did not write, as you would for `check_command`. |
 | `signals_interval` | duration > 0 | `"30m"` | both | Least time between two runs of `signals_command`. A plan in between uses the last reading; `sc status` shows when it last ran, its exit code, its size and when it is next due. |
 | `gate_poll_interval` | duration > 0 | `"1m"` | both | Safety on only: how often the run asks bd whether the pull request behind a `gh:pr` gate has merged, so the bead closes (P6-10, D-20). Each poll runs `gh pr view` once per open gate. |
 | `pr_poll_interval` | duration > 0 | `"1m"` | both | How often the run asks GitHub for open pull requests it did not open, so it can review them (D-11, P8-04). Each poll runs `gh pr list` once. It also bounds how quickly a review bead is settled when its pull request is merged or closed while the review is still in flight (P8-11), so a run shorter than one interval polls exactly once, at the start. Only used when external review is on — see `--review-prs`. |
 | `graph_poll_interval` | duration > 0 | `"2s"` | both | How often the standalone graph watcher lists the beads database (P3-07). Each poll runs one `bd list`, which costs about 0.2 s of bd time; a longer interval makes the graph lag, a shorter one competes with the run's own writes. **Not read by `sc run` today**: a run syncs the graph through its conductor instead, on that component's own faster cadence, and the watcher this key configures has no production caller yet (P1-20). Setting it changes nothing until it does. |
 | `max_diff_bytes` | integer ≥ 1024 | `204800` (200 KiB) | both | The largest unified diff a reviewer is handed in full (P4-04). A bigger change set comes back as a file list with per-file statistics and the testers open the files themselves. At least 1 KiB: a smaller cap truncates every diff to nothing, and `0` would be read as "use the default" rather than "show nothing". |
 | `re_review_threshold` | number in (0, 1] | `0.4` | both | The D-09 fraction of changed lines above which an earlier approval no longer stands: when a round moved more than this share of the change set, every tester re-reviews instead of only those who did not approve. `1` means only a complete rewrite does that; `0` is refused because it would be read as "use the default". |
-| `max_beads_per_plan` | integer ≥ 1 | `8` | both | How many beads one PO planning firing may propose. A plan with more is rejected outright and the PO is asked to redo it — the surplus is never trimmed, because dropping beads would break the dependencies of the ones that stayed (P5-02). |
+| `max_beads_per_plan` | integer ≥ 1 | `8` | both | How many beads one PO planning producer may propose. A producer over this cap is rejected and asked to redo it — the surplus is never trimmed, because dropping beads would break the dependencies of the ones that stayed (P5-02). With `po_planners = N`, all candidates also share one proposed and accepted graph cap of `N × max_beads_per_plan`; exceeding that combined cap rejects the round rather than trimming it. The default one producer therefore retains the original cap of 8. |
+| `po_planners` | integer ≥ 1 | `1` | both | How many independent PO producers run in one planning round (D-41). Values below 1 fail validation with `po_planners: must be at least 1`. The default preserves the exact legacy demand (zero `Slots`, treated as one), one `po-plan-1` producer, no semantic judge, no candidate namespacing and no contributor list. Above 1, producer IDs are unique, all producers finish before review or graph writes, and one combined round reserves N slots atomically; overall used slots never exceed `ammo`, and a round larger than ammo cannot reserve partial capacity. Planning and arbitration have independent caps; a planning cap above ammo is filled in ammo-sized waves, but that does not make an oversized weighted round reservable. The combined proposed/accepted cap is `N × max_beads_per_plan` (**16** at N=2 with the default 8). All contributors in a round share one signals reading, and the signals-backlog threshold uses the same combined cap. Animus intends `2`; that is intended configuration, not a deployment claim. |
 | `nice` | integer 0-19 | `10` | both | Scheduling niceness a run gives itself before it fires anything, so every agent, check command and test browser it starts inherits it and a busy run does not starve the rest of the machine. `0` leaves the priority alone; `19` is the lowest. A run that cannot lower its priority says so and fires anyway. |
 | `research` | bool | `true` | both | Lets the planning product owner search and read the web (the CLI's WebSearch and WebFetch; nothing else is added), so an autopilot plan researches comparable products before it pitches features. Only planning firings get it. `false` keeps the product owner to the repository. |
 | `auto_merge` | bool | `false` | both | Safety on only (refused with `safety = false`): the run squash-merges **the pull requests it opened itself** once they are green, instead of waiting for a human (D-31). A pull request is merged only when every clause of the ownership check holds — its head is exactly the bead's `sc/<id>-<slug>` branch, its base is the default branch, it carries the `slop-cannon` label, its body's marker names this run and this bead, its number is the bead's `sc_pr_number`, it was created after the run first started, and its author is the `gh` login — and only when its head is the commit the run delivered and its testers approved (`sc_pr_head`) or that commit plus the clean merges of the default branch GitHub made because the run asked it to (`gh pr update-branch`, recorded in `state.json` first; a commit anybody else pushed to the branch, or an update the run did not ask for, sends the bead to `needs_human`), the bead's local branch has no approved commits the pull request lacks yet (a re-delivery that has not pushed waits), it is open, not a draft, has at least one check, every check has finished and passed, every `auto_merge_checks` name is among them, GitHub reports it `CLEAN`, and `auto_merge_spacing` has passed since the run's last merge. The merge is exactly `gh pr merge <n> --squash --match-head-commit <sha>`: never `--admin`, `--auto` or `--delete-branch`, so branch protection is never bypassed and a push after the checks ran cancels it. Refused without at least one `auto_merge_checks` name. A pull request whose head does not contain the default branch's current tip is updated by GitHub first (`gh pr update-branch`, once per head commit GitHub accepted it for) and merged only once its checks have passed again on the updated head: the run checks the ancestry itself (`git merge-base --is-ancestor`), because GitHub reports a pull request `BEHIND` only when branch protection requires branches to be up to date, and without that a pull request tested before the run's previous merge would still read `CLEAN`; a conflicted one, or one with a failed check, goes back to its engineer as a change request (once per head, kept across a resume); a blocked one (a required review) waits. Nothing that existed before the run started is ever merged. Frozen with the run, so `--resume` keeps it; `--auto-merge` overrides it like `--safety`. |
@@ -85,11 +86,11 @@ line and the column of the offending value like every other parse error
 | `limits.max_plan_rejections` | integer ≥ 1 | `2` | both | How many plans in a row the planning validator may reject before the run gives up on that round of planning (P6-19). One rejection has already cost two plans: a rule failure is retried once inside the firing itself. A brief run that gives up finishes and says so; an autopilot run cools off and plans again (D-18). **The floor of 1 is deliberate**: the Go option behind this key (`orchestrator.PlannerOptions.RejectionLimit`) reads a negative value as "never give up", and the file cannot say that on purpose — a plan the validator keeps rejecting is a plan that keeps costing a product owner session, and in autopilot, which never ends on its own (D-18), "never give up" is a run that plans for ever with nothing to show. An embedder that wants it can pass the option; a config file cannot ask for it (P9-14). |
 | `limits.max_plan_failures` | integer ≥ 1 | `5` | both | How many planning firings in a row may fail for a reason that is not the plan's fault — a cartridge crash, an agent timeout, an unreadable rules file — before the run gives up on that round the same way. Looser than `max_plan_rejections` because the supervisor has already spent its own retries on those failures. Its floor of 1 is deliberate for the same reason. |
 | `cartridges.<name>.model` | string | `""` | global | Model passed to the CLI, e.g. `fable` for Claude Code. For `dandelion` it is the router's mode instead and must be `high` (`dandelion route --high`), `standard` or empty (`dandelion route`); the router names the real model (D-30). |
-| `cartridges.<name>.command` | string | `<name>` (`cursor-agent` for `cursor`) | global | Executable to run instead of the default (a full path or a different binary). For `dandelion`, the router; the delegated `claude` and `cursor-agent` are always looked up on `PATH`. |
+| `cartridges.<name>.command` | string | `<name>` (`cursor-agent` for `cursor`) | global | Executable to run instead of the default (a full path or a different binary). For `dandelion`, the router; each delegated driver's binary is looked up on `PATH`. |
 | `cartridges.<name>.args` | string array | `[]` | global | Extra arguments prepended to every invocation. For `dandelion`, appended to the `dandelion route` call. |
-| `cartridges.<name>.env` | table of strings | `{}` | global | Extra environment variables for the CLI process. For `dandelion`, set on the router and on the delegated CLI (`DANDELION_CLAUDE_WORK_CONFIG_DIR` and the other account dirs are read from here first). |
+| `cartridges.<name>.env` | table of strings | `{}` | global | Extra environment variables for the CLI process. For `dandelion`, set on the router and delegated CLI. Account-home variables such as `DANDELION_CLAUDE_WORK_CONFIG_DIR` and `DANDELION_CODEX_ANIMUS_HOME` are read here first. |
 | `roles.<role>.cartridge` | string | `""` | both | Per-role cartridge override (`po`, `engineer`, `tester`), D-12: that role's agents fire on this configured cartridge, with its own `model`, instead of the active one. The role falls back to the active cartridge, with a warning, when this one fails its Detect probe. |
-| `roles.<role>.model` | string | `""` | both | Per-role model (`po`, `engineer`, `tester`): that role's agents are fired with this model instead of the cartridge's own, e.g. `roles.po.model = "claude-opus-5-5"` for a stronger planner while engineers and testers stay on the cartridge's model. Applies to every firing of the role, planning and arbitration alike. **Ignored for a role on `dandelion`**, whose router picks the model (D-30). |
+| `roles.<role>.model` | string | `""` | both | Per-role model (`po`, `engineer`, `tester`): that role's agents are fired with this model instead of the cartridge's own, e.g. `roles.po.model = "claude-opus-5-5"` for a stronger planner while engineers and testers stay on the cartridge's model. Applies to every firing of the role, planning and arbitration alike. For a role on `dandelion`, `standard` or `high` selects the per-firing route mode (case and whitespace tolerated); empty, other and legacy values fall back to the configured Dandelion mode, and the real routed model still replaces `spec.Model`. Role models are effective config, not `ConfigSnapshot` fields: current repo role-model changes apply on the next ordinary resume, while the active cartridge and its default model/mode stay frozen (D-39). |
 
 A budget pause is cleared from the TUI (`p` resumes a paused run), and only
 from there: `sc resume` restarts an *earlier* run from disk rather than
@@ -100,9 +101,56 @@ the cap stays in the run log, and the summary still reports what the run
 spent. Give a headless autopilot run a budget you are content for it to stop
 at, or run it in the TUI (P9-01, P9-14).
 
-The valid cartridge names are `claude`, `cursor` (D-29) and `dandelion`
-(D-30). Any other name, in a file or on the command line, fails with
-`cartridge "<name>" is not supported yet (only "claude", "cursor", "dandelion" for now)`.
+The valid cartridge names are `claude`, `cursor`, `dandelion`, `agy`, `codex`,
+`kimi`, `grok`, `junie`, `hermes` and `kilo`. `codex-animus` is deliberately
+not a direct cartridge: it is a Dandelion provider driven through `codex`
+with an isolated `CODEX_HOME`. Any other name, in a file or on the command
+line, fails with `cartridge "<name>" is not supported yet (only "claude",
+"cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes",
+"kilo" for now)`.
+
+A direct Kilo configuration uses the ordinary cartridge keys:
+
+```toml
+[cartridges.kilo]
+model = "deepseek/deepseek-v4.1-flash-1017"
+args = ["--variant", "max"]
+```
+
+Kilo CLI 7.5.6 runs with `KILO_NO_DAEMON=1`, project configuration and
+automatic updates disabled, a generated in-memory agent config, and the
+complete combined prompt on stdin. `read_exec` and `read_write` are supported;
+`read_only` is refused. Configured arguments come before the mandatory
+invocation controls, so they cannot weaken those controls. At the CLI argument
+boundary, the pinned Dandelion model becomes
+`kilo/deepseek/deepseek-v4.1-flash-1017`; direct custom IDs and the
+unqualified route model in `RunSpec.Model` and logs are not rewritten.
+
+`SC_KILO_MIN_BALANCE_USD=10` is an internal Dandelion control, not a general
+run-budget setting: Dandelion sets it for delegated Kilo and the adapter
+removes it from the Kilo child environment. Every delegated launch checks a
+fresh `kilo profile --json`; a profile failure or balance at or below the
+floor fails closed and reroutes without Kilo. The in-session allowance is
+`balance - floor`, best effort only: a final request can overshoot before its
+cost is reported, concurrent sessions can spend the same balance, and other
+clients or later billed steps can still take the account below $10. Direct
+Kilo use does not enable this Dandelion floor.
+
+The dashboard's systemd sandbox, not the sc TOML configuration, keeps
+`ProtectHome=read-only` and allows writes only through these narrow Kilo
+runtime startup/auth exceptions:
+
+```ini
+ReadWritePaths=~/.local/share/kilo
+ReadWritePaths=~/.cache/kilo
+ReadWritePaths=~/.local/state/kilo
+```
+
+No broader home write access or writable Dandelion quota cache is required.
+The dashboard API normalizes literal `$` to `USD`; its final live Kilo balance
+was `31.232105 USD`, rendered as `balance $31.23` exactly once with no
+synthetic gauge and with Kilo visible in `usage only` with zero windows.
+
 A common split puts engineers and testers on Cursor and keeps the product
 owner on Claude:
 
@@ -122,18 +170,38 @@ A role on a cartridge other than the active one gets that cartridge's own
 [cartridges.md § Cursor Agent](cartridges.md#cursor-agent-cursor) for what
 running testers on a CLI without tool controls costs.
 
-`dandelion` routes every firing to whichever Claude Code account (or, for
-engineers, `cursor`) still has quota, so it can be the only cartridge:
+`dandelion` routes each firing to an installed provider allowed by its tool
+policy, so it can be the only cartridge. The applied Animus setup uses
+`standard` for engineers and testers and `high` for the product owner, with
+all three role models sourced from the repo:
 
 ```toml
 active_cartridge = "dandelion"
 
 [cartridges.dandelion]
 model = "high"
+
+[roles.engineer]
+cartridge = "dandelion"
+model = "standard"
+
+[roles.tester]
+cartridge = "dandelion"
+model = "standard"
+
+[roles.po]
+cartridge = "dandelion"
+model = "high"
 ```
 
-Product owners and testers on it only ever run on Claude Code accounts, with
-Claude Code's own tool controls; see
+The PO did not fire during the bounded 180-second wait, so `roles.po.model =
+"high"` is verified from effective configuration rather than launch-log
+evidence.
+
+`read_only` routes only to Claude accounts; `read_exec` can also use Codex or
+Codex Animus, Kimi, Grok, Hermes or Kilo; `read_write` can use every routable
+provider. Kilo is a standard-route balance fallback only and never joins the
+high chain. See
 [cartridges.md § Dandelion](cartridges.md#dandelion-dandelion).
 
 ## Secrets: withheld files and masked values
@@ -194,10 +262,13 @@ is unchanged by a second pass.
 
 ## Ammo allocation (D-05)
 
-`ammo` is a concurrency cap, not a fixed roster. The scheduler reserves one
-slot for the product owner when it needs one, lets at most
+`ammo` is a concurrency cap, not a fixed roster. The ordinary allocation
+reserves one product-owner slot when one is needed, lets at most
 `max(1, floor((ammo - 1) / 4))` engineers work at once, and gives every
-remaining slot to testers so each engineer can have three reviewers.
+remaining slot to testers so each engineer can have three reviewers. A
+parallel planning demand instead reserves all `po_planners` slots atomically,
+as described in the key table; overall used slots still cannot exceed `ammo`.
+Planning and arbitration caps are independent.
 
 | ammo | PO | engineers | testers |
 |---|---|---|---|

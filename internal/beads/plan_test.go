@@ -42,7 +42,7 @@ func planRequest(epic domain.BeadID) PlanRequest {
 // for the create --graph keys, plus overrides.
 func planFake(t *testing.T, overrides map[string]string) (*Client, *testutil.Shim) {
 	t.Helper()
-	all := map[string]string{"create-graph-dry-run": "graph-dry-run", "create-graph": "graph-create"}
+	all := map[string]string{"create-graph-dry-run": "graph-dry-run", "create-graph": "graph-create", "show": "graph-blocked"}
 	for k, v := range overrides {
 		all[k] = v
 	}
@@ -212,7 +212,7 @@ func TestApplyPlanCreatesTheDiamond(t *testing.T) {
 	assert.Empty(t, res.Unfinished)
 
 	calls := bd.ArgLists(t)
-	require.Len(t, calls, 8, "dry run, real run, six acceptance updates")
+	require.Len(t, calls, 9, "dry run, real run, six acceptance updates, dependency verification")
 	assert.Equal(t, []string{"--dry-run", "--json"}, calls[0][5:])
 	assert.Equal(t, "--graph", calls[0][3])
 	assert.Equal(t, []string{"--json"}, calls[1][5:])
@@ -255,7 +255,7 @@ func TestApplyPlanExistingEpic(t *testing.T) {
 	assert.Equal(t, len(planDiamond().Beads), res.DryRun.ParentDeps, "every work bead carries parent_id in the plan (P3-18)")
 
 	calls := bd.ArgLists(t)
-	require.Len(t, calls, 9, "show epic, dry run, real run, six acceptance updates")
+	require.Len(t, calls, 10, "show epic, dry run, real run, six acceptance updates, dependency verification")
 	assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "show", "px-26w", "--json", "--include-comments"}, calls[0])
 	assert.Equal(t, []string{"-C", "/tmp/fixture-repo", "update", "px-we1", "--acceptance", "acceptance a", "--json"}, calls[3],
 		"the epic is joined in the create, so the finishing update only writes acceptance criteria (P3-18)")
@@ -273,7 +273,7 @@ func TestApplyPlanRejectsBadEpic(t *testing.T) {
 		assert.Len(t, bd.ArgLists(t), 1, "nothing is created")
 	})
 	t.Run("not an epic", func(t *testing.T) {
-		c, bd := planFake(t, nil) // show.json answers with a bug
+		c, bd := planFake(t, map[string]string{"show": "show"}) // show.json answers with a bug
 		_, err := c.ApplyPlan(context.Background(), planRequest("fx-so0"), false)
 		assert.ErrorIs(t, err, ErrInvalid)
 		assert.Contains(t, err.Error(), "not an epic")
@@ -310,6 +310,7 @@ func TestApplyPlanReportsRealRunWarnings(t *testing.T) {
 	bd := testutil.FakeBD(t, clientStage(t, map[string]string{
 		"create-graph-dry-run": "graph-dry-run",
 		"create-graph":         "graph-create-warning",
+		"show":                 "graph-blocked",
 	}))
 	var logs bytes.Buffer
 	c := New("/tmp/fixture-repo", Options{
@@ -372,11 +373,12 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --graph) cp "$2" "$SC_FAKEBIN_DIR/plan.$SC_FAKEBIN_SEQ.json"; shift ;;
     --dry-run) dry=1 ;;
-    create|update) cmd=$1 ;;
+    create|update|show) cmd=$1 ;;
   esac
   shift
 done
 if [ "$cmd" = update ]; then cat "$samples/update-acceptance.json"; exit 0; fi
+if [ "$cmd" = show ]; then cat "$samples/graph-blocked.json"; exit 0; fi
 if [ "$dry" = 1 ]; then cat "$samples/graph-dry-run.json"; else cat "$samples/graph-create.json"; fi`)
 	c := New("/repo", Options{})
 	res, err := c.ApplyPlan(context.Background(), planRequest(""), false)

@@ -133,6 +133,29 @@ func TestFollowEventLogClosesAfterTheRunFinishes(t *testing.T) {
 	followClosed(t, ch)
 }
 
+func TestFollowEventLogFollowsAcrossAResumeWithoutReplay(t *testing.T) {
+	dir := t.TempDir()
+	path := EventLogPath(dir)
+	first, ok := elogRun()[0].(events.RunStarted)
+	require.True(t, ok)
+	finished := events.RunFinished{Meta: elogAt(99), Reason: events.FinishStopped}
+	resumed := first
+	resumed.Meta = elogAt(100)
+	resumed.Resumed = true
+	followWrite(t, path, first, finished, resumed)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := FollowEventLog(ctx, dir, FollowOptions{Poll: followPoll, FollowResumed: true})
+	require.Equal(t, []events.Event{first, finished, resumed}, followTake(t, ch, 3))
+	followNothing(t, ch)
+
+	later := events.RunResumed{Meta: elogAt(101), Reason: "live append"}
+	followWrite(t, path, later)
+	require.Equal(t, later, followNext(t, ch))
+	followNothing(t, ch)
+}
+
 func TestFollowEventLogClosesWhenTheWriterIsGone(t *testing.T) {
 	dir := t.TempDir()
 	path := EventLogPath(dir)

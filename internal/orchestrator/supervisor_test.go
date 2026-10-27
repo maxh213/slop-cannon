@@ -569,6 +569,23 @@ func TestSupervisorWaitsOutARateLimitUntilTheRunStops(t *testing.T) {
 	assert.GreaterOrEqual(t, len(f.Sleeper.Waits()), 6, "six pauses and more, on a supervisor with no crash retries at all")
 }
 
+func TestSupervisorCancellationRetainsAttemptError(t *testing.T) {
+	f := supSetup(t, map[string]*mock.Scenario{supAlpha: supApproval("alpha")})
+	sup := f.supervisor(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	attemptErr := errors.New("injected attempt failure")
+
+	_, err := sup.supervise(ctx,
+		supTesterFiring("tester-qa-bd-6-r3", "bd-6", f.worktree(t, "bd-6")),
+		func(context.Context, agents.AgentRun) (agents.Transcript, error) {
+			cancel()
+			return agents.Transcript{}, attemptErr
+		})
+	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, attemptErr)
+}
+
 func TestSupervisorHonoursARetryAfterHint(t *testing.T) {
 	sc := mock.NewScenario("polite-limit")
 	sc.Rule("limited", mock.Match{}).Once().FailWith(mock.Failure{

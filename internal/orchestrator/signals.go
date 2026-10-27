@@ -333,8 +333,8 @@ func (p *Planner) signalsDueLocked(now time.Time) bool {
 //     open means nobody has picked any up yet, and another plan would only
 //     pile more on top of them);
 //   - fewer of the run's beads are still to be shipped (open, being worked
-//     on, in review, approved, delivering or escalated) than one plan may
-//     create (`max_beads_per_plan`). A reading with timestamps in it
+//     on, in review, approved, delivering or escalated) than one planning
+//     round may accept (`po_planners × max_beads_per_plan`). A reading with timestamps in it
 //     changes every interval, and with engineers busy a plan every
 //     `signals_interval` would otherwise queue beads far faster than the
 //     run (and auto-merge's spacing) can ship them; once the backlog is
@@ -367,7 +367,7 @@ func (p *Planner) signalsWantLocked(ctx context.Context, now time.Time) bool {
 		return false
 	case s.untouched:
 		return false
-	case s.outstanding < 0 || s.outstanding >= p.maxBeads:
+	case s.outstanding < 0 || s.outstanding >= p.maxBeads*max(p.poPlanners, 1):
 		return false
 	}
 	s.wanted = true

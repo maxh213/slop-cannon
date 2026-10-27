@@ -157,6 +157,8 @@ func DemoScript(opts DemoOptions) []ScriptedEvent {
 		},
 	}
 	b.add(events.AgentFinished{Meta: b.meta(), Agent: demoPO, Role: domain.RolePO, Duration: 12 * time.Second, Produced: domain.MessagePlan})
+	b.add(events.PlanReviewed{Meta: b.meta(), Planner: demoPO, Candidate: "p2:retry", Decision: domain.PlanReviewDuplicate,
+		Canonical: "p1:retry", Provenance: domain.PlanProvenanceDeterministic})
 	b.add(events.PlanProduced{
 		Meta:    b.meta(),
 		Agent:   demoPO,

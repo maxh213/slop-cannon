@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode"
 
 	"slop-cannon/internal/domain"
 )
@@ -48,6 +49,12 @@ var (
 	ErrPlanNodeCount = errors.New("dry-run node count does not match the plan")
 	// ErrPlanIDs means the real run did not return an id for every key.
 	ErrPlanIDs = errors.New("bd did not return an id for every plan key")
+	// ErrPlanGraph means a graph edge is malformed, dangling, duplicated or
+	// part of a cycle.
+	ErrPlanGraph = errors.New("invalid bead dependency graph")
+	// ErrPlanDependencies means the applied beads do not carry the requested
+	// local and external dependency edges.
+	ErrPlanDependencies = errors.New("applied bead dependencies do not match the plan")
 )
 
 // PlanEpicKey is the graph-plan key of the run epic when ApplyPlan creates
@@ -64,6 +71,9 @@ type PlanRequest struct {
 	// Plan is the PO's proposal; it must pass domain.Plan.Validate and hold
 	// at least one bead.
 	Plan domain.Plan
+	// ExternalDeps are reconciled edges from Plan keys to existing canonical
+	// beads. They are kept separate from agent-produced local dependencies.
+	ExternalDeps []domain.PlanExternalDependency
 	// Epic is the run's existing epic (from CreateRunEpic or FindRunEpic).
 	// When set, the beads are created as its children; when empty, an epic
 	// node is created in the same graph plan (EpicTitle, EpicDescription).
@@ -146,7 +156,8 @@ func buildPlan(req PlanRequest) (planBuild, error) {
 	if strings.TrimSpace(string(req.Run)) == "" {
 		return planBuild{}, fmt.Errorf("beads: build plan: %w: empty run id", ErrInvalid)
 	}
-	if err := req.Plan.Validate(); err != nil {
+	combined := domain.CombinedPlan{Plan: req.Plan, ExternalDeps: req.ExternalDeps}
+	if err := combined.Validate(); err != nil {
 		return planBuild{}, fmt.Errorf("beads: build plan: %w", err)
 	}
 	if len(req.Plan.Beads) == 0 {
@@ -203,6 +214,12 @@ func buildPlan(req PlanRequest) (planBuild, error) {
 		}
 		b.keys = append(b.keys, pb.Key)
 		b.acceptance[pb.Key] = pb.Acceptance
+	}
+	for _, dep := range req.ExternalDeps {
+		b.graph.Edges = append(b.graph.Edges, GraphEdge{FromKey: dep.FromKey, ToID: dep.ToID, Type: DepBlocks})
+	}
+	if err := ValidateGraphPlan(b.graph); err != nil {
+		return planBuild{}, fmt.Errorf("beads: build plan: %w", err)
 	}
 	return b, nil
 }
@@ -271,6 +288,9 @@ func GraphMetadata(m map[string]any) map[string]any {
 // len(plan.Edges) (ErrPlanEdgeCount), which for a plan built by
 // BuildGraphPlan is Plan.DependencyCount() (P3-15).
 func VerifyDryRun(plan GraphPlan, res GraphResult) error {
+	if err := ValidateGraphPlan(plan); err != nil {
+		return fmt.Errorf("beads: plan dry run: %w", err)
+	}
 	if len(res.Warnings) > 0 {
 		return fmt.Errorf("beads: plan dry run: %w: %s", ErrPlanWarning, strings.Join(res.Warnings, "; "))
 	}
@@ -283,12 +303,139 @@ func VerifyDryRun(plan GraphPlan, res GraphResult) error {
 	return nil
 }
 
+// ValidateGraphPlan checks both local and external dependency edges. Every
+// source and local target must name a node, every edge must have exactly one
+// target, and local edges must be acyclic. External target existence is
+// checked against the fresh tracker snapshot by ApplyPlan.
+func ValidateGraphPlan(plan GraphPlan) error {
+	keys := make(map[string]bool, len(plan.Nodes))
+	for _, node := range plan.Nodes {
+		if node.Key == "" || strings.TrimSpace(node.Key) != node.Key || strings.ContainsFunc(node.Key, unicode.IsSpace) {
+			return fmt.Errorf("%w: malformed node key %q", ErrPlanGraph, node.Key)
+		}
+		if keys[node.Key] {
+			return fmt.Errorf("%w: duplicate node key %q", ErrPlanGraph, node.Key)
+		}
+		keys[node.Key] = true
+	}
+	local := make(map[string][]string, len(plan.Nodes))
+	seen := make(map[GraphEdge]bool, len(plan.Edges))
+	for _, edge := range plan.Edges {
+		if !keys[edge.FromKey] {
+			return fmt.Errorf("%w: dependency source %q is not a node", ErrPlanGraph, edge.FromKey)
+		}
+		if (edge.ToKey == "") == (edge.ToID == "") {
+			return fmt.Errorf("%w: dependency from %q must have exactly one of to_key and to_id", ErrPlanGraph, edge.FromKey)
+		}
+		if seen[edge] {
+			return fmt.Errorf("%w: duplicate dependency from %q", ErrPlanGraph, edge.FromKey)
+		}
+		seen[edge] = true
+		if edge.ToKey != "" {
+			if !keys[edge.ToKey] {
+				return fmt.Errorf("%w: dependency target %q is not a node", ErrPlanGraph, edge.ToKey)
+			}
+			if edge.ToKey == edge.FromKey {
+				return fmt.Errorf("%w: node %q depends on itself", ErrPlanGraph, edge.FromKey)
+			}
+			local[edge.FromKey] = append(local[edge.FromKey], edge.ToKey)
+			continue
+		}
+		id := string(edge.ToID)
+		if strings.TrimSpace(id) != id || strings.ContainsFunc(id, unicode.IsSpace) {
+			return fmt.Errorf("%w: malformed external dependency target %q", ErrPlanGraph, edge.ToID)
+		}
+	}
+
+	const (
+		visiting = 1
+		done     = 2
+	)
+	state := make(map[string]int, len(keys))
+	var visit func(string) error
+	visit = func(key string) error {
+		state[key] = visiting
+		for _, dep := range local[key] {
+			switch state[dep] {
+			case visiting:
+				return fmt.Errorf("%w: dependency cycle at %q", ErrPlanGraph, dep)
+			case 0:
+				if err := visit(dep); err != nil {
+					return err
+				}
+			}
+		}
+		state[key] = done
+		return nil
+	}
+	for _, node := range plan.Nodes {
+		if state[node.Key] == 0 {
+			if err := visit(node.Key); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// VerifyAppliedGraph compares the actual blocks edges of newly created
+// issues with the plan after local keys have been replaced by minted IDs.
+func VerifyAppliedGraph(plan GraphPlan, ids map[string]domain.BeadID, issues []Issue) error {
+	if err := ValidateGraphPlan(plan); err != nil {
+		return err
+	}
+	actual := make(map[domain.BeadID]Issue, len(issues))
+	for _, issue := range issues {
+		actual[issue.ID] = issue
+	}
+	expected := make(map[domain.BeadID]map[domain.BeadID]bool)
+	for _, edge := range plan.Edges {
+		from := ids[edge.FromKey]
+		if from == "" {
+			return fmt.Errorf("%w: no ID for source key %q", ErrPlanDependencies, edge.FromKey)
+		}
+		to := edge.ToID
+		if edge.ToKey != "" {
+			to = ids[edge.ToKey]
+			if to == "" {
+				return fmt.Errorf("%w: no ID for target key %q", ErrPlanDependencies, edge.ToKey)
+			}
+		}
+		if expected[from] == nil {
+			expected[from] = make(map[domain.BeadID]bool)
+		}
+		expected[from][to] = true
+	}
+	for id, issue := range actual {
+		if len(expected[id]) == 0 && len(issue.Blockers()) > 0 {
+			return fmt.Errorf("%w: bead %s has unplanned blockers", ErrPlanDependencies, id)
+		}
+	}
+	for from, deps := range expected {
+		issue, found := actual[from]
+		if !found {
+			return fmt.Errorf("%w: created bead %s was not returned for verification", ErrPlanDependencies, from)
+		}
+		blockers := issue.Blockers()
+		if len(blockers) != len(deps) {
+			return fmt.Errorf("%w: bead %s has %d blockers, plan has %d", ErrPlanDependencies, from, len(blockers), len(deps))
+		}
+		for _, blocker := range blockers {
+			if !deps[blocker] {
+				return fmt.Errorf("%w: bead %s has unexpected blocker %s", ErrPlanDependencies, from, blocker)
+			}
+		}
+	}
+	return nil
+}
+
 // ApplyPlan turns a validated PO plan into beads (D-22): it builds the
 // graph plan (BuildGraphPlan), runs `bd create --graph --dry-run` and
 // verifies the report (VerifyDryRun), then, unless dryRun is set, creates
-// every bead in one atomic call and finally writes each bead's acceptance
-// criteria with `bd update --acceptance` (bd 1.2.2 drops them from the
-// plan). The epic is always part of the create — as a node of the plan, or
+// every bead in one atomic call, writes each bead's acceptance criteria with
+// `bd update --acceptance` (bd 1.2.2 drops them from the plan), and reads the
+// new beads back to verify their local and external dependencies. The epic is
+// always part of the create — as a node of the plan, or
 // as every work node's parent_id when it already existed (P3-18) — so no
 // bead is ever left parentless by a failure here.
 //
@@ -318,6 +465,19 @@ func (c *Client) ApplyPlan(ctx context.Context, req PlanRequest, dryRun bool) (P
 		}
 		if len(issues) == 0 || !issues[0].IsEpic() {
 			return out, fmt.Errorf("beads: apply plan: %w: %s is not an epic", ErrInvalid, out.Epic)
+		}
+	}
+	if len(req.ExternalDeps) > 0 {
+		seen := make(map[domain.BeadID]bool, len(req.ExternalDeps))
+		var targets []domain.BeadID
+		for _, dep := range req.ExternalDeps {
+			if !seen[dep.ToID] {
+				seen[dep.ToID] = true
+				targets = append(targets, dep.ToID)
+			}
+		}
+		if _, err := c.Show(ctx, targets...); err != nil {
+			return out, fmt.Errorf("beads: apply plan: fresh canonical targets: %w", err)
 		}
 	}
 	dry, err := c.CreateGraph(ctx, b.graph, true)
@@ -370,6 +530,25 @@ func (c *Client) ApplyPlan(ctx context.Context, req PlanRequest, dryRun bool) (P
 			out.Unfinished = append([]domain.BeadID(nil), out.Beads[i:]...)
 			return out, fmt.Errorf("beads: plan created but finalising %s (key %q) failed: %w", id, k, err)
 		}
+	}
+	verifyIDs := make([]domain.BeadID, 0, len(b.graph.Edges))
+	seenVerify := make(map[domain.BeadID]bool, len(b.graph.Edges))
+	for _, edge := range b.graph.Edges {
+		id := out.IDs[edge.FromKey]
+		if !seenVerify[id] {
+			seenVerify[id] = true
+			verifyIDs = append(verifyIDs, id)
+		}
+	}
+	if len(verifyIDs) == 0 {
+		verifyIDs = out.Beads
+	}
+	issues, err := c.Show(ctx, verifyIDs...)
+	if err != nil {
+		return out, fmt.Errorf("beads: verify applied plan dependencies: %w", err)
+	}
+	if err := VerifyAppliedGraph(b.graph, real.IDs, issues); err != nil {
+		return out, fmt.Errorf("beads: verify applied plan: %w", err)
 	}
 	return out, nil
 }

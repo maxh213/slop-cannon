@@ -1,0 +1,2 @@
+API key configured
+Authentication is checked when you send a request.

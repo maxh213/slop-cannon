@@ -18,6 +18,7 @@ export type { RpcChild, RpcSpawner } from './codex.ts';
 export type { LaunchedProcess, Launcher } from './kimi.ts';
 export type { Fetcher, FileReader };
 export { probeClaudeStatus, probeCursorStatus, probeOpenAiStatus };
+export { freshKiloBalance } from './kilo.ts';
 
 export type ProbeIo = KimiIo & GrokIo & JunieIo & CodexIo & CursorIo & HermesIo & { fetcher: Fetcher; reader: FileReader };
 
@@ -53,6 +54,6 @@ function rawProbes(io: ProbeIo, env: Record<string, string | undefined>): Provid
     { id: 'cursor', probe: (now) => probeCursor(io, env, now) },
     { id: 'junie', probe: (now) => probeJunie(io, env, now) },
     { id: 'hermes', probe: (now) => probeHermes(io, env, now) },
-    cliProbe(io, kiloProbe(env))
+    cliProbe(io, kiloProbe())
   ];
 }

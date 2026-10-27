@@ -16,6 +16,7 @@ graph_poll_interval         2s          default
 max_diff_bytes              204800      default
 re_review_threshold         0.4         default
 max_beads_per_plan          8           default
+po_planners                 1           default
 nice                        10          default
 research                    true        default
 auto_merge                  false       default

@@ -6,12 +6,21 @@ every agent through the `cartridge.Cartridge` interface
 in, `Run` starts one session for a `RunSpec` (prompts, workdir, model, tool
 policy, limits) and streams `SessionEvent`s until a `Done` or `Error`.
 
-**Claude Code** and **Cursor Agent** ship today (D-29, superseding the
-Claude-only scope of D-19), and so does **dandelion**, a quota router that
-fires either of them on whichever account still has quota (D-30). Kimi,
-Animus and a custom-command adapter are planned; the interface, registry and
-mock cartridge are adapter-agnostic so each is one package plus one registry
-line.
+**Claude Code**, **Cursor Agent**, **Agy**, **Codex**, **Kimi**, **Grok
+Build**, **Junie**, **Hermes Agent** and **Kilo** ship as direct adapters,
+alongside **dandelion** as the quota router (D-29, D-30, D-37, D-40).
+`codex-animus` is a Dandelion provider delegated through Codex rather than a
+direct cartridge. Kilo is a standard-route balance fallback, never a high
+route. Animus and a custom-command adapter remain planned. The interface,
+registry and mock cartridge are adapter-agnostic, so a new adapter is one
+package plus one registry line.
+
+Parallel planning adds no provider-specific policy exception. Every
+independent PO producer and the combined round's semantic plan judge use the
+same `read_only` role policy and read-only `bd` shim. The judge classifies
+candidates only; it cannot rewrite plans, dependencies, quota, or tracker
+state, and the no-retry fallback does not widen tool access. Existing
+provider route sets and adapter behavior are unchanged.
 
 ## Claude Code (`claude`)
 
@@ -361,19 +370,62 @@ An unknown model exits 1 with `Cannot use this model: …` on stderr and is a
 (`testutil.FakeBin`); `SC_CURSOR_LIVE=1 go test -run TestLive
 ./internal/cartridge/cursor/` fires the real CLI once on `auto`.
 
+## Additional CLI adapters
+
+The directly configurable names are `claude`, `cursor`, `dandelion`, `agy`,
+`codex`, `kimi`, `grok`, `junie`, `hermes` and `kilo`. The newer adapters
+share the same `RunSpec`, streaming and error contracts, but deliberately
+expose only the policies their native controls can hold:
+
+| Cartridge | Policies | Prompt transport, native controls and isolation |
+|---|---|---|
+| `agy` | `read_write` | Print-mode JSON. Prompts over 96 KiB go verbatim into a mode-0600 file in the worktree and are replaced by a short read instruction; the file is removed on every exit path. `read_only` is not offered after the failed live enforcement canary; `read_exec` is not supported. |
+| `codex` | `read_exec`, `read_write` | `codex exec --json` with the prompt on stdin. `read_exec` uses the native read-only sandbox, which still permits shell and is therefore not `read_only`; `read_write` uses workspace-write. Codex Animus reuses this driver with a separate `CODEX_HOME`. |
+| `kimi` | `read_exec`, `read_write` | Kimi Code 2.3.1. Each firing gets a private Markdown profile and staged prompt file with native tool/subagent limits. Inputs beyond the argv budget stay in a workdir-private mode-0600 file loaded through Kimi's native Read tool; every file is removed on every path. `read_only` is unavailable. |
+| `grok` | `read_exec`, `read_write` | Grok Build streams JSON with a temporary prompt file, an embedded agent, native tool controls and no subagents. Optional web access follows `RunSpec.Web`. `read_only` fails closed because the installed CLI could not prove a closed shell allowlist. Timeout, cancellation and kill clean up the process group and descendants, and the prompt file is always removed. |
+| `junie` | `read_write` | Non-interactive `--task` JSON. Prompts over 32 KiB go to a private project-local file and are replaced by a read instruction. User/project configuration and extensions are isolated; timeout, cancellation and kill use process-group and tagged-descendant cleanup, never gateway lifecycle commands. |
+| `hermes` | `read_exec`, `read_write` | `hermes chat --oneshot --format stream-json` reads the joined prompt through `--query-file -`. `read_exec` enables only terminal tools; `read_write` adds file tools. Every firing gets fresh temporary `HERMES_HOME` and `HOME` directories, removed after exit, start failure, timeout, cancellation or kill. The explicitly shared Nous auth store is the only isolation exception; the adapter links but never reads its contents. |
+| `kilo` | `read_exec`, `read_write` | Kilo CLI 7.5.6: `kilo run … --pure --auto --format json --agent sc --dir <workdir>`, with the complete combined prompt on stdin. `read_exec` allows Bash and denies edits; `read_write` allows edits. Tasks and unrequested web tools are denied. `read_only` is refused because Bash is not a read-only execution boundary. |
+
+These adapters use the common process runner for cancellation and descendant
+cleanup. Restricted policies mean native enforcement only; none is silently
+approximated by an unrestricted session.
+
+Every Kilo child gets `KILO_NO_DAEMON=1`, `KILO_DISABLE_PROJECT_CONFIG=1` and
+`KILO_DISABLE_AUTOUPDATE=1`. Its private `sc` agent is generated in memory and
+passed through `KILO_CONFIG_CONTENT`, not written as project configuration.
+Configured arguments precede these mandatory invocation controls. `Detect`
+checks the local binary and version; authentication is established by the
+firing rather than claimed from a profile probe. See
+[config.md](config.md#keys) for a direct `[cartridges.kilo]` example.
+
+At the CLI argument boundary, the pinned Dandelion model
+`deepseek/deepseek-v4.1-flash-1017` is normalized to
+`kilo/deepseek/deepseek-v4.1-flash-1017`. Already-qualified and direct custom
+IDs are unchanged, while `RunSpec.Model` and the Dandelion launch log retain
+the unqualified route model. Real direct checks exercised balance-gated echo,
+structured output, native file creation, large-prompt stdin, and timeout/kill
+cleanup without a daemon. Delegated checks exercised fresh profiles before
+every launch, below-allowance cost, native `read_exec`/`read_write` behavior,
+and fail-closed rerouting after injected profile failure or an at-floor
+balance. `read_only` stays Claude-only and the high chain is unchanged. The
+final live balance was `31.232105 USD`, rendered as `balance $31.23` exactly
+once with no synthetic gauge and with Kilo visible in `usage only` with zero
+windows; literal `$` is normalized to `USD` at the dashboard API boundary.
+
 ## Dandelion (`dandelion`)
 
-Package `internal/cartridge/dandelion` (D-30). Registered under `dandelion`;
-configured by `[cartridges.dandelion]` (`model`, `command`, `args`, `env`).
-The binary is `dandelion` unless `command` names another.
+Package `internal/cartridge/dandelion` (D-30, D-37, D-40). Registered under
+`dandelion`; configured by `[cartridges.dandelion]` (`model`, `command`,
+`args`, `env`). The binary is `dandelion` unless `command` names another.
 
 dandelion is a quota router: `dandelion route` prints the subscription to
 use right now and `dandelion route --high` the strongest model that still
 has quota, as one line `<model>[ <effort>] <account>` (for example
 `claude-fable-5-1 max claude`). The cartridge asks it before every firing and
-then runs the session through the Claude Code or Cursor Agent adapter on
-that account. One cartridge name therefore stands for several accounts; the
-trade-offs that follow are recorded in D-30.
+then runs the session through the adapter registered for that account's
+driver. One cartridge name therefore stands for several accounts; the
+trade-offs that follow are recorded in D-30, D-37 and D-40.
 
 ```toml
 [cartridges.dandelion]
@@ -384,12 +436,21 @@ model = "high"      # "dandelion route --high"; "standard" or empty: "dandelion 
 sc cartridge --add dandelion --model high
 ```
 
-`model` selects the router's mode and nothing else: any value but `high`,
-`standard` or empty is a config error. **The routed model wins**:
-`RunSpec.Model` is ignored, so `roles.<role>.model` has no effect on a role
-that fires on dandelion (put that role on `claude` instead if it needs a
-pinned model). `args` are appended to the router call; `env` is set on the
-router and on the delegated CLI.
+`model` selects the router's mode: any value but `high`, `standard` or empty
+is a config error. A per-role `standard` or `high` overrides that mode for one
+firing, with case and whitespace tolerated; empty, other and legacy values
+fall back to the configured Dandelion mode. **The real routed model still
+replaces `RunSpec.Model` for the delegated CLI**, so a role model is a route
+mode selector, not a pinned model. `args` are appended to the router call;
+`env` is set on the router and on the delegated CLI.
+
+Role models are effective configuration rather than `ConfigSnapshot` fields.
+On an ordinary resume, the active cartridge and its default model/mode stay
+frozen, while current repo role-model changes apply on the next resume.
+
+The Animus setup is applied with repo-sourced `standard` for engineers and
+testers and `high` for the PO. No PO fired during the bounded 180-second wait,
+so the PO's `high` mode is verified from effective config only.
 
 ### Invocation
 
@@ -408,23 +469,32 @@ then, for the account the line names:
 | `claude-work` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_WORK_CONFIG_DIR`, else `~/.claude-work` |
 | `claude-deepseek` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_DEEPSEEK_CONFIG_DIR`, else `~/.claude-deepseek` |
 | `claude-ollama` | Claude Code, the same | `CLAUDE_CONFIG_DIR` = `DANDELION_CLAUDE_OLLAMA_CONFIG_DIR`, else `~/.claude-ollama` |
-| `cursor` | Cursor Agent: `cursor-agent -p … --model <model>` (`read_write` firings only) | as sc's own |
-| `agy`, `kimi`, `grok`, `codex`, `codex-animus`, `junie`, `hermes`, `kilo` | not driven: always in `DANDELION_DISABLE` | – |
+| `agy` | Agy, `read_write` only | large prompts use a workdir-private mode-0600 file, removed afterwards |
+| `kimi` | Kimi Code, `read_exec` and `read_write` | private profile and prompt files per firing |
+| `grok` | Grok Build, `read_exec` and `read_write` | temporary prompt file and per-firing environment |
+| `codex` | Codex, `read_exec` and `read_write` | prompt on stdin; the personal Codex account |
+| `codex-animus` | Codex, the same driver and policies | `CODEX_HOME` = `DANDELION_CODEX_ANIMUS_HOME`, else `~/.codex-animus` |
+| `cursor` | Cursor Agent: `cursor-agent -p … --model <model>` (`read_write` only) | as sc's own |
+| `junie` | Junie, `read_write` only | isolated configuration and private large-prompt file |
+| `hermes` | Hermes Agent, `read_exec` and `read_write` | fresh temporary `HERMES_HOME` and `HOME`, with only the documented shared-auth exception |
+| `kilo` | Kilo, `read_exec` and `read_write`: `kilo run … --model <model> --variant <effort>` | `SC_KILO_MIN_BALANCE_USD=10`; fresh profile and balance-floor guard before launch |
 
-The table is `dandelion.Providers`, mirrored from dandelion's
-`src/app/launch.ts` (`TARGETS`, `ACCOUNT_HOMES`) and `src/probes/index.ts`.
+The `kilo` row uses `DriverKilo`. The table is `dandelion.Providers`,
+mirrored from dandelion's `src/app/launch.ts` (`TARGETS`, `ACCOUNT_HOMES`)
+and `src/probes/index.ts`.
 Copies of both live in `testdata/dandelion/` and
 `TestProviders_MatchPinnedDandelionSources` fails when they name an account
-the table does not classify; its `README.md` says how to refresh them. The
-`--effort` pair is passed only when the line has an effort Claude Code
-accepts (`low`, `medium`, `high`, `xhigh`, `max`; anything else is dropped
-with a warning). The variables are looked up in the configured `env` first,
-then sc's environment. Everything the Claude and Cursor sections say about
-their invocation, parsing and errors applies to the delegated session; its
-errors and events carry the name `dandelion`. The delegated CLIs are always
-`claude` and `cursor-agent` from `PATH`: a `command` set under
-`[cartridges.claude]` or `[cartridges.cursor]` does not apply to dandelion's
-firings (the factory sees only `[cartridges.dandelion]`).
+the table does not classify; its `README.md` says how to refresh them. Each
+driver passes only effort values its own CLI accepts; unknown values are
+dropped rather than rewritten. Claude accepts `low`, `medium`, `high`,
+`xhigh` and `max`. Kilo maps the same supported values to `--variant`; its
+shipped standard and max lines are `deepseek/deepseek-v4.1-flash-1017 max`.
+The variables are looked up in the configured `env` first, then sc's
+environment. Delegated sessions use their driver's ordinary parser, policy
+mapping and error classification, but errors and events carry the name
+`dandelion`. Delegated binaries are looked up on `PATH`: a `command` under
+another cartridge's config does not replace them (the factory sees only
+`[cartridges.dandelion]`).
 
 The router is given the user's whole environment, minus the markers a
 parent Claude Code session sets: it probes every provider the way the user's
@@ -437,15 +507,40 @@ The adapter implements `agents.ToolPolicyEnforcer`:
 
 | `ToolPolicy` | Who gets it | Accounts it may route to | Enforcement |
 |---|---|---|---|
-| `read_only` | product owner | the Claude accounts only (`cursor` is disabled too) | native, Claude Code's own flags |
-| `read_exec` | testers | the Claude accounts only | native, Claude Code's own flags |
-| `read_write` | engineers | the Claude accounts and `cursor` (when `cursor-agent` is on `PATH`) | nothing to restrict (`none`) |
+| `read_only` | product owner | Claude accounts only | native, Claude Code's own flags |
+| `read_exec` | testers | Claude, Codex, Codex Animus, Kimi, Grok, Hermes and Kilo | native, each selected driver's own controls |
+| `read_write` | engineers | every routable provider whose driver is installed | nothing to restrict (`none`) |
 
 Because `read_only` and `read_exec` are held natively, no worktree copy is
 made and a planning product owner (which has no worktree) can fire on
-dandelion. Defence in depth: a route that names an account the firing's
-policy does not allow, for example `cursor` for a tester because the router
-ignored `DANDELION_DISABLE`, is treated as no route and nothing is started.
+dandelion. Agy and Grok `read_only` are deliberately absent after failed live
+enforcement canaries; they are not approximated by another mode. Kilo also
+has no `read_only` route and never joins the high chain; it is only the
+standard route's final balance fallback. Defence in depth: a route that names
+an account the firing's policy or current binary availability does not allow
+is treated as no route and nothing is started, including a route cached
+before those conditions changed.
+
+### Kilo launch authorization
+
+A cached Kilo route is only a routing hint. sc invalidates it and obtains a
+fresh route before delegating; immediately before every actual Kilo launch,
+the adapter separately runs `kilo profile --json` with a 20-second timeout.
+The balance must be strictly greater than the floor: exactly at the floor,
+below it, a failed profile, malformed JSON or a missing/invalid balance fails
+closed. A pre-launch budget refusal invalidates the Kilo route and reroutes
+without Kilo instead of launching its provider process or retiring the whole
+router.
+
+`SC_KILO_MIN_BALANCE_USD=10` is set only by Dandelion's Kilo route mapper and
+is removed from the Kilo child environment. Direct Kilo use does not enable
+this floor. The launch allowance is `balance - floor`. The session guard
+uses cumulative assistant-message cost when available and summed root step
+cost otherwise, stopping when reported cost reaches the allowance. It is best
+effort only: a final request can overshoot before its cost is reported,
+concurrent sessions can spend the same balance, and other clients or later
+billed steps can take the account below $10, so it is not an account-wide
+spending guarantee.
 
 ### Routing cost and the cache
 
@@ -502,27 +597,31 @@ Every delegated failure's message names the account and model, for example
 ### Detect and visibility
 
 `Detect` resolves the router on `PATH` and then runs the Claude adapter's
-Detect (`claude --version`, `claude auth status --json`): the product owner
-and the testers can only ever run on Claude Code. It never asks for a route.
-`Status.Version` is Claude Code's, and `Status.Detail` names the mode and
-the accounts, for example `dandelion route --high over claude, claude-work,
-claude-deepseek, claude-ollama (Claude Code) and cursor (Cursor Agent,
-read_write firings only); claude: logged in as …`.
+Detect (`claude --version`, `claude auth status --json`) as the baseline for
+`read_only`. Other delegated binaries are checked when each allowed route set
+is built and again before a cached route is used; Detect itself never asks for
+a route. `Status.Version` is Claude Code's, and `Status.Detail` describes the
+mode and baseline accounts rather than claiming that every restricted firing
+must use Claude.
 
 Each firing logs `dandelion routed a firing` to the run log with `agent`,
-`account`, `model`, `effort`, `mode`, `policy` and `cached`; that line is
-where the model a dandelion agent really ran on is recorded. The agent's own
-`Model` in state and the TUI stays the configured mode (`high`), because the
-supervisor stamps it before the adapter routes.
+`account`, `model`, `effort`, `mode`, `policy` and `cached`. `sc dash`
+reconstructs that evidence read-only and presents the actual account, model
+and effective effort for the exact attempt, with `pending`, `no_route` and
+`unknown` fallbacks; the actual model is therefore not available only in logs.
+The agent's own `Model` in state and the TUI stays the configured mode
+(`high`), because the supervisor stamps it before the adapter routes.
 
 ### Tests
 
 `internal/cartridge/dandelion` runs against a fake `dandelion`
 (`testutil.FakeBin`, answering from files so a test can change the route
-between calls and recording `DANDELION_DISABLE` per call) and fake `claude`
-and `cursor-agent` binaries replaying the fixtures in `testdata/claude/` and
-`testdata/cursor/`, on a `PATH` without the real tools. No test runs the real
-router.
+between calls and recording `DANDELION_DISABLE` per call) and fake delegated
+drivers replaying the adapter fixtures on a `PATH` without the real tools.
+The unit suite does not run the real router. Kilo's independent direct and
+delegated live checks, final offline gates, deployment evidence and remaining
+account-wide spending caveat are recorded in P2-20; earlier driver-family
+checks are in P2-18.
 
 ## Conformance suite
 
@@ -688,31 +787,36 @@ the 3-minute session timeout. Both are the service, not the adapter.)
 
 `make cartridge-conformance CARTRIDGE=dandelion` builds the cartridge with
 model `standard` (`SC_CONFORMANCE_MODEL=high` asks for `--high`, which costs
-far more) and fires real sessions on whatever accounts the router names. It
-has **not been run live yet** (P2-17 shipped with the unit tests only). What
-it should show:
+far more) and fires real sessions on whatever accounts the router names. The
+mock conformance suite passes 8/8 in the final integrated checks. The live
+evidence in P2-18 is provider-specific, not a claim of a complete live
+Dandelion conformance run.
 
-- `detect` passes when `dandelion` and a logged-in Claude Code are on
-  `PATH`; its detail is the mode and account list described above.
-- `echo`, `structured`, `refuse`, `timeout`, `kill` and `beads-readonly` are
-  `read_only` or `read_exec`, so they always land on a Claude account and
-  should look like the Claude Code run above. In particular `refuse`
-  passes: unlike plain `cursor`, dandelion never gives a read-only session
-  to Cursor.
-- `write` is `read_write` and may land on `cursor`, which passes it too.
-- Expected failures: none by design. When the router answers `none`, every
-  session check fails with `cartridge dandelion: rate limited: dandelion
-  route found no account with quota left`; that is the quota, not the
-  adapter. The first check waits for a probe round (about six seconds); the
-  rest share the cached route.
+- `detect` passes when `dandelion` and its baseline Claude Code are on `PATH`;
+  other drivers are admitted only when their binaries are available.
+- `echo`, `structured` and `refuse` are `read_only`, so they still route only
+  to Claude and enforce its native write refusal. `timeout`, `kill` and
+  `beads-readonly` are `read_exec` and may use any native driver in that
+  policy set.
+- `write` is `read_write` and may use any routable installed provider.
+- A router answer of `none` remains a rate limit rather than an adapter
+  failure. The first check pays for a probe round; later checks can share the
+  cached route.
+
+P2-18 records successful live policy, prompt, cancellation and isolation
+checks, but Hermes' model-dependent checks remain blocked by runtime account
+authentication. The personal Codex echo is also auth-blocked; Codex Animus
+passed independently and is not evidence for the personal account.
 
 ## Adding a new cartridge
 
-**Claude Code, Cursor Agent and the dandelion router ship today (D-29, D-30).** Kimi (P2-04), Animus (P2-05) and a
-custom-command adapter (P2-06) are planned and stay blocked until the human
-reopens them; do not pick them up on your own. This guide is for the day
-they are reopened, or for any other LLM CLI: the interface, registry, mock,
-selection policy, structured-output contract and conformance suite are
+**Claude Code, Cursor Agent, Agy, Codex, Kimi, Grok Build, Junie, Hermes
+Agent and the dandelion router ship today (D-29, D-30, D-37).** Animus
+(P2-05) and a custom-command adapter (P2-06) remain planned and blocked until
+the human reopens them; `codex-animus` is already supported only as a
+Dandelion provider through Codex, not as the generic Animus adapter. This
+guide is for the planned work or any other LLM CLI: the interface, registry,
+mock, selection policy, structured-output contract and conformance suite are
 adapter-agnostic, so a new cartridge is **one package under
 `internal/cartridge/<name>` plus one registry line**, and nothing in the
 orchestrator changes.

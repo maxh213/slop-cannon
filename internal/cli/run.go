@@ -22,15 +22,19 @@ import (
 	"slop-cannon/internal/agents/prompt"
 	"slop-cannon/internal/beads"
 	"slop-cannon/internal/cartridge"
-	// The Claude and Cursor adapters, and the dandelion router in front of
-	// them, are the ones a user may fire (D-29, D-30); importing them here
-	// is what puts them in cartridge.Default. The mock adapter registers
-	// itself the same way, so a test binary that imports
-	// internal/cartridge/mock can select it without loosening that for
-	// users (P8-08).
+	// Importing a supported adapter here puts it in cartridge.Default. The
+	// mock adapter registers itself the same way, so a test binary that imports
+	// internal/cartridge/mock can select it without exposing mock to users.
+	_ "slop-cannon/internal/cartridge/agy"
 	_ "slop-cannon/internal/cartridge/claude"
+	_ "slop-cannon/internal/cartridge/codex"
 	_ "slop-cannon/internal/cartridge/cursor"
 	_ "slop-cannon/internal/cartridge/dandelion"
+	_ "slop-cannon/internal/cartridge/grok"
+	_ "slop-cannon/internal/cartridge/hermes"
+	_ "slop-cannon/internal/cartridge/junie"
+	_ "slop-cannon/internal/cartridge/kilo"
+	_ "slop-cannon/internal/cartridge/kimi"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/events"
@@ -499,6 +503,7 @@ func runWriteText(w io.Writer, rc *config.RunConfig) error {
 		[2]string{"cartridge", fmt.Sprintf("%s (%s, command %s)%s", rc.CartridgeName,
 			cartridgeModelText(rc.Cartridge.Model), rc.Cartridge.Binary(rc.CartridgeName), src(config.KeyActiveCartridge))},
 		[2]string{"ammo", strings.TrimPrefix(rc.Allocation.String(), "ammo ") + src(config.KeyAmmo)},
+		[2]string{"po-planners", fmt.Sprintf("%d%s", eff.POPlanners, src(config.KeyPOPlanners))},
 		[2]string{"safety", fmt.Sprintf("%s%s: %s", safetyWord(eff.Safety), src(config.KeySafety), SafetyMeaning(eff.Safety))},
 		[2]string{"vibes", runList(eff.Vibes) + src(config.KeyVibes)},
 		[2]string{"rules", runList(eff.Rules) + src(config.KeyRules)},
@@ -1296,9 +1301,21 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 	planFire = gate.GuardPlanner(c.spend.meter(budget.MeterPlanner(
 		prReviewPlanner(reviewer, runFeedbackPlanner(feedback)))))
 
+	planReviewer := agents.StructuredPlanReviewRunner{}
+	if cfg.POPlanners > 1 {
+		planReviewer, err = newRunPlanReviewer(ctx, sel, rc, scan, rules, vibes, func(u cartridge.Usage) {
+			c.spend.Record(u)
+			budget.Record(u)
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
 	planner, err := orchestrator.NewPlanner(orchestrator.PlannerOptions{
-		Config:      rc,
-		ShimOptions: runShimOptions,
+		Config:       rc,
+		PlannerCount: cfg.POPlanners,
+		Reviewer:     planReviewer,
+		ShimOptions:  runShimOptions,
 		// The planning firing bypasses the scheduler's firing planner, so
 		// it is metered here or nowhere (P9-17).
 		Runner:  c.spend.meterPlan(budget.MeterPlanRunner(orchestrator.SupervisorPlanRunner(sup))),
@@ -1346,6 +1363,7 @@ func assembleRun(ctx context.Context, rc *config.RunConfig, set runSetup) (_ *ca
 
 	sched = orchestrator.NewScheduler(orchestrator.SchedulerOptions{
 		Allocation: rc.Allocation,
+		Planning:   cfg.POPlanners,
 		// The feedback loop is offered nothing on a bead the deliverer
 		// holds for a conflict round (P6-66).
 		Work:                budget.Work(prReviewSources(reviewer, planner, orchestrator.ExceptHeld(deliverer, feedback), deliverer)),
@@ -1723,6 +1741,35 @@ func discardRunDir(dir string, logger *slog.Logger) {
 	}
 }
 
+// newRunPlanReviewer selects the PO's actual cartridge and builds the
+// semantic judge. AgentID stays empty so the agents runner derives a unique
+// judge identity from each round's first candidate.
+func newRunPlanReviewer(ctx context.Context, sel *cartridge.Selector, rc *config.RunConfig,
+	scan prompt.RepoContext, rules, vibes []prompt.Doc, record func(cartridge.Usage),
+) (agents.StructuredPlanReviewRunner, error) {
+	judge, err := sel.Select(ctx, domain.RolePO)
+	if err != nil {
+		return agents.StructuredPlanReviewRunner{}, err
+	}
+	model := rc.Effective.RoleModels[domain.RolePO]
+	if model == "" {
+		model = "high"
+	}
+	return agents.StructuredPlanReviewRunner{
+		Cartridge: judge,
+		Request: agents.PlanReviewRequest{
+			Run: rc.Run.ID, Round: 1, Repo: scan, Brief: rc.Run.Brief,
+			Rules: rules, Vibes: vibes, Model: model,
+			Timeout: rc.Effective.Limits.AgentTimeout.Duration(),
+			OnUsage: func(u cartridge.Usage) {
+				if orchestrator.UsageReported(u) && record != nil {
+					record(u)
+				}
+			},
+		},
+	}, nil
+}
+
 // runSpend totals what the run's agents cost. The P9-01 budget meters the
 // same numbers, but only when a cap is configured; the final summary wants
 // them either way, so this chains onto the same hook.
@@ -1783,6 +1830,9 @@ func (s *runSpend) meterPlan(inner orchestrator.PlanRunner) orchestrator.PlanRun
 		return plan, tr, err
 	})
 }
+
+// Record adds one directly metered session, such as the semantic plan judge.
+func (s *runSpend) Record(u cartridge.Usage) { s.add(u) }
 
 // add records one session's usage.
 func (s *runSpend) add(u cartridge.Usage) {

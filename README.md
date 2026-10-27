@@ -157,6 +157,7 @@ While it runs, from any other terminal — inside the repository, or with
 
 ```sh
 sc watch                  # the full TUI, live: beads, agents, reviews, PRs
+sc dash                   # read-only browser dashboard at 127.0.0.1:8790
 sc status                 # phase, bead states, PRs, live agents, recent events
 sc status sc-1a2b         # one bead's whole timeline out of bd
 sc logs --follow          # the orchestrator's log; --follow works on a bead id too
@@ -179,6 +180,7 @@ repository.
 | `sc resume` | continue the most recent run of a repository |
 | `sc stop` | stop the run going in a repository, from another terminal |
 | `sc watch` | open the TUI on a run that is already firing, from any terminal |
+| `sc dash [PATH]` | serve a read-only browser dashboard for the latest or a named run |
 | `sc status [BEAD-ID]` | the state of a run, or one bead's timeline, reconciled with `bd` |
 | `sc logs [AGENT-ID\|BEAD-ID]` | tail the run's log, an agent's log, or every agent that touched a bead |
 | `sc doctor` | check git, bd, dolt, gh, the cartridges, the repo and its `.gitignore` |
@@ -196,12 +198,164 @@ Every command, every flag, and the examples from `--help` are in
 also takes `--headless`, `--dry-run`, `--ammo`, `--safety`, `--cartridge`,
 `--resume`, `--review-prs`, `--no-anim` and `--force`.
 
+### Read-only browser dashboard
+
+`sc dash [PATH]` serves the most recent run at `http://127.0.0.1:8790/`;
+`--run ID` selects another. It shows bead flow, live and recent agents,
+review rounds, deliveries, notices and lifecycle activity for a live, quiet,
+finished or crashed run, and keeps following if that run is resumed. It is
+strictly observational: no run controls, lock ownership or state writes, and
+no prompts, diffs, agent output, review transcripts or raw notice prose.
+Notices expose only their time, kind, source and a fixed category.
+
+`--host HOST` and `--port PORT` change the listener (port `0` chooses a free
+port), and `--base-path /sc` puts the page and its two GET API endpoints
+under that prefix. The snapshot API is bounded and redacted; `/health`
+reports the dashboard observer's health, not the run's liveness. Run status,
+lock state and inactivity (`quiet`) are separate snapshot fields, so a
+finished or crashed run does not make a healthy observer look unhealthy.
+
+#### Host resources
+
+On Linux the dashboard samples the host every two seconds: aggregate and
+per-core CPU usage, memory, swap and root-disk usage. CPU percentages need two
+samples with matching topology; per-core results are bounded with omitted
+counts. Memory, swap and disk are used/total byte pairs, and zero-swap systems
+omit the swap row. Failed samples retain the last complete sample, while
+unsupported platforms report no host snapshot; neither changes observer
+`/health`.
+
+#### Dandelion routed-model labels
+
+For agents using the `dandelion` cartridge, the dashboard can show the model
+and account Dandelion actually selected, for example
+`engineer · claude-opus-5-5 · dandelion/claude · effort max`. This is read-only
+evidence from the ordered structured `sc.log`, correlated first by a launch's
+timestamp interval and then by exact agent and supervisor-attempt history
+within that generation. It is not inferred from the global quota route or a
+latest-route guess.
+
+Each launch freezes its spawn time and the current and previous direct event
+starts. Generation selection uses **`(previous event start, current event
+start]`**: the previous boundary is excluded and the current one included.
+Only direct `agent fired` and `dandelion routed a firing` records in the
+selected generation and exact attempt supply route metadata. Arrival skew,
+where the event start is ahead of `sc.log`, is `unknown`; it never selects the
+previous generation.
+
+This interval identity survives event-log rotation. With **five direct starts
+but only four retained event starts**, current-run replay recovers generation
+five, while an old last-seen card keeps its own valid frozen interval and
+model four. Prior history is preserved, and an old card never inherits a newer
+generation's model. The observer backfills the launch log from the beginning
+and then follows complete appended lines with bounded, metadata-only parsing.
+HTTP requests serve the cached snapshot and never read the log.
+
+Within one exact attempt, a multi-session attempt shows its latest selected
+structured route and may show the route count in a tooltip. Duplicate attempts
+within one generation remain `unknown`. A new attempt never inherits the
+previous attempt's model, and the browser shows routed metadata only for the
+matching incarnation and `route_attempt`. This restores valid routes
+previously suppressed after resumes without changing adapters or the
+requested `domain.Agent.Model`. When no exact route is available, the subtitle
+is explicit:
+
+- `dandelion · routing…` — the exact live fired attempt has no route yet.
+- `dandelion · no route` — the exact fired attempt has no route and a typed
+  `rate_limited` failure. Error prose or another attempt's failure is not
+  enough.
+- `dandelion · route unknown` — history is missing, ambiguous or damaged.
+
+Dandelion's configured `model` remains the requested `high` or `standard`
+mode; it is not displayed as the actual routed model. Route selection also
+does not prove that the delegated process started or succeeded. Non-Dandelion
+agent rendering is unchanged, and these labels do not require the optional
+quota panel below.
+
+#### Optional Dandelion quota
+
+Dandelion quota collection is off by default. `sc dash --dandelion` enables it
+and adds the quota panel; `--dandelion-refresh DURATION` takes a Go duration,
+defaults to `10m` and rejects values below `1m`. For example:
+
+```sh
+sc dash --dandelion --dandelion-refresh 15m
+```
+
+The first probe starts immediately and later probes run sequentially, never
+concurrently. Each runs `dandelion --json --max-age <refresh-seconds>` with a
+fixed five-minute timeout and bounded output. Dandelion can reuse its cache
+while it is fresh within that age; otherwise it performs real external
+provider probes. `sc` keeps its own last-good result in memory only and writes
+no Dandelion quota cache to disk.
+
+Last attempt and last success are separate: a failed refresh does not make
+retained data look newly successful. The panel exposes probing and stale state
+plus only the fixed collector error codes `not_installed`, `timed_out`,
+`probe_failed` and `invalid_snapshot`; raw collector subprocess stderr/errors
+are never serialized. Unavailable/error provider `reason` values are separate,
+bounded, explicitly allowlisted Dandelion diagnostics. HTTP requests only read
+the cached snapshot and never start probes; quota failures never change
+observer `/health`.
+
+The panel shows both standard and high routes, probe activity and
+attempt/success ages, and each provider's name, plan, status, reason and
+routing-off state. Every window shows its label, a clamped percentage gauge,
+and reset and projected-full countdowns. Gauge tones are calm below 50%, warm
+from 50% to below 80%, hot from 80% to below 95%, and crit at 95% or above.
+An optional provider `balance` contains only `amount` and `currency`, is
+projected independently of windows, and never creates a synthetic gauge,
+reset, percentage or binding score. Literal `$` is normalized to `USD` at the
+API boundary; the final live Kilo balance was `31.232105 USD`, rendered as
+`balance $31.23` exactly once with zero meter elements and zero percentage
+strings. Kilo remains visible in `usage only` with zero windows because it has
+a valid balance.
+
+The default-on `usage only` toggle persists in `localStorage`; zero-percent
+windows still count as usage. Missing, malformed and zero timestamps are
+blanked with their DOM metadata instead of becoming year-one dates or bogus
+countdowns. The whole panel is hidden when `--dandelion` is not set.
+
+The dashboard service keeps `ProtectHome=read-only` and grants only these
+Kilo runtime startup/auth write exceptions, not a general home write or a
+Dandelion quota cache:
+
+```ini
+ReadWritePaths=~/.local/share/kilo
+ReadWritePaths=~/.cache/kilo
+ReadWritePaths=~/.local/state/kilo
+```
+
+The default listener is loopback-only. Every HTTP `Host` header is validated
+against `localhost`, `127.0.0.1`, `::1` and exact hostnames or IPs added with
+the repeatable `--allowed-host HOSTNAME`; wildcards, schemes, ports and paths
+are not accepted in that flag. This is DNS-rebinding protection, not
+authentication. To share a dashboard, keep it on loopback behind an
+authenticating reverse proxy where possible, preserve the public `Host`,
+allow that hostname, and set `--base-path` to the prefix the proxy forwards.
+Do not expose the unauthenticated server directly to a public network; a
+non-loopback `--host` needs the same authenticated proxy boundary.
+
 ## How the feedback loop works
 
-One product owner plans; one engineer implements each bead in its own
-worktree; up to three testers review it through the ux, qa and test lenses;
-the engineer may push back, and a held argument is settled by the product
-owner. Nothing merges until every lens is satisfied.
+By default, one product owner plans; one engineer implements each bead in its
+own worktree; up to three testers review it through the ux, qa and test
+lenses; the engineer may push back, and a held argument is settled by the
+product owner. Nothing merges until every lens is satisfied. The default-one
+planning path is unchanged: one producer, the ordinary eight-bead cap, and no
+semantic judge or candidate namespacing.
+
+Setting `po_planners = N` above 1 instead runs N independent planning
+producers as one combined round. The round waits for every producer, then
+reconciles their candidates with at most one read-only semantic judge before
+applying one graph under the run's epic. Its combined cap is
+`N × max_beads_per_plan` — **16** with two planners and the default eight —
+and an oversized graph is rejected, never trimmed. A combined round reserves
+N weighted scheduler slots atomically within `ammo`, never partial capacity;
+planning and arbitration caps are independent. See
+[parallel PO planning](docs/architecture.md#parallel-po-planning-d-41),
+[Ammo, in practice](#ammo-in-practice), and the
+[`po_planners` configuration](docs/config.md#keys).
 
 ```
         ┌──────────────────────────────────────────────────────────────┐
@@ -284,10 +438,10 @@ step, the state machine and the resume model — is
 
 The [Ammo breakdown](#ammo-breakdown) at the top is the original sketch, and
 it is what got built — with one refinement. `ammo` is a concurrency **cap**,
-not a fixed roster: the scheduler keeps one
-slot for the product owner when it needs one, lets
-`max(1, floor((ammo - 1) / 4))` engineers work at once, and gives every
-remaining slot to testers, so each engineer can have its three reviewers.
+not a fixed roster: the ordinary allocation keeps one product-owner slot when
+one is needed, lets `max(1, floor((ammo - 1) / 4))` engineers work at once,
+and gives every remaining slot to testers, so each engineer can have its
+three reviewers.
 
 | ammo | PO | engineers in flight | testers | testers per bead |
 | ---: | ---: | ---: | ---: | ---: |
@@ -296,6 +450,13 @@ remaining slot to testers, so each engineer can have its three reviewers.
 | 10 (default) | 1 | 2 | 7 | 3 |
 | 13 | 1 | 3 | 9 | 3 |
 | 17 | 1 | 4 | 12 | 3 |
+
+The table is the ordinary D-05 allocation, not permission to exceed `ammo`.
+Default-one planning leaves `Demand.Slots` at zero, meaning one. A parallel
+round reserves all `po_planners` slots at once and waits when they are not
+free; a round larger than `ammo` never reserves partially. Planning and
+arbitration caps are independent. A planning cap above `ammo` is served in
+ammo-sized waves, but each weighted round must still fit whole.
 
 `sc ammo N` prints the allocation the number implies before it saves it. The
 full table, and the order demands are served in when slots free up, are in
@@ -406,7 +567,10 @@ subject.
 
 - **Agents get a read-only `bd`.** Every agent subprocess runs with a shim on
   `PATH` that refuses any write, so an agent cannot close its own bead or
-  rewrite the graph (D-21). Only the orchestrator writes.
+  rewrite the graph (D-21). Only the orchestrator writes. Within one `sc`
+  process, a double-checked mutex serializes the once-per-binary verification
+  and failed probes are retried rather than cached. Independent `sc`
+  processes are not coordinated and still rely on bd's own locking.
 - **Agents are asked, never trusted.** Every reply must satisfy a JSON
   schema ([docs/schemas/](docs/schemas/README.md)); a malformed one is
   rejected and retried rather than acted on.
@@ -428,15 +592,18 @@ A cartridge is an LLM CLI adapter plus its model: the CLI you already log
 into, driven as a subprocess. `sc` makes no API calls of its own and wants no
 API key.
 
-**Claude Code and Cursor Agent ship today** (D-29), plus the dandelion
-router in front of them (D-30): Claude verified against
-`2.1.258 (Claude Code)` and refusing anything below 2.0.0, Cursor against
-`cursor-agent` `2026.09.28-64d2043`:
+**Claude Code, Cursor Agent, Agy, Codex, Kimi, Grok Build, Junie, Hermes
+Agent and Kilo ship as direct adapters**, plus the dandelion router (D-29,
+D-30, D-37, D-40). Claude is verified against `2.1.258 (Claude Code)` and
+refuses anything below 2.0.0; Cursor is verified against `cursor-agent`
+`2026.09.28-64d2043`; the Kilo adapter targets Kilo CLI 7.5.6:
 
 ```sh
 sc cartridge --add claude --model fable
 sc cartridge --add cursor --model auto
 sc cartridge --add dandelion --model high
+sc cartridge --add kimi
+sc cartridge --add kilo --model deepseek/deepseek-v4.1-flash-1017
 sc cartridge --list
 sc cartridge --use claude
 ```
@@ -448,18 +615,78 @@ Claude; see [docs/config.md](docs/config.md).
 `dandelion` is a quota router rather than a CLI of its own (D-30): before
 every firing it asks `dandelion route --high` (model `high`) or
 `dandelion route` (model `standard`) which account still has quota, and fires
-Claude Code or Cursor Agent on it with the model the router names, so
-`roles.<role>.model` is ignored for it. Only Claude Code accounts and
-`cursor` are used; product owners and testers only ever land on Claude Code.
-See [docs/cartridges.md § Dandelion](docs/cartridges.md#dandelion-dandelion).
+the provider's registered driver with the model the router names. A per-role
+`standard` or `high` selects that firing's route mode, with case and
+whitespace tolerated; empty, other and legacy values fall back to the
+configured Dandelion mode. The real routed model still replaces `spec.Model`
+for the delegated CLI. The expansion enables `agy`, `kimi`, `grok`, `codex`,
+`codex-animus`, `junie`, `hermes` and `kilo` through seven direct CLI
+families; Codex Animus shares Codex with an isolated `CODEX_HOME`. Kilo is a
+standard-route balance fallback only and is never in Dandelion's high chain.
 
-Kimi, Animus and a custom-command adapter are planned; until then
-`sc cartridge --add kimi` fails with
-`cartridge "kimi" is not supported yet (only "claude", "cursor", "dandelion" for now)`. The
-interface, the registry and the conformance suite are adapter-agnostic, so
-each new one is a package and a registry line: the whole recipe — the
-contract, the error-kind and tool-policy mapping tables to fill in, the
-fixtures, the conformance run and a worked example — is
+Role models are effective configuration, not `ConfigSnapshot` fields. On an
+ordinary resume the active cartridge and its default model/mode stay frozen,
+but current repo role-model changes take effect on the next resume.
+
+The Animus setup is now applied and deployed with all three role models
+sourced from the repo: engineers and testers use `standard`, and the PO uses
+`high`. The PO did not fire during the bounded 180-second wait, so `high` is
+verified from effective config only. Final Kilo completion evidence has
+orchestrator PID 1637159 with a live lock and the same standard-work/high-PO
+split, with dashboard and tunnel healthy. Existing monitor
+`01M5R7ZMS30P8YMJ3W16PXNVW3` remains read-only at minutes 7/27/47 of each
+20-minute cycle, with no automatic state changes and no indefinite monitoring
+claim.
+
+Restricted routing is native-only: `read_only` uses Claude accounts;
+`read_exec` uses Claude, Codex/Codex Animus, Kimi, Grok, Hermes or Kilo;
+`read_write` can use every routable installed provider. Agy and Grok
+`read_only` are deliberately disabled after failed live enforcement canaries.
+Kilo also refuses `read_only`, because its Bash permission is not a read-only
+execution boundary.
+
+Every Kilo firing sets `KILO_NO_DAEMON=1`, disables project configuration and
+automatic updates, and supplies a generated in-memory agent configuration;
+the complete combined prompt travels on stdin. At the CLI argument boundary,
+the pinned Dandelion model `deepseek/deepseek-v4.1-flash-1017` is normalized
+to `kilo/deepseek/deepseek-v4.1-flash-1017`; direct custom IDs and the
+unqualified route model in `RunSpec.Model` and launch logs are not rewritten.
+
+For delegated Kilo firings, Dandelion supplies
+`SC_KILO_MIN_BALANCE_USD=10`, which is Dandelion-only and is removed from the
+Kilo child environment. A cached Kilo route is only a hint: sc obtains a fresh
+route and checks `kilo profile --json` immediately before every Kilo launch.
+Profile failure or a balance at or below the floor fails closed, excludes Kilo
+and reroutes without launching it. The in-session allowance is
+`balance - floor`, enforced best effort from reported cost: a final request
+can overshoot before its cost arrives, and concurrent sessions can spend the
+same balance. Prelaunch freshness and that allowance cannot guarantee other
+clients or later billed steps will never take the account below $10.
+
+Real direct checks exercised balance-gated echo, structured output, native
+file creation, large-prompt stdin, and timeout/kill cleanup without a daemon.
+Delegated checks exercised a fresh profile before every launch, normalized
+argv with an unqualified route log, `read_exec`/`read_write` policy behavior,
+cost below the fresh allowance, and fail-closed reroute after injected profile
+failure or an at-floor balance. `read_only` remains Claude-only and the high
+chain is unchanged.
+
+Large prompts travel by stdin or private files removed on every exit path,
+cancellation and kill clean up process groups and descendants, and
+account-specific homes do not leak between firings. See
+[docs/cartridges.md](docs/cartridges.md) for each adapter's exact policy and
+prompt handling.
+
+Codex and Codex Animus have real `read_exec` and `read_write` drivers. The
+personal Codex account being logged out and the Codex Animus app-server probe
+error are current account availability issues, not missing adapters. `codex-animus`
+is not in Dandelion's high chain.
+
+Animus and a custom-command adapter remain planned. The interface, registry
+and conformance suite are adapter-agnostic, so each new one is a package and a
+registry line: the whole recipe — the contract, the error-kind and tool-policy
+mapping tables to fill in, the fixtures, the conformance run and a worked
+example — is
 [docs/cartridges.md § Adding a new cartridge](docs/cartridges.md#adding-a-new-cartridge).
 
 There is also a `mock` cartridge that plays a scripted scenario. It is how

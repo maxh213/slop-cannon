@@ -149,10 +149,10 @@ func TestDocCartridges(t *testing.T) {
 	g, err := OpenGlobal()
 	require.NoError(t, err)
 
-	_, err = g.AddCartridge("kimi", "3")
-	assert.EqualError(t, err, `cartridge "kimi" is not supported yet (only "claude", "cursor", "dandelion" for now)`)
+	_, err = g.AddCartridge("codex-animus", "")
+	assert.EqualError(t, err, `cartridge "codex-animus" is not supported yet (only "claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo" for now)`)
 	_, err = g.AddCartridge("animus", "")
-	assert.EqualError(t, err, `cartridge "animus" is not supported yet (only "claude", "cursor", "dandelion" for now)`)
+	assert.EqualError(t, err, `cartridge "animus" is not supported yet (only "claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo" for now)`)
 	_, err = g.AddCartridge("dandelion", "fable")
 	assert.EqualError(t, err, `cartridge "dandelion" takes model "high" or "standard", not "fable": the router picks the real model`)
 	assert.Nil(t, g.File.Cartridges)
@@ -169,7 +169,7 @@ func TestDocCartridges(t *testing.T) {
 	assert.Equal(t, "opus", g.File.Cartridges["claude"].Model)
 
 	require.NoError(t, g.SetActive("claude"))
-	assert.EqualError(t, g.SetActive("kimi"), `cartridge "kimi" is not supported yet (only "claude", "cursor", "dandelion" for now)`)
+	assert.EqualError(t, g.SetActive("codex-animus"), `cartridge "codex-animus" is not supported yet (only "claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo" for now)`)
 
 	_, _, err = g.RemoveCartridge("kimi")
 	assert.EqualError(t, err, `cartridge "kimi" is not configured`)

@@ -1,0 +1,1 @@
+{"conversation_id":"rate-session","status":"ERROR","response":"partial rate response","error":"RESOURCE_EXHAUSTED (code 429): too many requests; try again later","duration_seconds":2.5,"num_turns":1,"usage":{"input_tokens":9,"output_tokens":3,"thinking_tokens":1,"cache_read_tokens":0,"total_tokens":12}}

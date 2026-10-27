@@ -234,6 +234,9 @@ type Demand struct {
 	// Round is the review round the work belongs to (D-08). It is part of
 	// the demand's identity, so a new round is new work.
 	Round int
+	// Slots is how many agent sessions this demand reserves. Zero means one.
+	// A parallel planning round sets it to its internal producer count.
+	Slots int
 	// Task overrides the kind's default [events.Task] — an engineer
 	// answering feedback (events.TaskAddressFeedback) or resolving a
 	// conflict (events.TaskResolveConflict) is still a DemandImplement.
@@ -269,6 +272,10 @@ type Demand struct {
 // Role is the role that serves the demand.
 func (d Demand) Role() domain.Role { return d.Kind.Role() }
 
+// slots is the capacity this demand reserves; invalid non-positive values
+// retain the ordinary single-session behavior.
+func (d Demand) slots() int { return max(d.Slots, 1) }
+
 // FiringTask is the [events.Task] the agent is fired for.
 func (d Demand) FiringTask() events.Task {
 	if d.Task != "" {
@@ -292,6 +299,9 @@ func (d Demand) FiringTask() events.Task {
 // D-05 product-owner cap still bounds how many run together.
 func (d Demand) Key() string {
 	k := string(d.Kind) + "|" + string(d.Bead) + "|" + string(d.Lens) + "|" + strconv.Itoa(d.Round)
+	if d.Kind == DemandPlan && d.Agent != "" {
+		k += "|" + string(d.Agent)
+	}
 	if w, ok := d.Payload.(FeedbackWork); ok && w.Item != "" {
 		k += "|" + w.Item
 	}
@@ -463,12 +473,14 @@ type BeadParker interface {
 var _ BeadParker = (*StateMachine)(nil)
 
 // SlotCaps is the D-05 allocation as the scheduler enforces it: one pool
-// per role plus the overall ammo cap.
+// per role plus the overall ammo cap and an independent planning pool.
 type SlotCaps struct {
 	// Ammo is the total number of agents that may be live at once.
 	Ammo int
-	// PO is how many product owners may run at once (D-05: one).
+	// PO is how many arbitration or escalation product owners may run at once.
 	PO int
+	// Planning is how many read-only planning product owners may run at once.
+	Planning int
 	// Engineers is max_engineers_in_flight.
 	Engineers int
 	// Testers is every remaining slot.
@@ -483,7 +495,7 @@ func CapsFor(a config.Allocation) SlotCaps {
 	if a.Ammo < config.MinAmmo {
 		a, _ = config.Allocate(config.MinAmmo)
 	}
-	return SlotCaps{Ammo: a.Ammo, PO: max(a.PO, 1), Engineers: max(a.MaxEngineers, 1), Testers: max(a.MaxTesters, 1)}
+	return SlotCaps{Ammo: a.Ammo, PO: max(a.PO, 1), Planning: 1, Engineers: max(a.MaxEngineers, 1), Testers: max(a.MaxTesters, 1)}
 }
 
 // For returns the cap of one role's pool; an unknown role has none.
@@ -508,8 +520,12 @@ func (c SlotCaps) TestersPerBead() int {
 
 // String renders the caps the way the CLI renders an allocation.
 func (c SlotCaps) String() string {
-	return fmt.Sprintf("ammo %d → %d PO, up to %d engineers, up to %d testers, %d testers per bead",
+	line := fmt.Sprintf("ammo %d → %d PO, up to %d engineers, up to %d testers, %d testers per bead",
 		c.Ammo, c.PO, c.Engineers, c.Testers, c.TestersPerBead())
+	if c.Planning > 1 {
+		line += fmt.Sprintf(", up to %d planning POs", c.Planning)
+	}
+	return line
 }
 
 // SchedulerStatus is a snapshot of the ammo in use, for `sc status`, the
@@ -517,9 +533,9 @@ func (c SlotCaps) String() string {
 type SchedulerStatus struct {
 	// Caps is the allocation being enforced.
 	Caps SlotCaps
-	// Live is how many agents are running right now.
+	// Live is how many ammo slots running demands occupy.
 	Live int
-	// ByRole counts the live agents of each role.
+	// ByRole counts the occupied slots of each role.
 	ByRole map[domain.Role]int
 	// Agents are the live agent records, in the order they were fired.
 	Agents []domain.Agent
@@ -541,11 +557,18 @@ type SchedulerStatus struct {
 	// re-plan (P6-05) — looks at this rather than Idle, which also demands
 	// that every agent has finished.
 	Quiet bool
+	// arbitration is the PO subset using the arbitration cap rather than the
+	// planning cap; it is derived while the scheduler lock is held.
+	arbitration int
 }
 
 // Free is how many slots of the role are still available.
 func (s SchedulerStatus) Free(role domain.Role) int {
-	return max(0, min(s.Caps.For(role)-s.ByRole[role], s.Caps.Ammo-s.Live))
+	used := s.ByRole[role]
+	if role == domain.RolePO && s.Caps.Planning > 1 {
+		used = s.arbitration
+	}
+	return max(0, min(s.Caps.For(role)-used, s.Caps.Ammo-s.Live))
 }
 
 // StopCondition decides when the run is over. The planning loop (P6-05)
@@ -573,6 +596,9 @@ type SchedulerOptions struct {
 	// Allocation is the D-05 split to enforce. The zero value means "the
 	// run's own", read from [Run.Allocation] when the loop starts.
 	Allocation config.Allocation
+	// Planning is the independent planning-PO cap. Zero or negative preserves
+	// the single-planner behavior; values above ammo run in ammo-sized waves.
+	Planning int
 	// Work reports what wants doing. Nil means nothing ever does.
 	Work WorkSource
 	// Fire runs the agents. Required whenever Work is set.
@@ -620,7 +646,7 @@ type SchedulerOptions struct {
 	Park BeadParker
 }
 
-// liveAgent is one slot in use.
+// liveAgent is one reservation, which may occupy several slots.
 type liveAgent struct {
 	agent   domain.Agent
 	demand  Demand
@@ -649,21 +675,23 @@ type Scheduler struct {
 	kickCh chan struct{}
 	wg     sync.WaitGroup
 
-	mu       sync.Mutex
-	caps     SlotCaps
-	live     map[domain.AgentID]*liveAgent
-	byKey    map[string]domain.AgentID
-	attempts map[string]int
-	failures map[string]int
-	parked   map[string]bool
-	byRole   map[domain.Role]int
-	ticks    uint64
-	fired    uint64
-	idle     bool
+	mu        sync.Mutex
+	caps      SlotCaps
+	live      map[domain.AgentID]*liveAgent
+	usedSlots int
+	byKey     map[string]domain.AgentID
+	attempts  map[string]int
+	failures  map[string]int
+	parked    map[string]bool
+	byRole    map[domain.Role]int
+	ticks     uint64
+	fired     uint64
+	idle      bool
 }
 
 // NewScheduler returns a scheduler configured by opts.
 func NewScheduler(opts SchedulerOptions) *Scheduler {
+	opts.Planning = max(opts.Planning, 1)
 	s := &Scheduler{
 		opts:     opts,
 		clock:    opts.Clock,
@@ -680,6 +708,7 @@ func NewScheduler(opts SchedulerOptions) *Scheduler {
 		parked:   map[string]bool{},
 		byRole:   map[domain.Role]int{},
 	}
+	s.caps.Planning = opts.Planning
 	if s.limit == 0 {
 		s.limit = DefaultDemandFailureLimit
 	}
@@ -719,11 +748,11 @@ func (s *Scheduler) Caps() SlotCaps {
 	return s.caps
 }
 
-// Live is how many agents are running right now.
+// Live is how many ammo slots running demands occupy right now.
 func (s *Scheduler) Live() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return len(s.live)
+	return s.usedSlots
 }
 
 // Status snapshots the ammo in use.
@@ -735,14 +764,15 @@ func (s *Scheduler) Status() SchedulerStatus {
 
 func (s *Scheduler) statusLocked() SchedulerStatus {
 	st := SchedulerStatus{
-		Caps:   s.caps,
-		Live:   len(s.live),
-		ByRole: make(map[domain.Role]int, len(s.byRole)),
-		Ticks:  s.ticks,
-		Fired:  s.fired,
-		Parked: len(s.parked),
-		Idle:   s.idle && len(s.live) == 0,
-		Quiet:  s.idle,
+		Caps:        s.caps,
+		Live:        s.usedSlots,
+		ByRole:      make(map[domain.Role]int, len(s.byRole)),
+		Ticks:       s.ticks,
+		Fired:       s.fired,
+		Parked:      len(s.parked),
+		Idle:        s.idle && len(s.live) == 0,
+		Quiet:       s.idle,
+		arbitration: s.demandsOn(DemandArbitrate),
 	}
 	for role, n := range s.byRole {
 		if n > 0 {
@@ -783,6 +813,7 @@ func (s *Scheduler) Run(ctx context.Context, r *Run) (Outcome, error) {
 	if s.opts.Allocation.Ammo < config.MinAmmo {
 		s.mu.Lock()
 		s.caps = CapsFor(r.Allocation())
+		s.caps.Planning = s.opts.Planning
 		s.mu.Unlock()
 	}
 	r.Log().Info("scheduler started", slog.String("caps", s.Caps().String()))
@@ -1006,7 +1037,7 @@ func lensRank(l domain.Lens) int {
 // reserve takes a slot for the demand if the allocation allows one and the
 // work is not already in flight. It is the whole of the ammo accounting.
 func (s *Scheduler) reserve(d Demand) bool {
-	role := d.Role()
+	role, slots := d.Role(), d.slots()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, busy := s.byKey[d.Key()]; busy {
@@ -1018,13 +1049,20 @@ func (s *Scheduler) reserve(d Demand) bool {
 		// silently is what ends the livelock.
 		return false
 	}
-	if len(s.live) >= s.caps.Ammo {
+	if s.usedSlots+slots > s.caps.Ammo {
 		return false
 	}
-	if s.byRole[role] >= s.caps.For(role) {
+	switch {
+	case s.caps.Planning == 1 && s.byRole[role]+slots > s.caps.For(role):
+		return false
+	case d.Kind == DemandPlan && s.demandsOn(DemandPlan)+slots > s.caps.Planning:
+		return false
+	case d.Kind == DemandArbitrate && s.demandsOn(DemandArbitrate)+slots > s.caps.PO:
+		return false
+	case d.Kind != DemandPlan && d.Kind != DemandArbitrate && s.byRole[role]+slots > s.caps.For(role):
 		return false
 	}
-	if d.Kind == DemandReview && s.testersOn(d.Bead) >= s.caps.TestersPerBead() {
+	if d.Kind == DemandReview && s.testersOn(d.Bead)+slots > s.caps.TestersPerBead() {
 		return false
 	}
 	if role == domain.RoleEngineer && d.Bead != "" && s.engineerOn(d.Bead) {
@@ -1036,10 +1074,11 @@ func (s *Scheduler) reserve(d Demand) bool {
 		// to fire into the same worktree. The later one waits its turn.
 		return false
 	}
-	// A placeholder holds the slot until start() replaces it, so two
-	// demands of one dispatch cannot both take the last one.
+	// A placeholder holds the slots until start() replaces it, so two
+	// demands of one dispatch cannot both take the last capacity.
 	s.byKey[d.Key()] = ""
-	s.byRole[role]++
+	s.byRole[role] += slots
+	s.usedSlots += slots
 	s.live[s.pendingID(d)] = &liveAgent{demand: d}
 	return true
 }
@@ -1056,16 +1095,29 @@ func (s *Scheduler) unreserve(d Demand) {
 	defer s.mu.Unlock()
 	delete(s.byKey, d.Key())
 	delete(s.live, s.pendingID(d))
-	s.byRole[d.Role()]--
+	s.byRole[d.Role()] -= d.slots()
+	s.usedSlots -= d.slots()
 }
 
-// testersOn counts the live testers reviewing one bead; the caller holds
-// the lock.
+// demandsOn counts slots occupied by live or reserved demands of one kind;
+// the caller holds the lock. Planning and arbitration have separate caps.
+func (s *Scheduler) demandsOn(kind DemandKind) int {
+	n := 0
+	for _, l := range s.live {
+		if l.demand.Kind == kind {
+			n += l.demand.slots()
+		}
+	}
+	return n
+}
+
+// testersOn counts the slots used by testers reviewing one bead; the caller
+// holds the lock.
 func (s *Scheduler) testersOn(bead domain.BeadID) int {
 	n := 0
 	for _, l := range s.live {
 		if l.demand.Kind == DemandReview && l.demand.Bead == bead {
-			n++
+			n += l.demand.slots()
 		}
 	}
 	return n
@@ -1091,6 +1143,19 @@ func (s *Scheduler) plannedAgentID(d Demand) domain.AgentID {
 	s.mu.Lock()
 	attempt := s.attempts[jobKey(d)] + 1
 	s.mu.Unlock()
+	return s.mintAgentID(d, attempt)
+}
+
+// mintAgentID keeps the legacy names for a single planner. Parallel planning
+// names include the round, while an explicit contributor id always wins.
+func (s *Scheduler) mintAgentID(d Demand, attempt int) domain.AgentID {
+	if d.Kind == DemandPlan && s.opts.Planning > 1 {
+		id := "po-plan"
+		if d.Round > 0 {
+			id += "-r" + strconv.Itoa(d.Round)
+		}
+		return domain.AgentID(id + "-" + strconv.Itoa(attempt))
+	}
 	return mintAgentID(d, attempt)
 }
 
@@ -1222,7 +1287,7 @@ func (s *Scheduler) start(ctx context.Context, r *Run, d Demand) {
 	seq := s.fired
 	id := d.Agent
 	if id == "" {
-		id = mintAgentID(d, attempt)
+		id = s.mintAgentID(d, attempt)
 	}
 	agent := domain.Agent{
 		ID:        id,
@@ -1398,7 +1463,7 @@ func (s *Scheduler) update(l *liveAgent, r *Run, a domain.Agent) {
 	}
 }
 
-// finished frees the agent's slot.
+// finished frees the agent's slots.
 func (s *Scheduler) finished(l *liveAgent) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1410,8 +1475,9 @@ func (s *Scheduler) finished(l *liveAgent) {
 		delete(s.byKey, l.demand.Key())
 	}
 	if n := s.byRole[l.demand.Role()]; n > 0 {
-		s.byRole[l.demand.Role()] = n - 1
+		s.byRole[l.demand.Role()] = n - l.demand.slots()
 	}
+	s.usedSlots -= l.demand.slots()
 }
 
 // clearFailures forgets a demand's failures once one of its firings has
@@ -1575,7 +1641,10 @@ func (s *Scheduler) drainAgents(r *Run) {
 	select {
 	case <-done:
 	case <-s.clock.After(s.drain):
+		s.mu.Lock()
+		remaining = len(s.live)
+		s.mu.Unlock()
 		r.Warn(SourceScheduler,
-			fmt.Sprintf("%d agents were still running after %s; leaving them to the supervisor", s.Live(), s.drain), nil)
+			fmt.Sprintf("%d agents were still running after %s; leaving them to the supervisor", remaining, s.drain), nil)
 	}
 }

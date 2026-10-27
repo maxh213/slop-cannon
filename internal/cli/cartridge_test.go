@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"slop-cannon/internal/cartridge"
 	"slop-cannon/internal/config"
 )
 
@@ -52,6 +53,22 @@ func TestCartridgeHelpGolden(t *testing.T) {
 	out, err := cartridgeRun(t, "--help")
 	require.NoError(t, err)
 	rootGolden(t, "cartridge-help", out)
+}
+
+func TestCartridgeDirectProviderRegistration(t *testing.T) {
+	cartridgeTestEnv(t)
+	for _, name := range []string{"agy", "codex", "kimi", "grok", "junie", "hermes", "kilo"} {
+		require.True(t, cartridge.Default.Has(name), name)
+		out, err := cartridgeRun(t, "--add", name, "--model", "cheap")
+		require.NoError(t, err, name)
+		require.Contains(t, out, `added cartridge "`+name+`"`, name)
+	}
+	require.False(t, cartridge.Default.Has("codex-animus"))
+	file, exists := cartridgeFile(t)
+	require.True(t, exists)
+	for _, name := range []string{"agy", "codex", "kimi", "grok", "junie", "hermes", "kilo"} {
+		require.Equal(t, config.Cartridge{Model: "cheap"}, file.Cartridges[name])
+	}
 }
 
 func TestCartridgeREADMEAddAndRemove(t *testing.T) {
@@ -103,14 +120,14 @@ func TestCartridgeRejectsUnsupportedNames(t *testing.T) {
 		args []string
 		name string
 	}{
-		{[]string{"--add", "kimi", "--model", "3"}, "kimi"},
+		{[]string{"--add", "codex-animus"}, "codex-animus"},
 		{[]string{"--add", "animus"}, "animus"},
-		{[]string{"--use", "kimi"}, "kimi"},
+		{[]string{"--use", "kilo-unsupported"}, "kilo-unsupported"},
 	}
 	for _, tc := range cases {
 		out, err := cartridgeRun(t, tc.args...)
 		require.Error(t, err, tc.args)
-		require.Equal(t, `cartridge "`+tc.name+`" is not supported yet (only "claude", "cursor", "dandelion" for now)`, err.Error(), tc.args)
+		require.Equal(t, `cartridge "`+tc.name+`" is not supported yet (only "claude", "cursor", "dandelion", "agy", "codex", "kimi", "grok", "junie", "hermes", "kilo" for now)`, err.Error(), tc.args)
 		require.Empty(t, out, tc.args)
 		_, exists := cartridgeFile(t)
 		require.False(t, exists, "a rejected command must not write the config")
@@ -120,10 +137,10 @@ func TestCartridgeRejectsUnsupportedNames(t *testing.T) {
 func TestCartridgeUnsupportedNameExitCode(t *testing.T) {
 	cartridgeTestEnv(t)
 	var stdout, stderr bytes.Buffer
-	code := ExecuteContext(context.Background(), []string{"cartridge", "--add", "kimi", "--model", "3"}, &stdout, &stderr)
+	code := ExecuteContext(context.Background(), []string{"cartridge", "--add", "codex-animus"}, &stdout, &stderr)
 	require.Equal(t, 1, code)
 	require.Empty(t, stdout.String())
-	require.Equal(t, "sc: cartridge \"kimi\" is not supported yet (only \"claude\", \"cursor\", \"dandelion\" for now)\n", stderr.String())
+	require.Equal(t, "sc: cartridge \"codex-animus\" is not supported yet (only \"claude\", \"cursor\", \"dandelion\", \"agy\", \"codex\", \"kimi\", \"grok\", \"junie\", \"hermes\", \"kilo\" for now)\n", stderr.String())
 }
 
 func TestCartridgeAddWithoutModelAndReAdd(t *testing.T) {

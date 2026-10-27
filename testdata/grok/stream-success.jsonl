@@ -1,0 +1,8 @@
+{"type":"thought","data":"Analyzing"}
+{"type":"tool_call","toolCallId":"call_1","title":"Read","kind":"read","status":"in_progress","toolName":"read_file","rawInput":{"path":"/work/hello.txt"},"content":[],"locations":[]}
+{"type":"tool_call_update","toolCallId":"call_1","status":"completed","rawOutput":"hello from disk","content":[],"locations":[]}
+{"type":"text","data":"Hello "}
+{"type":"text","data":"world"}
+{"type":"usage","messageId":"resp_1","stopReason":"tool_use","usage":{"input_tokens":8,"output_tokens":3,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}}
+{"type":"end","stopReason":"end_turn","sessionId":"abc","requestId":"req_1","num_turns":2,"usage":{"input_tokens":10,"output_tokens":4,"cache_read_input_tokens":7,"cache_creation_input_tokens":3},"total_cost_usd":0.012}
+{"type":"text","data":"ignored after end"}

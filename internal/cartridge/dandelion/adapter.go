@@ -2,6 +2,7 @@ package dandelion
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -12,8 +13,9 @@ import (
 
 	"slop-cannon/internal/agents"
 	"slop-cannon/internal/cartridge"
+	"slop-cannon/internal/cartridge/agy"
 	"slop-cannon/internal/cartridge/claude"
-	"slop-cannon/internal/cartridge/cursor"
+	"slop-cannon/internal/cartridge/kilo"
 	"slop-cannon/internal/config"
 	"slop-cannon/internal/domain"
 	"slop-cannon/internal/proc"
@@ -74,13 +76,15 @@ const (
 )
 
 // Adapter is the dandelion cartridge: every firing asks the router which
-// account to use and delegates to the Claude Code or Cursor Agent adapter
-// built under this cartridge's name. Build it through the registry
+// account to use and delegates to its registered driver under this
+// cartridge's name. Build it through the registry
 // (cartridge.New("dandelion", cfg)) or New; the zero value is not usable.
 type Adapter struct {
-	name string
-	cfg  config.Cartridge
-	mode Mode
+	name      string
+	cfg       config.Cartridge
+	mode      Mode
+	providers []Provider
+	drivers   map[Driver]driverCapabilities
 
 	// Seams for tests.
 	now       func() time.Time
@@ -109,6 +113,8 @@ var (
 
 func init() {
 	cartridge.MustRegister(Name, New)
+	// agy is the one delegated adapter without self-registration.
+	cartridge.MustRegister(agy.Name, agy.New)
 }
 
 // New is the cartridge.Factory for dandelion. name is the registry name;
@@ -125,6 +131,7 @@ func New(name string, cfg config.Cartridge) (cartridge.Cartridge, error) {
 	}
 	a := &Adapter{
 		name: name, cfg: cfg, mode: mode,
+		providers: append([]Provider(nil), Providers...), drivers: cloneDrivers(),
 		now: time.Now, homeDir: os.UserHomeDir,
 		cache: map[routeKey]cachedRoute{}, flights: map[routeKey]*flight{},
 		clean: map[routeKey]uint64{}, benched: map[string]time.Time{},
@@ -166,10 +173,11 @@ func (a *Adapter) claudeAdapter(cfg config.Cartridge) cartridge.Cartridge {
 }
 
 // Detect implements cartridge.Cartridge: it resolves the router binary and
-// then detects Claude Code, which every read_only and read_exec firing (the
-// product owner, the testers) is routed to. It does not ask the router for
-// a route: a probe round starts every provider's CLI. Status.Version is
-// Claude Code's, and Detail says the mode and the accounts sc can drive.
+// detects Claude Code as the baseline adapter available to every restricted
+// policy. Other delegated binaries are checked when the allowed route set is
+// built. Detect does not ask the router for a route: a probe round starts
+// every provider's CLI. Status.Version is Claude Code's, and Detail says the
+// mode and the baseline accounts sc can drive.
 func (a *Adapter) Detect(ctx context.Context) (cartridge.Status, error) {
 	var st cartridge.Status
 	bin := a.Binary()
@@ -206,38 +214,110 @@ func (a *Adapter) describe() string {
 
 // cursorInstalled reports whether the Cursor Agent CLI is on PATH.
 func cursorInstalled() bool {
-	_, err := proc.LookPath(config.Cartridge{}.Binary(cursor.Name))
-	return err == nil
+	return driverAvailable(builtinDrivers, DriverCursor)
 }
 
-// ToolPolicyEnforcement implements agents.ToolPolicyEnforcer. read_only
-// and read_exec firings are only ever routed to Claude accounts (Run
-// disables cursor for them and refuses a route that names anything else),
-// so they are held natively, exactly as the Claude adapter holds them;
-// this is what lets a planning product owner, which has no worktree to
-// copy, fire on dandelion. read_write may land on Cursor too and needs no
-// restriction.
+func (a *Adapter) allowed(policy cartridge.ToolPolicy) []string {
+	return allowedProviders(a.providers, a.drivers, policy, func(driver Driver) bool {
+		return driverAvailable(a.drivers, driver)
+	})
+}
+
+func (a *Adapter) providerByID(id string) (Provider, bool) {
+	for _, p := range a.providers {
+		if p.ID == id {
+			return p, true
+		}
+	}
+	return Provider{}, false
+}
+
+// routeUsable repeats the capability checks after routing. In particular, a
+// cached route cannot survive a policy or binary-availability change merely
+// because the router printed it before that change.
+func (a *Adapter) routeUsable(p Provider, allowed []string, policy cartridge.ToolPolicy) bool {
+	return slices.Contains(allowed, p.ID) &&
+		driverAllows(a.drivers, p.Driver, policy) && driverAvailable(a.drivers, p.Driver)
+}
+
+type policyDriver struct {
+	driver       Driver
+	capabilities driverCapabilities
+}
+
+// policyDrivers is the eligible driver set shared conceptually by routing and
+// enforcement, deduplicated when several accounts use the same adapter.
+func (a *Adapter) policyDrivers(policy cartridge.ToolPolicy) []policyDriver {
+	var out []policyDriver
+	seen := map[Driver]bool{}
+	for _, provider := range a.providers {
+		if seen[provider.Driver] {
+			continue
+		}
+		capabilities := a.drivers[provider.Driver]
+		if _, ok := capabilities.policyMode(policy); !ok {
+			continue
+		}
+		seen[provider.Driver] = true
+		out = append(out, policyDriver{driver: provider.Driver, capabilities: capabilities})
+	}
+	return out
+}
+
+// ToolPolicyEnforcement resolves the same driver policy declarations used by
+// Allowed and routeUsable. Every driver eligible for a restricted policy must
+// confirm native enforcement; EnforceNone is accepted only for read_write.
 func (a *Adapter) ToolPolicyEnforcement(p cartridge.ToolPolicy) (agents.Enforcement, error) {
 	if !p.Valid() {
 		return agents.Enforcement{}, fmt.Errorf("%w: tool policy %q", domain.ErrUnknownValue, string(p))
 	}
+	drivers := a.policyDrivers(p)
+	if len(drivers) == 0 {
+		return agents.Enforcement{}, fmt.Errorf("cartridge %s: no routed driver can enforce %s", a.name, p)
+	}
+	details := make([]string, 0, len(drivers))
+	for _, driver := range drivers {
+		detail := driver.capabilities.detail
+		if detail == "" {
+			detail = string(driver.driver)
+		}
+		details = append(details, detail)
+	}
 	if p == cartridge.ToolReadWrite {
 		return agents.Enforcement{
 			Cartridge: a.name, Policy: p, Mode: agents.EnforceNone,
-			Detail: "nothing to restrict; routed to a Claude Code account or to Cursor Agent",
+			Detail: "nothing to restrict; routed to " + strings.Join(details, ", "),
 		}, nil
 	}
-	inner, ok := a.claudeAdapter(config.Cartridge{}).(agents.ToolPolicyEnforcer)
-	if !ok {
-		return agents.Enforcement{}, fmt.Errorf("cartridge %s: the Claude Code adapter reports no tool-policy enforcement", a.name)
+
+	var aggregate agents.Enforcement
+	for _, driver := range drivers {
+		inner, err := driver.capabilities.factory(a.name, config.Cartridge{Env: a.cfg.Env})
+		if err != nil {
+			return agents.Enforcement{}, fmt.Errorf("cartridge %s: building driver %q for tool-policy enforcement: %w", a.name, driver.driver, err)
+		}
+		if inner == nil {
+			return agents.Enforcement{}, fmt.Errorf("cartridge %s: driver %q returned no adapter for tool-policy enforcement", a.name, driver.driver)
+		}
+		en, err := agents.EnforcementFor(inner, p)
+		if err != nil {
+			return agents.Enforcement{}, err
+		}
+		if en.Mode != agents.EnforceNative || en.Check() != nil {
+			return agents.Enforcement{}, fmt.Errorf("cartridge %s: driver %q does not natively enforce %s", a.name, driver.driver, p)
+		}
+		if aggregate.Mode == "" {
+			aggregate = en
+		}
 	}
-	en, err := inner.ToolPolicyEnforcement(p)
-	if err != nil {
-		return agents.Enforcement{}, err
+	aggregate.Cartridge = a.name
+	if len(drivers) == 1 {
+		aggregate.Detail = "routed to " + details[0] + " only; " + aggregate.Detail
+	} else {
+		aggregate.Controls = nil
+		aggregate.Detail = fmt.Sprintf("every routed driver enforces %s natively (%s)", p, strings.Join(details, ", "))
 	}
-	en.Cartridge = a.name
-	en.Detail = "routed to Claude Code accounts only; " + en.Detail
-	return en, nil
+	return aggregate, nil
 }
 
 // fired is what one firing was routed to, for the outcome translation.
@@ -246,94 +326,91 @@ type fired struct {
 }
 
 // Run implements cartridge.Cartridge: it asks the router for an account the
-// firing's tool policy allows (see Allowed), then starts the session on it
-// through the Claude Code or Cursor Agent adapter with the routed model.
-// spec.Model is ignored: the router's model wins. A route naming an account
-// the policy does not allow is treated as no route at all.
+// firing's tool policy and installed drivers allow (see Allowed), then starts
+// the session through that account's adapter with the routed model and effort.
+// spec.Model selects a route mode only when it is standard or high, trimmed
+// and case-insensitively; every other value keeps the configured mode. The
+// routed model still replaces spec.Model before delegation. Kilo additionally
+// requires fresh route and balance authorization on every launch; ErrBudget
+// invalidates Kilo and retries afresh without it.
 func (a *Adapter) Run(ctx context.Context, spec cartridge.RunSpec) (cartridge.Session, error) {
 	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
-	allowed, wait := a.unbenched(Allowed(spec.ToolPolicy, cursorInstalled()))
-	if len(allowed) == 0 {
-		e := a.noRoute("every account sc can use for this firing failed recently and is benched")
-		e.RetryAfter = min(wait, NoRouteRetryAfter)
-		return nil, e
+	mode := a.mode
+	switch {
+	case strings.EqualFold(strings.TrimSpace(spec.Model), string(ModeStandard)):
+		mode = ModeStandard
+	case strings.EqualFold(strings.TrimSpace(spec.Model), string(ModeHigh)):
+		mode = ModeHigh
 	}
-	key := routeKey{mode: a.mode, allowed: strings.Join(allowed, ",")}
-	user, _ := a.lookupEnv(disableEnv)
-	r, cached, err := a.route(ctx, key, Disabled(allowed, user))
-	if err != nil {
-		return nil, err
-	}
-	p, known := providerByID(r.Account)
-	if !known || !slices.Contains(allowed, r.Account) {
-		a.invalidate(r)
-		msg := fmt.Sprintf("dandelion routed to %q (%s), which is not one sc can drive", r.Account, r)
-		switch {
-		case a.isBenched(r.Account):
-			msg = fmt.Sprintf("dandelion routed to %q (%s), which failed recently and is benched", r.Account, r)
-		case known && p.allows(spec.ToolPolicy):
-			msg = fmt.Sprintf("dandelion routed to %q (%s), which needs cursor-agent on PATH", r.Account, r)
-		case known && p.Driver != DriverNone:
-			msg = fmt.Sprintf("dandelion routed to %q (%s), which cannot hold %s", r.Account, r, spec.ToolPolicy)
+	excludeKilo := false
+	for range 4 {
+		candidates := a.allowed(spec.ToolPolicy)
+		if excludeKilo {
+			candidates = slices.DeleteFunc(candidates, func(id string) bool { return id == kilo.Name })
 		}
-		return nil, a.noRoute(msg)
-	}
-
-	inner, effort, err := a.delegate(p, r, &spec)
-	if err != nil {
-		return nil, err
-	}
-	a.log().Info("dandelion routed a firing",
-		slog.String("agent", spec.Labels.Get(cartridge.LabelAgent)),
-		slog.String("account", r.Account), slog.String("model", r.Model), slog.String("effort", effort),
-		slog.String("mode", string(a.mode)), slog.String("policy", string(spec.ToolPolicy)),
-		slog.Bool("cached", cached))
-
-	s, err := inner.Run(ctx, spec)
-	if err != nil {
-		return nil, a.translate(err, fired{r})
-	}
-	return a.watch(s, fired{r}), nil
-}
-
-// delegate builds the adapter for p and points spec at the routed model
-// and, for a Claude account, its config dir. effort is the --effort value
-// passed on, empty when the line had none or one Claude Code does not
-// accept.
-func (a *Adapter) delegate(p Provider, r Route, spec *cartridge.RunSpec) (cartridge.Cartridge, string, error) {
-	spec.Model = r.Model
-	switch p.Driver {
-	case DriverCursor:
-		c, _ := cursor.New(a.name, config.Cartridge{Model: r.Model, Env: a.cfg.Env}) // never fails
-		return c, "", nil
-	default:
-		dir, err := p.configDir(a.lookupEnv, a.homeDir)
+		allowed, wait := a.unbenched(candidates)
+		if len(allowed) == 0 {
+			if excludeKilo {
+				return nil, a.noRoute("Kilo's balance check failed and no other account is routable")
+			}
+			e := a.noRoute("every account sc can use for this firing failed recently and is benched")
+			e.RetryAfter = min(wait, NoRouteRetryAfter)
+			return nil, e
+		}
+		key := routeKey{mode: mode, allowed: strings.Join(allowed, ",")}
+		user, _ := a.lookupEnv(disableEnv)
+		r, cached, err := a.route(ctx, key, Disabled(allowed, user))
 		if err != nil {
-			return nil, "", cartridge.NewError(cartridge.KindCrash, a.name, "", err)
+			return nil, err
 		}
-		if dir != "" {
-			env := make(map[string]string, len(spec.Env)+1)
-			for k, v := range spec.Env {
-				env[k] = v
+		p, known := a.providerByID(r.Account)
+		if !known || !a.routeUsable(p, allowed, spec.ToolPolicy) {
+			a.invalidate(r)
+			msg := fmt.Sprintf("dandelion routed to %q (%s), which is not one sc can drive", r.Account, r)
+			switch {
+			case a.isBenched(r.Account):
+				msg = fmt.Sprintf("dandelion routed to %q (%s), which failed recently and is benched", r.Account, r)
+			case known && driverAllows(a.drivers, p.Driver, spec.ToolPolicy) && !driverAvailable(a.drivers, p.Driver):
+				msg = fmt.Sprintf("dandelion routed to %q (%s), which needs %s on PATH", r.Account, r, a.drivers[p.Driver].binary)
+			case known && p.Driver != DriverNone:
+				msg = fmt.Sprintf("dandelion routed to %q (%s), which cannot hold %s", r.Account, r, spec.ToolPolicy)
 			}
-			env["CLAUDE_CONFIG_DIR"] = dir
-			spec.Env = env
+			return nil, a.noRoute(msg)
 		}
-		var args []string
-		effort := r.Effort
-		if slices.Contains(Efforts, effort) {
-			args = []string{"--effort", effort}
-		} else {
-			if effort != "" {
-				a.log().Warn("dandelion route has an effort Claude Code does not accept; dropped",
-					slog.String("route", r.String()))
-			}
-			effort = ""
+		if p.Driver == DriverKilo && cached {
+			// A cached Kilo route is only a routing hint, never launch
+			// authorization. Probe again before checking Kilo's live balance.
+			a.invalidate(r)
+			continue
 		}
-		return a.claudeAdapter(config.Cartridge{Model: r.Model, Args: args, Env: a.cfg.Env}), effort, nil
+
+		inner, effort, err := a.delegate(p, r, &spec)
+		if err != nil {
+			return nil, err
+		}
+		a.log().Info("dandelion routed a firing",
+			slog.String("agent", spec.Labels.Get(cartridge.LabelAgent)),
+			slog.String("account", r.Account), slog.String("model", r.Model), slog.String("effort", effort),
+			slog.String("mode", string(mode)), slog.String("policy", string(spec.ToolPolicy)),
+			slog.Bool("cached", cached))
+
+		s, err := inner.Run(ctx, spec)
+		if p.Driver == DriverKilo && errors.Is(err, kilo.ErrBudget) {
+			// Kilo checks its profile before starting the provider process.
+			// Drop every Kilo route and retry once without it; do not bench
+			// the account or turn this into a cartridge-retiring error.
+			a.invalidate(r)
+			excludeKilo = true
+			continue
+		}
+		if err != nil {
+			return nil, a.translate(err, fired{r})
+		}
+		return a.watch(s, fired{r}), nil
 	}
+	return nil, cartridge.NewError(cartridge.KindCrash, a.name, "could not obtain a fresh dandelion route for launch", nil)
 }
 
 // watch relays the delegated session, translating its failure.

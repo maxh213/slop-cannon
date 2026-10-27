@@ -853,33 +853,43 @@ func TestAutoMergeWaitsWhenItCannotShowTheHeadContainsTheBase(t *testing.T) {
 	assert.Contains(t, h.status().Reason, "fetch failed")
 }
 
-// A failed check sends the bead back; its engineer commits a fix, the
-// testers approve it, and the delivery moves the bead to delivering again
-// before it pushes. Until the push lands the pull request still shows the
-// old head, which sc_pr_head still names. Even when the failed check has
-// been re-run green on it meanwhile (a flake), the old head must not be
-// merged: the bead would close with the approved fix never shipped. Nor is
-// it handed to a person for failing again while the fix is on its way.
+// A failed check or conflict sends the bead back; its engineer commits a fix
+// or resolution, the testers approve it, and the delivery moves the bead to
+// delivering again before it pushes. Until the push lands the pull request
+// still shows the old head, which sc_pr_head still names. Even when the old
+// head has re-run green, still fails, or still conflicts, it must not be
+// merged, sent back again, or handed to a person while the approved work is
+// on its way.
 func TestAutoMergeWaitsWhileARedeliveryHasNotPushed(t *testing.T) {
 	t.Parallel()
 	const fix = "5555555555555555555555555555555555555555"
 	for _, tc := range []struct {
-		name  string
-		check string
+		name     string
+		check    string
+		conflict bool
 	}{
-		{"the old head re-run green", "SUCCESS"},
-		{"the old head still failing", "FAILURE"},
+		{name: "the old head re-run green", check: "SUCCESS"},
+		{name: "the old head still failing", check: "FAILURE"},
+		{name: "the old head still conflicting", conflict: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			h := newAMHarness(t, nil)
-			h.GH.set(amOwnedView(amHead, amCheck("test", "FAILURE")))
+			initial := amOwnedView(amHead, amCheck("test", "FAILURE"))
+			if tc.conflict {
+				initial.MergeStateStatus, initial.Mergeable, initial.Checks = "DIRTY", "CONFLICTING", nil
+			}
+			h.GH.set(initial)
 			h.pending()
 			h.poll()
 			require.Equal(t, string(domain.BeadStateChangesRequested), h.BD.State(amBead))
 
 			h.Branches.markAhead(fix, amHead)
-			h.GH.set(amOwnedView(amHead, amCheck("test", tc.check)))
+			old := amOwnedView(amHead, amCheck("test", tc.check))
+			if tc.conflict {
+				old.MergeStateStatus, old.Mergeable, old.Checks = "DIRTY", "CONFLICTING", nil
+			}
+			h.GH.set(old)
 			h.redeliver()
 			h.pending()
 			h.poll()
@@ -889,12 +899,21 @@ func TestAutoMergeWaitsWhileARedeliveryHasNotPushed(t *testing.T) {
 			assert.Equal(t, AutoMergeWaiting, h.status().State)
 			assert.Contains(t, h.status().Reason, "waiting for its re-delivery to push them")
 
-			// The push lands and the delivery records it.
-			h.BD.SetMeta(amBead, beads.MetaPRHead, fix)
+			// The push landing is not enough on its own: the delivery must also
+			// record that this is the head its reviewers approved.
 			h.GH.set(amOwnedView(fix))
 			h.pending()
 			h.poll()
+			assert.Empty(t, h.GH.Merges)
+			assert.Len(t, h.Outcomes.all(), 1, "the unrecorded head is not sent back either")
+			assert.Equal(t, string(domain.BeadStateDelivering), h.BD.State(amBead), "still not handed off")
+			assert.Contains(t, h.status().Reason, "its delivery has not recorded yet")
+
+			h.BD.SetMeta(amBead, beads.MetaPRHead, fix)
+			h.pending()
+			h.poll()
 			assert.Equal(t, []string{"7@" + fix}, h.GH.Merges)
+			assert.Equal(t, AutoMergeMerging, h.status().State)
 		})
 	}
 }

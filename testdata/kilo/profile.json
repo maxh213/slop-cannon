@@ -1,0 +1,7 @@
+{
+  "name": "Fixture Person",
+  "email": "fixture-person@example.invalid",
+  "team": "Fixture Team",
+  "organizationId": "fixture-org",
+  "balance": 12.5
+}

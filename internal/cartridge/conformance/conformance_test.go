@@ -15,9 +15,16 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"slop-cannon/internal/cartridge"
-	_ "slop-cannon/internal/cartridge/claude"    // registers "claude" for CARTRIDGE=claude
-	_ "slop-cannon/internal/cartridge/cursor"    // registers "cursor" for CARTRIDGE=cursor
-	_ "slop-cannon/internal/cartridge/dandelion" // registers "dandelion" for CARTRIDGE=dandelion
+	_ "slop-cannon/internal/cartridge/agy"    // registers "agy" for CARTRIDGE=agy
+	_ "slop-cannon/internal/cartridge/claude" // registers "claude" for CARTRIDGE=claude
+	_ "slop-cannon/internal/cartridge/codex"  // registers "codex" for CARTRIDGE=codex
+	_ "slop-cannon/internal/cartridge/cursor" // registers "cursor" for CARTRIDGE=cursor
+	_ "slop-cannon/internal/cartridge/dandelion"
+	_ "slop-cannon/internal/cartridge/grok"   // registers "grok" for CARTRIDGE=grok
+	_ "slop-cannon/internal/cartridge/hermes" // registers "hermes" for CARTRIDGE=hermes
+	_ "slop-cannon/internal/cartridge/junie"  // registers "junie" for CARTRIDGE=junie
+	_ "slop-cannon/internal/cartridge/kilo"   // registers "kilo" for CARTRIDGE=kilo
+	_ "slop-cannon/internal/cartridge/kimi"   // registers "kimi" for CARTRIDGE=kimi
 	"slop-cannon/internal/cartridge/mock"
 	"slop-cannon/internal/config"
 )
@@ -25,10 +32,26 @@ import (
 // conformanceDefaultModels names the cheapest model per real cartridge for
 // the driver test when SC_CONFORMANCE_MODEL is not set.
 var conformanceDefaultModels = map[string]string{
+	"agy":    "gemini-2.5-flash",
 	"claude": "claude-haiku-4-5-20251001",
+	"codex":  "gpt-5.1-codex-mini",
 	"cursor": "auto",
 	// dandelion's model is its mode; the router picks the real model.
 	"dandelion": "standard",
+	"grok":      "grok-4-fast",
+	"hermes":    "hermes-4.1-8b",
+	"junie":     "gpt-5.1",
+	"kilo":      "deepseek/deepseek-v4.1-flash-1017",
+	"kimi":      "kimi-k2.5",
+}
+
+func TestConformanceDefaultModelsCoverDirectCartridges(t *testing.T) {
+	t.Parallel()
+	for _, name := range config.KnownCartridges {
+		assert.NotEmpty(t, conformanceDefaultModels[name], name)
+	}
+	assert.NotContains(t, conformanceDefaultModels, "codex-animus")
+	assert.False(t, cartridge.Default.Has("codex-animus"))
 }
 
 // conformanceFastOptions are Options that make a mock run finish in well

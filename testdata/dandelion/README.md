@@ -2,7 +2,7 @@
 
 Verbatim copies of the two dandelion source files the `dandelion` cartridge
 (`internal/cartridge/dandelion`, D-30) mirrors, taken from the dandelion
-repository at commit `6680b41` (2026-10-24):
+repository at commit `7709ecf` (2026-10-27):
 
 | File | Copied from | What the cartridge takes from it |
 |---|---|---|

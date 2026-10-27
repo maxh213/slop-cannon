@@ -1,0 +1,1 @@
+{"role":"meta","type":"turn.step.retrying","failed_attempt":4,"next_attempt":5,"max_attempts":4,"delay_ms":32000,"error_name":"RateLimitError","error_message":"HTTP 429: requests per minute exceeded","status_code":429}

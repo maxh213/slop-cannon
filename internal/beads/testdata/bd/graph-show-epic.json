@@ -19,6 +19,41 @@
       "dependent_count": 6,
       "dependency_count": 0,
       "comment_count": 0
+    },
+    {
+      "id": "px-b79",
+      "title": "Fix Mean",
+      "status": "open",
+      "priority": 1,
+      "blocked_by": ["px-we1"]
+    },
+    {
+      "id": "px-xg3",
+      "title": "Fix Max",
+      "status": "open",
+      "priority": 2,
+      "blocked_by": ["px-we1"]
+    },
+    {
+      "id": "px-ay2",
+      "title": "Add Median",
+      "status": "open",
+      "priority": 2,
+      "blocked_by": ["px-xg3", "px-b79"]
+    },
+    {
+      "id": "px-bq2",
+      "title": "Document stats",
+      "status": "open",
+      "priority": 3,
+      "blocked_by": ["px-ay2"]
+    },
+    {
+      "id": "px-9u2",
+      "title": "Benchmark stats",
+      "status": "open",
+      "priority": 4,
+      "blocked_by": ["px-bq2"]
     }
   ],
   "schema_version": 1

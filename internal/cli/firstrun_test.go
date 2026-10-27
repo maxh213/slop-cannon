@@ -972,11 +972,13 @@ var tsMessagePackages = []string{
 const tsWildcard = "\x00"
 
 // tsExempt are the sentinels docs/troubleshooting.md deliberately does not
-// document, each with the reason. They are assembly-time invariants of sc's
-// own wiring or internal control flow: reaching one is a bug in sc, not a
-// situation a user can be advised out of. A new sentinel must be documented
-// or listed here, and a stale entry fails too.
+// document, each with the reason. They are assembly-time invariants, internal
+// control flow, or adapter policy guards that refuse before a session starts.
+// A new sentinel must be documented or listed here, and a stale entry fails too.
 var tsExempt = map[string]string{
+	"agy.ErrReadOnlyUnverified":           "Dandelion keeps agy out of read_only routing until the canary passes; direct use refuses before starting",
+	"agy.ErrReadExecUnsupported":          "agy has no execute-without-write mode and is excluded from read_exec routing",
+	"agy.ErrPlanSlashConflict":            "a configuration combination the adapter rejects before plan mode can be weakened",
 	"agents.ErrInvalidAgentRun":           "a firing sc assembled wrongly; the user cannot cause it",
 	"agents.ErrInvalidPlanRequest":        "same: the planning request is built by sc",
 	"agents.ErrIncompleteRuling":          "same: the arbitration request is built by sc",
@@ -988,6 +990,9 @@ var tsExempt = map[string]string{
 	"beads.ErrShimLayout":                 "the read-only bd shim was asked for a directory that is not a run worktree: sc's own layout",
 	"beads.ErrNoGate":                     "control flow: 'this bead has no open gate', which the gate poller expects",
 	"gitx.ErrNoHeadCommit":                "a merge guard: the gate poller always passes the head it read; only a programming error trips it",
+	"kimi.ErrReadOnlyUnavailable":         "Kimi has no exact read_only mode and is excluded from read_only routing",
+	"kilo.ErrBudget":                      "Dandelion invalidates Kilo and retries without it; direct use refuses before the provider process starts",
+	"kilo.ErrReadOnlyUnavailable":         "Kilo has no exact read_only boundary and is excluded from read_only routing",
 	"mock.ErrNoMatch":                     "the mock cartridge is a test double; it is never fired at a user's repository",
 	"orchestrator.ErrNoDeliveryHost":      "assembly invariant: the deliverer is always built with a host",
 	"orchestrator.ErrNoGateStore":         "assembly invariant: the gate poller is always built with a store",
@@ -2172,6 +2177,8 @@ func TestTroubleshootingCoversEveryWarningTheRunRaises(t *testing.T) {
 // rest are prefixes and sc's own programming errors. A new warning must be
 // documented or listed here, and a stale entry fails too.
 var tsExemptWarnings = map[string]string{
+	"dandelion route has an effort the delegated CLI does not accept; dropped": "the routed model still runs; only an unsupported optional effort is omitted, never rewritten",
+
 	// Bookkeeping after the work: a bd or git step that failed, reported so
 	// the log shows it. The run keeps going and re-does or skips the step.
 	"could not record agent …":                                                           "the run could not write an agent to its own state; the firing itself is unaffected",

@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"thread-malformed"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"msg-1","type":"agent_message","text":"PARTIAL"}}
+{"type":"turn.completed"}

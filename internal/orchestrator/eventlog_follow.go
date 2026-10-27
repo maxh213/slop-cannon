@@ -25,6 +25,11 @@ type FollowOptions struct {
 	// once it says true the follower drains what is left and closes the
 	// stream. Nil means the run ends only with its [events.RunFinished].
 	Ended func() bool
+	// FollowResumed keeps the stream open after [events.RunFinished] records,
+	// so a log's earlier incarnations can be followed through a later resumed
+	// RunStarted and its live appends. The zero value preserves the original
+	// stop-at-the-first-finish behavior used by sc watch.
+	FollowResumed bool
 }
 
 // FollowEventLog streams a run's log as it is written: the rotated segment
@@ -32,18 +37,16 @@ type FollowOptions struct {
 // the run appends, the way `tail -F` follows a file. It is how `sc watch`
 // puts a TUI on a run another process is firing.
 //
-// The stream closes when ctx is done, after the run's [events.RunFinished],
-// or when opts.Ended reports the writer gone and the file is drained. A log
-// that does not exist yet is waited for. A line that does not parse is
-// skipped, and a line still being written is held until its newline lands.
-// A rotation mid-follow is followed onto the new file, after the rest of the
-// old one is read, so no event is lost to it.
+// The stream closes when ctx is done, after the run's [events.RunFinished]
+// unless opts.FollowResumed is set, or when opts.Ended reports the writer
+// gone and the file is drained. A log that does not exist yet is waited for.
+// A line that does not parse is skipped, and a line still being written is
+// held until its newline lands. A rotation mid-follow is followed onto the
+// new file, after the rest of the old one is read, so no event is lost to it.
 func FollowEventLog(ctx context.Context, runDir string, opts FollowOptions) <-chan events.Event {
 	f := &follower{
-		dir:   filepath.Clean(runDir),
-		poll:  opts.Poll,
-		ended: opts.Ended,
-		out:   make(chan events.Event, 256),
+		dir: filepath.Clean(runDir), poll: opts.Poll, ended: opts.Ended,
+		followResumed: opts.FollowResumed, out: make(chan events.Event, 256),
 	}
 	if f.poll <= 0 {
 		f.poll = DefaultFollowPoll
@@ -60,11 +63,12 @@ func FollowEventLog(ctx context.Context, runDir string, opts FollowOptions) <-ch
 
 // follower is the state of one [FollowEventLog] stream.
 type follower struct {
-	dir      string
-	poll     time.Duration
-	ended    func() bool
-	out      chan events.Event
-	finished bool
+	dir           string
+	poll          time.Duration
+	ended         func() bool
+	followResumed bool
+	out           chan events.Event
+	finished      bool
 }
 
 // run is the follower's goroutine body.
@@ -184,7 +188,7 @@ func (f *follower) emit(ctx context.Context, line []byte) bool {
 	if err != nil {
 		return true
 	}
-	if _, ok := ev.(events.RunFinished); ok {
+	if _, ok := ev.(events.RunFinished); ok && !f.followResumed {
 		f.finished = true
 	}
 	select {

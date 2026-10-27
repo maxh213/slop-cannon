@@ -321,6 +321,18 @@ func TestPlannerGivesTheProductOwnerTheCachedSignalsUntilTheIntervalPasses(t *te
 	assert.Equal(t, f.clock.Now().Add(signalsInterval), st.NextAt)
 }
 
+func TestParallelPlanningTakesOneSignalsReadingPerRound(t *testing.T) {
+	f := signalsSetup(t, "")
+	f.p.poPlanners = 2
+	req := f.fire()
+	require.NotNil(t, req.Signals)
+	assert.Equal(t, 1, f.sig.count(), "contributors share the designated producer's reading")
+
+	f.clock.Advance(signalsInterval)
+	f.fire()
+	assert.Equal(t, 2, f.sig.count(), "the next round takes one new reading, not one per contributor")
+}
+
 func TestPlannerTakesNoSignalsInBriefMode(t *testing.T) {
 	f := signalsSetup(t, "make the tests pass")
 	req := f.fire()
@@ -632,6 +644,35 @@ func TestPlannerHoldsSignalsPlansWhileTheBacklogIsFull(t *testing.T) {
 	f.clock.Advance(signalsInterval)
 	f.demands()
 	assert.Equal(t, []Demand{planDemand()}, f.demands(), "the backlog is below one plan again")
+}
+
+func TestPlannerSignalsBacklogUsesTheCombinedRoundCap(t *testing.T) {
+	for _, tc := range []struct {
+		planners, outstanding int
+		want                  bool
+	}{
+		{planners: 1, outstanding: 8, want: false},
+		{planners: 2, outstanding: 8, want: true},
+		{planners: 2, outstanding: 16, want: false},
+	} {
+		t.Run(fmt.Sprintf("%d-planners-%d-beads", tc.planners, tc.outstanding), func(t *testing.T) {
+			f := signalsFirstPlan(t)
+			f.p.poPlanners = tc.planners
+			beads := make([]domain.Bead, tc.outstanding)
+			for i := range beads {
+				beads[i] = planningBead(domain.BeadID(fmt.Sprintf("sc-open-%d", i)), domain.BeadStateOpen)
+			}
+			f.beads.set(beads...)
+			f.sig.set("ERROR E-2 changed\n", "")
+			f.clock.Advance(signalsInterval)
+			readings, listings := f.sig.count(), f.beads.count()
+			f.demands()
+			got := f.demands()
+			assert.Equal(t, tc.want, len(got) > 0)
+			assert.Equal(t, readings+1, f.sig.count(), "one reading per round")
+			assert.Equal(t, listings+1, f.beads.count(), "one backlog listing with that reading")
+		})
+	}
 }
 
 func TestSignalsOutstandingCountsWorkStillToShip(t *testing.T) {

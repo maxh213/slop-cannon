@@ -17,7 +17,7 @@ var ErrNotEvent = errors.New("not an event envelope")
 // the registry, [Kinds] and the exhaustive tests all derive from it.
 var prototypes = []Event{
 	RunStarted{}, RunPaused{}, RunResumed{}, RunStopped{}, RunFinished{},
-	PlanProduced{},
+	PlanProduced{}, PlanReviewed{},
 	BeadCreated{}, BeadUpdated{}, BeadStateChanged{}, GraphChanged{},
 	AgentSpawned{}, AgentOutput{}, AgentFinished{}, AgentFailed{},
 	RoundStarted{}, VerdictReceived{}, ResponseReceived{}, ArbitrationReceived{},

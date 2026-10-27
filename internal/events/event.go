@@ -32,6 +32,8 @@ const (
 	KindRunFinished Kind = "run_finished"
 	// KindPlanProduced is a [PlanProduced] event.
 	KindPlanProduced Kind = "plan_produced"
+	// KindPlanReviewed is a [PlanReviewed] event.
+	KindPlanReviewed Kind = "plan_reviewed"
 	// KindBeadCreated is a [BeadCreated] event.
 	KindBeadCreated Kind = "bead_created"
 	// KindBeadUpdated is a [BeadUpdated] event.
@@ -227,6 +229,8 @@ type Task string
 const (
 	// TaskPlan is the PO researching and producing a plan.
 	TaskPlan Task = "plan"
+	// TaskPlanReview is the PO semantically reconciling parallel plan candidates.
+	TaskPlanReview Task = "plan_review"
 	// TaskImplement is an engineer implementing a bead.
 	TaskImplement Task = "implement"
 	// TaskAddressFeedback is an engineer answering a round of feedback.

@@ -1,0 +1,2 @@
+{"type":"step_finish","sessionID":"session-credits","part":{"id":"step-1","type":"step-finish","reason":"stop","cost":0.01,"tokens":{"input":11,"output":2,"reasoning":0,"cache":{"read":1,"write":0}}}}
+{"type":"error","sessionID":"session-credits","error":{"name":"APIError","data":{"message":"HTTP 429 quota exceeded: insufficient balance","statusCode":429}}}
